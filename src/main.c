@@ -13,7 +13,7 @@ int main(){
     int sockfd, newsockfd, portno;
     socklen_t clilen;
     char buffer[256];
-    struct sockaddr_in, serv_addr, cli_addr;
+    struct sockaddr_in serv_addr, cli_addr;
     int n, i, max_sd, sd;
     int client_socket[MAX_CLIENTS];
     fd_set readfds;
