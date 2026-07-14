@@ -6,6 +6,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Third-party vendored libraries — pulled in BEFORE -Werror so FetchContent
+# targets don't inherit our strict warning flags.
+add_subdirectory(third_party)
+
 # Treat warnings as errors in CI; off by default for local builds
 option(VW_WERROR "Treat compiler warnings as errors" OFF)
 
@@ -55,9 +59,6 @@ option(VW_BUILD_TESTS  "Build unit and integration tests" ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-
-# Third-party vendored libraries
-add_subdirectory(third_party)
 
 # Shared core library (vw_net, vw_proto, vw_crypto, vw_fs)
 add_subdirectory(src/core)
