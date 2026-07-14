@@ -16,6 +16,8 @@ add_executable(test_auth_handshake
     ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
     ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
 )
 
