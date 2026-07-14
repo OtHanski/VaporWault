@@ -207,6 +207,9 @@
 /** Platform abstraction layer (memory, I/O). */
 #define MBEDTLS_PLATFORM_C
 
+/** Error-string translation — enables mbedtls_strerror(). */
+#define MBEDTLS_ERROR_C
+
 /* ------------------------------------------------------------------ */
 /* Explicitly excluded — do NOT re-enable without SEC.07 sign-off     */
 /* ------------------------------------------------------------------ */

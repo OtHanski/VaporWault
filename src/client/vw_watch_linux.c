@@ -118,8 +118,9 @@ static int move_push(struct vw_watcher *w, uint32_t cookie, const char *path)
         w->move_cap = nc;
     }
     w->moves[w->move_count].cookie = cookie;
-    strncpy(w->moves[w->move_count].path, path, 1023);
-    w->moves[w->move_count].path[1023] = '\0';
+    { size_t _n = strnlen(path, 1023);
+      memcpy(w->moves[w->move_count].path, path, _n);
+      w->moves[w->move_count].path[_n] = '\0'; }
     w->move_count++;
     return 0;
 }
@@ -130,8 +131,9 @@ static int move_pop(struct vw_watcher *w, uint32_t cookie, char *out_path)
     uint32_t i;
     for (i = 0; i < w->move_count; i++) {
         if (w->moves[i].cookie == cookie) {
-            strncpy(out_path, w->moves[i].path, 1023);
-            out_path[1023] = '\0';
+            { size_t _n = strnlen(w->moves[i].path, 1023);
+              memcpy(out_path, w->moves[i].path, _n);
+              out_path[_n] = '\0'; }
             w->moves[i] = w->moves[--w->move_count];
             return 1;
         }
@@ -247,14 +249,17 @@ static void drain_inotify(struct vw_watcher *w)
 
             vw_watch_event_t out;
             memset(&out, 0, sizeof(out));
-            strncpy(out.path, fullpath, 1023);
+            { size_t _n = strlen(fullpath); /* already verified < 1024 */
+              memcpy(out.path, fullpath, _n + 1); }
 
             if (ev->mask & (IN_CREATE | IN_MOVED_TO)) {
                 if (ev->mask & IN_MOVED_TO) {
                     char old_path[1024];
                     if (move_pop(w, ev->cookie, old_path)) {
                         out.type = VW_WATCH_MOVED;
-                        strncpy(out.old_path, old_path, 1023);
+                        { size_t _n = strnlen(old_path, 1023);
+                          memcpy(out.old_path, old_path, _n);
+                          out.old_path[_n] = '\0'; }
                         ring_push(w, &out);
                     } else {
                         out.type = VW_WATCH_CREATED;
