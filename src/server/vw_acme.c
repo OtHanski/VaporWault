@@ -60,6 +60,7 @@ void     vw_acme_stop(vw_acme_ctx_t *ctx)                     { (void)ctx; }
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -908,6 +909,7 @@ static vw_err_t http01_write(vw_acme_ctx_t *ctx,
                                const char *kauth,
                                char *file_path, size_t path_sz)
 {
+    (void)ctx;
     if (token_safe(token) != 0) {
         acme_log("ERROR", "HTTP-01 token contains unsafe characters");
         return VW_ERR_INVALID_ARG;

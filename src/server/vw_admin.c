@@ -1,3 +1,7 @@
+/* _GNU_SOURCE must precede all system headers to expose struct ucred
+ * (SO_PEERCRED) and other Linux-specific extensions. */
+#define _GNU_SOURCE
+
 /*
  * vw_admin.c — admin IPC server for VaporWault.
  *

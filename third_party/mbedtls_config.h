@@ -152,6 +152,9 @@
 /** Public-key parser (PEM/DER). */
 #define MBEDTLS_PK_PARSE_C
 
+/** Public-key writer (PEM/DER) — needed by ACME to serialise generated keys. */
+#define MBEDTLS_PK_WRITE_C
+
 /** PKCS #5 (password-based key derivation; used by PEM decryption). */
 #define MBEDTLS_PKCS5_C
 
@@ -164,6 +167,12 @@
 
 /** X.509 certificate use (verification). */
 #define MBEDTLS_X509_USE_C
+
+/** X.509 object creation (base for CRT write and CSR write). */
+#define MBEDTLS_X509_CREATE_C
+
+/** X.509 CSR writer — needed by ACME to generate certificate signing requests. */
+#define MBEDTLS_X509_CSR_WRITE_C
 
 /* ------------------------------------------------------------------ */
 /* Encoding / ASN.1 / utility                                          */

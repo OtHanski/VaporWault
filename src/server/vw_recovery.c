@@ -192,7 +192,7 @@ vw_err_t vw_recovery_find_latest(vw_recovery_store_t *s,
     int      found     = 0;
     uint64_t best_slot = 0;
     uint64_t best_exp  = 0;
-    vw_recovery_record_t best_rec;
+    vw_recovery_record_t best_rec = {0};
 
     for (uint64_t i = 0; i < nslots; i++) {
         vw_recovery_record_t rec;
