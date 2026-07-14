@@ -653,7 +653,7 @@ vw_err_t vw_storage_gc_run(vw_storage_t *st)
      * Phase B stub: dark-orphan walk is deferred to Phase 5.
      * Orphans (crash between chunk write and ref_count set) accumulate on disk
      * but cause no correctness issues — they are simply unreferenced files.
-     * A Phase 5 implementation will walk data/chunks/**\/*.chunk, decode the
+     * A Phase 5 implementation will walk data/chunks/<shard>/*.chunk, decode the
      * SHA-256 filename, and register any file with no HT entry as ref_count=0
      * so Phase A can delete it on the next pass.
      */

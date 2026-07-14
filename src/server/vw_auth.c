@@ -11,8 +11,8 @@
 #include <time.h>
 
 /* Defeat dead-store elimination for sensitive buffers. */
-static void (*volatile g_memset_fn)(void *, int, size_t) = memset;
-#define secure_zero(p, n) (g_memset_fn)((p), 0, (size_t)(n))
+static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
+#define secure_zero(p, n) ((void)(g_memset_fn)((p), 0, (size_t)(n)))
 
 /* ── Defaults ────────────────────────────────────────────────────────────── */
 
