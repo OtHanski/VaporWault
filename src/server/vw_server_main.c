@@ -111,7 +111,7 @@ static void vw_log(vw_log_level_t level, const char *fmt, ...) {
 #else
     gmtime_r(&now, &tm);
 #endif
-    char ts[24];
+    char ts[80];
     snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec);
@@ -200,7 +200,7 @@ static int pid_file_create(const char *data_dir) {
         /* Stale? Read existing PID and check if the process is alive. */
         FILE *pf = fopen(g_pid_path, "r");
         int existing = 0;
-        if (pf) { (void)fscanf(pf, "%d", &existing); fclose(pf); }
+        if (pf) { if (fscanf(pf, "%d", &existing) != 1) existing = 0; fclose(pf); }
         if (existing > 0 && kill((pid_t)existing, 0) == 0) return -1;  /* alive */
         remove(g_pid_path);
         fd = open(g_pid_path, O_CREAT | O_EXCL | O_WRONLY, 0644);

@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
 #include "vw_ipc.h"
 #include "../core/vw_proto.h"
 
