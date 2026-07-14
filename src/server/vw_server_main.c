@@ -200,7 +200,7 @@ static int pid_file_create(const char *data_dir) {
         /* Stale? Read existing PID and check if the process is alive. */
         FILE *pf = fopen(g_pid_path, "r");
         int existing = 0;
-        if (pf) { fscanf(pf, "%d", &existing); fclose(pf); }
+        if (pf) { (void)fscanf(pf, "%d", &existing); fclose(pf); }
         if (existing > 0 && kill((pid_t)existing, 0) == 0) return -1;  /* alive */
         remove(g_pid_path);
         fd = open(g_pid_path, O_CREAT | O_EXCL | O_WRONLY, 0644);
@@ -435,6 +435,8 @@ typedef struct {
 } thread_pool_t;
 
 static thread_pool_t g_pool;
+
+static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn);
 
 static void *pool_worker(void *arg) {
     (void)arg;

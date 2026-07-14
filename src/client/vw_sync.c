@@ -8,12 +8,22 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
-#include <pthread.h>
 
 #ifdef _WIN32
 #  include <windows.h>
+   typedef CRITICAL_SECTION vw__mutex_t;
+#  define vw__mu_init(m)    (InitializeCriticalSection(m), 0)
+#  define vw__mu_lock(m)    EnterCriticalSection(m)
+#  define vw__mu_unlock(m)  LeaveCriticalSection(m)
+#  define vw__mu_destroy(m) DeleteCriticalSection(m)
 #else
 #  include <sys/stat.h>
+#  include <pthread.h>
+   typedef pthread_mutex_t vw__mutex_t;
+#  define vw__mu_init(m)    pthread_mutex_init((m), NULL)
+#  define vw__mu_lock(m)    pthread_mutex_lock(m)
+#  define vw__mu_unlock(m)  pthread_mutex_unlock(m)
+#  define vw__mu_destroy(m) pthread_mutex_destroy(m)
 #endif
 
 /* ── Platform helpers ────────────────────────────────────────────────────── */
@@ -291,7 +301,7 @@ done:
 struct vw_sync_ctx {
     vw_client_sess_t *sess;
     vw_cache_t       *cache;
-    pthread_mutex_t   mu;
+    vw__mutex_t       mu;
     char              offline_path[512];
     oq_entry_t       *oq;
     uint32_t          oq_count;
@@ -375,9 +385,9 @@ static void sync_prog_cb(uint64_t done, uint64_t total, void *ud) {
     prog_ud_t *p = ud;
     uint64_t delta = (done >= p->prev) ? (done - p->prev) : 0;
     p->prev = done;
-    pthread_mutex_lock(&p->ctx->mu);
+    vw__mu_lock(&p->ctx->mu);
     p->ctx->bytes_done += delta;
-    pthread_mutex_unlock(&p->ctx->mu);
+    vw__mu_unlock(&p->ctx->mu);
 }
 
 /* ── Convert virtual path → local path ───────────────────────────────────── */
@@ -768,10 +778,10 @@ static vw_err_t sync_one_folder(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
     if (err != VW_OK) { free(actions.arr); return err; }
 
     /* Accumulate bytes_total for progress */
-    pthread_mutex_lock(&ctx->mu);
+    vw__mu_lock(&ctx->mu);
     for (uint32_t i = 0; i < actions.count; i++)
         ctx->bytes_total += actions.arr[i].size;
-    pthread_mutex_unlock(&ctx->mu);
+    vw__mu_unlock(&ctx->mu);
 
     /* Execute uploads first */
     for (uint32_t i = 0; i < actions.count; i++) {
@@ -806,7 +816,7 @@ vw_err_t vw_sync_open(const vw_sync_cfg_t *cfg, vw_sync_ctx_t **out) {
 
     ctx->sess  = cfg->sess;
     ctx->cache = cfg->cache;
-    if (pthread_mutex_init(&ctx->mu, NULL) != 0) { free(ctx); return VW_ERR_IO; }
+    if (vw__mu_init(&ctx->mu) != 0) { free(ctx); return VW_ERR_IO; }
 
     snprintf(ctx->offline_path, sizeof(ctx->offline_path),
              "%s/offline_queue.db", cfg->state_dir);
@@ -819,7 +829,7 @@ vw_err_t vw_sync_open(const vw_sync_cfg_t *cfg, vw_sync_ctx_t **out) {
         ctx->oq = malloc(n * sizeof(oq_entry_t));
         if (!ctx->oq) {
             free(oq_data);
-            pthread_mutex_destroy(&ctx->mu);
+            vw__mu_destroy(&ctx->mu);
             free(ctx);
             return VW_ERR_OOM;
         }
@@ -835,25 +845,25 @@ vw_err_t vw_sync_open(const vw_sync_cfg_t *cfg, vw_sync_ctx_t **out) {
 
 void vw_sync_close(vw_sync_ctx_t *ctx) {
     if (!ctx) return;
-    pthread_mutex_destroy(&ctx->mu);
+    vw__mu_destroy(&ctx->mu);
     free(ctx->oq);
     free(ctx);
 }
 
 void vw_sync_set_session(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
-    pthread_mutex_lock(&ctx->mu);
+    vw__mu_lock(&ctx->mu);
     ctx->sess = sess;
-    pthread_mutex_unlock(&ctx->mu);
+    vw__mu_unlock(&ctx->mu);
 }
 
 vw_err_t vw_sync_run(vw_sync_ctx_t *ctx) {
     if (!ctx) return VW_ERR_INVALID_ARG;
 
-    pthread_mutex_lock(&ctx->mu);
+    vw__mu_lock(&ctx->mu);
     vw_client_sess_t *sess = ctx->sess;
     ctx->bytes_done  = 0;
     ctx->bytes_total = 0;
-    pthread_mutex_unlock(&ctx->mu);
+    vw__mu_unlock(&ctx->mu);
 
     /* Drain offline queue first when online */
     if (sess) oq_drain(ctx, sess);
@@ -920,8 +930,8 @@ void vw_sync_get_progress(const vw_sync_ctx_t *ctx,
                            uint64_t *out_done, uint64_t *out_total) {
     if (!ctx) { if (out_done) *out_done = 0; if (out_total) *out_total = 0; return; }
     vw_sync_ctx_t *nc = (vw_sync_ctx_t *)(uintptr_t)ctx;
-    pthread_mutex_lock(&nc->mu);
+    vw__mu_lock(&nc->mu);
     if (out_done)  *out_done  = nc->bytes_done;
     if (out_total) *out_total = nc->bytes_total;
-    pthread_mutex_unlock(&nc->mu);
+    vw__mu_unlock(&nc->mu);
 }
