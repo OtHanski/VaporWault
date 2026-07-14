@@ -155,6 +155,17 @@
 /** Public-key writer (PEM/DER) — needed by ACME to serialise generated keys. */
 #define MBEDTLS_PK_WRITE_C
 
+/** PEM writer — needed by MBEDTLS_PK_WRITE_C to produce mbedtls_pk_write_key_pem. */
+#define MBEDTLS_PEM_WRITE_C
+
+/**
+ * MBEDTLS_ECP_LIGHT is normally auto-derived by check_config.h when
+ * MBEDTLS_ECP_C is set.  Define it here explicitly to ensure mbedtls_pk_ec_rw
+ * and the ECP-gated PK accessors are visible when our custom config is used
+ * (some toolchain/include-order combinations miss the auto-derivation).
+ */
+#define MBEDTLS_ECP_LIGHT
+
 /** PKCS #5 (password-based key derivation; used by PEM decryption). */
 #define MBEDTLS_PKCS5_C
 

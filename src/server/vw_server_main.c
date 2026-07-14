@@ -527,7 +527,7 @@ static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn) {
         if (err != VW_OK) { vw_log(LOG_DEBUG, "recv error %d", (int)err); break; }
 
         err = vw_server_dispatch_file_op(sctx, conn, type, buf, plen);
-        if (err == VW_ERR_AUTH_INVALID || err == VW_ERR_PROTO_INVALID) break;
+        if (err == VW_ERR_AUTH_REQUIRED || err == VW_ERR_PROTO_INVALID) break;
         if (err == VW_ERR_NOT_IMPL)
             vw_log(LOG_WARN, "unhandled msg type 0x%04x", (unsigned)type);
     }

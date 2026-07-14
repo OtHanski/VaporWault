@@ -919,7 +919,13 @@ static vw_err_t http01_write(vw_acme_ctx_t *ctx,
     snprintf(dir, sizeof(dir), "%s/.well-known/acme-challenge", http_root);
     if (vw_fs_ensure_dir(dir) != VW_OK) return VW_ERR_IO;
 
-    snprintf(file_path, path_sz, "%s/%s", dir, token);
+    {
+        size_t dlen = strlen(dir), tlen = strlen(token);
+        if (dlen + 1 + tlen + 1 > path_sz) return VW_ERR_INVALID_ARG;
+        memcpy(file_path, dir, dlen);
+        file_path[dlen] = '/';
+        memcpy(file_path + dlen + 1, token, tlen + 1);
+    }
 
     /* Verify the resulting path is strictly under http_root (SEC.07). */
     if (strncmp(file_path, http_root, strlen(http_root)) != 0) {
