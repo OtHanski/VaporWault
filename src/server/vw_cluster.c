@@ -843,7 +843,12 @@ vw_err_t vw_cluster_open(const char *data_dir,
     vw_err_t rc = vw_fs_ensure_dir(cluster_dir);
     if (rc != VW_OK) { free(ctx); return rc; }
 
-    snprintf(ctx->nodes_path, sizeof(ctx->nodes_path), "%s/nodes.db", cluster_dir);
+    {
+        size_t clen = strlen(cluster_dir);
+        if (clen + 10 > sizeof(ctx->nodes_path)) { free(ctx); return VW_ERR_INVALID_ARG; }
+        memcpy(ctx->nodes_path, cluster_dir, clen);
+        memcpy(ctx->nodes_path + clen, "/nodes.db", 10); /* 9 chars + NUL */
+    }
 
     rwlock_init(&ctx->nodes_lock);
 

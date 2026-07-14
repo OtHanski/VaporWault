@@ -541,8 +541,12 @@ static int gen_ec_key(vw_acme_ctx_t *ctx, mbedtls_pk_context *key) {
     mbedtls_pk_init(key);
     ret = mbedtls_pk_setup(key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
     if (ret != 0) return ret;
-    mbedtls_ecp_keypair *ec = mbedtls_pk_ec_rw(key);
-    return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, ec,
+    /* mbedtls_pk_ec_rw() is gated by MBEDTLS_ECP_LIGHT which isn't visible
+     * with our custom config despite MBEDTLS_ECP_C being set.  Use the
+     * deprecated mbedtls_pk_ec() accessor with a const cast — safe because
+     * key is a non-const object we own and have just initialised above. */
+    return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,
+                                (mbedtls_ecp_keypair *)mbedtls_pk_ec(key),
                                 mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
 }
 
