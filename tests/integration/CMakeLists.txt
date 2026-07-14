@@ -26,7 +26,10 @@ target_include_directories(test_auth_handshake PRIVATE
     ${CMAKE_SOURCE_DIR}/tests/unit
 )
 
-target_link_libraries(test_auth_handshake PRIVATE vw_core pthread)
+target_link_libraries(test_auth_handshake PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_auth_handshake PRIVATE pthread)
+endif()
 
 if(WIN32)
     target_link_libraries(test_auth_handshake PRIVATE ws2_32)

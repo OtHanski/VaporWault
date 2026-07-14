@@ -16,7 +16,10 @@ function(vw_add_unit_test name source)
         ${CMAKE_SOURCE_DIR}/src/client
         ${CMAKE_SOURCE_DIR}/tests/unit
     )
-    target_link_libraries(test_${name} PRIVATE vw_core pthread)
+    target_link_libraries(test_${name} PRIVATE vw_core)
+    if(UNIX)
+        target_link_libraries(test_${name} PRIVATE pthread)
+    endif()
     add_test(NAME unit_${name} COMMAND test_${name})
 endfunction()
 
@@ -51,7 +54,10 @@ target_include_directories(test_vw_oplog PRIVATE
     ${CMAKE_SOURCE_DIR}/tests/unit
 )
 
-target_link_libraries(test_vw_oplog PRIVATE vw_core pthread)
+target_link_libraries(test_vw_oplog PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_oplog PRIVATE pthread)
+endif()
 
 add_test(NAME unit_vw_oplog COMMAND test_vw_oplog)
 
@@ -74,7 +80,10 @@ target_include_directories(test_vw_smtp PRIVATE
     ${CMAKE_SOURCE_DIR}/src/client
     ${CMAKE_SOURCE_DIR}/tests/unit
 )
-target_link_libraries(test_vw_smtp PRIVATE vw_core pthread)
+target_link_libraries(test_vw_smtp PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_smtp PRIVATE pthread)
+endif()
 add_test(NAME unit_vw_smtp COMMAND test_vw_smtp)
 
 # ── Phase 8 unit tests ────────────────────────────────────────────────────
@@ -137,6 +146,9 @@ target_include_directories(test_vw_gc PRIVATE
     ${CMAKE_SOURCE_DIR}/tests/unit
 )
 
-target_link_libraries(test_vw_gc PRIVATE vw_core pthread)
+target_link_libraries(test_vw_gc PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_gc PRIVATE pthread)
+endif()
 
 add_test(NAME unit_vw_gc COMMAND test_vw_gc)

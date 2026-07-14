@@ -107,9 +107,18 @@ jobs:
         with:
           submodules: recursive
 
+      # Set up the MSVC native tools environment so CMake can find cl.exe.
+      # ilammy/msvc-dev-cmd uses vswhere to locate any installed VS version,
+      # so this works with VS 2022 and VS 2026 alike.
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
             -DVW_BUILD_SERVER=ON `
             -DVW_BUILD_CLIENT=ON `
             -DVW_BUILD_GUI=OFF   `
@@ -118,13 +127,13 @@ jobs:
             -DVW_WERROR=ON
 
       - name: Build
-        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+        run: cmake --build build --parallel
 
       - name: Unit tests
         working-directory: build
         env:
           CTEST_TEST_TIMEOUT: "30"
-        run: ctest -C ${{ matrix.build_type }} --output-on-failure --no-tests=error -R unit
+        run: ctest --output-on-failure --no-tests=error -R unit
 
 # ── Integration: real server + Python pytest suite ────────────────────────────
   integration:

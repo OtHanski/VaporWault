@@ -30,6 +30,18 @@
 /** TLS 1.3 protocol support. */
 #define MBEDTLS_SSL_PROTO_TLS1_3
 
+/**
+ * PSA Crypto API — required by TLS 1.3 in mbedTLS 3.x.
+ * The TLS 1.3 implementation uses PSA internally for key operations.
+ */
+#define MBEDTLS_PSA_CRYPTO_C
+
+/**
+ * Retain the peer certificate after the handshake.
+ * Required for TLS 1.3 in mbedTLS 3.x (check_config.h enforces this).
+ */
+#define MBEDTLS_SSL_KEEP_PEER_CERTIFICATE
+
 /** TLS session tickets (resumption without server-side state). */
 #define MBEDTLS_SSL_SESSION_TICKETS
 
@@ -91,6 +103,9 @@
 /** Generic message-digest abstraction layer. */
 #define MBEDTLS_MD_C
 
+/** HKDF (HMAC-based Key Derivation Function) — used in TLS 1.3 handshake. */
+#define MBEDTLS_HKDF_C
+
 /** SHA-256 (used in TLS 1.3 handshake, certificate verification). */
 #define MBEDTLS_SHA256_C
 
@@ -122,8 +137,14 @@
 /** NIST P-384 curve (for certificates signed with SHA-384). */
 #define MBEDTLS_ECP_DP_SECP384R1_ENABLED
 
+/** X25519 (Curve25519 ECDH) — TLS 1.3 prefers this for key shares. */
+#define MBEDTLS_ECP_DP_CURVE25519_ENABLED
+
 /** RSA (certificate parsing and verification; key exchange not used). */
 #define MBEDTLS_RSA_C
+
+/** PKCS#1 v1.5 — required when MBEDTLS_RSA_C is defined. */
+#define MBEDTLS_PKCS1_V15
 
 /** Abstract public-key interface. */
 #define MBEDTLS_PK_C
