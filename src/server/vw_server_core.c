@@ -25,8 +25,8 @@
 
 /* Volatile-function-pointer trick: defeats dead-store elimination on stack
  * buffers holding sensitive credential data (auth_token, session token). */
-static void (* volatile g_memset_fn)(void *, int, size_t) = memset;
-#define secure_zero(p, n) g_memset_fn((p), 0, (n))
+static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
+#define secure_zero(p, n) ((void)g_memset_fn((p), 0, (n)))
 
 struct vw_server_ctx {
     vw_auth_ctx_t       *auth;

@@ -6,8 +6,8 @@
 #include <string.h>
 #include <time.h>
 
-static void (* volatile g_memset_fn)(void *, int, size_t) = memset;
-#define secure_zero(p, n) g_memset_fn((p), 0, (n))
+static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
+#define secure_zero(p, n) ((void)g_memset_fn((p), 0, (n)))
 
 struct vw_client_sess {
     vw_conn_t *conn;

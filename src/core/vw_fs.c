@@ -82,8 +82,8 @@ cleanup_win:
     close(fd);
 
     if (rename(tmp, path) != 0) { unlink(tmp); return VW_ERR_IO; }
-#endif
     return VW_OK;
+#endif
 }
 
 vw_err_t vw_fs_read_file(const char *path, void **out_buf, size_t *out_len) {

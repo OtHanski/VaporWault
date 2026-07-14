@@ -42,8 +42,15 @@ static void gc_log(const char *level, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+#endif
 #define GC_INFO(fmt, ...)  gc_log("INFO",  fmt, ##__VA_ARGS__)
 #define GC_WARN(fmt, ...)  gc_log("WARN",  fmt, ##__VA_ARGS__)
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 /* ── Platform thread abstraction ─────────────────────────────────────────── */
 

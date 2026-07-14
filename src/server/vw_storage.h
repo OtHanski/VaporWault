@@ -151,7 +151,7 @@ vw_err_t vw_storage_chunk_query(vw_storage_t *st,
  * Run a GC pass:
  *   Phase A — collect: delete chunk files for all in-memory entries with
  *              ref_count == 0; zero those entries in refcounts.db.
- *   Phase B — dark-orphan scan: walk data/chunks/** for .chunk files with
+ *   Phase B — dark-orphan scan: walk data/chunks/ for .chunk files with
  *              no in-memory entry; add them as ref_count=0 (they will be
  *              collected on the next GC pass). This handles crash recovery
  *              for chunks written before the ref_count was set.

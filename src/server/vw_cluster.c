@@ -120,9 +120,16 @@ static void cluster_log(const char *level, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+#endif
 #define CL_INFO(fmt, ...)  cluster_log("INFO",  fmt, ##__VA_ARGS__)
 #define CL_WARN(fmt, ...)  cluster_log("WARN",  fmt, ##__VA_ARGS__)
 #define CL_DEBUG(fmt, ...) cluster_log("DEBUG", fmt, ##__VA_ARGS__)
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 /* ── Disk helpers ──────────────────────────────────────────────────────────── */
 

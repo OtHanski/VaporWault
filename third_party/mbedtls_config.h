@@ -61,6 +61,10 @@
 /** Portable network layer (BSD socket wrappers). */
 #define MBEDTLS_NET_C
 
+/** Filesystem I/O — enables *_parse_file() / *_parse_keyfile() helpers.
+ *  Required by vw_net.c load_server_cert() and vw_net_ctx_reload_cert(). */
+#define MBEDTLS_FS_IO
+
 /* ------------------------------------------------------------------ */
 /* Entropy and random number generation                                */
 /* ------------------------------------------------------------------ */

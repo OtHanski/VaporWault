@@ -85,8 +85,8 @@ static int store_pread(const char *path, void *buf, size_t len, uint64_t off)
  * Uses a volatile function pointer so the call cannot be dead-store-eliminated.
  * Required before free() on any buffer containing password hashes or tokens.
  */
-static void (* volatile g_memset_fn)(void *, int, size_t) = memset;
-#define secure_zero(p, n) g_memset_fn((p), 0, (n))
+static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
+#define secure_zero(p, n) ((void)g_memset_fn((p), 0, (n)))
 
 /* ── Hash table entry types ───────────────────────────────────────────────── */
 

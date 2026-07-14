@@ -46,7 +46,7 @@ typedef struct {
     uint64_t sync_watermark;    /* last confirmed oplog entry_id from this node */
     uint8_t  is_active;         /* 1 = enabled; 0 = deregistered/disabled */
     uint8_t  role;              /* VW_NODE_ROLE_REPLICA or VW_NODE_ROLE_SELF */
-    uint8_t  _pad[62];          /* reserved; zero on write                 */
+    uint8_t  _pad[78];          /* reserved; zero on write                 */
 } vw_node_record_t;
 
 /*

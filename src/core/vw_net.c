@@ -1,7 +1,6 @@
 #include "vw_net.h"
 #include "vw_crypto.h"
 
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,7 +20,12 @@
 #   include <winsock2.h>
 #   include <ws2tcpip.h>
 #   pragma comment(lib, "ws2_32.lib")
+/* Platform shims for recv_timeout_ms atomics (MSVC C mode lacks stdatomic). */
+#   define VW_RECV_TIMEOUT_TYPE           volatile LONG
+#   define vw_recv_timeout_load(p)        ((uint32_t)InterlockedCompareExchange((volatile LONG *)(p), 0, 0))
+#   define vw_recv_timeout_store(p, v)    ((void)InterlockedExchange((volatile LONG *)(p), (LONG)(v)))
 #else
+#   include <stdatomic.h>
 #   include <arpa/inet.h>
 #   include <errno.h>
 #   include <fcntl.h>
@@ -30,6 +34,10 @@
 #   include <pthread.h>
 #   include <sys/select.h>
 #   include <sys/socket.h>
+#   include <unistd.h>
+#   define VW_RECV_TIMEOUT_TYPE           _Atomic uint32_t
+#   define vw_recv_timeout_load(p)        atomic_load_explicit((p), memory_order_relaxed)
+#   define vw_recv_timeout_store(p, v)    atomic_store_explicit((p), (v), memory_order_relaxed)
 #endif
 
 /* ── TLS configuration constants ─────────────────────────────────────────── */
@@ -124,7 +132,7 @@ struct vw_conn {
     token_bucket_t      upload_bucket;
     token_bucket_t      download_bucket;
     char                peer_addr[254];
-    _Atomic uint32_t    recv_timeout_ms; /* per-connection recv deadline; 0 = none */
+    VW_RECV_TIMEOUT_TYPE recv_timeout_ms; /* per-connection recv deadline; 0 = none */
     int                 is_client;    /* 1 = owns client_tls; 0 = borrows server conf */
     vw_client_tls_t    *client_tls;  /* non-NULL iff is_client == 1 */
 #ifdef _WIN32
@@ -172,7 +180,7 @@ static int conn_recv_timeout(void *ctx, unsigned char *buf, size_t len,
 {
     vw_conn_t *conn = (vw_conn_t *)ctx;
     (void)timeout_ms;
-    uint32_t tms = atomic_load_explicit(&conn->recv_timeout_ms, memory_order_relaxed);
+    uint32_t tms = vw_recv_timeout_load(&conn->recv_timeout_ms);
     return mbedtls_net_recv_timeout(&conn->net, buf, len, tms);
 }
 
@@ -704,7 +712,7 @@ const char *vw_net_alpn(const vw_conn_t *conn) {
 vw_err_t vw_net_conn_set_recv_timeout(vw_conn_t *conn, uint32_t timeout_ms)
 {
     if (!conn) return VW_ERR_INVALID_ARG;
-    atomic_store_explicit(&conn->recv_timeout_ms, timeout_ms, memory_order_relaxed);
+    vw_recv_timeout_store(&conn->recv_timeout_ms, timeout_ms);
     return VW_OK;
 }
 

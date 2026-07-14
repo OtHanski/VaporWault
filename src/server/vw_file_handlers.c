@@ -13,14 +13,22 @@
 #include <stddef.h>
 
 /* Defeat dead-store elimination on buffers holding session tokens. */
-static void (* volatile g_memset_fn)(void *, int, size_t) = memset;
-#define secure_zero(p, n) g_memset_fn((p), 0, (n))
+static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
+#define secure_zero(p, n) ((void)g_memset_fn((p), 0, (n)))
 
-/* Debug/warning logs (no tokens, no chunk data per SEC.07). */
+/* Debug/warning logs (no tokens, no chunk data per SEC.07).
+ * ##__VA_ARGS__ is a GNU extension; suppress the pedantic warning on Clang. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+#endif
 #define LOG_DEBUG(fmt, ...) \
     fprintf(stderr, "[DBG] vw_file_handlers: " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...) \
     fprintf(stderr, "[WRN] vw_file_handlers: " fmt "\n", ##__VA_ARGS__)
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
