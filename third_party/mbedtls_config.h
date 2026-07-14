@@ -48,10 +48,10 @@
 /** Application-Layer Protocol Negotiation extension. */
 #define MBEDTLS_SSL_ALPN
 
-/** TLS session cache (server-side). */
-#define MBEDTLS_SSL_CACHE_C
-
-/** TLS ticket support (stateless resumption). */
+/** TLS ticket support (stateless resumption — the TLS 1.3 mechanism).
+ *  MBEDTLS_SSL_CACHE_C is intentionally omitted: it is the TLS 1.2
+ *  server-side session cache, which is unavailable when TLS 1.3 is the
+ *  only enabled protocol version. */
 #define MBEDTLS_SSL_TICKET_C
 
 /* ------------------------------------------------------------------ */
@@ -60,10 +60,6 @@
 
 /** Portable network layer (BSD socket wrappers). */
 #define MBEDTLS_NET_C
-
-/** Filesystem I/O — enables *_parse_file() / *_parse_keyfile() helpers.
- *  Required by vw_net.c load_server_cert() and vw_net_ctx_reload_cert(). */
-#define MBEDTLS_FS_IO
 
 /* ------------------------------------------------------------------ */
 /* Entropy and random number generation                                */

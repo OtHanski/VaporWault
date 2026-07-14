@@ -8,7 +8,6 @@
 
 /* mbedTLS */
 #include <mbedtls/ssl.h>
-#include <mbedtls/ssl_cache.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
@@ -148,7 +147,6 @@ struct vw_net_ctx {
     mbedtls_ssl_config      conf;
     mbedtls_x509_crt        cert;
     mbedtls_pk_context      key;
-    mbedtls_ssl_cache_context cache;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_net_context     listen_net;
@@ -288,18 +286,54 @@ static vw_err_t configure_ssl_defaults(mbedtls_ssl_config *conf,
     return VW_OK;
 }
 
+/* Read a PEM file into a NUL-terminated heap buffer.
+ * mbedTLS PEM parsers require the buffer to be NUL-terminated; len includes it. */
+static vw_err_t load_pem_file(const char *path,
+                               unsigned char **out_buf, size_t *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return VW_ERR_NET_TLS;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return VW_ERR_NET_TLS; }
+    long sz = ftell(f);
+    if (sz < 0 || sz > 1024 * 1024) { fclose(f); return VW_ERR_NET_TLS; }
+    rewind(f);
+
+    unsigned char *buf = (unsigned char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return VW_ERR_OOM; }
+
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return VW_ERR_NET_TLS;
+    }
+    fclose(f);
+    buf[sz] = '\0';
+    *out_buf = buf;
+    *out_len = (size_t)sz + 1; /* length includes NUL for PEM parser */
+    return VW_OK;
+}
+
 static vw_err_t load_server_cert(vw_net_ctx_t *ctx,
                                   const char *cert_path,
                                   const char *key_path) {
-    if (mbedtls_x509_crt_parse_file(&ctx->cert, cert_path) != 0)
-        return VW_ERR_NET_TLS;
-    if (mbedtls_pk_parse_keyfile(&ctx->key, key_path, NULL,
-                                  mbedtls_ctr_drbg_random,
-                                  &ctx->ctr_drbg) != 0)
-        return VW_ERR_NET_TLS;
+    unsigned char *cert_buf = NULL, *key_buf = NULL;
+    size_t cert_len = 0, key_len = 0;
+    vw_err_t err = VW_OK;
+
+    if (load_pem_file(cert_path, &cert_buf, &cert_len) != VW_OK ||
+        load_pem_file(key_path,  &key_buf,  &key_len)  != VW_OK)
+    { err = VW_ERR_NET_TLS; goto done; }
+
+    if (mbedtls_x509_crt_parse(&ctx->cert, cert_buf, cert_len) != 0)
+    { err = VW_ERR_NET_TLS; goto done; }
+    if (mbedtls_pk_parse_key(&ctx->key, key_buf, key_len, NULL, 0,
+                              mbedtls_ctr_drbg_random, &ctx->ctr_drbg) != 0)
+    { err = VW_ERR_NET_TLS; goto done; }
     if (mbedtls_ssl_conf_own_cert(&ctx->conf, &ctx->cert, &ctx->key) != 0)
-        return VW_ERR_NET_TLS;
-    return VW_OK;
+    { err = VW_ERR_NET_TLS; goto done; }
+done:
+    free(cert_buf);
+    free(key_buf);
+    return err;
 }
 
 static vw_err_t vw_net_listen_internal(const char *host, uint16_t port,
@@ -313,7 +347,6 @@ static vw_err_t vw_net_listen_internal(const char *host, uint16_t port,
     mbedtls_ssl_config_init(&ctx->conf);
     mbedtls_x509_crt_init(&ctx->cert);
     mbedtls_pk_init(&ctx->key);
-    mbedtls_ssl_cache_init(&ctx->cache);
     mbedtls_entropy_init(&ctx->entropy);
     mbedtls_ctr_drbg_init(&ctx->ctr_drbg);
     mbedtls_net_init(&ctx->listen_net);
@@ -334,9 +367,8 @@ static vw_err_t vw_net_listen_internal(const char *host, uint16_t port,
                                 ctx->alpn_protos) != VW_OK)
         goto fail;
 
-    mbedtls_ssl_conf_session_cache(&ctx->conf, &ctx->cache,
-                                   mbedtls_ssl_cache_get,
-                                   mbedtls_ssl_cache_set);
+    /* TLS 1.3 session resumption uses PSK tickets (MBEDTLS_SSL_TICKET_C),
+     * not the TLS 1.2 session cache — no mbedtls_ssl_conf_session_cache needed. */
 
     if (load_server_cert(ctx, cert_pem_path, key_pem_path) != VW_OK)
         goto fail;
@@ -354,7 +386,6 @@ fail:
     mbedtls_ssl_config_free(&ctx->conf);
     mbedtls_x509_crt_free(&ctx->cert);
     mbedtls_pk_free(&ctx->key);
-    mbedtls_ssl_cache_free(&ctx->cache);
     mbedtls_entropy_free(&ctx->entropy);
     mbedtls_ctr_drbg_free(&ctx->ctr_drbg);
     mbedtls_net_free(&ctx->listen_net);
@@ -472,7 +503,6 @@ void vw_net_ctx_close(vw_net_ctx_t *ctx) {
     mbedtls_ssl_config_free(&ctx->conf);
     mbedtls_x509_crt_free(&ctx->cert);
     mbedtls_pk_free(&ctx->key);
-    mbedtls_ssl_cache_free(&ctx->cache);
     mbedtls_entropy_free(&ctx->entropy);
     mbedtls_ctr_drbg_free(&ctx->ctr_drbg);
     mbedtls_net_free(&ctx->listen_net);
@@ -529,9 +559,13 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
     } else {
         mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
         if (ca_cert_pem_path) {
-            if (mbedtls_x509_crt_parse_file(&tls->ca_cert,
-                                             ca_cert_pem_path) != 0)
-                goto fail;
+            unsigned char *ca_buf = NULL;
+            size_t ca_len = 0;
+            int ca_ret = -1;
+            if (load_pem_file(ca_cert_pem_path, &ca_buf, &ca_len) == VW_OK)
+                ca_ret = mbedtls_x509_crt_parse(&tls->ca_cert, ca_buf, ca_len);
+            free(ca_buf);
+            if (ca_ret != 0) goto fail;
             tls->ca_loaded = 1;
             mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->ca_cert, NULL);
         }
@@ -723,6 +757,8 @@ vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
     mbedtls_pk_context        new_key;
     mbedtls_entropy_context   tmp_entropy;
     mbedtls_ctr_drbg_context  tmp_drbg;
+    unsigned char            *cert_buf = NULL, *key_buf = NULL;
+    size_t                    cert_len = 0, key_len = 0;
     mbedtls_x509_crt_init(&new_cert);
     mbedtls_pk_init(&new_key);
     mbedtls_entropy_init(&tmp_entropy);
@@ -734,10 +770,13 @@ vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
     if (mbedtls_ctr_drbg_seed(&tmp_drbg, mbedtls_entropy_func,
                                &tmp_entropy, pers, sizeof(pers) - 1) != 0)
         goto fail_parse;
-    if (mbedtls_x509_crt_parse_file(&new_cert, cert_pem_path) != 0) goto fail_parse;
-    if (mbedtls_pk_parse_keyfile(&new_key, key_pem_path, NULL,
-                                  mbedtls_ctr_drbg_random,
-                                  &tmp_drbg) != 0) goto fail_parse;
+    if (load_pem_file(cert_pem_path, &cert_buf, &cert_len) != VW_OK) goto fail_parse;
+    if (load_pem_file(key_pem_path,  &key_buf,  &key_len)  != VW_OK) goto fail_parse;
+    if (mbedtls_x509_crt_parse(&new_cert, cert_buf, cert_len) != 0) goto fail_parse;
+    if (mbedtls_pk_parse_key(&new_key, key_buf, key_len, NULL, 0,
+                              mbedtls_ctr_drbg_random, &tmp_drbg) != 0) goto fail_parse;
+    free(cert_buf); cert_buf = NULL;
+    free(key_buf);  key_buf  = NULL;
     mbedtls_ctr_drbg_free(&tmp_drbg);
     mbedtls_entropy_free(&tmp_entropy);
 
@@ -765,9 +804,6 @@ vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
                                            MBEDTLS_SSL_IS_SERVER,
                                            ctx->alpn_protos);
     if (err == VW_OK) {
-        mbedtls_ssl_conf_session_cache(&ctx->conf, &ctx->cache,
-                                       mbedtls_ssl_cache_get,
-                                       mbedtls_ssl_cache_set);
         if (mbedtls_ssl_conf_own_cert(&ctx->conf, &ctx->cert, &ctx->key) != 0)
             err = VW_ERR_NET_TLS;
     }
@@ -780,6 +816,8 @@ vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
     return err;
 
 fail_parse:
+    free(cert_buf);
+    free(key_buf);
     mbedtls_x509_crt_free(&new_cert);
     mbedtls_pk_free(&new_key);
     mbedtls_ctr_drbg_free(&tmp_drbg);

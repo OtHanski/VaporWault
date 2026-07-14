@@ -67,6 +67,25 @@ void     vw_acme_stop(vw_acme_ctx_t *ctx)                     { (void)ctx; }
 #include <errno.h>
 #include <ctype.h>
 
+/* Read a PEM file into a NUL-terminated heap buffer for mbedTLS parsing. */
+static int acme_load_pem(const char *path, unsigned char **out, size_t *outlen)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0 || sz > 1024 * 1024) { fclose(f); return -1; }
+    rewind(f);
+    unsigned char *buf = (unsigned char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz)
+    { free(buf); fclose(f); return -1; }
+    fclose(f);
+    buf[sz] = '\0';
+    *out = buf; *outlen = (size_t)sz + 1;
+    return 0;
+}
+
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
 #define RESP_BUF_SIZE    (65536u)
@@ -961,9 +980,12 @@ static vw_err_t generate_csr(vw_acme_ctx_t *ctx,
 static int cert_days_remaining(const char *cert_pem_path) {
     mbedtls_x509_crt crt;
     mbedtls_x509_crt_init(&crt);
-    if (mbedtls_x509_crt_parse_file(&crt, cert_pem_path) != 0) {
-        mbedtls_x509_crt_free(&crt);
-        return -1;
+    {
+        unsigned char *buf = NULL; size_t blen = 0;
+        int ret = (acme_load_pem(cert_pem_path, &buf, &blen) == 0)
+                  ? mbedtls_x509_crt_parse(&crt, buf, blen) : -1;
+        free(buf);
+        if (ret != 0) { mbedtls_x509_crt_free(&crt); return -1; }
     }
     struct tm exp_tm;
     memset(&exp_tm, 0, sizeof(exp_tm));
@@ -1277,8 +1299,11 @@ vw_err_t vw_acme_ctx_create(const vw_acme_cfg_t *cfg,
     mbedtls_x509_crt_init(&ctx->ca_certs);
     int ca_loaded = 0;
     for (int i = 0; CA_BUNDLE_PATHS[i]; i++) {
-        if (mbedtls_x509_crt_parse_file(&ctx->ca_certs,
-                                          CA_BUNDLE_PATHS[i]) == 0) {
+        unsigned char *ca_buf = NULL; size_t ca_len = 0;
+        int ca_ret = (acme_load_pem(CA_BUNDLE_PATHS[i], &ca_buf, &ca_len) == 0)
+                     ? mbedtls_x509_crt_parse(&ctx->ca_certs, ca_buf, ca_len) : -1;
+        free(ca_buf);
+        if (ca_ret == 0) {
             acme_log("INFO", "CA bundle: %s", CA_BUNDLE_PATHS[i]);
             ca_loaded = 1;
             break;

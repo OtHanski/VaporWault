@@ -15,7 +15,6 @@
 
 #include "../core/vw_crypto.h"
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -53,6 +52,35 @@
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
 
+/* ── Platform atomic shim (MSVC C mode lacks stdatomic) ─────────────────── */
+#ifdef _WIN32
+static volatile LONG s_smtp_msgid_seq = 0;
+#define smtp_msgid_next() ((uint32_t)InterlockedIncrement(&s_smtp_msgid_seq) - 1u)
+#else
+#include <stdatomic.h>
+static _Atomic uint32_t s_smtp_msgid_seq = 0;
+#define smtp_msgid_next() atomic_fetch_add_explicit(&s_smtp_msgid_seq, 1u, memory_order_relaxed)
+#endif
+
+/* ── PEM file loader (no MBEDTLS_FS_IO required) ────────────────────────── */
+static int smtp_load_pem(const char *path, unsigned char **out, size_t *outlen)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0 || sz > 1024 * 1024) { fclose(f); return -1; }
+    rewind(f);
+    unsigned char *buf = (unsigned char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz)
+    { free(buf); fclose(f); return -1; }
+    fclose(f);
+    buf[sz] = '\0';
+    *out = buf; *outlen = (size_t)sz + 1;
+    return 0;
+}
+
 /* ── Constants ──────────────────────────────────────────────────────────── */
 #define SMTP_LINE_BUF    2048
 #define SMTP_CMD_BUF     1024
@@ -61,8 +89,7 @@
 
 /* ── Module state ───────────────────────────────────────────────────────── */
 
-/* Monotonic fallback counter for Message-ID when vw_crypto_random fails. */
-static _Atomic uint32_t g_msgid_seq = 0;
+/* s_smtp_msgid_seq (and smtp_msgid_next macro) defined above. */
 
 /* ── Private helpers ─────────────────────────────────────────────────────── */
 
@@ -83,8 +110,7 @@ static void make_message_id(char *out, size_t out_sz,
         }
         rand_hex[16] = '\0';
     } else {
-        uint32_t seq = atomic_fetch_add_explicit(&g_msgid_seq, 1u,
-                                                  memory_order_relaxed);
+        uint32_t seq = smtp_msgid_next();
         (void)snprintf(rand_hex, sizeof(rand_hex), "ctr%013x", (unsigned)seq);
     }
 
@@ -347,7 +373,15 @@ static vw_err_t smtp_tls_upgrade(smtp_conn_t *c,
                     "SMTP: verify_cert=1 requires ca_cert_path to be set");
             goto fail;
         }
-        rc = mbedtls_x509_crt_parse_file(cacert, ca_cert_path);
+        {
+            unsigned char *ca_buf = NULL;
+            size_t ca_len = 0;
+            if (smtp_load_pem(ca_cert_path, &ca_buf, &ca_len) != 0)
+                rc = -1;
+            else
+                rc = mbedtls_x509_crt_parse(cacert, ca_buf, ca_len);
+            free(ca_buf);
+        }
         if (rc != 0) {
             set_err(err_buf, err_sz,
                     "mbedTLS: failed to load CA chain from '%s' (%d)",
