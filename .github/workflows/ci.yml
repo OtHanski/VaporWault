@@ -37,10 +37,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            ninja-build python3
-          # mbedTLS is built from the vendored submodule in third_party/mbedtls/.
+            ninja-build python3 git
+          # mbedTLS and Argon2 are downloaded at configure time via FetchContent.
           # Do not install libmbedtls-dev — the project config header would be ignored.
-          # GUI targets are disabled (DVW_BUILD_GUI=OFF) so SDL2 is not required here.
+          # GUI targets are disabled (VW_BUILD_GUI=OFF) so SDL2 is not required here.
 
       - name: Configure
         run: |
