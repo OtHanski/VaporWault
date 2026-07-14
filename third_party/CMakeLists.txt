@@ -10,8 +10,12 @@ include(FetchContent)
 # Point mbedTLS at our trimmed config header before its CMake tree is loaded.
 set(MBEDTLS_CONFIG_FILE "${CMAKE_SOURCE_DIR}/third_party/mbedtls_config.h"
     CACHE STRING "Path to the project-specific mbedTLS config header" FORCE)
-set(ENABLE_TESTING  OFF CACHE BOOL "" FORCE)
-set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING        OFF CACHE BOOL "" FORCE)
+set(ENABLE_PROGRAMS       OFF CACHE BOOL "" FORCE)
+# mbedTLS defaults MBEDTLS_FATAL_WARNINGS=ON, which appends -Werror (GCC/Clang)
+# or /WX (MSVC) to CMAKE_C_FLAGS — a cache variable that bleeds into our own
+# targets. Force it off so mbedTLS never touches CMAKE_C_FLAGS for warnings.
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(mbedtls
     GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
