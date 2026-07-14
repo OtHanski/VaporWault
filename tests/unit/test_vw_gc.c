@@ -37,7 +37,7 @@
  * We define the struct here so tests can create and control it.
  * vw_cluster.c must NOT be linked into this test binary.
  */
-struct vw_cluster {
+struct vw_cluster_ctx {
     int      has_active_replicas; /* non-zero → GC uses min_sync_watermark    */
     uint64_t min_sync_watermark;  /* returned by vw_cluster_min_sync_watermark */
 };

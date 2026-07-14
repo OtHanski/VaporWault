@@ -23,14 +23,43 @@
 #include "vw_net.h"
 #include "vw_proto.h"
 
-#include <pthread.h>
+#ifdef _WIN32
+/* ── Windows pthread compatibility shim ─────────────────────────────────── */
+#  include <windows.h>
+#  include <stdlib.h>
+typedef HANDLE            pthread_t;
+typedef CRITICAL_SECTION  pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+typedef struct { void *(*fn)(void *); void *arg; } _pt_thunk_t;
+static DWORD WINAPI _pt_thunk(LPVOID p) {
+    _pt_thunk_t *t = (_pt_thunk_t *)p; t->fn(t->arg); free(t); return 0;
+}
+static int pthread_create(pthread_t *h, void *a, void *(*fn)(void *), void *arg) {
+    _pt_thunk_t *t; (void)a;
+    t = (_pt_thunk_t *)malloc(sizeof(*t)); if (!t) return 1;
+    t->fn = fn; t->arg = arg;
+    *h = CreateThread(NULL, 0, _pt_thunk, t, 0, NULL);
+    if (!*h) { free(t); return 1; } return 0;
+}
+static int pthread_join(pthread_t h, void **r) { (void)r; WaitForSingleObject(h, INFINITE); CloseHandle(h); return 0; }
+static int pthread_mutex_init(pthread_mutex_t *m, void *a)    { (void)a; InitializeCriticalSection(m); return 0; }
+static int pthread_mutex_destroy(pthread_mutex_t *m)           { DeleteCriticalSection(m); return 0; }
+static int pthread_mutex_lock(pthread_mutex_t *m)              { EnterCriticalSection(m); return 0; }
+static int pthread_mutex_unlock(pthread_mutex_t *m)            { LeaveCriticalSection(m); return 0; }
+static int pthread_cond_init(pthread_cond_t *c, void *a)       { (void)a; InitializeConditionVariable(c); return 0; }
+static int pthread_cond_destroy(pthread_cond_t *c)             { (void)c; return 0; }
+static int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) { return SleepConditionVariableCS(c, m, INFINITE) ? 0 : 1; }
+static int pthread_cond_signal(pthread_cond_t *c)              { WakeConditionVariable(c); return 0; }
+#else
+#  include <pthread.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #ifdef _WIN32
-#  include <windows.h>
 #  define VW_PID() ((unsigned)GetCurrentProcessId())
 #else
 #  include <dirent.h>

@@ -359,7 +359,7 @@ vw_err_t vw_watcher_wait(vw_watcher_t *w, uint32_t timeout_ms)
     pfd.events = POLLIN;
     pfd.revents = 0;
 
-    ret = poll(&pfd, 1, (int)(timeout_ms == 0 ? -1 : timeout_ms));
+    ret = poll(&pfd, 1, timeout_ms == 0 ? -1 : (int)timeout_ms);
     if (ret < 0) return VW_ERR_IO;
     if (ret == 0) return VW_ERR_TIMEOUT;
     return VW_OK;

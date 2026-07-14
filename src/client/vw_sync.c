@@ -173,8 +173,12 @@ static vw_err_t walk_recursive(lfiles_t *lf,
 static int walk_cb(const char *name, void *ud) {
     walk_ctx_t *wc = ud;
     char lpath[512], vpath[512];
-    snprintf(lpath, sizeof(lpath), "%s/%s", wc->dir_local,   name);
-    snprintf(vpath, sizeof(vpath), "%s/%s", wc->dir_virtual, name);
+    { size_t _dl = strlen(wc->dir_local),   _nl = strlen(name);
+      size_t _dv = strlen(wc->dir_virtual);
+      size_t _ll = _dl + 1 + _nl < sizeof(lpath) - 1 ? _nl : sizeof(lpath) - _dl - 2;
+      size_t _vl = _dv + 1 + _nl < sizeof(vpath) - 1 ? _nl : sizeof(vpath) - _dv - 2;
+      memcpy(lpath, wc->dir_local,   _dl); lpath[_dl] = '/'; memcpy(lpath + _dl + 1, name, _ll); lpath[_dl + 1 + _ll] = '\0';
+      memcpy(vpath, wc->dir_virtual, _dv); vpath[_dv] = '/'; memcpy(vpath + _dv + 1, name, _vl); vpath[_dv + 1 + _vl] = '\0'; }
 
     if (is_directory(lpath)) {
         wc->lf->err = walk_recursive(wc->lf, lpath, vpath);

@@ -114,7 +114,10 @@ static void log_init(const char *state_dir, int to_file) {
     }
     g_log_to_file = to_file;
     if (to_file && state_dir) {
-        snprintf(g_log_path, sizeof(g_log_path), "%s/%s", state_dir, LOG_FILE);
+        { size_t _sl = strlen(state_dir), _fl = sizeof(LOG_FILE) - 1;
+          if (_sl + 1 + _fl + 1 > sizeof(g_log_path)) _sl = sizeof(g_log_path) - _fl - 2;
+          memcpy(g_log_path, state_dir, _sl); g_log_path[_sl] = '/';
+          memcpy(g_log_path + _sl + 1, LOG_FILE, _fl + 1); }
         g_log_fp = fopen(g_log_path, "a");
         if (!g_log_fp) {
             g_log_fp = NULL;
@@ -167,13 +170,16 @@ static int pid_is_running(int pid) {
 }
 
 static vw_err_t pid_file_create(const char *state_dir) {
-    snprintf(g_pid_path, sizeof(g_pid_path), "%s/%s", state_dir, PID_FILE);
+    { size_t _sl = strlen(state_dir), _fl = sizeof(PID_FILE) - 1;
+      if (_sl + 1 + _fl + 1 > sizeof(g_pid_path)) _sl = sizeof(g_pid_path) - _fl - 2;
+      memcpy(g_pid_path, state_dir, _sl); g_pid_path[_sl] = '/';
+      memcpy(g_pid_path + _sl + 1, PID_FILE, _fl + 1); }
 
     /* Check if a running daemon already holds the PID file */
     FILE *fp = fopen(g_pid_path, "r");
     if (fp) {
         int old_pid = 0;
-        fscanf(fp, "%d", &old_pid);
+        if (fscanf(fp, "%d", &old_pid) != 1) old_pid = 0;
         fclose(fp);
         if (old_pid > 0 && pid_is_running(old_pid)) {
             vw_log(LOG_ERROR, "daemon already running (pid %d)", old_pid);
@@ -197,7 +203,7 @@ static vw_err_t pid_file_create(const char *state_dir) {
     if (fd < 0) return VW_ERR_IO;
     char buf[16];
     int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
-    (void)write(fd, buf, (size_t)n);
+    if (write(fd, buf, (size_t)n) != n) { close(fd); return VW_ERR_IO; }
     close(fd);
 #endif
     return VW_OK;
