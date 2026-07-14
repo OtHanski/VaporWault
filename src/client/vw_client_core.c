@@ -2,6 +2,7 @@
 #include "../core/vw_crypto.h"
 #include "../core/vw_fs.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
