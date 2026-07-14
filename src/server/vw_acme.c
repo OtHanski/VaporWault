@@ -546,7 +546,7 @@ static int gen_ec_key(vw_acme_ctx_t *ctx, mbedtls_pk_context *key) {
      * deprecated mbedtls_pk_ec() accessor with a const cast — safe because
      * key is a non-const object we own and have just initialised above. */
     return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,
-                                (mbedtls_ecp_keypair *)mbedtls_pk_ec(key),
+                                mbedtls_pk_ec(*key),
                                 mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
 }
 
