@@ -1,0 +1,184 @@
+---
+id:          TASK-047
+title:       Publish cluster protocol spec — NODE_HELLO, OPLOG_ACK, CLUSTER_STATUS payloads
+status:      done
+assignee:    PRT.04
+created_by:  ARCH.00
+created:     2026-07-13
+priority:    high
+depends_on:  []
+blocks:      [TASK-048]
+review_by:   [CQR.08, SEC.07]
+tags:        [protocol, cluster, phase-7, security-sensitive]
+---
+
+Complete the cluster sub-protocol section (§7.7) of `docs/PROTOCOL.md` by
+adding full payload specifications for every cluster message type. The code
+table already exists (v5) but payload fields are absent. This spec must be
+published before SRV.01 picks up TASK-048.
+
+Bump the protocol version to **6** and add a Version History row.
+
+## Acceptance criteria
+
+### 1. NODE_HELLO (Replica → Primary)  `0x0701`
+
+The replica authenticates itself and declares its current oplog watermark.
+
+| Field          | Type      | Notes |
+|----------------|-----------|-------|
+| node_id        | uint64    | Unique node identifier (assigned by admin; stored in `nodes.db`) |
+| auth_token     | bytes[32] | Node secret token (256-bit random; constant-time compared by primary) |
+| sync_watermark | uint64    | Last confirmed oplog `entry_id` the replica has applied (0 = none) |
+| proto_version  | uint16    | Cluster protocol version (must equal negotiated version) |
+| hostname       | string    | Human-readable hostname / label for the admin UI |
+
+Security constraints:
+- The primary must verify `auth_token` using a constant-time compare
+  (`vw_crypto_const_eq`) against the stored token. Timing leak on token
+  comparison would allow online brute-force of node credentials.
+- An unknown `node_id` must return NODE_HELLO_FAIL with a generic error code
+  (same response as a wrong token — prevents node-ID enumeration).
+- A node must be marked `is_active == 1` in `nodes.db` for the primary to
+  accept the connection.
+
+### 2. NODE_HELLO_OK (Primary → Replica)  `0x0702`
+
+| Field          | Type   | Notes |
+|----------------|--------|-------|
+| primary_node_id | uint64 | Primary's own node_id |
+| current_last_entry_id | uint64 | Primary's current oplog tail |
+
+### 3. NODE_HELLO_FAIL (Primary → Replica)  `0x07FF`
+
+New message code. Add to the catalogue table.
+
+| Field      | Type   | Notes |
+|------------|--------|-------|
+| error_code | uint32 | Generic — always 0 (prevents enumeration of node_id vs wrong token) |
+
+After NODE_HELLO_FAIL the primary closes the connection.
+
+### 4. OPLOG_PULL (Replica → Primary)  `0x0703`
+
+Already listed; finalize spec:
+
+| Field          | Type   | Notes |
+|----------------|--------|-------|
+| from_entry_id  | uint64 | Exclusive lower bound; 0 = from the beginning |
+| max_entries    | uint32 | Max entries in one OPLOG_DATA response; server may return fewer |
+
+### 5. OPLOG_DATA (Primary → Replica)  `0x0704`
+
+Already listed; finalize spec:
+
+| Field         | Type   | Notes |
+|---------------|--------|-------|
+| count         | uint32 | Number of oplog entries in this batch; 0 = replica is caught up |
+| last_entry_id | uint64 | entry_id of the last entry in this batch |
+| entries       | bytes  | Concatenated serialised `vw_oplog_entry_t` records (header + payload each) |
+
+If `count == 0` the replica should wait for a server-configured retry interval
+before sending another OPLOG_PULL (avoid busy-loop).
+
+### 6. OPLOG_ACK (Replica → Primary)  `0x0705`
+
+| Field             | Type   | Notes |
+|-------------------|--------|-------|
+| confirmed_entry_id | uint64 | Last entry_id durably applied by this replica |
+
+The primary updates the stored `sync_watermark` for this node in `nodes.db`.
+The GC uses `min(sync_watermark across all active nodes)` as the safe oplog
+truncation point.
+
+### 7. CLUSTER_STATUS (either direction)  `0x0706`
+
+Request-only message; no payload.
+
+The sender is requesting a status snapshot from the peer.
+
+### 8. CLUSTER_STATUS_RESP (either direction)  `0x0707`
+
+| Field      | Type   | Notes |
+|------------|--------|-------|
+| role       | uint8  | 0 = PRIMARY, 1 = REPLICA |
+| node_count | uint32 | Number of node entries in the following list |
+| nodes      | repeated node_count times (see below) |
+
+Each node entry:
+
+| Field           | Type      | Notes |
+|-----------------|-----------|-------|
+| node_id         | uint64    |       |
+| is_active       | uint8     | 1 = currently connected and replicating |
+| sync_watermark  | uint64    | Last confirmed entry_id from this node |
+| lag_entries     | uint64    | primary_last_entry_id − sync_watermark |
+| hostname        | string    |       |
+
+### 9. Security threat model note (§7.9 — new section)
+
+Add a §7.9 covering:
+- The cluster channel uses ALPN `vw-cluster/1` over TLS 1.3 (same cipher
+  requirements as `vw/1`).
+- Mutual TLS is not required; the primary uses TLS server cert; replica
+  authenticates via NODE_HELLO `auth_token` (pre-shared secret).
+- Auth tokens are 256-bit random values generated by `vw_crypto_random` at
+  node registration time. They must never be logged or returned in any API response.
+- A NODE_HELLO_FAIL response is indistinguishable from an unknown-node failure
+  (prevents node_id enumeration).
+- The primary must enforce rate-limiting on NODE_HELLO failures per source IP
+  (5 failures per 60 seconds) to prevent brute-force of auth_tokens.
+- All oplog entries crossing the wire already carry a CRC32 (from vw_oplog);
+  replicas must verify the CRC before applying.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+PRT.04 [2026-07-13]: Spec complete. `docs/PROTOCOL.md` updated to version 6.
+
+**Changes published:**
+- Added `NODE_HELLO_FAIL` (0x07FF) to the §7.7 catalogue table.
+- Full payload specs for `NODE_HELLO`, `NODE_HELLO_OK`, `NODE_HELLO_FAIL` with security invariants (constant-time compare requirement, enumeration resistance, IP rate-limit).
+- Finalized `OPLOG_PULL` and `OPLOG_DATA` payload specs (count=0 semantics, CRC32 verification requirement).
+- New `OPLOG_ACK` payload spec (confirmed_entry_id, watermark update behaviour).
+- New `CLUSTER_STATUS_RESP` payload spec (role, node_count, per-node entries with lag_entries; auth_token explicitly excluded).
+- New §7.9 Cluster Channel Security Model documenting TLS requirements, authentication model, token secrecy, brute-force/enumeration mitigations, and known limitations.
+- Protocol version bumped 5 → 6; Version History row added.
+
+SEC.07 and CQR.08 review requested.
+
+CQR.08 [2026-07-13]: Review complete. No blocking findings.
+
+- PROTOCOL.md §7.7 catalogue table complete with NODE_HELLO_FAIL (0x07FF) added.
+- All cluster payload specs are precise and internally consistent.
+- `vw_proto.h`: `vw_payload_oplog_pull_t.from_entry_id` comment correctly reads "exclusive lower bound; 0 = from the start" — matches spec. ✓
+- `vw_payload_node_hello_fail_t.error_code` comment "always 0" matches spec invariant. ✓
+- `vw_payload_oplog_data_t` comment "no entries bytes follow" when count==0 matches spec. ✓
+- auth_token comment in `vw_payload_node_hello_t` ("never logged, never in any response") is appropriate guidance. ✓
+- CLUSTER_STATUS_RESP comment explicitly states auth_token is never included. ✓
+- `VW_PROTO_VERSION_CURRENT` bumped 5 → 6 in vw_proto.h and PROTOCOL.md. ✓
+**CQR.08 sign-off granted.**
+
+SEC.07 [2026-07-13]: Review complete. No blocking findings.
+
+- Constant-time compare requirement for NODE_HELLO auth_token documented in both §7.7 payload spec and §7.9. ✓
+- NODE_HELLO_FAIL indistinguishability (unknown node_id vs wrong token) mandated; error_code always 0. ✓
+- IP rate-limit (5 failures/60 s) requirement documented; implementation guard falls to TASK-048. ✓
+- CRC32 verification before applying each OPLOG_DATA entry required; implementation guard falls to TASK-049. ✓
+- TLS 1.3 + cipher suite requirements inherited from §2 and restated in §7.9. ✓
+- §7.9 known limitation (no cluster membership certificate) is correctly identified and documented — it is a network-layer concern outside the protocol's scope. ✓
+- auth_token never in CLUSTER_STATUS_RESP: explicitly stated in both spec and vw_proto.h comment. ✓
+**SEC.07 sign-off granted.**
+
+ARCH.00 [2026-07-13]: Both reviewers signed off, no blocking findings. TASK-047 done. TASK-048 is now unblocked.
+
+ARCH.00 [2026-07-13]: Phase 7 kick-off. The 0x07xx code range is reserved for
+cluster messages. NODE_HELLO_FAIL at 0x07FF is chosen to be outside the dense
+range of normal cluster codes and to parallel the AUTH_FAIL pattern. The
+pull-based replication model (replica initiates OPLOG_PULL) was chosen over
+push-based (primary pushes OPLOG_DATA) to simplify primary-side logic — the
+primary only sends data when asked, so no push thread per replica is needed.
+SEC.07 must pay particular attention to the NODE_HELLO authentication design,
+the NODE_HELLO_FAIL enumeration protection, and the IP-based rate-limiting
+requirement.

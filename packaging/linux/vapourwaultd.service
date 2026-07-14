@@ -1,0 +1,28 @@
+[Unit]
+Description=VaporWault cloud file server
+Documentation=file:/etc/vapourwault/server.conf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vapourwaultd --config /etc/vapourwault/server.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+User=vapourwault
+Group=vapourwault
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/vapourwault /var/log/vapourwault /etc/vapourwault /run/vapourwault
+
+# Allow larger file descriptor count for busy deployments
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,119 @@
+# VaporWault server configuration example
+# Copy to /etc/vapourwault/server.conf and edit before starting the service.
+# Keys are case-sensitive. Lines starting with # are comments.
+
+# ── Network ───────────────────────────────────────────────────────────────────
+
+# IP address to listen on. Use 0.0.0.0 to listen on all interfaces.
+listen_host      = 0.0.0.0
+
+# TCP port for client connections (TLS). Default: 4430.
+listen_port      = 4430
+
+# Maximum number of simultaneous client connections.
+max_connections  = 256
+
+# Number of worker threads in the connection thread pool.
+max_workers      = 4
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+
+# Directory where server data is stored (users, files, oplog).
+# Must be readable and writable by the vapourwault user.
+data_dir         = /var/lib/vapourwault
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+# Path to the TLS certificate in PEM format.
+# Either supply a real certificate here or enable ACME below.
+cert_pem_path    = /etc/vapourwault/server.crt
+
+# Path to the TLS private key in PEM format.
+key_pem_path     = /etc/vapourwault/server.key
+
+# ── Administration ────────────────────────────────────────────────────────────
+
+# Path to the AF_UNIX admin socket. Only the vapourwault user (or root) can
+# connect. Used by vapourwault-server-cli.
+admin_socket     = /run/vapourwault/admin.sock
+
+# Logging verbosity: ERROR, WARN, INFO, or DEBUG.
+log_level        = INFO
+
+# ── Garbage collection ────────────────────────────────────────────────────────
+
+# How often to run the GC thread (seconds). Set to 0 to disable.
+# GC removes expired sessions, orphaned chunks, and old oplog segments.
+gc_interval_secs = 300
+
+# ── ACME (automatic TLS via Let's Encrypt) ───────────────────────────────────
+
+# Set to 1 to enable. Requires acme_domain and either acme_dns_hook or
+# acme_http_root to be configured.
+acme_enabled      = 0
+
+# ACME directory URL. Default is Let's Encrypt production.
+acme_directory    = https://acme-v02.api.letsencrypt.org/directory
+
+# Contact email for certificate expiry notifications (mailto: prefix required).
+acme_contact      =
+
+# Domain name for which to obtain a certificate.
+acme_domain       =
+
+# Path to the ACME account private key (created on first run if absent).
+acme_account_key  = /etc/vapourwault/acme-account.key
+
+# DNS-01 challenge: path to a hook script that adds/removes the _acme-challenge
+# TXT record. The script is called with arguments: add|remove <domain> <token>.
+acme_dns_hook     =
+
+# HTTP-01 challenge: directory served at http://<domain>/.well-known/acme-challenge/
+# Leave empty to use DNS-01 only.
+acme_http_root    =
+
+# Renew the certificate this many days before expiry.
+acme_renew_days   = 30
+
+# ── SMTP (email for 2FA / password recovery) ─────────────────────────────────
+
+# Outbound SMTP relay hostname. Leave empty to disable email features.
+smtp_host         =
+
+# SMTP port. Common values: 587 (STARTTLS), 465 (implicit TLS), 25 (no auth).
+smtp_port         = 587
+
+# TLS mode for SMTP: none, starttls, or tls.
+smtp_tls_mode     = starttls
+
+# SMTP credentials.
+smtp_username     =
+smtp_password     =
+
+# From address and display name for outgoing email.
+smtp_from_addr    =
+smtp_from_name    = VaporWault
+
+# Verify the SMTP server's TLS certificate. Set to 0 only for testing.
+smtp_verify_cert  = 1
+
+# Optional CA certificate for SMTP TLS verification.
+smtp_ca_cert_path =
+
+# ── Cluster (replication) ─────────────────────────────────────────────────────
+
+# TCP port for cluster replication. Set to 0 to disable cluster mode.
+# Primary nodes listen on this port; replica nodes connect to the primary here.
+cluster_port              = 9010
+
+# Set to 1 if this instance is a replica (connects to a primary).
+cluster_is_replica        = 0
+
+# Primary hostname/IP (replica only).
+cluster_primary_host      =
+
+# Primary cluster port (replica only).
+cluster_primary_port      = 9010
+
+# How often a replica polls the primary for new oplog entries (seconds).
+cluster_poll_interval_secs = 5

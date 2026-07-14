@@ -1,0 +1,52 @@
+# VaporWault server configuration example (Windows)
+# Copy to C:\ProgramData\VaporWault\server.conf and edit before starting.
+# Use forward slashes or escaped backslashes in paths.
+
+# ── Network ───────────────────────────────────────────────────────────────────
+listen_host      = 0.0.0.0
+listen_port      = 4430
+max_connections  = 256
+max_workers      = 4
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+data_dir         = C:/ProgramData/VaporWault/data
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+cert_pem_path    = C:/ProgramData/VaporWault/server.crt
+key_pem_path     = C:/ProgramData/VaporWault/server.key
+
+# ── Administration ────────────────────────────────────────────────────────────
+# Admin socket is not supported on Windows; admin CLI connects via named pipe.
+admin_socket     =
+log_level        = INFO
+
+# ── Garbage collection ────────────────────────────────────────────────────────
+gc_interval_secs = 300
+
+# ── ACME (automatic TLS via Let's Encrypt) ───────────────────────────────────
+acme_enabled      = 0
+acme_directory    = https://acme-v02.api.letsencrypt.org/directory
+acme_contact      =
+acme_domain       =
+acme_account_key  = C:/ProgramData/VaporWault/acme-account.key
+acme_dns_hook     =
+acme_http_root    =
+acme_renew_days   = 30
+
+# ── SMTP ──────────────────────────────────────────────────────────────────────
+smtp_host         =
+smtp_port         = 587
+smtp_tls_mode     = starttls
+smtp_username     =
+smtp_password     =
+smtp_from_addr    =
+smtp_from_name    = VaporWault
+smtp_verify_cert  = 1
+smtp_ca_cert_path =
+
+# ── Cluster ───────────────────────────────────────────────────────────────────
+cluster_port               = 0
+cluster_is_replica         = 0
+cluster_primary_host       =
+cluster_primary_port       = 9010
+cluster_poll_interval_secs = 5

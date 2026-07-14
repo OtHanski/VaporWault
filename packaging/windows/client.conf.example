@@ -1,0 +1,29 @@
+# VaporWault client daemon configuration
+# Install to: %APPDATA%\VaporWault\daemon.conf
+# Permissions: restrict to your user account (the daemon refuses to start if
+#              the file is readable by other users).
+#
+# After editing, restart the daemon via Task Scheduler:
+#   Stop-ScheduledTask -TaskName VaporWaultDaemon
+#   Start-ScheduledTask -TaskName VaporWaultDaemon
+
+# Hostname or IP address of the VaporWault server.
+server_host      = vault.example.com
+
+# TLS port the server listens on (default: 4430).
+server_port      = 4430
+
+# Path to the server's CA certificate in PEM format.
+# Leave empty to use the Windows certificate store (CNG / SChannel roots).
+ca_cert_pem_path =
+
+# Username to authenticate as.
+username         = yourname
+
+# TCP port the local daemon listens on for vapourwault-cli connections.
+# Only loopback connections are accepted; change only if 47832 conflicts.
+ipc_port         = 47832
+
+# How often (in milliseconds) the daemon polls for remote changes.
+# File-system events trigger uploads immediately regardless of this value.
+sync_interval_ms = 30000

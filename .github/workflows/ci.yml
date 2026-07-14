@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# ── Linux matrix: GCC + Clang × Debug + Release ─────────────────────────────
+jobs:
+  build-linux:
+    name: Linux / ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      CC:  ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build python3
+          # mbedTLS is built from the vendored submodule in third_party/mbedtls/.
+          # Do not install libmbedtls-dev — the project config header would be ignored.
+          # GUI targets are disabled (DVW_BUILD_GUI=OFF) so SDL2 is not required here.
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DVW_BUILD_SERVER=ON  \
+            -DVW_BUILD_CLIENT=ON  \
+            -DVW_BUILD_GUI=OFF    \
+            -DVW_BUILD_TOOLS=ON   \
+            -DVW_BUILD_TESTS=ON   \
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests
+        working-directory: build
+        env:
+          CTEST_TEST_TIMEOUT: "30"
+        run: ctest --output-on-failure --no-tests=error -R unit
+
+      # Fuzz regression: build with libFuzzer+ASan+UBSan, replay the seed corpus.
+      # Only runs on the Clang/Release cell — libFuzzer is a Clang/LLVM component.
+      # The regression script replays each corpus seed once (-runs=1) to catch
+      # regressions without spending time on corpus expansion.
+      - name: Fuzz regression (Clang / Release only)
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Release'
+        run: |
+          cmake -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=Fuzz \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DVW_BUILD_SERVER=ON \
+            -DVW_BUILD_CLIENT=OFF \
+            -DVW_BUILD_GUI=OFF \
+            -DVW_BUILD_TOOLS=OFF \
+            -DVW_BUILD_TESTS=ON
+
+          cmake --build build-fuzz --parallel \
+            --target fuzz_proto_recv \
+                    fuzz_path_validate \
+                    fuzz_oplog_replay \
+                    fuzz_cluster_hello \
+                    fuzz_admin_dispatch
+
+          if [ -f tests/fuzz/run_regression.sh ]; then
+            bash tests/fuzz/run_regression.sh build-fuzz
+          else
+            echo "No fuzz corpus yet — skipping regression replay"
+          fi
+
+# ── Windows matrix: MSVC × Debug + Release ───────────────────────────────────
+  build-windows:
+    name: Windows / MSVC / ${{ matrix.build_type }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DVW_BUILD_SERVER=ON `
+            -DVW_BUILD_CLIENT=ON `
+            -DVW_BUILD_GUI=OFF   `
+            -DVW_BUILD_TOOLS=ON  `
+            -DVW_BUILD_TESTS=ON  `
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Unit tests
+        working-directory: build
+        env:
+          CTEST_TEST_TIMEOUT: "30"
+        run: ctest -C ${{ matrix.build_type }} --output-on-failure --no-tests=error -R unit
+
+# ── Integration: real server + Python pytest suite ────────────────────────────
+  integration:
+    name: Integration / Linux / gcc / Release
+    runs-on: ubuntu-latest
+    needs: build-linux   # run after matrix so we know it at least compiles
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build python3 python3-pip openssl
+
+      - name: Configure
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVW_BUILD_SERVER=ON  \
+            -DVW_BUILD_CLIENT=ON  \
+            -DVW_BUILD_GUI=OFF    \
+            -DVW_BUILD_TOOLS=ON   \
+            -DVW_BUILD_TESTS=ON   \
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Install Python test dependencies
+        run: pip install pytest pytest-timeout
+
+      - name: Generate test TLS certificate
+        run: |
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout tests/integration/test.key \
+            -out    tests/integration/test.crt \
+            -days 1 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+
+      - name: Run pytest integration tests
+        run: |
+          pytest tests/integration/ \
+            -v -m "not cluster" \
+            --timeout=60 \
+            --server-bin  build/bin/vapourwaultd \
+            --admin-cli   build/bin/vapourwault-server-cli \
+            --test-cert   tests/integration/test.crt \
+            --test-key    tests/integration/test.key
+
+      # Fallback: run the older TAP-based integration suite if pytest has
+      # no collected tests yet (TASK-055 adds them; this guards the window
+      # between TASK-058 merging and TASK-055 landing).
+      - name: Run legacy TAP integration suite
+        if: always()
+        working-directory: build
+        run: |
+          ctest --output-on-failure --no-tests=warn -L integration --timeout 180

@@ -1,0 +1,17 @@
+[Unit]
+Description=VaporWault client sync daemon
+Documentation=https://github.com/vapourwault/vapourwault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vapourwault-daemon --state-dir %h/.local/share/vapourwault
+Restart=on-failure
+RestartSec=10s
+
+# Give the daemon time to finish an in-progress sync before we kill it.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
