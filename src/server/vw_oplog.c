@@ -60,9 +60,29 @@
 /* ── CRC-32 (ISO 3309, polynomial 0xEDB88320) ───────────────────────────── */
 
 static uint32_t s_crc32_table[256];
-static int      s_crc32_table_ready = 0;
 
-static void crc32_init_table(void)
+#ifdef _WIN32
+static INIT_ONCE s_crc32_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK crc32_init_once_win(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    uint32_t i, j, cv;
+    for (i = 0; i < 256; i++) {
+        cv = i;
+        for (j = 0; j < 8; j++) {
+            if (cv & 1u) cv = 0xEDB88320u ^ (cv >> 1);
+            else         cv >>= 1;
+        }
+        s_crc32_table[i] = cv;
+    }
+    return TRUE;
+}
+static void crc32_init_table(void) {
+    InitOnceExecuteOnce(&s_crc32_once, crc32_init_once_win, NULL, NULL);
+}
+#else
+static pthread_once_t s_crc32_once = PTHREAD_ONCE_INIT;
+static void crc32_fill_table(void)
 {
     uint32_t i, j, c;
     for (i = 0; i < 256; i++) {
@@ -73,8 +93,9 @@ static void crc32_init_table(void)
         }
         s_crc32_table[i] = c;
     }
-    s_crc32_table_ready = 1;
 }
+static void crc32_init_table(void) { pthread_once(&s_crc32_once, crc32_fill_table); }
+#endif
 
 static uint32_t crc32_update(uint32_t crc, const void *buf, size_t len)
 {
@@ -566,7 +587,7 @@ vw_err_t vw_oplog_open(const char *data_dir, vw_oplog_t **out_ctx)
 {
     if (!data_dir || !out_ctx) return VW_ERR_INVALID_ARG;
 
-    if (!s_crc32_table_ready) crc32_init_table();
+    crc32_init_table();
 
     vw_oplog_t *ctx = (vw_oplog_t *)calloc(1, sizeof(vw_oplog_t));
     if (!ctx) return VW_ERR_OOM;

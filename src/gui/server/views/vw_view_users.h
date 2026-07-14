@@ -56,4 +56,6 @@ private:
 
     /* Error / status display */
     char                 error_msg_[256]  = {};
+
+    bool                 session_expired_ = false;
 };

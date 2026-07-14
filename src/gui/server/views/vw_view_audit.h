@@ -26,7 +26,7 @@ public:
 private:
     void do_query(ServerApp &app);
     bool parse_audit_resp(const uint8_t *buf, uint32_t len);
-    void export_csv() const;
+    void export_csv();
 
     static const char *op_type_name(uint8_t op_type);
 
@@ -36,4 +36,6 @@ private:
     uint32_t                 max_entries_    = 100;
     std::vector<AuditEntry>  entries_;
     char                     error_msg_[256] = {};
+    std::string              last_export_path_;
+    std::string              last_export_error_;
 };

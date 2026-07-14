@@ -459,6 +459,15 @@ vw_err_t vw_store_file_create(vw_file_store_t *fs,
         return VW_ERR_ALREADY_EXISTS;
     }
 
+    /* Pre-grow path_ht before any disk writes so the post-commit insert below
+     * cannot fail with OOM after the record is already durable on disk. */
+    if (fs->path_ht_len * 4 >= fs->path_ht_cap * 3) {
+        if (path_ht_grow(fs) != 0) {
+            rwlock_wrunlock(&fs->files_lock);
+            return VW_ERR_OOM;
+        }
+    }
+
     rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_WRITE,
                          &rec->owner_id, (uint32_t)sizeof(rec->owner_id), &eid);
     if (rc != VW_OK) { rwlock_wrunlock(&fs->files_lock); return rc; }
@@ -736,6 +745,9 @@ vw_err_t vw_store_version_create(vw_file_store_t *fs,
     if (!fs || !rec || !out_version_id) return VW_ERR_INVALID_ARG;
     if (rec->file_id == 0)              return VW_ERR_INVALID_ARG;
     if (rec->chunk_count > 0 && !chunk_hashes) return VW_ERR_INVALID_ARG;
+    /* Protocol limits chunk_count to uint16 range; guard the storage layer too
+     * to prevent blob_bytes overflow when passed chunk_count is unvalidated. */
+    if (rec->chunk_count > UINT16_MAX) return VW_ERR_INVALID_ARG;
 
     rwlock_wrlock(&fs->versions_lock);
 

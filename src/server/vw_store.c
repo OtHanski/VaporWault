@@ -40,6 +40,8 @@ typedef SRWLOCK vw_rwlock_t;
 #   define rwlock_destroy(l)  ((void)(l))
 #else
 #   include <pthread.h>
+#   include <fcntl.h>
+#   include <unistd.h>
 typedef pthread_rwlock_t vw_rwlock_t;
 #   define rwlock_init(l)     pthread_rwlock_init((l), NULL)
 #   define rwlock_rdlock(l)   pthread_rwlock_rdlock(l)
@@ -47,6 +49,35 @@ typedef pthread_rwlock_t vw_rwlock_t;
 #   define rwlock_wrlock(l)   pthread_rwlock_wrlock(l)
 #   define rwlock_wrunlock(l) pthread_rwlock_unlock(l)
 #   define rwlock_destroy(l)  pthread_rwlock_destroy(l)
+#endif
+
+/* ── Atomic slot read (no seek state, no full-file read) ─────────────────── */
+
+#ifdef _WIN32
+static int store_pread(const char *path, void *buf, size_t len, uint64_t off)
+{
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.Offset     = (DWORD)(off & 0xFFFFFFFFu);
+    ov.OffsetHigh = (DWORD)(off >> 32);
+    DWORD nread = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)len, &nread, &ov);
+    CloseHandle(h);
+    return (ok && nread == (DWORD)len) ? 0 : -1;
+}
+#else
+static int store_pread(const char *path, void *buf, size_t len, uint64_t off)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = pread(fd, buf, len, (off_t)off);
+    close(fd);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
 #endif
 
 /*
@@ -186,13 +217,14 @@ static int uname_ht_grow(vw_store_t *ctx)
 
 static int uname_ht_insert(vw_store_t *ctx, const char *username, uint64_t slot)
 {
-    /* Grow at 75% load */
-    if (ctx->username_ht_len * 4 >= ctx->username_ht_cap * 3) {
+    int is_new = (uname_ht_find(ctx, username) == 0); /* 0 = not found */
+    /* Grow at 75% load only for new entries (updates reuse an existing bucket). */
+    if (is_new && ctx->username_ht_len * 4 >= ctx->username_ht_cap * 3) {
         if (uname_ht_grow(ctx) != 0) return -1;
     }
     if (uname_ht_insert_raw(ctx->username_ht, ctx->username_ht_cap,
                              username, slot) != 0) return -1;
-    ctx->username_ht_len++;
+    if (is_new) ctx->username_ht_len++;
     return 0;
 }
 
@@ -259,12 +291,14 @@ static int email_ht_grow(vw_store_t *ctx)
 
 static int email_ht_insert(vw_store_t *ctx, const char *email, uint64_t slot)
 {
-    if (ctx->email_ht_len * 4 >= ctx->email_ht_cap * 3) {
+    int is_new = (email_ht_find(ctx, email) == 0); /* 0 = not found */
+    /* Grow at 75% load only for new entries (updates reuse an existing bucket). */
+    if (is_new && ctx->email_ht_len * 4 >= ctx->email_ht_cap * 3) {
         if (email_ht_grow(ctx) != 0) return -1;
     }
     if (email_ht_insert_raw(ctx->email_ht, ctx->email_ht_cap, email, slot) != 0)
         return -1;
-    ctx->email_ht_len++;
+    if (is_new) ctx->email_ht_len++;
     return 0;
 }
 
@@ -795,31 +829,21 @@ vw_err_t vw_store_user_create(vw_store_t *ctx,
 static vw_err_t read_user_slot(vw_store_t *ctx, uint64_t slot,
                                 vw_user_record_t *out_record)
 {
-    void            *buf = NULL;
-    size_t           buf_len = 0;
-    size_t           off = 0;
-    vw_err_t         rc = VW_OK;
     vw_user_record_t tmp;
+    uint64_t         off = slot * (uint64_t)sizeof(vw_user_record_t);
 
-    rc = vw_fs_read_file(ctx->users_path, &buf, &buf_len);
-    if (rc != VW_OK) return rc;
+    /* Read exactly one slot — avoids loading all password hashes into memory. */
+    if (store_pread(ctx->users_path, &tmp, sizeof(tmp), off) != 0) {
+        secure_zero(&tmp, sizeof(tmp));
+        return VW_ERR_IO;
+    }
 
-    off = (size_t)slot * sizeof(vw_user_record_t);
-    if (off + sizeof(vw_user_record_t) > buf_len) {
-        /* Zero entire buffer before freeing — it contains password hashes. */
-        secure_zero(buf, buf_len);
-        free(buf);
+    if (tmp.user_id == 0) {
+        secure_zero(&tmp, sizeof(tmp));
         return VW_ERR_NOT_FOUND;
     }
-    memcpy(&tmp, (uint8_t *)buf + off, sizeof(tmp));
 
-    /* Zero entire buffer before freeing — it contains password hashes. */
-    secure_zero(buf, buf_len);
-    free(buf);
-
-    if (tmp.user_id == 0) return VW_ERR_NOT_FOUND;
-
-    /* Zero sensitive fields in the copy before returning. */
+    /* Zero sensitive fields before returning. */
     memset(tmp.password_hash, 0, sizeof(tmp.password_hash));
     memset(tmp.password_salt, 0, sizeof(tmp.password_salt));
     *out_record = tmp;
@@ -1297,8 +1321,10 @@ vw_err_t vw_store_session_gc(vw_store_t *ctx, uint64_t now_unix,
         expired++;
     }
 
-    if (expired > 0)
-        vw_fs_sync_file(ctx->sessions_path);
+    if (expired > 0) {
+        vw_err_t sync_rc = vw_fs_sync_file(ctx->sessions_path);
+        (void)sync_rc; /* best-effort; expired sessions are zeroed; GC retries on next cycle */
+    }
 
     /* Zero buffer — it contains session tokens. */
     secure_zero(buf, buf_len);
@@ -1361,8 +1387,10 @@ vw_err_t vw_store_sessions_revoke_by_user(vw_store_t *ctx, uint64_t user_id,
         revoked++;
     }
 
-    if (revoked > 0)
-        vw_fs_sync_file(ctx->sessions_path);
+    if (revoked > 0) {
+        vw_err_t sync_rc = vw_fs_sync_file(ctx->sessions_path);
+        (void)sync_rc; /* best-effort; revoked sessions are zeroed; GC retries on next cycle */
+    }
 
     /* Buffer contains session tokens — zero before free. */
     secure_zero(buf, buf_len);

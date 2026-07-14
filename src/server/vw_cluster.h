@@ -45,9 +45,17 @@ typedef struct {
     uint8_t  hostname[128];     /* NUL-terminated, max 127 bytes           */
     uint64_t sync_watermark;    /* last confirmed oplog entry_id from this node */
     uint8_t  is_active;         /* 1 = enabled; 0 = deregistered/disabled */
-    uint8_t  role;              /* 0 = REPLICA, 1 = PRIMARY (self-record)  */
+    uint8_t  role;              /* VW_NODE_ROLE_REPLICA or VW_NODE_ROLE_SELF */
     uint8_t  _pad[62];          /* reserved; zero on write                 */
 } vw_node_record_t;
+
+/*
+ * role field values. The meaning is context-dependent:
+ *   On the PRIMARY's nodes.db: REPLICA (0) marks a registered replica node.
+ *   On a REPLICA's nodes.db: SELF (1) marks the node's own self-registration record.
+ */
+#define VW_NODE_ROLE_REPLICA  0u   /* primary-side: this is a known replica */
+#define VW_NODE_ROLE_SELF     1u   /* replica-side: this is our own record */
 
 _Static_assert(sizeof(vw_node_record_t) == 256,
                "vw_node_record_t must be exactly 256 bytes");

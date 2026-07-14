@@ -208,7 +208,14 @@ static int pid_file_create(const char *data_dir) {
     }
     char buf[32];
     int  n = snprintf(buf, sizeof(buf), "%lu\n", VW_GETPID());
-    if (n > 0) write(fd, buf, (size_t)n);
+    if (n > 0) {
+        size_t pos = 0, total = (size_t)n;
+        while (pos < total) {
+            ssize_t w = write(fd, buf + pos, total - pos);
+            if (w < 0) { if (errno == EINTR) continue; break; }
+            pos += (size_t)w;
+        }
+    }
     close(fd);
 #endif
     return 0;

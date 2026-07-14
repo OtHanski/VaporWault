@@ -408,12 +408,31 @@ int vw_server_cli_main(int argc, char *argv[])
 
     if (strcmp(cmd, "user-create") == 0) {
         if (argi + 1 >= argc) {
-            fprintf(stderr, "Usage: %s user-create <username> <password> [--admin]\n", argv[0]);
+            fprintf(stderr, "Usage: %s user-create <username> <password|-|--stdin-password> [--admin]\n"
+                            "  Pass '-' or '--stdin-password' to read the password from stdin.\n",
+                    argv[0]);
             goto done;
         }
         const char *uname = argv[argi++];
-        const char *pw    = argv[argi++];
+        const char *pw_arg = argv[argi++];
         int is_admin = (argi < argc && strcmp(argv[argi], "--admin") == 0);
+
+        /* Read password from stdin when '-' or '--stdin-password' is specified,
+         * to avoid exposing it in /proc/<pid>/cmdline and ps output. */
+        static char stdin_pw[256];
+        const char *pw;
+        if (strcmp(pw_arg, "-") == 0 || strcmp(pw_arg, "--stdin-password") == 0) {
+            if (!fgets(stdin_pw, (int)sizeof(stdin_pw), stdin)) {
+                fprintf(stderr, "error: failed to read password from stdin\n");
+                goto done;
+            }
+            /* Strip trailing newline */
+            size_t plen = strlen(stdin_pw);
+            if (plen > 0 && stdin_pw[plen - 1] == '\n') stdin_pw[--plen] = '\0';
+            pw = stdin_pw;
+        } else {
+            pw = pw_arg;
+        }
         rc = cmd_user_create(fd, uname, pw, is_admin);
 
     } else if (strcmp(cmd, "user-list") == 0) {

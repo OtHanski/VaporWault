@@ -242,6 +242,11 @@ static vw_err_t handle_session_resume(vw_server_ctx_t *ctx, vw_conn_t *conn,
  * Blocking sleep for timing normalisation.
  * AUTH_RECOVER_REQUEST must always take ≥ RECOVERY_RESPONSE_MS regardless of
  * whether the email is registered, to prevent email enumeration via timing.
+ *
+ * Advisory: this is a FLOOR, not a fixed delay. Under high server load, actual
+ * response time may exceed RECOVERY_RESPONSE_MS, potentially distinguishing
+ * valid from invalid codes via timing. For stronger guarantees, replace with an
+ * unconditional sleep(RECOVERY_RESPONSE_MS) that ignores the processing time.
  */
 #define RECOVERY_RESPONSE_MS 200u
 #define RECOVERY_CODE_TTL_SECS 600u

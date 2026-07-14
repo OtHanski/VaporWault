@@ -16,9 +16,11 @@
 static void (* volatile g_memset_fn)(void *, int, size_t) = memset;
 #define secure_zero(p, n) g_memset_fn((p), 0, (n))
 
-/* Debug log (no tokens, no chunk data per SEC.07). */
+/* Debug/warning logs (no tokens, no chunk data per SEC.07). */
 #define LOG_DEBUG(fmt, ...) \
     fprintf(stderr, "[DBG] vw_file_handlers: " fmt "\n", ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...) \
+    fprintf(stderr, "[WRN] vw_file_handlers: " fmt "\n", ##__VA_ARGS__)
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
@@ -685,9 +687,15 @@ static vw_err_t handle_file_commit(vw_store_t      *store,
     updated.current_version_id = new_version_id;
     updated.size_bytes          = logical_size;
     updated.mtime_unix          = (int64_t)ver_rec.created_at;
-    (void)vw_store_file_update(fs, new_file_id, &updated);
-    /* NOTE(TASK-024): The oplog records version_create and file_update as two
-     * separate entries. Atomic compound journalling is a Phase 5 concern. */
+    if (vw_store_file_update(fs, new_file_id, &updated) != VW_OK) {
+        /* The new version was committed but the file record meta-update failed.
+         * Log a warning and let GC clean up; do not surface this to the client
+         * because the version data is durable. Atomic compound journalling is a
+         * Phase 5 concern (TASK-024). */
+        LOG_WARN("FILE_COMMIT: vw_store_file_update failed for fid=%llu; "
+                 "version is durable, file record will be stale until GC",
+                 (unsigned long long)new_file_id);
+    }
 
     /* FILE_COMMIT_ACK: [file_id u64][version_id u64][error_code u32] */
     uint8_t ack[8 + 8 + 4];
@@ -1237,12 +1245,14 @@ static vw_err_t handle_audit_query(vw_store_t *store, vw_oplog_t *oplog,
         return (send_error(conn, err), VW_OK);
     }
 
-    /* Compute byte length of entries_buf. */
+    /* Compute byte length of entries_buf; guard against uint32_t overflow. */
     uint32_t entries_bytes = 0;
     if (entries_buf && entries_count > 0) {
         const uint8_t *p = entries_buf;
         for (uint32_t i = 0; i < entries_count; i++) {
             uint32_t eplen = vw_read_u32le(p + 4);
+            if (eplen > VW_MAX_MSG_BYTES || entries_bytes > VW_MAX_MSG_BYTES - (17u + eplen))
+                break;  /* truncate — should not happen with server-generated data */
             entries_bytes += 17u + eplen;
             p             += 17u + eplen;
         }

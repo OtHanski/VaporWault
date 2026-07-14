@@ -51,12 +51,22 @@ typedef struct {
     uint64_t last_refill_ns;
 } token_bucket_t;
 
+#ifdef _WIN32
+static LARGE_INTEGER s_qpf;
+static INIT_ONCE     s_qpf_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK qpf_once_cb(PINIT_ONCE o, PVOID p, PVOID *ctx) {
+    (void)o; (void)p; (void)ctx;
+    QueryPerformanceFrequency(&s_qpf);
+    return TRUE;
+}
+#endif
+
 static uint64_t now_ns(void) {
 #ifdef _WIN32
-    LARGE_INTEGER freq, cnt;
-    QueryPerformanceFrequency(&freq);
+    InitOnceExecuteOnce(&s_qpf_once, qpf_once_cb, NULL, NULL);
+    LARGE_INTEGER cnt;
     QueryPerformanceCounter(&cnt);
-    return (uint64_t)cnt.QuadPart * 1000000000ULL / (uint64_t)freq.QuadPart;
+    return (uint64_t)cnt.QuadPart * 1000000000ULL / (uint64_t)s_qpf.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -113,7 +123,7 @@ struct vw_conn {
     mbedtls_net_context net;
     token_bucket_t      upload_bucket;
     token_bucket_t      download_bucket;
-    char                peer_addr[46];
+    char                peer_addr[254];
     _Atomic uint32_t    recv_timeout_ms; /* per-connection recv deadline; 0 = none */
     int                 is_client;    /* 1 = owns client_tls; 0 = borrows server conf */
     vw_client_tls_t    *client_tls;  /* non-NULL iff is_client == 1 */
@@ -555,7 +565,7 @@ fail:
     mbedtls_ssl_free(&conn->ssl);
     mbedtls_net_free(&conn->net);
     mbedtls_ssl_config_free(&tls->conf);
-    if (tls->ca_loaded) mbedtls_x509_crt_free(&tls->ca_cert);
+    mbedtls_x509_crt_free(&tls->ca_cert);
     mbedtls_entropy_free(&tls->entropy);
     mbedtls_ctr_drbg_free(&tls->ctr_drbg);
     free(tls);
@@ -701,16 +711,27 @@ vw_err_t vw_net_conn_set_recv_timeout(vw_conn_t *conn, uint32_t timeout_ms)
 vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
                                  const char *cert_pem_path,
                                  const char *key_pem_path) {
-    mbedtls_x509_crt   new_cert;
-    mbedtls_pk_context new_key;
+    mbedtls_x509_crt         new_cert;
+    mbedtls_pk_context        new_key;
+    mbedtls_entropy_context   tmp_entropy;
+    mbedtls_ctr_drbg_context  tmp_drbg;
     mbedtls_x509_crt_init(&new_cert);
     mbedtls_pk_init(&new_key);
+    mbedtls_entropy_init(&tmp_entropy);
+    mbedtls_ctr_drbg_init(&tmp_drbg);
 
-    /* Parse outside lock — slow I/O */
+    /* Parse outside lock — slow I/O; use a local RNG to avoid racing with
+     * concurrent TLS handshakes that hold a shared lock on ctx->ctr_drbg. */
+    static const unsigned char pers[] = "vapourwault_reload_drbg";
+    if (mbedtls_ctr_drbg_seed(&tmp_drbg, mbedtls_entropy_func,
+                               &tmp_entropy, pers, sizeof(pers) - 1) != 0)
+        goto fail_parse;
     if (mbedtls_x509_crt_parse_file(&new_cert, cert_pem_path) != 0) goto fail_parse;
     if (mbedtls_pk_parse_keyfile(&new_key, key_pem_path, NULL,
                                   mbedtls_ctr_drbg_random,
-                                  &ctx->ctr_drbg) != 0) goto fail_parse;
+                                  &tmp_drbg) != 0) goto fail_parse;
+    mbedtls_ctr_drbg_free(&tmp_drbg);
+    mbedtls_entropy_free(&tmp_entropy);
 
 #ifdef _WIN32
     AcquireSRWLockExclusive(&ctx->cert_rw_lock);
@@ -753,5 +774,7 @@ vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
 fail_parse:
     mbedtls_x509_crt_free(&new_cert);
     mbedtls_pk_free(&new_key);
+    mbedtls_ctr_drbg_free(&tmp_drbg);
+    mbedtls_entropy_free(&tmp_entropy);
     return VW_ERR_NET_TLS;
 }

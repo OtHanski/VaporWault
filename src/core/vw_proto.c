@@ -233,9 +233,9 @@ vw_err_t vw_proto_decode_auth_request(
     uint32_t o = 0;
     vw_err_t err;
     if ((err = vw_proto_read_str(buf, len, &o, &out->username, &out->username_len)) != VW_OK) return err;
-    if (out->username_len == 0 || out->username_len > VW_MAX_USERNAME_BYTES) return VW_ERR_PROTO_TRUNCATED;
+    if (out->username_len == 0 || out->username_len > VW_MAX_USERNAME_BYTES) return VW_ERR_PROTO_INVALID;
     if ((err = pr_raw(buf, len, &o, out->auth_token, VW_TOKEN_BYTES)) != VW_OK) return err;
-    if (o != len) return VW_ERR_PROTO_TRUNCATED;
+    if (o != len) return VW_ERR_PROTO_INVALID;
     return VW_OK;
 }
 
@@ -259,7 +259,7 @@ vw_err_t vw_proto_decode_auth_challenge(
     vw_err_t err;
     if ((err = pr_u8(buf, len, &o, &out->challenge_type)) != VW_OK) return err;
     if ((err = vw_proto_read_str(buf, len, &o, &out->hint, &out->hint_len)) != VW_OK) return err;
-    if (o != len) return VW_ERR_PROTO_TRUNCATED;
+    if (o != len) return VW_ERR_PROTO_INVALID;
     return VW_OK;
 }
 
@@ -281,8 +281,8 @@ vw_err_t vw_proto_decode_auth_otp(
     uint32_t o = 0;
     vw_err_t err;
     if ((err = vw_proto_read_str(buf, len, &o, &out->otp_code, &out->otp_len)) != VW_OK) return err;
-    if (out->otp_len < 1 || out->otp_len > 8) return VW_ERR_PROTO_TRUNCATED;
-    if (o != len) return VW_ERR_PROTO_TRUNCATED;
+    if (out->otp_len < 1 || out->otp_len > 8) return VW_ERR_PROTO_INVALID;
+    if (o != len) return VW_ERR_PROTO_INVALID;
     return VW_OK;
 }
 
@@ -316,7 +316,7 @@ vw_err_t vw_proto_decode_auth_ok(
     if ((err = pr_u64(buf, len, &o, &out->quota_bytes)) != VW_OK) return err;
     if ((err = pr_u64(buf, len, &o, &out->used_bytes)) != VW_OK) return err;
     if ((err = pr_u64(buf, len, &o, &out->user_id)) != VW_OK) return err;
-    if (o != len) return VW_ERR_PROTO_TRUNCATED;
+    if (o != len) return VW_ERR_PROTO_INVALID;
     return VW_OK;
 }
 
@@ -340,7 +340,7 @@ vw_err_t vw_proto_decode_auth_fail(
     vw_err_t err;
     if ((err = pr_u32(buf, len, &o, &out->error_code)) != VW_OK) return err;
     if ((err = pr_u16(buf, len, &o, &out->lockout_remaining_secs)) != VW_OK) return err;
-    if (o != len) return VW_ERR_PROTO_TRUNCATED;
+    if (o != len) return VW_ERR_PROTO_INVALID;
     return VW_OK;
 }
 
@@ -364,6 +364,6 @@ vw_err_t vw_proto_decode_error(
     vw_err_t err;
     if ((err = pr_u32(buf, len, &o, out_code)) != VW_OK) return err;
     if ((err = vw_proto_read_str(buf, len, &o, out_msg, out_msg_len)) != VW_OK) return err;
-    if (o != len) return VW_ERR_PROTO_TRUNCATED;
+    if (o != len) return VW_ERR_PROTO_INVALID;
     return VW_OK;
 }

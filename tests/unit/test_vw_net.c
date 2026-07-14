@@ -362,6 +362,10 @@ VW_TEST_SUITE("vw_net") {
             }
 
             /* Hot-swap: reload the same cert (simulates a renewal). */
+            /* TODO (test coverage): This test only verifies reload completes without error.
+             * A thorough regression test should generate two distinct self-signed certs,
+             * reload the second, and verify via mbedtls_ssl_get_peer_cert that clients
+             * now receive the new certificate's serial/fingerprint. */
             vw_err_t reload_err = VW_ERR_INVALID_ARG;
             if (srv_ctx)
                 reload_err = vw_net_ctx_reload_cert(srv_ctx, cert_path, key_path);

@@ -128,7 +128,7 @@ vw_err_t vw_fs_list_dir(const char *dir,
  * Opaque chunk reader context. Stack-allocate; initialise with vw_fs_chunk_open.
  */
 typedef struct vw_fs_chunk_ctx {
-    uint8_t  _opaque[256];  /* platform-specific state; do not access directly */
+    _Alignas(8) uint8_t  _opaque[256];  /* platform-specific state; do not access directly */
 } vw_fs_chunk_ctx_t;
 
 /*
@@ -173,7 +173,7 @@ void vw_fs_chunk_close(vw_fs_chunk_ctx_t *ctx);
  * If any step fails, call vw_fs_chunk_writer_abort(&ctx) to clean up.
  */
 typedef struct vw_fs_chunk_writer_ctx {
-    uint8_t _opaque[256];
+    _Alignas(8) uint8_t _opaque[256];
 } vw_fs_chunk_writer_ctx_t;
 
 vw_err_t vw_fs_chunk_writer_open(const char *path,

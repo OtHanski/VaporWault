@@ -39,6 +39,9 @@ void vw_admin_server_stop(vw_admin_server_t *srv) { (void)srv; }
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#if defined(LOCAL_PEERCRED)
+#   include <sys/ucred.h>
+#endif
 
 /* ── Frame helpers ─────────────────────────────────────────────────────────── */
 
@@ -471,6 +474,17 @@ static void *admin_listener(void *arg)
             if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED,
                            &cred, &cred_len) < 0 ||
                 cred.uid != getuid()) {
+                close(client_fd);
+                continue;
+            }
+        }
+#elif defined(LOCAL_PEERCRED)
+        {
+            struct xucred cred;
+            socklen_t     cred_len = (socklen_t)sizeof(cred);
+            if (getsockopt(client_fd, SOL_LOCAL, LOCAL_PEERCRED,
+                           &cred, &cred_len) < 0 ||
+                cred.cr_uid != getuid()) {
                 close(client_fd);
                 continue;
             }

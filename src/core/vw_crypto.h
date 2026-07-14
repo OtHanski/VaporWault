@@ -16,6 +16,13 @@
 extern "C" {
 #endif
 
+/* ── Secure memory zeroing ───────────────────────────────────────────────── */
+
+static inline void vw_crypto_secure_zero(void *p, size_t n) {
+    volatile unsigned char *vp = (volatile unsigned char *)p;
+    while (n--) *vp++ = 0;
+}
+
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
 #define VW_ARGON2_SALT_BYTES      16u

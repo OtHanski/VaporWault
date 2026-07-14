@@ -229,6 +229,7 @@ vw_err_t vw_fs_rename(const char *src, const char *dst) {
 
 vw_err_t vw_fs_append(const char *path, const void *data, size_t len) {
 #ifdef _WIN32
+    if (len > (size_t)MAXDWORD) return VW_ERR_INVALID_ARG;
     HANDLE fh = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ,
                             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) return VW_ERR_IO;

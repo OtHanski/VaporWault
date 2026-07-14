@@ -186,6 +186,38 @@ VW_TEST_SUITE("vw_crypto") {
         VW_ASSERT_ERR(vw_crypto_hex_decode("deadbXef", 8, out), VW_ERR_INVALID_ARG);
     }
 
+    /* ── vw_crypto_constant_time_eq ───────────────────────────────────────── */
+
+    VW_TEST_CASE("constant_time_eq: equal inputs are equal") {
+        uint8_t a[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        uint8_t b[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        VW_ASSERT(vw_crypto_constant_time_eq(a, b, 16));
+    }
+
+    VW_TEST_CASE("constant_time_eq: last-byte-differs is unequal") {
+        uint8_t a[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        uint8_t b[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,255};
+        VW_ASSERT(!vw_crypto_constant_time_eq(a, b, 16));
+    }
+
+    VW_TEST_CASE("constant_time_eq: first-byte-differs is unequal") {
+        uint8_t a[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        uint8_t b[16] = {0,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        VW_ASSERT(!vw_crypto_constant_time_eq(a, b, 16));
+    }
+
+    VW_TEST_CASE("constant_time_eq: all-zero buffers are equal") {
+        uint8_t z1[16] = {0};
+        uint8_t z2[16] = {0};
+        VW_ASSERT(vw_crypto_constant_time_eq(z1, z2, 16));
+    }
+
+    VW_TEST_CASE("constant_time_eq: zero-length comparison is equal") {
+        uint8_t a[1] = {0xFF};
+        uint8_t b[1] = {0x00};
+        VW_ASSERT(vw_crypto_constant_time_eq(a, b, 0));
+    }
+
     vw_crypto_cleanup();
 }
 VW_TEST_SUITE_END()

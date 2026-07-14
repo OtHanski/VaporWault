@@ -3,8 +3,8 @@
  *
  * See vw_storage.h for design overview.
  *
- * On-disk refcounts record (40 bytes):
- *   hash[32] + ref_count(u32) + _pad(u32)
+ * On-disk refcounts record (48 bytes):
+ *   hash[32] + ref_count(u32) + _pad(u32) + owner_user_id(u64)
  *
  * refcounts.db:
  *   Slot 0 is a guard (all-zero). Slots 1+ hold real records.
@@ -462,7 +462,10 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
     st->rc_slots++;
 
     if (ht_insert(st, hash, 1, slot, owner_user_id) != 0) {
-        /* OOM in HT — data is on disk with ref recorded; next open rebuilds HT. */
+        /* OOM in HT — data is on disk with ref recorded; next open rebuilds HT.
+         * Roll back the quota charged above so usage stays accurate. */
+        if (st->store)
+            (void)vw_store_quota_add(st->store, owner_user_id, -(int64_t)len);
         rwlock_wrunlock(&st->lock);
         return VW_ERR_OOM;
     }

@@ -98,7 +98,7 @@ static int ht_insert_raw(ht_entry_t *ht, size_t cap,
     uint64_t h = code_fnv1a(code) % (uint64_t)cap;
     for (size_t i = 0; i < cap; i++) {
         size_t idx = (size_t)((h + (uint64_t)i) % (uint64_t)cap);
-        if (ht[idx].code[0] == '\0' || memcmp(ht[idx].code, code, 32) == 0) {
+        if (ht[idx].code[0] == '\0' || vw_crypto_constant_time_eq(ht[idx].code, code, 32)) {
             memcpy(ht[idx].code, code, 32);
             ht[idx].slot = slot;
             return 0;
@@ -115,7 +115,7 @@ static uint64_t ht_find(const ht_entry_t *ht, size_t cap, const uint8_t code[32]
     for (size_t i = 0; i < cap; i++) {
         size_t idx = (size_t)((h + (uint64_t)i) % (uint64_t)cap);
         if (ht[idx].code[0] == '\0') return UINT64_MAX;
-        if (memcmp(ht[idx].code, code, 32) == 0) return ht[idx].slot;
+        if (vw_crypto_constant_time_eq(ht[idx].code, code, 32)) return ht[idx].slot;
     }
     return UINT64_MAX;
 }
@@ -309,7 +309,7 @@ vw_err_t vw_invite_get(vw_invite_store_t *s,
 
     /* Check usability while still under the read lock. */
     if (rec.is_used ||
-        (rec.expires_at != 0u && (uint64_t)time(NULL) > rec.expires_at)) {
+        (rec.expires_at != 0u && (uint64_t)time(NULL) >= rec.expires_at)) {
         inv_rwlock_runlock(&s->lock);
         return VW_ERR_NOT_FOUND;
     }
@@ -354,7 +354,7 @@ vw_err_t vw_invite_claim(vw_invite_store_t *s,
 
     /* Validate while holding write lock — no concurrent claim can pass this check. */
     if (rec.is_used ||
-        (rec.expires_at != 0u && (uint64_t)time(NULL) > rec.expires_at)) {
+        (rec.expires_at != 0u && (uint64_t)time(NULL) >= rec.expires_at)) {
         inv_rwlock_wunlock(&s->lock);
         return VW_ERR_NOT_FOUND;
     }

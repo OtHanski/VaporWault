@@ -17,6 +17,7 @@
 #include "vw_acme.h"
 #include "vw_ddns.h"
 #include "../core/vw_fs.h"
+#include "../core/vw_crypto.h"
 
 /* ── Platform guard ──────────────────────────────────────────────────────── */
 
@@ -536,7 +537,7 @@ static int account_key_load_or_create(vw_acme_ctx_t *ctx) {
                                         (const uint8_t *)buf, len + 1,
                                         NULL, 0,
                                         mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
-        memset(buf, 0, len);
+        vw_crypto_secure_zero(buf, len);
         free(buf);
         return ret;
     }
@@ -1176,10 +1177,17 @@ cleanup_challenge:
         return rc;
     }
 
-    /* Atomically promote .new files. */
-    if (vw_fs_rename(key_new, ctx->key_pem_path) != VW_OK ||
-        vw_fs_rename(cert_new, ctx->cert_pem_path) != VW_OK) {
-        acme_log("ERROR", "cannot rename new cert/key files");
+    /* Promote new key then new cert. If the cert rename fails, roll back the
+     * key so we don't end up with a new key paired with an old certificate. */
+    if (vw_fs_rename(key_new, ctx->key_pem_path) != VW_OK) {
+        acme_log("ERROR", "cannot rename new key file to %s", ctx->key_pem_path);
+        return VW_ERR_IO;
+    }
+    if (vw_fs_rename(cert_new, ctx->cert_pem_path) != VW_OK) {
+        acme_log("ERROR", "cannot rename new cert file to %s; rolling back key",
+                 ctx->cert_pem_path);
+        /* Best-effort rollback — if this also fails, the server needs a manual fix. */
+        vw_fs_rename(ctx->key_pem_path, key_new);
         return VW_ERR_IO;
     }
 

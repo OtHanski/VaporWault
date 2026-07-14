@@ -225,12 +225,12 @@ vw_err_t vw_crypto_argon2id_verify(const uint8_t hash[VW_ARGON2_HASH_BYTES],
     );
 
     if (rc != ARGON2_OK) {
-        memset(computed, 0, sizeof(computed));
+        vw_crypto_secure_zero(computed, sizeof(computed));
         return VW_ERR_CRYPTO;
     }
 
     int match = vw_crypto_constant_time_eq(hash, computed, VW_ARGON2_HASH_BYTES);
-    memset(computed, 0, sizeof(computed));
+    vw_crypto_secure_zero(computed, sizeof(computed));
     return match ? VW_OK : VW_ERR_AUTH_BAD_CREDS;
 }
 

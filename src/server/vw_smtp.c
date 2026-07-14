@@ -337,6 +337,8 @@ static vw_err_t smtp_tls_upgrade(smtp_conn_t *c,
     mbedtls_ssl_conf_rng(conf, mbedtls_ctr_drbg_random, ctr_drbg);
 
     if (verify_cert == 0) {
+        /* Advisory: cert verification disabled — relay connection is not MITM-safe.
+         * Set smtp_verify_cert=1 with a ca_cert_path in production. */
         mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_NONE);
     } else {
         mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_REQUIRED);
@@ -534,14 +536,14 @@ static vw_err_t smtp_do_auth(smtp_conn_t *c,
         result = VW_OK;
 
 cleanup:
-    memset(local_user,  0, sizeof(local_user));
-    memset(local_pass,  0, sizeof(local_pass));
-    memset(b64_user,    0, sizeof(b64_user));
-    memset(b64_pass,    0, sizeof(b64_pass));
-    memset(line,        0, sizeof(line));
-    memset(plain_token, 0, sizeof(plain_token));
-    memset(b64_plain,   0, sizeof(b64_plain));
-    memset(plain_cmd,   0, sizeof(plain_cmd));
+    vw_crypto_secure_zero(local_user,  sizeof(local_user));
+    vw_crypto_secure_zero(local_pass,  sizeof(local_pass));
+    vw_crypto_secure_zero(b64_user,    sizeof(b64_user));
+    vw_crypto_secure_zero(b64_pass,    sizeof(b64_pass));
+    vw_crypto_secure_zero(line,        sizeof(line));
+    vw_crypto_secure_zero(plain_token, sizeof(plain_token));
+    vw_crypto_secure_zero(b64_plain,   sizeof(b64_plain));
+    vw_crypto_secure_zero(plain_cmd,   sizeof(plain_cmd));
     return result;
 }
 

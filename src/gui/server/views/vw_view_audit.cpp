@@ -11,8 +11,17 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <cerrno>
 
-/* Oplog on-disk entry header size: crc32(4)+payload_len(4)+entry_id(8)+confirmed(1)+op_type(1) */
+#ifdef _WIN32
+#  include <direct.h>   /* _fullpath */
+#else
+#  include <limits.h>
+#  include <stdlib.h>   /* realpath */
+#endif
+
+/* Oplog on-disk entry header size: crc32(4)+payload_len(4)+entry_id(8)+confirmed(1) = 17 bytes.
+ * op_type is the first byte of the payload, not part of the header. */
 static constexpr uint32_t OPLOG_ENTRY_HDR = 17u;
 
 const char *VwViewAudit::op_type_name(uint8_t op_type)
@@ -30,8 +39,10 @@ const char *VwViewAudit::op_type_name(uint8_t op_type)
 
 void VwViewAudit::on_connected()
 {
-    state_       = State::Idle;
-    error_msg_[0] = '\0';
+    state_            = State::Idle;
+    error_msg_[0]     = '\0';
+    last_export_path_.clear();
+    last_export_error_.clear();
     entries_.clear();
 }
 
@@ -54,8 +65,17 @@ bool VwViewAudit::render(ServerApp &app)
     if (ImGui::Button("Search##audit"))
         do_query(app);
     ImGui::SameLine();
-    if (ImGui::Button("Export CSV##audit"))
+    if (ImGui::Button("Export CSV##audit")) {
+        last_export_path_.clear();
+        last_export_error_.clear();
         export_csv();
+    }
+    if (!last_export_path_.empty())
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f),
+                           "Exported: %s", last_export_path_.c_str());
+    if (!last_export_error_.empty())
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                           "%s", last_export_error_.c_str());
 
     if (state_ == State::Error) {
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error: %s", error_msg_);
@@ -105,8 +125,11 @@ bool VwViewAudit::parse_audit_resp(const uint8_t *buf, uint32_t len)
         uint64_t entry_id    = vw_read_u64le(p + 8);
         uint8_t  op_type     = p[17];  /* confirmed byte at [16], op_type at [17] */
 
+        /* Guard against uint32_t overflow: remaining >= OPLOG_ENTRY_HDR is already
+         * checked above, so the subtraction is safe. This also replaces the old
+         * post-addition bounds check, which was bypassed on overflow. */
+        if (stored_plen > remaining - OPLOG_ENTRY_HDR) break;
         uint32_t entry_total = OPLOG_ENTRY_HDR + stored_plen;
-        if (entry_total > remaining) break;
 
         AuditEntry e;
         e.entry_id = entry_id;
@@ -195,15 +218,23 @@ void VwViewAudit::do_query(ServerApp &app)
     state_ = State::Ready;
 }
 
-void VwViewAudit::export_csv() const
+void VwViewAudit::export_csv()
 {
-    /* Write to a fixed filename in the current directory. */
+    /* Build a timestamped filename in the current working directory. */
     char filename[64];
-    snprintf(filename, sizeof(filename), "audit_export_%llu.csv",
-             (unsigned long long)(uint64_t)entries_.size());  /* use count as simple suffix */
+    time_t now = time(nullptr);
+    struct tm *tm_info = localtime(&now);
+    if (tm_info)
+        strftime(filename, sizeof(filename), "audit_export_%Y%m%d_%H%M%S.csv", tm_info);
+    else
+        snprintf(filename, sizeof(filename), "audit_export_%llu.csv",
+                 (unsigned long long)(uint64_t)entries_.size());
 
     FILE *f = fopen(filename, "w");
-    if (!f) return;
+    if (!f) {
+        last_export_error_ = std::string("Export failed: ") + strerror(errno);
+        return;
+    }
 
     fprintf(f, "EntryID,EventType,Detail\n");
     for (const auto &e : entries_) {
@@ -213,4 +244,19 @@ void VwViewAudit::export_csv() const
                 e.detail.c_str());
     }
     fclose(f);
+
+    /* Resolve and store the full path for display in the UI. */
+#ifdef _WIN32
+    char full_path[4096] = {};
+    if (_fullpath(full_path, filename, sizeof(full_path)))
+        last_export_path_ = full_path;
+    else
+        last_export_path_ = filename;
+#else
+    char full_path[PATH_MAX] = {};
+    if (realpath(filename, full_path))
+        last_export_path_ = full_path;
+    else
+        last_export_path_ = filename;
+#endif
 }

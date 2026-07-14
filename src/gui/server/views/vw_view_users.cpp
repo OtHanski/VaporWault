@@ -14,19 +14,23 @@ static constexpr uint32_t ULIST_ENTRY_WIRE = 220u;
 
 void VwViewUsers::on_connected()
 {
-    state_          = State::Idle;
-    page_offset_    = 0;
-    filter_[0]      = '\0';
-    error_msg_[0]   = '\0';
+    state_            = State::Idle;
+    page_offset_      = 0;
+    filter_[0]        = '\0';
+    error_msg_[0]     = '\0';
+    session_expired_  = false;
     users_.clear();
 }
 
 bool VwViewUsers::render(ServerApp &app)
 {
+    if (session_expired_) return true;
+
     if (state_ == State::Idle) {
         /* Auto-fetch on first render. */
         do_fetch(app);
     }
+    if (session_expired_) return true;
 
     ImGui::Spacing();
 
@@ -238,8 +242,10 @@ void VwViewUsers::do_fetch(ServerApp &app)
         uint32_t code = (rlen >= 4) ? vw_read_u32le((const uint8_t *)rbuf) : 0;
         free(rbuf);
         if (code == (uint32_t)VW_ERR_AUTH_REQUIRED ||
-            code == (uint32_t)VW_ERR_AUTH_SESSION_EXPIRED)
-            return; /* caller should call on_session_expired — TODO: signal up */
+            code == (uint32_t)VW_ERR_AUTH_SESSION_EXPIRED) {
+            session_expired_ = true;
+            return;
+        }
         snprintf(error_msg_, sizeof(error_msg_), "server error: %u", code);
         state_ = State::Error;
         return;
