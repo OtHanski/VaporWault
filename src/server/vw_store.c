@@ -24,6 +24,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -214,6 +215,9 @@ static int uname_ht_grow(vw_store_t *ctx)
     ctx->username_ht_cap = new_cap;
     return 0;
 }
+
+static uint64_t uname_ht_find(const vw_store_t *ctx, const char *username);
+static uint64_t email_ht_find(const vw_store_t *ctx, const char *email);
 
 static int uname_ht_insert(vw_store_t *ctx, const char *username, uint64_t slot)
 {

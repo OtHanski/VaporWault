@@ -634,7 +634,7 @@ static vw_err_t handle_file_commit(vw_store_t      *store,
             file_rec.owner_id      = user_id;
             file_rec.parent_dir_id = parent_dir_id;
             file_rec.entry_type    = VW_ENTRY_FILE;
-            strncpy(file_rec.name, leaf, sizeof(file_rec.name) - 1u);
+            (void)snprintf(file_rec.name, sizeof(file_rec.name), "%s", leaf);
             is_new = 1;
         }
     } else {
