@@ -466,6 +466,10 @@ vw_err_t vw_net_accept(vw_net_ctx_t *ctx, vw_conn_t **out_conn) {
     mbedtls_ssl_set_bio(&conn->ssl, conn,
                         conn_send, conn_recv, conn_recv_timeout);
 
+    /* Finite recv timeout during handshake — prevents deadlock if the client
+     * never sends data. Reset to 0 after so data-phase reads are unaffected. */
+    vw_recv_timeout_store(&conn->recv_timeout_ms, 10000u);
+
     accept_diag_step = 2; accept_diag_rc = 0;
     {
         int rc;
@@ -477,6 +481,7 @@ vw_err_t vw_net_accept(vw_net_ctx_t *ctx, vw_conn_t **out_conn) {
             }
         }
     }
+    vw_recv_timeout_store(&conn->recv_timeout_ms, 0u);
 
 #ifdef _WIN32
     ReleaseSRWLockShared(&ctx->cert_rw_lock);
@@ -611,6 +616,12 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
                         conn_send, conn_recv, conn_recv_timeout);
     mbedtls_ssl_set_hostname(&conn->ssl, host);
 
+    /* Set a finite recv timeout so the handshake cannot block indefinitely.
+     * conn->recv_timeout_ms starts at 0 (= infinite) which deadlocks if the
+     * peer never sends data (e.g. a non-TLS service is listening on the port).
+     * Reset to 0 after the handshake so data-phase reads are unaffected. */
+    vw_recv_timeout_store(&conn->recv_timeout_ms, 10000u);
+
     diag_step = 6; diag_rc = 0;
     {
         int rc;
@@ -622,6 +633,7 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
             }
         }
     }
+    vw_recv_timeout_store(&conn->recv_timeout_ms, 0u);
 
     strncpy(conn->peer_addr, host, sizeof(conn->peer_addr) - 1);
     conn->upload_bucket.last_refill_ns   = now_ns();
