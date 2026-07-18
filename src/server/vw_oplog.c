@@ -409,6 +409,7 @@ static vw_err_t seg_scan(const char *path,
         uint8_t  confirmed   = hdr[ENTRY_CONFIRMED_OFF]; /* offset 16 */
 
         if (payload_len == 0) break;   /* malformed */
+        if (payload_len > VW_OPLOG_SEGMENT_MAX) break; /* malformed — exceeds segment cap */
 
         /* Read payload (op_type byte + op_payload) */
         uint8_t *payload = (uint8_t *)malloc(payload_len);
@@ -941,6 +942,7 @@ vw_err_t vw_oplog_replay_from(vw_oplog_t *ctx,
             uint8_t  confirmed   = hdr[ENTRY_CONFIRMED_OFF]; /* offset 16 */
 
             if (stored_plen == 0) break; /* malformed */
+            if (stored_plen > VW_OPLOG_SEGMENT_MAX) break; /* malformed — exceeds segment cap */
 
             uint8_t *payload = (uint8_t *)malloc(stored_plen);
             if (!payload) { rc = VW_ERR_OOM; stop = 1; break; }

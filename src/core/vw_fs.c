@@ -97,8 +97,8 @@ vw_err_t vw_fs_read_file(const char *path, void **out_buf, size_t *out_len) {
 
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(fh, &sz)) { CloseHandle(fh); return VW_ERR_IO; }
-    if (sz.QuadPart > (LONGLONG)SIZE_MAX)  { CloseHandle(fh); return VW_ERR_OOM; }
-    if (sz.QuadPart > (LONGLONG)MAXDWORD) { CloseHandle(fh); return VW_ERR_IO; }
+    if ((ULONGLONG)sz.QuadPart > (ULONGLONG)SIZE_MAX)  { CloseHandle(fh); return VW_ERR_OOM; }
+    if ((ULONGLONG)sz.QuadPart > (ULONGLONG)MAXDWORD) { CloseHandle(fh); return VW_ERR_IO; }
 
     size_t len = (size_t)sz.QuadPart;
     void *buf = malloc(len + 1);
