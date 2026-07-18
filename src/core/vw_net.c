@@ -460,14 +460,22 @@ vw_err_t vw_net_accept(vw_net_ctx_t *ctx, vw_conn_t **out_conn) {
     pthread_rwlock_rdlock(&ctx->cert_rw_lock);
 #endif
 
-    if (mbedtls_ssl_setup(&conn->ssl, &ctx->conf) != 0) goto fail;
+    int accept_diag_step = 1, accept_diag_rc = 0;
+    if ((accept_diag_rc = mbedtls_ssl_setup(&conn->ssl, &ctx->conf)) != 0)
+        goto fail;
     mbedtls_ssl_set_bio(&conn->ssl, conn,
                         conn_send, conn_recv, conn_recv_timeout);
 
-    int rc;
-    while ((rc = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
-        if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE)
-            goto fail;
+    accept_diag_step = 2; accept_diag_rc = 0;
+    {
+        int rc;
+        while ((rc = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
+            if (rc != MBEDTLS_ERR_SSL_WANT_READ &&
+                rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                accept_diag_rc = rc;
+                goto fail;
+            }
+        }
     }
 
 #ifdef _WIN32
@@ -482,6 +490,13 @@ vw_err_t vw_net_accept(vw_net_ctx_t *ctx, vw_conn_t **out_conn) {
     return VW_OK;
 
 fail:
+    {
+        char errbuf[256] = "";
+        mbedtls_strerror(accept_diag_rc, errbuf, sizeof(errbuf));
+        fprintf(stderr,
+                "[vw_net] vw_net_accept FAIL step=%d rc=%d (%s)\n",
+                accept_diag_step, accept_diag_rc, errbuf);
+    }
 #ifdef _WIN32
     ReleaseSRWLockShared(&ctx->cert_rw_lock);
 #else
@@ -544,11 +559,16 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
     pthread_mutex_init(&conn->send_mu, NULL);
 #endif
 
+    int diag_step = 0, diag_rc = 0;
+
     static const unsigned char pers[] = "vapourwault_cli_drbg";
-    if (mbedtls_ctr_drbg_seed(&tls->ctr_drbg, mbedtls_entropy_func,
-                               &tls->entropy, pers, sizeof(pers) - 1) != 0)
+    diag_step = 1;
+    if ((diag_rc = mbedtls_ctr_drbg_seed(&tls->ctr_drbg, mbedtls_entropy_func,
+                                          &tls->entropy, pers,
+                                          sizeof(pers) - 1)) != 0)
         goto fail;
 
+    diag_step = 2;
     if (configure_ssl_defaults(&tls->conf, &tls->ctr_drbg,
                                 MBEDTLS_SSL_IS_CLIENT,
                                 VW_ALPN_CLIENT) != VW_OK)
@@ -562,9 +582,11 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
             unsigned char *ca_buf = NULL;
             size_t ca_len = 0;
             int ca_ret = -1;
+            diag_step = 3;
             if (load_pem_file(ca_cert_pem_path, &ca_buf, &ca_len) == VW_OK)
                 ca_ret = mbedtls_x509_crt_parse(&tls->ca_cert, ca_buf, ca_len);
             free(ca_buf);
+            diag_rc = ca_ret;
             if (ca_ret != 0) goto fail;
             tls->ca_loaded = 1;
             mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->ca_cert, NULL);
@@ -574,22 +596,31 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
 
+    diag_step = 4;
     uint32_t ctimeout = opts ? opts->connect_timeout_ms : 0;
-    if (connect_with_timeout(&conn->net, host, port_str, ctimeout) != 0)
+    if ((diag_rc = connect_with_timeout(&conn->net, host, port_str,
+                                         ctimeout)) != 0)
         goto fail;
 
     if (opts && opts->recv_timeout_ms)
         conn->recv_timeout_ms = opts->recv_timeout_ms;
 
-    if (mbedtls_ssl_setup(&conn->ssl, &tls->conf) != 0) goto fail;
+    diag_step = 5;
+    if ((diag_rc = mbedtls_ssl_setup(&conn->ssl, &tls->conf)) != 0) goto fail;
     mbedtls_ssl_set_bio(&conn->ssl, conn,
                         conn_send, conn_recv, conn_recv_timeout);
     mbedtls_ssl_set_hostname(&conn->ssl, host);
 
-    int rc;
-    while ((rc = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
-        if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE)
-            goto fail;
+    diag_step = 6; diag_rc = 0;
+    {
+        int rc;
+        while ((rc = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
+            if (rc != MBEDTLS_ERR_SSL_WANT_READ &&
+                rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                diag_rc = rc;
+                goto fail;
+            }
+        }
     }
 
     strncpy(conn->peer_addr, host, sizeof(conn->peer_addr) - 1);
@@ -604,6 +635,13 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
     return VW_OK;
 
 fail:
+    {
+        char errbuf[256] = "";
+        mbedtls_strerror(diag_rc, errbuf, sizeof(errbuf));
+        fprintf(stderr,
+                "[vw_net] vw_net_connect FAIL step=%d rc=%d (%s)\n",
+                diag_step, diag_rc, errbuf);
+    }
     mbedtls_ssl_free(&conn->ssl);
     mbedtls_net_free(&conn->net);
     mbedtls_ssl_config_free(&tls->conf);

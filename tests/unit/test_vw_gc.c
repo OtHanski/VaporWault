@@ -197,19 +197,21 @@ VW_TEST_SUITE("vw_gc") {
             VW_ASSERT_OK(vw_store_session_create(s.store, &rec, tok_live));
 
             /*
-             * GC run_once uses the current wall clock for session expiry.
-             * We cannot inject a fake clock, so we verify via store_session_gc
-             * directly that the mechanism works, and verify run_once returns OK.
-             */
-            VW_ASSERT_OK(vw_gc_run_once(s.gc));
-
-            /*
-             * Directly expire the stale session via the store to verify the
-             * session GC path independently (with a controlled timestamp).
+             * Verify the store-level GC path with a controlled timestamp.
+             * This must run BEFORE vw_gc_run_once, because run_once uses the
+             * real wall clock (which is >> 1000) and would already remove
+             * the stale session, leaving nothing for vw_store_session_gc.
              */
             uint32_t expired = 0;
             VW_ASSERT_OK(vw_store_session_gc(s.store, 1000, &expired));
             VW_ASSERT_EQ(1u, (unsigned)expired);
+
+            /*
+             * GC run_once uses the current wall clock for session expiry.
+             * The stale session is already gone (expired above); run_once
+             * should still return VW_OK and exercise the full GC pass.
+             */
+            VW_ASSERT_OK(vw_gc_run_once(s.gc));
 
             VW_ASSERT_ERR(vw_store_session_get(s.store, tok_stale, &out),
                           VW_ERR_NOT_FOUND);
