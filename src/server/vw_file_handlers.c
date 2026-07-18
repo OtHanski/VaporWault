@@ -58,12 +58,16 @@ vw_err_t vw_path_validate(const char *path, uint32_t len)
 
     /* No empty components ('//') and no '..' components. */
     const char *p = path;
-    while (*p) {
+    const char *end = path + len;
+    while (p < end) {
         if (*p == '/') {
             p++;
+            if (p >= end) break; /* trailing slash — done */
             if (*p == '/') return VW_ERR_PATH_INVALID; /* empty component */
-            /* Check for '..' */
-            if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
+            /* Check for '..' component bounded by '/' or end of path */
+            size_t remain = (size_t)(end - p);
+            if (remain >= 2 && p[0] == '.' && p[1] == '.'
+                    && (remain == 2 || p[2] == '/'))
                 return VW_ERR_PATH_INVALID;
         } else {
             p++;
