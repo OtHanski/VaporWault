@@ -22,6 +22,7 @@
 #include "vw_test.h"
 #include "vw_net.h"
 #include "vw_proto.h"
+#include "vw_crypto.h"
 
 #ifdef _WIN32
 /* ── Windows pthread compatibility shim ─────────────────────────────────── */
@@ -262,6 +263,7 @@ static void srv_join(srv_t *s, pthread_t tid) {
 /* ── Test suite ──────────────────────────────────────────────────────────── */
 
 VW_TEST_SUITE("vw_net") {
+    VW_ASSERT_OK(vw_crypto_init());
 
     /* Write cert and key to a per-process temp directory. */
     make_tmpdir(g_tmpdir, sizeof(g_tmpdir));

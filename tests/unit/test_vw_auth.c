@@ -9,6 +9,7 @@
 #include "vw_auth.h"
 #include "vw_store.h"
 #include "vw_oplog.h"
+#include "vw_crypto.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -131,6 +132,7 @@ static uint64_t make_user(auth_stack_t *s, const char *username,
 /* ── Test suite ───────────────────────────────────────────────────────────── */
 
 VW_TEST_SUITE("vw_auth") {
+    VW_ASSERT_OK(vw_crypto_init());
 
     /* ── Password hashing ─────────────────────────────────────────────────── */
 

@@ -9,6 +9,7 @@
 #include "vw_test.h"
 #include "vw_store.h"
 #include "vw_oplog.h"
+#include "vw_crypto.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -128,6 +129,7 @@ static int scan_count_cb(const vw_user_record_t *r, void *ud)
 /* ── Test suite ───────────────────────────────────────────────────────────── */
 
 VW_TEST_SUITE("vw_store") {
+    VW_ASSERT_OK(vw_crypto_init());
 
     /* ── User CRUD ──────────────────────────────────────────────────────────── */
 

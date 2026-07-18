@@ -15,6 +15,7 @@
 #include <mbedtls/md.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <psa/crypto.h>
 
 /* Argon2 reference implementation */
 #include <argon2.h>
@@ -89,6 +90,11 @@ static int                      g_initialized = 0;
 
 vw_err_t vw_crypto_init(void) {
     if (g_initialized) return VW_OK;
+
+    /* PSA Crypto must be initialized before TLS 1.3 handshakes.
+     * mbedTLS 3.x uses PSA internally for key operations during the handshake;
+     * without this the TLS handshake hangs or crashes on some platforms. */
+    if (psa_crypto_init() != PSA_SUCCESS) return VW_ERR_CRYPTO;
 
     mutex_init(&g_rng_mu);
     mbedtls_entropy_init(&g_entropy);

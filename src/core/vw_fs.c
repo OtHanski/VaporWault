@@ -151,7 +151,15 @@ vw_err_t vw_fs_ensure_dir(const char *path) {
     if (len == 0 || len >= sizeof(tmp)) return VW_ERR_INVALID_ARG;
     memcpy(tmp, path, len + 1);
 
-    for (size_t i = 1; i <= len; i++) {
+    /* On Windows, skip the bare drive letter ("X:") to avoid calling
+     * CreateDirectoryA("X:", NULL), which returns ERROR_ACCESS_DENIED
+     * rather than ERROR_ALREADY_EXISTS and would be treated as an error. */
+#ifdef _WIN32
+    size_t start = (len >= 2 && tmp[1] == ':') ? 3 : 1;
+#else
+    size_t start = 1;
+#endif
+    for (size_t i = start; i <= len; i++) {
         if (i == len || tmp[i] == '/' || tmp[i] == '\\') {
             char saved = tmp[i];
             tmp[i] = '\0';

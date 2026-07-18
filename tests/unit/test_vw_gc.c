@@ -15,6 +15,7 @@
 #include "vw_gc.h"
 #include "vw_store.h"
 #include "vw_oplog.h"
+#include "vw_crypto.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -168,6 +169,7 @@ static void append_confirmed(vw_oplog_t *oplog, int n)
 /* ── Test suite ───────────────────────────────────────────────────────────── */
 
 VW_TEST_SUITE("vw_gc") {
+    VW_ASSERT_OK(vw_crypto_init());
 
     /* ── Session expiry pass ─────────────────────────────────────────────── */
 
