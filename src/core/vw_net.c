@@ -44,6 +44,7 @@
 static const int VW_TLS_CIPHERSUITES[] = {
     MBEDTLS_TLS1_3_AES_256_GCM_SHA384,
     MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256,
+    MBEDTLS_TLS1_3_AES_128_GCM_SHA256, /* RFC 8446 mandatory — guarantees PSA availability */
     0
 };
 

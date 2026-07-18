@@ -60,7 +60,7 @@ jobs:
         working-directory: build
         env:
           CTEST_TEST_TIMEOUT: "30"
-        run: ctest --output-on-failure --no-tests=error -R unit
+        run: ctest --output-on-failure --no-tests=error -R unit --timeout 30
 
       # Fuzz regression: build with libFuzzer+ASan+UBSan, replay the seed corpus.
       # Only runs on the Clang/Release cell — libFuzzer is a Clang/LLVM component.
@@ -129,11 +129,14 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      - name: Disable Windows Error Reporting dialogs
+        run: reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
+
       - name: Unit tests
         working-directory: build
         env:
           CTEST_TEST_TIMEOUT: "30"
-        run: ctest --output-on-failure --no-tests=error -R unit
+        run: ctest --output-on-failure --no-tests=error -R unit --timeout 30
 
 # ── Integration: real server + Python pytest suite ────────────────────────────
   integration:
