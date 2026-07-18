@@ -24,6 +24,16 @@
 /** Enable the TLS/SSL module. */
 #define MBEDTLS_SSL_TLS_C
 
+/**
+ * Enable TLS client and server endpoint support.
+ * These are NOT auto-derived from MBEDTLS_SSL_TLS_C in a custom config
+ * file — without them, mbedtls_ssl_handshake_step() returns
+ * MBEDTLS_ERR_SSL_BAD_INPUT_DATA immediately on both endpoints because
+ * the client/server handshake state-machine code is compiled out.
+ */
+#define MBEDTLS_SSL_CLI_C
+#define MBEDTLS_SSL_SRV_C
+
 /** TLS 1.3 ephemeral key exchange (forward secrecy). */
 #define MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED
 
