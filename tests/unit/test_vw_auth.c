@@ -163,7 +163,7 @@ VW_TEST_SUITE("vw_auth") {
     /* ── Session lifecycle ────────────────────────────────────────────────── */
 
     VW_TEST_CASE("create_session + validate_session returns correct user_id") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "sess_val");
         {
             uint64_t uid = make_user(&s, "alice", "alicepw", 0);
@@ -177,7 +177,7 @@ VW_TEST_SUITE("vw_auth") {
     }
 
     VW_TEST_CASE("revoke_session then validate returns an error") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "sess_rev");
         {
             uint64_t uid = make_user(&s, "bob", "bobpw", 0);
@@ -191,7 +191,7 @@ VW_TEST_SUITE("vw_auth") {
     }
 
     VW_TEST_CASE("validate with zeroed token returns an error") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "sess_zero");
         {
             uint8_t zero[32];
@@ -203,7 +203,7 @@ VW_TEST_SUITE("vw_auth") {
     }
 
     VW_TEST_CASE("two sessions for the same user are independent") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "sess_two");
         {
             uint64_t uid = make_user(&s, "carol", "carolpw", 0);
@@ -227,7 +227,7 @@ VW_TEST_SUITE("vw_auth") {
     /* ── Login flow ───────────────────────────────────────────────────────── */
 
     VW_TEST_CASE("begin_login: correct credentials succeed (no 2FA)") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "login_ok");
         {
             uint64_t uid = make_user(&s, "dave", "davepw123", 0);
@@ -239,7 +239,7 @@ VW_TEST_SUITE("vw_auth") {
     }
 
     VW_TEST_CASE("begin_login: wrong password returns VW_ERR_AUTH_BAD_CREDS") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "login_badpw");
         {
             (void)make_user(&s, "eve", "correctpw", 0);
@@ -251,7 +251,7 @@ VW_TEST_SUITE("vw_auth") {
     }
 
     VW_TEST_CASE("begin_login: unknown user returns same error as wrong password") {
-        auth_stack_t s;
+        auth_stack_t s = {0};
         auth_stack_open(&s, "login_nouser");
         {
             vw_auth_state_t state;

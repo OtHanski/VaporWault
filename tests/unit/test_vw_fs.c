@@ -205,14 +205,16 @@ VW_TEST_SUITE("vw_fs") {
         VW_ASSERT_OK(vw_fs_read_file(p, &buf, &len));
         VW_ASSERT_EQ((int)len, 16);
 
-        char *cb = (char *)buf;
-        int prefix_ok = (cb[0]=='A' && cb[1]=='A' && cb[2]=='A' && cb[3]=='A');
-        int patch_ok  = (cb[4]=='B' && cb[5]=='B' && cb[6]=='B' && cb[7]=='B');
-        int suffix_ok = (cb[8]=='A' && cb[9]=='A' && cb[10]=='A' && cb[11]=='A'
-                      && cb[12]=='A' && cb[13]=='A' && cb[14]=='A' && cb[15]=='A');
-        VW_ASSERT(prefix_ok);
-        VW_ASSERT(patch_ok);
-        VW_ASSERT(suffix_ok);
+        {
+            char *cb = (char *)buf;
+            int prefix_ok = cb ? (cb[0]=='A' && cb[1]=='A' && cb[2]=='A' && cb[3]=='A') : 0;
+            int patch_ok  = cb ? (cb[4]=='B' && cb[5]=='B' && cb[6]=='B' && cb[7]=='B') : 0;
+            int suffix_ok = cb ? (cb[8]=='A' && cb[9]=='A' && cb[10]=='A' && cb[11]=='A'
+                          && cb[12]=='A' && cb[13]=='A' && cb[14]=='A' && cb[15]=='A') : 0;
+            VW_ASSERT(prefix_ok);
+            VW_ASSERT(patch_ok);
+            VW_ASSERT(suffix_ok);
+        }
         free(buf);
     }
 
@@ -225,7 +227,7 @@ VW_TEST_SUITE("vw_fs") {
 
         void *buf = NULL; size_t len = 0;
         VW_ASSERT_OK(vw_fs_read_file(p, &buf, &len));
-        VW_ASSERT(memcmp(buf, "YYYY", 4) == 0);
+        VW_ASSERT(buf && memcmp(buf, "YYYY", 4) == 0);
         free(buf);
     }
 

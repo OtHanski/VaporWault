@@ -174,7 +174,7 @@ VW_TEST_SUITE("vw_gc") {
     /* ── Session expiry pass ─────────────────────────────────────────────── */
 
     VW_TEST_CASE("run_once expires sessions whose expires_at <= now") {
-        gc_stack_t s;
+        gc_stack_t s = {0};
         gc_stack_open(&s, "sess_exp", NULL);
         {
             vw_session_record_t rec, out;
@@ -223,7 +223,7 @@ VW_TEST_SUITE("vw_gc") {
     /* ── Oplog truncation — single-node (cluster = NULL) ─────────────────── */
 
     VW_TEST_CASE("run_once single-node: truncates oplog segments before last entry") {
-        gc_stack_t s;
+        gc_stack_t s = {0};
         gc_stack_open(&s, "oplog_single", NULL);
         {
             int before_count = 0;
@@ -265,7 +265,7 @@ VW_TEST_SUITE("vw_gc") {
 
     VW_TEST_CASE("run_once cluster-aware: uses replica watermark not last_entry_id") {
         vw_cluster_t stub_cluster;
-        gc_stack_t s;
+        gc_stack_t s = {0};
 
         /*
          * Entry size calculation (for SEGMENT_MAX=512):
@@ -320,7 +320,7 @@ VW_TEST_SUITE("vw_gc") {
 
     VW_TEST_CASE("run_once: cluster with no active replicas behaves like single-node") {
         vw_cluster_t stub_cluster;
-        gc_stack_t s_cluster, s_solo;
+        gc_stack_t s_cluster = {0}, s_solo = {0};
         int count_cluster = 0, count_solo = 0;
 
         stub_cluster.has_active_replicas = 0;

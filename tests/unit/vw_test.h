@@ -33,6 +33,7 @@ static int g_vw_test_failed = 0;  /* failed assertions         */
 
 #define VW_TEST_SUITE(name)                      \
     int main(void) {                             \
+        setvbuf(stdout, NULL, _IONBF, 0);        \
         printf("TAP version 13\n");              \
         (void)(name);
 

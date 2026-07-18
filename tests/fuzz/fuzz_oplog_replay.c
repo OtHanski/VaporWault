@@ -16,6 +16,9 @@
  *
  */
 
+/* nftw, FTW_DEPTH, FTW_PHYS require _GNU_SOURCE on glibc */
+#define _GNU_SOURCE
+
 #include "vw_oplog.h"   /* vw_oplog_open/close/replay_from; pulls in vw_err_t */
 #include <stdint.h>
 #include <stddef.h>

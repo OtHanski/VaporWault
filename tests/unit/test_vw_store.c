@@ -134,7 +134,7 @@ VW_TEST_SUITE("vw_store") {
     /* ── User CRUD ──────────────────────────────────────────────────────────── */
 
     VW_TEST_CASE("user_create + user_get_by_id returns matching record") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_id");
         {
             vw_user_record_t rec, out;
@@ -150,7 +150,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_get_by_id returns VW_ERR_NOT_FOUND for unknown id") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_id_nf");
         {
             vw_user_record_t out;
@@ -161,7 +161,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_get_by_username finds the correct record") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_name");
         {
             vw_user_record_t rec, out;
@@ -176,7 +176,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_get_by_username returns VW_ERR_NOT_FOUND for unknown name") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_name_nf");
         {
             vw_user_record_t out;
@@ -187,7 +187,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_get_by_email finds the correct record") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_email");
         {
             vw_user_record_t rec, out;
@@ -201,7 +201,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_create duplicate username returns VW_ERR_ALREADY_EXISTS") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_dup");
         {
             vw_user_record_t rec;
@@ -217,7 +217,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_update_field changes is_active in place") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_upd");
         {
             vw_user_record_t rec, out;
@@ -239,7 +239,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("user_scan visits all active users") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_scan");
         {
             vw_user_record_t rec;
@@ -260,7 +260,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("get_by_id zeroes password_hash and password_salt") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "usr_cred_zero");
         {
             vw_user_record_t rec, out;
@@ -286,7 +286,7 @@ VW_TEST_SUITE("vw_store") {
     /* ── Session CRUD ────────────────────────────────────────────────────── */
 
     VW_TEST_CASE("session_create + session_get returns active session") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "sess_get");
         {
             vw_session_record_t rec, out;
@@ -307,7 +307,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("session_delete then session_get returns VW_ERR_NOT_FOUND") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "sess_del");
         {
             vw_session_record_t rec, out;
@@ -330,7 +330,7 @@ VW_TEST_SUITE("vw_store") {
     /* ── Session GC ──────────────────────────────────────────────────────── */
 
     VW_TEST_CASE("session_gc expires sessions whose expires_at <= now_unix") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "sess_gc");
         {
             vw_session_record_t rec, out;
@@ -368,7 +368,7 @@ VW_TEST_SUITE("vw_store") {
     }
 
     VW_TEST_CASE("sessions_revoke_by_user invalidates all sessions for a user") {
-        store_stack_t s;
+        store_stack_t s = {0};
         store_stack_open(&s, "sess_revoke_uid");
         {
             vw_session_record_t rec, out;
