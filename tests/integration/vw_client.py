@@ -501,18 +501,33 @@ class AdminClient:
     Connects to the AF_UNIX admin socket.  Uses the same 8-byte framing as the
     main TLS protocol with admin-specific message types (0x9000-0x9FFF).
     Protocol version field is set to 0 (no version negotiation on admin socket).
+
+    The server's admin socket is a strict one-shot request/response channel by
+    design (see `handle_admin_connection` in `src/server/vw_admin.c`): it reads
+    exactly one frame, dispatches to exactly one handler, and the connection is
+    then done. Accordingly this client does NOT keep a persistent connection
+    around — each RPC method opens a fresh `AF_UNIX` connection, sends its
+    single request, reads its single response, and closes the connection
+    again. This matches the only real production caller's usage pattern too
+    (`vapourwault-server-cli` opens one connection per invocation).
     """
 
     def __init__(self, socket_path):
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(15)
-        self._sock.connect(socket_path)
+        self._socket_path = socket_path
 
-    def _send(self, msg_type, payload=b""):
-        self._sock.sendall(_make_frame(msg_type, payload, version=0))
-
-    def _recv(self):
-        return _read_frame(self._sock)
+    def _request(self, msg_type, payload=b""):
+        """
+        Open a fresh connection, send one request frame, read one response
+        frame, and close the connection. Returns (msg_type, payload).
+        """
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        try:
+            sock.connect(self._socket_path)
+            sock.sendall(_make_frame(msg_type, payload, version=0))
+            return _read_frame(sock)
+        finally:
+            sock.close()
 
     def create_user(self, username, password, is_admin=False):
         """
@@ -528,8 +543,7 @@ class AdminClient:
             + _encode_str(uname_b)
             + _encode_str(pw_b)
         )
-        self._send(ADMIN_USER_CREATE_REQ, payload)
-        mt, resp = self._recv()
+        mt, resp = self._request(ADMIN_USER_CREATE_REQ, payload)
         if mt != ADMIN_USER_CREATE_RESP:
             raise RuntimeError(f"expected USER_CREATE_RESP (0x9002), got 0x{mt:04X}")
         error_code, user_id = struct.unpack_from("<IQ", resp, 0)
@@ -545,8 +559,7 @@ class AdminClient:
         """
         uname_b = username.encode("utf-8")
         payload = _encode_str(uname_b) + struct.pack("<Q", quota_bytes)
-        self._send(ADMIN_SET_QUOTA_REQ, payload)
-        mt, resp = self._recv()
+        mt, resp = self._request(ADMIN_SET_QUOTA_REQ, payload)
         if mt != ADMIN_SET_QUOTA_RESP:
             raise RuntimeError(f"expected SET_QUOTA_RESP (0x9006), got 0x{mt:04X}")
         error_code = struct.unpack_from("<I", resp, 0)[0]
@@ -559,8 +572,7 @@ class AdminClient:
 
         Returns list of dicts: entry_id (int), op_type (int).
         """
-        self._send(ADMIN_OPLOG_TAIL_REQ, struct.pack("<I", min(count, 100)))
-        mt, resp = self._recv()
+        mt, resp = self._request(ADMIN_OPLOG_TAIL_REQ, struct.pack("<I", min(count, 100)))
         if mt != ADMIN_OPLOG_TAIL_RESP:
             raise RuntimeError(f"expected OPLOG_TAIL_RESP (0x9008), got 0x{mt:04X}")
         n      = struct.unpack_from("<I", resp, 0)[0]
@@ -574,10 +586,13 @@ class AdminClient:
         return entries
 
     def close(self):
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+        """
+        No-op: AdminClient no longer holds a persistent connection (each RPC
+        opens and closes its own socket). Kept for backward compatibility with
+        callers (e.g. the `admin_client` pytest fixture) that call close() /
+        use this as a context manager.
+        """
+        pass
 
     def __enter__(self):
         return self
