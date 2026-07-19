@@ -202,4 +202,4 @@ jobs:
         if: always()
         working-directory: build
         run: |
-          ctest --output-on-failure --no-tests=warn -L integration --timeout 180
+          ctest --output-on-failure --no-tests=error -L integration --timeout 180
