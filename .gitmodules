@@ -1,0 +1,10 @@
+[submodule "third_party/mbedtls"]
+	path = third_party/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
+[submodule "third_party/argon2"]
+	path = third_party/argon2
+	url = https://github.com/P-H-C/phc-winner-argon2.git
+[submodule "third_party/imgui"]
+	path = third_party/imgui
+	url = https://github.com/ocornut/imgui.git
+	branch = docking
