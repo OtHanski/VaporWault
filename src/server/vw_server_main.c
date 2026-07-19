@@ -33,6 +33,7 @@
 #include "../core/vw_net.h"
 #include "../core/vw_proto.h"
 #include "../core/vw_fs.h"
+#include "../core/vw_crypto.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -613,6 +614,12 @@ int vw_server_main_run(int argc, char *argv[]) {
     if (vw_storage_open(cfg.data_dir, &chunks) != VW_OK) {
         vw_log(LOG_ERROR, "vw_storage_open failed"); goto shutdown; }
 
+    /* Seed the mbedTLS entropy/CTR-DRBG context used by vw_crypto_random()
+     * (and, transitively, Argon2id password hashing). Must happen before
+     * any subsystem that may hash a password — vw_auth_open is the first. */
+    if (vw_crypto_init() != VW_OK) {
+        vw_log(LOG_ERROR, "vw_crypto_init failed"); goto shutdown; }
+
     {
         const vw_smtp_cfg_t *smtp = (cfg.smtp.host[0] != '\0') ? &cfg.smtp : NULL;
         if (vw_auth_open(store, smtp, NULL, &auth) != VW_OK) {
@@ -820,6 +827,7 @@ shutdown:
     if (file_store)   vw_file_store_close(file_store);
     if (store)        vw_store_close(store);
     if (oplog)      vw_oplog_close(oplog);
+    vw_crypto_cleanup();
     if (g_log_fp)   { fclose(g_log_fp); g_log_fp = NULL; }
     return rc;
 }
