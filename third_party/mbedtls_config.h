@@ -156,6 +156,27 @@
 /** PKCS#1 v1.5 — required when MBEDTLS_RSA_C is defined. */
 #define MBEDTLS_PKCS1_V15
 
+/**
+ * PKCS#1 v2.1 (RSASSA-PSS / RSAES-OAEP).
+ *
+ * TLS 1.3 forbids RSASSA-PKCS1-v1_5 in handshake signatures (RFC 8446
+ * §4.2.3) — an RSA server cert can only sign as rsa_pss_rsae_sha{256,384,
+ * 512}. Without this, an RSA cert has zero usable signature algorithms
+ * and the handshake fails with handshake_failure (ECDSA certs are
+ * unaffected). Must be paired with MBEDTLS_X509_RSASSA_PSS_SUPPORT below.
+ */
+#define MBEDTLS_PKCS1_V21
+
+/**
+ * Required alongside MBEDTLS_PKCS1_V21 above: it gates whether
+ * rsa_pss_rsae_sha{256,384,512} appears in mbedTLS's own TLS 1.3 offer
+ * list (ssl_preset_default_sig_algs in ssl_tls.c). PKCS1_V21 alone only
+ * lets the server verify a client's RSA-PSS signature_algorithms
+ * extension — it doesn't add RSA-PSS to what the server itself offers,
+ * so an RSA cert would still have no matching signature algorithm.
+ */
+#define MBEDTLS_X509_RSASSA_PSS_SUPPORT
+
 /** Abstract public-key interface. */
 #define MBEDTLS_PK_C
 
