@@ -50,6 +50,13 @@ typedef enum {
  * Payload wire formats (all integers little-endian):
  *
  * USER_CREATE_REQ:   u8 is_admin, u16 uname_len, uname[], u16 pw_len, pw[]
+ *                    pw[] is the RAW operator-supplied password, not
+ *                    pre-hashed by the caller — safe since this socket is
+ *                    local-only (AF_UNIX, mode 0600, SO_PEERCRED-verified).
+ *                    The server SHA-256s pw[] internally before Argon2id,
+ *                    matching the Argon2id(SHA-256(password)) derivation
+ *                    used everywhere else (see docs/PROTOCOL.md). Callers
+ *                    must NOT pre-hash pw[] themselves.
  * USER_CREATE_RESP:  u32 error_code, u64 user_id (user_id valid only if code==0)
  *
  * USER_LIST_REQ:     (no payload)

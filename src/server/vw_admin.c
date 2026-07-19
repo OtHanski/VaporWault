@@ -13,6 +13,7 @@
 
 #include "vw_admin.h"
 #include "vw_auth.h"      /* vw_auth_hash_password */
+#include "../core/vw_crypto.h"  /* vw_crypto_sha256 */
 
 #include <stdlib.h>
 #include <string.h>
@@ -156,7 +157,19 @@ static void handle_user_create(vw_admin_server_t *srv, int fd,
         send_u32_resp(fd, VW_ADMIN_USER_CREATE_RESP, VW_ERR_INVALID_ARG); return;
     }
 
-    rc = vw_auth_hash_password(p + 3 + uname_len + 2, pw_len, hash, salt);
+    /* Every stored credential is Argon2id(SHA-256(password)) — hash the raw
+     * operator password here first so admin-created accounts match what
+     * login verification expects. */
+    {
+        uint8_t pw_token[32];
+        rc = vw_crypto_sha256(p + 3 + uname_len + 2, pw_len, pw_token);
+        if (rc != VW_OK) {
+            memset(pw_token, 0, sizeof(pw_token));
+            send_u32_resp(fd, VW_ADMIN_USER_CREATE_RESP, rc); return;
+        }
+        rc = vw_auth_hash_password(pw_token, sizeof(pw_token), hash, salt);
+        memset(pw_token, 0, sizeof(pw_token));
+    }
     if (rc != VW_OK) {
         memset(hash, 0, sizeof(hash)); memset(salt, 0, sizeof(salt));
         send_u32_resp(fd, VW_ADMIN_USER_CREATE_RESP, rc); return;
