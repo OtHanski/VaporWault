@@ -74,12 +74,22 @@ static vw_err_t build_and_send_auth_ok(vw_server_ctx_t *ctx, vw_conn_t *conn,
     err = vw_store_user_get_by_id(ctx->store, user_id, &user_rec);
     if (err != VW_OK) return err;
 
+    /* Populate real quota/usage from the store. A missing quota record means
+     * "unlimited quota, nothing used yet" (vw_store.h:379-380) — mirrors the
+     * existing call sites in vw_file_handlers.c:1098 and vw_admin.c:223. */
+    vw_quota_record_t quota_rec;
+    uint64_t quota_bytes = 0, used_bytes = 0;
+    if (vw_store_quota_get(ctx->store, user_id, &quota_rec) == VW_OK) {
+        quota_bytes = quota_rec.quota_bytes;
+        used_bytes  = quota_rec.used_bytes;
+    }
+
     vw_payload_auth_ok_t ok;
     memcpy(ok.session_token, token, VW_TOKEN_BYTES);
     ok.expires_at  = (int64_t)sess_rec.expires_at;
     ok.is_admin    = user_rec.is_admin;
-    ok.quota_bytes = 0;  /* TODO(SRV.01): populate from vw_store_quota_get */
-    ok.used_bytes  = 0;
+    ok.quota_bytes = quota_bytes;
+    ok.used_bytes  = used_bytes;
     ok.user_id     = user_id;
 
     /* AUTH_OK payload: 32 + 8 + 1 + 8 + 8 + 8 = 65 bytes */
@@ -119,9 +129,10 @@ static vw_err_t handle_auth_request(vw_server_ctx_t *ctx, vw_conn_t *conn,
     uname[req.username_len] = '\0';
 
     vw_auth_state_t state;
+    uint16_t        lockout_secs = 0;
     err = vw_auth_begin_login(ctx->auth, uname,
                                req.auth_token, VW_TOKEN_BYTES,
-                               &state);
+                               &state, &lockout_secs);
     secure_zero(req.auth_token, VW_TOKEN_BYTES);  /* wipe credential immediately */
 
     if (err == VW_OK) {
@@ -182,6 +193,15 @@ static vw_err_t handle_auth_request(vw_server_ctx_t *ctx, vw_conn_t *conn,
             return v2fa_err;
         }
         return build_and_send_auth_ok(ctx, conn, token, uid, out_info);
+
+    } else if (err == VW_ERR_AUTH_LOCKED) {
+        /* TASK-075: password brute-force lockout. vw_auth_begin_login only
+         * ever returns this for an existing account (see its doc comment),
+         * so sending the real lockout_secs here does not violate the
+         * anti-enumeration invariant below — a nonexistent username can
+         * never reach this branch. */
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_LOCKED, lockout_secs);
+        return err;
 
     } else {
         /* Always BAD_CREDS with lockout_secs=0 — VW_ERR_AUTH_LOCKED applies only

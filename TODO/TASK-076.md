@@ -1,7 +1,7 @@
 ---
 id:          TASK-076
 title:       AUTH_OK always reports quota_bytes=0 and used_bytes=0 (hardcoded stub, never populated from store)
-status:      todo
+status:      done
 assignee:    SRV.01
 created_by:  ARCH.00
 created:     2026-07-19
@@ -119,3 +119,59 @@ routing rule 2, `CQR.08` alone in `review_by` is sufficient. Priority
 the suite, and has no security impact — but it is a real, user-visible
 correctness bug (clients cannot see their own storage usage), so not
 `normal`/`low` either.
+
+SRV.01 [2026-07-19]: Fixed. In `build_and_send_auth_ok`
+(`src/server/vw_server_core.c:77-88`), replaced the hardcoded
+`ok.quota_bytes = 0; ok.used_bytes = 0;` with a real
+`vw_store_quota_get(ctx->store, user_id, &quota_rec)` call, populating
+`quota_bytes`/`used_bytes` from the returned record and falling back to
+`0`/`0` only when `vw_store_quota_get` returns non-`VW_OK` (i.e. no quota
+record yet - per `vw_store.h:379-380`, "unlimited quota, 0 used"). This
+mirrors the existing call sites at `vw_file_handlers.c:1096-1101` and
+`vw_admin.c:223-226`. Since `build_and_send_auth_ok` is the single shared
+builder for both `handle_auth_request` and `handle_session_resume`, both
+paths now report real usage - no separate fix needed for `SESSION_RESUME`.
+
+Verified end-to-end, not just statically: built the full project on Linux
+(WSL Ubuntu, GCC 13.3.0) via a fresh out-of-tree CMake configure with
+`-DVW_WERROR=ON -DCMAKE_BUILD_TYPE=Debug` (matching CI's strict-warnings
+flag); zero warnings/errors across the whole build. Ran the full pytest
+integration suite (`pytest tests/integration -m "not cluster"`, 20/20
+passed) - `test_quota.py::test_used_bytes_does_not_increase_after_delete`
+and its two siblings (`test_upload_fails_when_quota_exceeded`,
+`test_quota_adjust_allows_upload`) all pass, confirming both the fix and
+no regression in existing quota-enforcement behavior. Also ran the
+`ctest` suite (all 11 targets, including `unit_vw_store`,
+`integration_auth_handshake`, and the Phase 5 `integration` TAP runner) -
+100% pass.
+
+No wire/protocol change: `vw_payload_auth_ok_t` already had
+`quota_bytes`/`used_bytes` fields (PROTOCOL.md section 7.1's AUTH_OK
+payload table already documents them); this was purely a server-side bug
+in what value got written into an existing field. Setting `status:
+review` for CQR.08 per `review_by`.
+
+CQR.08 [2026-07-19]: Code-quality review. Confirmed `vw_store_quota_get`'s
+documented semantics (`vw_store.h:378-381`: returns `VW_ERR_NOT_FOUND` when
+no quota record exists, meaning "unlimited, 0 used" - not a
+corruption/uninitialized-record signal). The new code's fallback-to-0/0 on
+any non-`VW_OK` return (not just `VW_ERR_NOT_FOUND` specifically) is
+correct and matches the existing pattern exactly at both cited call
+sites - `vw_file_handlers.c`'s `ulist_tls_cb` (~1096-1101) and
+`vw_admin.c`'s `ulist_cb` (~220-242) both use the identical
+"`if (get() == VW_OK) populate; else leave zero-initialized`" idiom
+without distinguishing NOT_FOUND from other errors either, so this isn't
+a new gap being introduced. Grepped `build_and_send_auth_ok` project-wide:
+4 call sites total - `handle_auth_request`'s two success branches
+(direct-login and post-2FA), `handle_session_resume`, and
+`handle_invite_redeem` - all four now get real quota/usage automatically
+since it's one shared builder. Confirms SRV.01's claim that both
+`AUTH_REQUEST` and `SESSION_RESUME` are fixed (plus `INVITE_REDEEM` as an
+unclaimed bonus, also correctly fixed). Style: the new mid-block
+declarations (`quota_rec`, `quota_bytes`/`used_bytes`) match this same
+function's pre-existing C11 idiom just above (`sess_rec`, `user_rec` are
+declared the same way, not hoisted to the top of the function) - no
+inconsistency introduced. No blocking findings. Clean sign-off.
+
+ARCH.00 [2026-07-19]: CQR.08 signed off clean. Confirming resolution and
+closing — status: done.

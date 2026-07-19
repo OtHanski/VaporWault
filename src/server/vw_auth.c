@@ -10,6 +10,23 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#   define WIN32_LEAN_AND_MEAN
+#   include <windows.h>
+typedef CRITICAL_SECTION vw_auth_mutex_t;
+#   define auth_mutex_init(m)    InitializeCriticalSection(m)
+#   define auth_mutex_destroy(m) DeleteCriticalSection(m)
+#   define auth_mutex_lock(m)    EnterCriticalSection(m)
+#   define auth_mutex_unlock(m)  LeaveCriticalSection(m)
+#else
+#   include <pthread.h>
+typedef pthread_mutex_t vw_auth_mutex_t;
+#   define auth_mutex_init(m)    pthread_mutex_init((m), NULL)
+#   define auth_mutex_destroy(m) pthread_mutex_destroy(m)
+#   define auth_mutex_lock(m)    pthread_mutex_lock(m)
+#   define auth_mutex_unlock(m)  pthread_mutex_unlock(m)
+#endif
+
 /* Defeat dead-store elimination for sensitive buffers. */
 static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
 #define secure_zero(p, n) ((void)(g_memset_fn)((p), 0, (size_t)(n)))
@@ -20,12 +37,55 @@ static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
 #define DEFAULT_OTP_WINDOW_SECS    600u
 #define DEFAULT_OTP_MAX_ATTEMPTS   5u
 
+/*
+ * Password brute-force lockout policy (TASK-075; distinct from the
+ * OTP-attempt lockout above, which only guards the 2FA-code-entry step).
+ * PROTOCOL.md §7.1/§8.3 document the equivalent OTP policy (5 failures /
+ * 10-minute window / 10-minute lockout, AUTH_FAIL code 304/305); no separate
+ * password-brute-force policy is documented, so the same threshold/window
+ * numbers are reused here for consistency (also matches AUTH_LOCKOUT_SECS in
+ * vw_server_core.c, and the 5-failure threshold asserted by
+ * test_auth.py::test_brute_force_lockout).
+ */
+#define LOCKOUT_MAX_ATTEMPTS 5u
+#define LOCKOUT_WINDOW_SECS  600u
+
+/*
+ * In-memory per-user failed-password-attempt table. Mirrors the IP
+ * rate-limit table pattern in vw_cluster.c (rate_entry_t / RATE_TABLE_SIZE)
+ * — a fixed-size ring buffer scanned linearly, evicting the oldest slot when
+ * full. Unlike vw_cluster.c's table (accessed only from a single accept
+ * thread), auth requests are served by a worker thread pool
+ * (vw_server_main.c), so this table is guarded by lockout_mu.
+ *
+ * Deliberately in-memory rather than persisted via vw_store: lockout state
+ * does not need to survive a server restart (a restart is already a much
+ * stronger reset than any legitimate client could trigger), and keeping it
+ * out of vw_store avoids growing the fixed-size, on-disk vw_user_record_t
+ * (already at its declared 256-byte budget) or adding a whole new slotted
+ * disk table for what is fundamentally ephemeral rate-limit bookkeeping.
+ */
+#define LOCKOUT_TABLE_SIZE 256
+
+typedef struct {
+    uint64_t user_id;        /* 0 = free/unused slot                          */
+    uint32_t fail_count;      /* failed attempts within the current window    */
+    time_t   first_fail_at;   /* start of the current counting window         */
+    time_t   locked_until;    /* 0 = not locked; else Unix time lockout ends  */
+} lockout_entry_t;
+
 /* ── Internal context ────────────────────────────────────────────────────── */
 
 struct vw_auth_ctx {
     vw_store_t          *store;      /* borrowed */
     const vw_smtp_cfg_t *smtp_cfg;   /* borrowed; may be NULL if 2FA unused */
     vw_auth_cfg_t        cfg;
+
+    /* Password brute-force lockout table; see lockout_entry_t above. */
+    lockout_entry_t   lockout_table[LOCKOUT_TABLE_SIZE];
+    uint32_t          lockout_next_slot;   /* ring-buffer eviction cursor    */
+    vw_auth_mutex_t   lockout_mu;
+    int               lockout_mu_init;
 };
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
@@ -52,6 +112,9 @@ vw_err_t vw_auth_open(vw_store_t *store, const vw_smtp_cfg_t *smtp_cfg,
     if (ctx->cfg.otp_max_attempts == 0)
         ctx->cfg.otp_max_attempts = DEFAULT_OTP_MAX_ATTEMPTS;
 
+    auth_mutex_init(&ctx->lockout_mu);
+    ctx->lockout_mu_init = 1;
+
     *out_ctx = ctx;
     return VW_OK;
 }
@@ -59,6 +122,7 @@ vw_err_t vw_auth_open(vw_store_t *store, const vw_smtp_cfg_t *smtp_cfg,
 void vw_auth_close(vw_auth_ctx_t *ctx)
 {
     if (!ctx) return;
+    if (ctx->lockout_mu_init) auth_mutex_destroy(&ctx->lockout_mu);
     free(ctx);
 }
 
@@ -166,12 +230,93 @@ static vw_err_t send_otp_email(const vw_smtp_cfg_t *smtp_cfg,
                         body, NULL, 0);
 }
 
+/* ── Password lockout table (TASK-075) ──────────────────────────────────── */
+
+/* Caller must hold ctx->lockout_mu. */
+static lockout_entry_t *lockout_find(vw_auth_ctx_t *ctx, uint64_t user_id)
+{
+    for (int i = 0; i < LOCKOUT_TABLE_SIZE; i++) {
+        if (ctx->lockout_table[i].user_id == user_id)
+            return &ctx->lockout_table[i];
+    }
+    return NULL;
+}
+
+/* Caller must hold ctx->lockout_mu. */
+static lockout_entry_t *lockout_find_or_evict(vw_auth_ctx_t *ctx, uint64_t user_id)
+{
+    lockout_entry_t *e = lockout_find(ctx, user_id);
+    if (e) return e;
+
+    e = &ctx->lockout_table[ctx->lockout_next_slot];
+    ctx->lockout_next_slot = (ctx->lockout_next_slot + 1u) % LOCKOUT_TABLE_SIZE;
+    memset(e, 0, sizeof(*e));
+    e->user_id = user_id;
+    return e;
+}
+
+/*
+ * Returns the number of seconds remaining in an active lockout for user_id,
+ * or 0 if the account is not currently locked (also clears an expired
+ * lockout in-place, resetting the failure window). Caller must hold
+ * ctx->lockout_mu.
+ */
+static uint32_t lockout_remaining(vw_auth_ctx_t *ctx, uint64_t user_id, time_t now)
+{
+    lockout_entry_t *e = lockout_find(ctx, user_id);
+    if (!e || e->locked_until == 0) return 0;
+
+    if (now >= e->locked_until) {
+        /* Lockout window elapsed: clear it and the failure count so the
+         * next attempt starts with a clean slate. */
+        e->locked_until  = 0;
+        e->fail_count    = 0;
+        e->first_fail_at = 0;
+        return 0;
+    }
+    return (uint32_t)(e->locked_until - now);
+}
+
+/* Record one failed password attempt for user_id. Caller must hold
+ * ctx->lockout_mu. Locks the account once LOCKOUT_MAX_ATTEMPTS is reached
+ * within LOCKOUT_WINDOW_SECS — the attempt that reaches the threshold still
+ * reports VW_ERR_AUTH_BAD_CREDS to the caller; only the *next* attempt sees
+ * VW_ERR_AUTH_LOCKED (mirrors the off-by-one behavior of the existing
+ * OTP-attempt counter in vw_auth_verify_2fa). */
+static void lockout_record_failure(vw_auth_ctx_t *ctx, uint64_t user_id, time_t now)
+{
+    lockout_entry_t *e = lockout_find_or_evict(ctx, user_id);
+
+    if (e->fail_count == 0 ||
+        (now - e->first_fail_at) >= (time_t)LOCKOUT_WINDOW_SECS) {
+        e->fail_count    = 0;
+        e->first_fail_at = now;
+    }
+    e->fail_count++;
+    if (e->fail_count >= LOCKOUT_MAX_ATTEMPTS) {
+        e->locked_until = now + (time_t)LOCKOUT_WINDOW_SECS;
+    }
+}
+
+/* Clear any failure/lockout state for user_id after a successful login.
+ * Caller must hold ctx->lockout_mu. */
+static void lockout_reset(vw_auth_ctx_t *ctx, uint64_t user_id)
+{
+    lockout_entry_t *e = lockout_find(ctx, user_id);
+    if (e) {
+        e->fail_count    = 0;
+        e->first_fail_at = 0;
+        e->locked_until  = 0;
+    }
+}
+
 /* ── vw_auth_begin_login ─────────────────────────────────────────────────── */
 
 vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
                               const char *username,
                               const void *password, size_t pw_len,
-                              vw_auth_state_t *out_state)
+                              vw_auth_state_t *out_state,
+                              uint16_t *out_lockout_secs)
 {
     vw_user_record_t rec;
     uint8_t          real_hash[32];
@@ -184,8 +329,12 @@ vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
     vw_err_t         cred_rc;
     vw_err_t         pw_rc;
     vw_err_t         rc;
+    time_t           now;
 
-    if (!ctx || !username || !password || !out_state) return VW_ERR_INVALID_ARG;
+    if (!ctx || !username || !password || !out_state || !out_lockout_secs)
+        return VW_ERR_INVALID_ARG;
+
+    *out_lockout_secs = 0;
 
     /* Zero out_state at entry: on any error return, caller must not use it.
      * Ensures magic == 0 so vw_auth_verify_2fa rejects stale/failed states. */
@@ -194,9 +343,29 @@ vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
     memset(real_hash, 0, sizeof(real_hash));
     memset(real_salt, 0, sizeof(real_salt));
 
+    now = time(NULL);
     user_found = (vw_store_user_get_by_username(ctx->store, username, &rec) == VW_OK);
 
     if (user_found) {
+        /* Anti-enumeration: VW_ERR_AUTH_LOCKED is only ever returned here,
+         * inside the user_found branch — a nonexistent username can never
+         * produce this code (PROTOCOL.md §7.1; see also the caller's
+         * final-else comment in vw_server_core.c). */
+        uint32_t remaining;
+        auth_mutex_lock(&ctx->lockout_mu);
+        remaining = lockout_remaining(ctx, rec.user_id, now);
+        auth_mutex_unlock(&ctx->lockout_mu);
+
+        if (remaining > 0) {
+            /* Skip the expensive Argon2id hash entirely while locked — the
+             * whole point of the lockout is to stop CPU burn under
+             * brute-force, and there is no enumeration concern here since
+             * the account's existence is already established (unlike the
+             * user-not-found path below). */
+            *out_lockout_secs = (uint16_t)(remaining > 0xFFFFu ? 0xFFFFu : remaining);
+            return VW_ERR_AUTH_LOCKED;
+        }
+
         cred_rc = vw_store_user_get_credentials(ctx->store, rec.user_id,
                                                  real_hash, real_salt);
         if (cred_rc != VW_OK) {
@@ -217,7 +386,20 @@ vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
     secure_zero(real_hash, sizeof(real_hash));
     secure_zero(real_salt, sizeof(real_salt));
 
-    if (pw_rc != VW_OK) return VW_ERR_AUTH_BAD_CREDS;
+    if (pw_rc != VW_OK) {
+        if (user_found) {
+            auth_mutex_lock(&ctx->lockout_mu);
+            lockout_record_failure(ctx, rec.user_id, now);
+            auth_mutex_unlock(&ctx->lockout_mu);
+        }
+        return VW_ERR_AUTH_BAD_CREDS;
+    }
+
+    if (user_found) {
+        auth_mutex_lock(&ctx->lockout_mu);
+        lockout_reset(ctx, rec.user_id);
+        auth_mutex_unlock(&ctx->lockout_mu);
+    }
 
     /* Credentials verified. Populate base state. */
     out_state->magic        = VW_AUTH_STATE_MAGIC;

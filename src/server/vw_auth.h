@@ -131,11 +131,20 @@ vw_err_t vw_auth_revoke_session(vw_auth_ctx_t *ctx, const uint8_t token[32]);
  *
  * Always runs Argon2id even when the username is not found (timing normalisation).
  * Never reveals whether a username exists in the error response.
+ *
+ * Password brute-force lockout (TASK-075): *out_lockout_secs is always set to
+ * 0 on entry and left at 0 unless the return value is VW_ERR_AUTH_LOCKED, in
+ * which case it receives the number of seconds remaining before the account
+ * unlocks. After 5 failed attempts within a 10-minute window, the account is
+ * locked for 10 minutes — including against a subsequently-correct password.
+ * Only ever returned for a username that maps to an existing account (never
+ * for an unknown username, preserving the anti-enumeration property).
  */
 vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
                               const char *username,
                               const void *password, size_t pw_len,
-                              vw_auth_state_t *out_state);
+                              vw_auth_state_t *out_state,
+                              uint16_t *out_lockout_secs);
 
 /*
  * Complete a 2FA login. state must be the value populated by vw_auth_begin_login.

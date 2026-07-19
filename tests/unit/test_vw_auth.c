@@ -232,7 +232,8 @@ VW_TEST_SUITE("vw_auth") {
         {
             uint64_t uid = make_user(&s, "dave", "davepw123", 0);
             vw_auth_state_t state;
-            VW_ASSERT_OK(vw_auth_begin_login(s.auth, "dave", "davepw123", 9, &state));
+            uint16_t lockout_secs = 0;
+            VW_ASSERT_OK(vw_auth_begin_login(s.auth, "dave", "davepw123", 9, &state, &lockout_secs));
             VW_ASSERT_EQ(uid, state.user_id);
         }
         auth_stack_close(&s);
@@ -244,8 +245,10 @@ VW_TEST_SUITE("vw_auth") {
         {
             (void)make_user(&s, "eve", "correctpw", 0);
             vw_auth_state_t state;
-            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "eve", "wrongpw!!", 9, &state),
+            uint16_t lockout_secs = 0;
+            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "eve", "wrongpw!!", 9, &state, &lockout_secs),
                           VW_ERR_AUTH_BAD_CREDS);
+            VW_ASSERT_EQ(0, (int)lockout_secs);
         }
         auth_stack_close(&s);
     }
@@ -255,9 +258,62 @@ VW_TEST_SUITE("vw_auth") {
         auth_stack_open(&s, "login_nouser");
         {
             vw_auth_state_t state;
+            uint16_t lockout_secs = 0;
             /* Must run dummy Argon2id hash — we only check the error code here */
-            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "nobody", "anything", 8, &state),
+            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "nobody", "anything", 8, &state, &lockout_secs),
                           VW_ERR_AUTH_BAD_CREDS);
+            VW_ASSERT_EQ(0, (int)lockout_secs);
+        }
+        auth_stack_close(&s);
+    }
+
+    VW_TEST_CASE("begin_login: brute-force lockout after 5 failed attempts (TASK-075)") {
+        auth_stack_t s = {0};
+        auth_stack_open(&s, "login_lockout");
+        {
+            (void)make_user(&s, "frank", "correctpw", 0);
+            vw_auth_state_t state;
+            uint16_t lockout_secs;
+
+            for (int i = 0; i < 5; i++) {
+                lockout_secs = 0;
+                VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "frank", "wrongpw!!", 9,
+                                                   &state, &lockout_secs),
+                              VW_ERR_AUTH_BAD_CREDS);
+                VW_ASSERT_EQ(0, (int)lockout_secs);
+            }
+
+            /* 6th attempt: locked, even though credentials would fail anyway. */
+            lockout_secs = 0;
+            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "frank", "wrongpw!!", 9,
+                                               &state, &lockout_secs),
+                          VW_ERR_AUTH_LOCKED);
+            VW_ASSERT(lockout_secs > 0);
+
+            /* Still locked even with the CORRECT password. */
+            lockout_secs = 0;
+            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "frank", "correctpw", 9,
+                                               &state, &lockout_secs),
+                          VW_ERR_AUTH_LOCKED);
+            VW_ASSERT(lockout_secs > 0);
+        }
+        auth_stack_close(&s);
+    }
+
+    VW_TEST_CASE("begin_login: unknown username never locks regardless of attempt count (anti-enumeration)") {
+        auth_stack_t s = {0};
+        auth_stack_open(&s, "login_nouser_lockout");
+        {
+            vw_auth_state_t state;
+            uint16_t lockout_secs;
+
+            for (int i = 0; i < 10; i++) {
+                lockout_secs = 0;
+                VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "ghost", "anything", 8,
+                                                   &state, &lockout_secs),
+                              VW_ERR_AUTH_BAD_CREDS);
+                VW_ASSERT_EQ(0, (int)lockout_secs);
+            }
         }
         auth_stack_close(&s);
     }
