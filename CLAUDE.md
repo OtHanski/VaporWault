@@ -306,4 +306,5 @@ project evolves. Do not move or rename them without updating this file.
 | `ARCHITECTURE.md`     | ARCH.00 | Living system architecture and API contracts.    |
 | `docs/PROTOCOL.md`    | PRT.04  | Wire protocol specification and version history. |
 | `docs/STYLE.md`       | CQR.08  | C/C++ style decisions that apply project-wide.   |
+| `docs/RELEASE.md`     | BLD.05  | Build-and-release workflow: versioning, artifacts, dry-run/verification. |
 | `TODO/`               | All     | One file per task. See protocol above.           |
