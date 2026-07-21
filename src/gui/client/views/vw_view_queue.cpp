@@ -26,7 +26,7 @@ void vw_view_queue_render(const VwIpcStatus &status, ClientApp &app) {
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    char ts_buf[32];
+    char ts_buf[64];
     format_utc(ts_buf, sizeof(ts_buf), status.last_sync_at);
     ImGui::Text("Last sync: %s", ts_buf);
     ImGui::SameLine(0, 20);

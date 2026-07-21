@@ -66,7 +66,6 @@ int main(int /*argc*/, char ** /*argv*/)
         ImFontConfig cfg;
         cfg.SizePixels = 13.0f * dpi_scale;
         io.Fonts->AddFontDefault(&cfg);
-        ImGui_ImplOpenGL3_CreateFontsTexture();
     }
 
     ServerApp app;

@@ -35,8 +35,12 @@ the file browser view. The API is backward-compatible with the master branch.
 
 ```sh
 git submodule add --branch docking https://github.com/ocornut/imgui.git third_party/imgui
-cd third_party/imgui && git checkout v1.91.6 && cd ../..
+cd third_party/imgui && git checkout 81c008f90 && cd ../..
 ```
+
+The commit above (`81c008f90`, `git describe`: `v1.92.8-docking-148-g81c008f90`) is
+the version actually pinned in this repo's submodule reference — check it with
+`git -C third_party/imgui describe --tags` if this drifts after a future bump.
 
 **SDL2** (minimum version **2.26.0**) is the cross-platform windowing backend:
 

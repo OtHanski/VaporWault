@@ -1,8 +1,8 @@
 # Third-party vendored libraries.
 #
 # mbedTLS and Argon2 are downloaded at configure time via FetchContent.
-# Dear ImGui is still a manual vendor (only needed for GUI targets, which are
-# disabled in CI).  See VENDOR_SETUP.md for manual-vendor instructions.
+# Dear ImGui + SDL2 are still manually vendored (only needed when
+# VW_BUILD_GUI=ON). See VENDOR_SETUP.md for manual-vendor instructions.
 
 include(FetchContent)
 
@@ -51,17 +51,58 @@ if(UNIX)
 endif()
 
 # ── Dear ImGui + SDL2 backend (C++ GUI library) ───────────────────────────────
-# Only needed when VW_BUILD_GUI=ON (disabled in CI).
 # Vendor manually: git clone --branch docking https://github.com/ocornut/imgui third_party/imgui
 # See VENDOR_SETUP.md for the exact checkout tag.
+#
+# Dear ImGui does not ship its own CMakeLists.txt upstream — it's designed to be
+# compiled directly into the consuming project, not add_subdirectory()'d as a
+# self-contained subproject. We define our own STATIC target here instead, the
+# same approach already used for Argon2 above: list the exact source files we
+# need (core + the SDL2/OpenGL3 backend, matching what src/gui/* actually uses)
+# rather than assume the vendored tree builds itself.
 if(VW_BUILD_GUI)
-    if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
-        add_subdirectory(imgui)
-    else()
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui.cpp)
         message(FATAL_ERROR
             "Dear ImGui not found at third_party/imgui/.\n"
             "Run: git clone --branch docking https://github.com/ocornut/imgui third_party/imgui\n"
-            "     cd third_party/imgui && git checkout v1.91.6\n"
+            "     cd third_party/imgui && git checkout 81c008f90\n"
             "See VENDOR_SETUP.md for details.")
     endif()
+
+    find_package(OpenGL REQUIRED)
+
+    if(WIN32)
+        # The vendored VC devel package ships its own CMake config (targets
+        # SDL2::SDL2 / SDL2::SDL2main) — see VENDOR_SETUP.md for how to place it.
+        if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/SDL2/cmake/sdl2-config.cmake)
+            message(FATAL_ERROR
+                "SDL2 not found at third_party/SDL2/. See VENDOR_SETUP.md for the "
+                "Windows vendoring steps (download the official VC devel package).")
+        endif()
+        find_package(SDL2 REQUIRED CONFIG
+            PATHS ${CMAKE_CURRENT_SOURCE_DIR}/SDL2/cmake
+            NO_DEFAULT_PATH)
+        set(VW_SDL2_LIBS SDL2::SDL2main SDL2::SDL2)
+    else()
+        # Linux/macOS: the system package (apt install libsdl2-dev / brew install
+        # sdl2) ships a pkg-config file, not a CMake config.
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+        set(VW_SDL2_LIBS PkgConfig::SDL2)
+    endif()
+
+    add_library(imgui STATIC
+        imgui/imgui.cpp
+        imgui/imgui_demo.cpp
+        imgui/imgui_draw.cpp
+        imgui/imgui_tables.cpp
+        imgui/imgui_widgets.cpp
+        imgui/backends/imgui_impl_sdl2.cpp
+        imgui/backends/imgui_impl_opengl3.cpp
+    )
+    target_include_directories(imgui PUBLIC
+        imgui
+        imgui/backends
+    )
+    target_link_libraries(imgui PUBLIC ${VW_SDL2_LIBS} OpenGL::GL)
 endif()

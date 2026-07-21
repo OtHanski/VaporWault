@@ -3,8 +3,8 @@
 #include "imgui.h"
 #include <cstring>
 
-/* Sync state colours */
-static ImVec4 sync_colour(uint32_t state) {
+/* Sync state colours — used when file rows are populated (Phase 5) */
+[[maybe_unused]] static ImVec4 sync_colour(uint32_t state) {
     /* vw_sync_state_t: 0=synced, 1=local_mod, 2=conflict, 3=error */
     switch (state) {
     case 0:  return ImVec4(0.2f, 0.9f, 0.2f, 1.0f); /* green  — synced     */
@@ -14,7 +14,7 @@ static ImVec4 sync_colour(uint32_t state) {
     }
 }
 
-static const char *sync_label(uint32_t state) {
+[[maybe_unused]] static const char *sync_label(uint32_t state) {
     switch (state) {
     case 0: return "Synced";
     case 1: return "Modified";
@@ -82,6 +82,4 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
     }
 
     ImGui::End();
-
-    (void)sync_colour; (void)sync_label;  /* used when file rows are populated */
 }

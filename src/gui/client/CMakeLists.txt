@@ -6,6 +6,7 @@ add_executable(vapourwault-gui
     views/vw_view_browser.cpp
     views/vw_view_queue.cpp
     views/vw_view_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/client/vw_ipc.c
 )
 
 target_include_directories(vapourwault-gui PRIVATE

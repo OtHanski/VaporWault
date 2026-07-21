@@ -3,12 +3,6 @@
 #include <cstring>
 #include <cstdio>
 
-static void write_u32_le(uint8_t *buf, uint32_t v) {
-    buf[0] = (uint8_t)(v);
-    buf[1] = (uint8_t)(v >> 8);
-    buf[2] = (uint8_t)(v >> 16);
-    buf[3] = (uint8_t)(v >> 24);
-}
 static uint32_t read_u32_le(const uint8_t *buf) {
     return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
          | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
