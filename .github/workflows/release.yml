@@ -1,0 +1,192 @@
+name: Release
+
+# Push a version tag (e.g. `v0.1.0`) to build binaries for Linux and Windows and
+# publish them as a GitHub Release. Can also be run manually via workflow_dispatch
+# to dry-run the build/package steps (no release is published for manual runs) —
+# see docs/RELEASE.md.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag name to use for build artifacts (dry run only — no GitHub Release is published for manual runs)'
+        required: true
+        default: v0.0.0-dryrun
+
+# Least-privilege default: only the publish job (which calls `gh release create`)
+# elevates to contents:write, scoped at the job level below.
+permissions:
+  contents: read
+
+env:
+  # Pin to a specific SDL2 release for Windows vendoring. VENDOR_SETUP.md only
+  # documents a *minimum* supported version (2.26.0) for local/manual vendoring —
+  # keep SDL2_VERSION in sync with that minimum when bumping either one.
+  SDL2_VERSION: "2.32.10"
+  SDL2_ZIP_SHA256: "af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e"
+  # Computed once, shared by every job — see the "TAG comes from workflow-level
+  # env" comments below for why this is never interpolated directly into a
+  # `run:` block.
+  TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
+  REPO: ${{ github.repository }}
+
+jobs:
+  build-linux:
+    name: Build / Linux / x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build python3 git libsdl2-dev
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVW_BUILD_SERVER=ON  \
+            -DVW_BUILD_CLIENT=ON  \
+            -DVW_BUILD_GUI=ON     \
+            -DVW_BUILD_TOOLS=ON   \
+            -DVW_BUILD_TESTS=OFF  \
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # TAG comes from workflow-level `env:` (never interpolated directly from a
+      # `${{ }}` expression into a shell script — avoids template/script
+      # injection via an attacker-controlled ref/tag name).
+      - name: Stage release archive
+        run: |
+          STAGE="vaporwault-${TAG}-linux-x86_64"
+          mkdir -p "$STAGE"
+          cp build/bin/* "$STAGE"/
+          cp README.md "$STAGE"/
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz
+            vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Build / Windows / x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Set up the MSVC native tools environment so CMake can find cl.exe.
+      # ilammy/msvc-dev-cmd uses vswhere to locate any installed VS version,
+      # so this works with VS 2022 and VS 2026 alike (matches ci.yml).
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Vendor SDL2 (VC devel package)
+        shell: pwsh
+        run: |
+          $ver = $env:SDL2_VERSION
+          $url = "https://github.com/libsdl-org/SDL/releases/download/release-$ver/SDL2-devel-$ver-VC.zip"
+          Invoke-WebRequest -Uri $url -OutFile sdl2.zip
+
+          $actualHash = (Get-FileHash sdl2.zip -Algorithm SHA256).Hash
+          if ($actualHash -ne $env:SDL2_ZIP_SHA256) {
+            Write-Error "SDL2 zip checksum mismatch: expected $env:SDL2_ZIP_SHA256, got $actualHash"
+            exit 1
+          }
+
+          Expand-Archive -Path sdl2.zip -DestinationPath sdl2-extracted
+          Move-Item "sdl2-extracted/SDL2-$ver" "third_party/SDL2"
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DVW_BUILD_SERVER=ON  `
+            -DVW_BUILD_CLIENT=ON  `
+            -DVW_BUILD_GUI=ON     `
+            -DVW_BUILD_TOOLS=ON   `
+            -DVW_BUILD_TESTS=OFF  `
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # TAG comes from workflow-level `env:` (see note in the Linux job's staging step).
+      - name: Stage release archive
+        shell: pwsh
+        run: |
+          $stage = "vaporwault-$env:TAG-windows-x86_64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item build/bin/*.exe $stage/
+          Copy-Item third_party/SDL2/lib/x64/SDL2.dll $stage/
+          Copy-Item README.md $stage/
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$stage.zip.sha256" -Value "$hash  $stage.zip" -NoNewline -Encoding ascii
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            vaporwault-${{ env.TAG }}-windows-x86_64.zip
+            vaporwault-${{ env.TAG }}-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    # Manual workflow_dispatch runs are build-only dry runs — never publish a
+    # real release from one.
+    if: github.event_name == 'push'
+    permissions:
+      contents: write   # only this job needs write access, for gh release create/upload
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # Re-running this workflow for a tag that was already published (e.g. after
+      # a transient failure) uploads/overwrites assets instead of hard-failing
+      # with "release already exists". TAG/REPO come from workflow-level `env:`
+      # (never interpolated directly from a `${{ }}` expression into a shell
+      # script) — same rationale as the build jobs' staging steps.
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              dist/linux-release/* \
+              dist/windows-release/* \
+              --repo "$REPO" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              dist/linux-release/* \
+              dist/windows-release/* \
+              --repo "$REPO" \
+              --title "VaporWault $TAG" \
+              --generate-notes
+          fi
