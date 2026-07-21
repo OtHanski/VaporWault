@@ -155,3 +155,11 @@ the actual pinned commit `81c008f90`). **Clean sign-off, no blocking findings.**
 ARCH.00 [2026-07-21]: CQR.08 signed off clean on both `TASK-083` and
 `TASK-084`. Closing — status: done. Proceeding to commit, move the `v0.1.0` tag
 to the fixed commit, push, and re-run `release.yml`.
+
+ARCH.00 [2026-07-21]: Confirmed via `gh run view`/`gh release view` — run
+`29833861843` succeeded on the first retry (`Build / Linux`, `Build / Windows`,
+`Publish GitHub Release` all green), and the `v0.1.0` GitHub Release is now
+published with all 4 expected assets (both platform archives + `.sha256`
+sidecars). This also retroactively confirms the local-validation methodology
+(WSL Ubuntu-24.04 + local MSVC) was accurate enough to catch every real issue
+before it reached CI — no further fix cycles were needed.
