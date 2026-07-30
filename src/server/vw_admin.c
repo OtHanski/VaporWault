@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>  /* offsetof */
 
 /* ── Windows stubs ─────────────────────────────────────────────────────────── */
 
@@ -202,8 +203,9 @@ typedef struct {
 } ulist_ctx_t;
 
 /* u64 user_id(8) + u8 is_admin(1) + u8 is_active(1) + u8[2] pad(2)
- * + u8[64] username(64) + u64 quota_bytes(8) + u64 used_bytes(8) = 92 */
-#define ULIST_ENTRY_SIZE 92u
+ * + u8[64] username(64) + u64 quota_bytes(8) + u64 used_bytes(8)
+ * + u32 admin_caps(4, TASK-092 — appended, does not disturb prior fields) = 96 */
+#define ULIST_ENTRY_SIZE 96u
 
 static int ulist_cb(const vw_user_record_t *rec, void *ud)
 {
@@ -233,6 +235,7 @@ static int ulist_cb(const vw_user_record_t *rec, void *ud)
     memcpy(entry + 12, rec->username, 64);
     w64le(entry + 76, quota_bytes);
     w64le(entry + 84, used_bytes);
+    w32le(entry + 92, rec->admin_caps);
 
     memcpy(c->buf + c->len, entry, ULIST_ENTRY_SIZE);
     c->len   += ULIST_ENTRY_SIZE;
@@ -325,6 +328,61 @@ static void handle_set_quota(vw_admin_server_t *srv, int fd,
     send_u32_resp(fd, VW_ADMIN_SET_QUOTA_RESP, rc);
 }
 
+/* TASK-092: set (replace) a user's fine-grained admin capability bitmask.
+ * Only meaningful for is_admin==1 targets; see vw_admin_cap_t in vw_proto.h
+ * for the "caps==0 means full/legacy admin" convention. */
+static void handle_set_admin_caps(vw_admin_server_t *srv, int fd,
+                                    const uint8_t *p, uint32_t plen)
+{
+    uint16_t         uname_len;
+    char             username[65];
+    uint32_t         caps;
+    vw_user_record_t rec;
+    vw_err_t         rc;
+
+    if (plen < 3u) { send_u32_resp(fd, VW_ADMIN_SET_CAPS_RESP, VW_ERR_INVALID_ARG); return; }
+
+    uname_len = r16le(p);
+    if (uname_len == 0 || uname_len > 63u || plen < (uint32_t)(2u + uname_len + 4u)) {
+        send_u32_resp(fd, VW_ADMIN_SET_CAPS_RESP, VW_ERR_INVALID_ARG); return;
+    }
+    memcpy(username, p + 2, uname_len);
+    username[uname_len] = '\0';
+    caps = r32le(p + 2 + uname_len);
+
+    rc = vw_store_user_get_by_username(srv->ctx.store, username, &rec);
+    if (rc != VW_OK) {
+        memset(&rec, 0, sizeof(rec));
+        send_u32_resp(fd, VW_ADMIN_SET_CAPS_RESP, rc); return;
+    }
+
+    rc = vw_store_user_update_field(srv->ctx.store, rec.user_id,
+                                     (uint32_t)offsetof(vw_user_record_t, admin_caps),
+                                     &caps, sizeof(caps));
+
+    /* Audit log — same best-effort convention as handle_set_quota above. */
+    if (rc == VW_OK && srv->ctx.oplog) {
+        uint8_t oplog_payload[12];
+        w64le(oplog_payload, rec.user_id);
+        w32le(oplog_payload + 8, caps);
+        uint64_t eid = 0;
+        vw_err_t log_rc = vw_oplog_append(srv->ctx.oplog, VW_OPLOG_USER_WRITE,
+                                           oplog_payload, sizeof(oplog_payload),
+                                           &eid);
+        if (log_rc == VW_OK)
+            vw_oplog_confirm(srv->ctx.oplog, eid);
+        else
+            (void)fprintf(stderr,
+                "[WARN] admin: set-admin-caps oplog append failed (rc=%d) "
+                "for user_id=%llu — capabilities were changed but audit log "
+                "is incomplete\n",
+                (int)log_rc, (unsigned long long)rec.user_id);
+    }
+
+    memset(&rec, 0, sizeof(rec));
+    send_u32_resp(fd, VW_ADMIN_SET_CAPS_RESP, rc);
+}
+
 /* Callback context for oplog tail */
 #define TAIL_MAX 100u
 
@@ -404,14 +462,51 @@ static void handle_oplog_tail(vw_admin_server_t *srv, int fd,
     }
 }
 
+/* u64 conn_id(8) + u64 user_id(8) + i64 connected_since(8) + u8[64] peer_addr(64) = 88 */
+#define CONN_ENTRY_SIZE 88u
+
 static void handle_conn_list(vw_admin_server_t *srv, int fd)
 {
-    /* Phase 5: active connections are not tracked centrally. Return empty list. */
-    uint8_t resp[4];
-    (void)srv;
-    w32le(resp, 0u);
-    send_frame(fd, VW_ADMIN_CONN_LIST_RESP, resp, sizeof(resp));
+    vw_conn_info_t *entries = NULL;
+    uint32_t        count   = 0;
+
+    if (srv->ctx.conn_registry) {
+        if (vw_conn_registry_list(srv->ctx.conn_registry, &entries, &count) != VW_OK) {
+            entries = NULL;
+            count   = 0;
+        }
+    }
+
+    {
+        uint8_t  frm_hdr[ADMIN_HDR_SIZE];
+        uint8_t  cnt_buf[4];
+        uint32_t total = (uint32_t)(ADMIN_HDR_SIZE + 4u + count * CONN_ENTRY_SIZE);
+        uint32_t i;
+
+        w32le(frm_hdr,     total);
+        w16le(frm_hdr + 4, (uint16_t)VW_ADMIN_CONN_LIST_RESP);
+        w16le(frm_hdr + 6, ADMIN_PROTO_VER);
+        send_all(fd, frm_hdr, ADMIN_HDR_SIZE);
+
+        w32le(cnt_buf, count);
+        send_all(fd, cnt_buf, 4);
+
+        for (i = 0; i < count; i++) {
+            uint8_t entry[CONN_ENTRY_SIZE];
+            size_t  n = strnlen(entries[i].peer_addr, sizeof(entries[i].peer_addr));
+            memset(entry, 0, sizeof(entry));
+            w64le(entry,      entries[i].conn_id);
+            w64le(entry + 8,  entries[i].user_id);
+            w64le(entry + 16, (uint64_t)entries[i].connected_since);
+            memcpy(entry + 24, entries[i].peer_addr, n);
+            send_all(fd, entry, sizeof(entry));
+        }
+    }
+
+    free(entries);
 }
+
+#undef CONN_ENTRY_SIZE
 
 static void handle_reload_cert(vw_admin_server_t *srv, int fd)
 {
@@ -419,6 +514,261 @@ static void handle_reload_cert(vw_admin_server_t *srv, int fd)
      * The admin channel does not currently hold a reference to net_ctx. */
     (void)srv;
     send_u32_resp(fd, VW_ADMIN_RELOAD_CERT_RESP, VW_ERR_INVALID_ARG);
+}
+
+static void handle_node_add(vw_admin_server_t *srv, int fd,
+                             const uint8_t *p, uint32_t plen)
+{
+    uint16_t hlen;
+    char     hostname[128];
+    uint64_t node_id = 0;
+    uint8_t  token[32];
+    vw_err_t rc;
+    uint8_t  resp[44]; /* u32 error_code + u64 node_id + u8[32] auth_token */
+
+    if (!srv->ctx.cluster) {
+        send_u32_resp(fd, VW_ADMIN_NODE_ADD_RESP, VW_ERR_INVALID_ARG);
+        return;
+    }
+    if (plen < 2u) { send_u32_resp(fd, VW_ADMIN_NODE_ADD_RESP, VW_ERR_INVALID_ARG); return; }
+
+    hlen = r16le(p);
+    if (hlen == 0 || hlen > 127u || plen < (uint32_t)(2u + hlen)) {
+        send_u32_resp(fd, VW_ADMIN_NODE_ADD_RESP, VW_ERR_INVALID_ARG); return;
+    }
+    memcpy(hostname, p + 2, hlen);
+    hostname[hlen] = '\0';
+
+    rc = vw_cluster_node_add(srv->ctx.cluster, hostname, VW_NODE_ROLE_REPLICA,
+                              &node_id, token);
+
+    memset(resp, 0, sizeof(resp));
+    w32le(resp, (uint32_t)rc);
+    if (rc == VW_OK) {
+        w64le(resp + 4, node_id);
+        memcpy(resp + 12, token, 32);
+    }
+    send_frame(fd, VW_ADMIN_NODE_ADD_RESP, resp, sizeof(resp));
+    memset(token, 0, sizeof(token));
+    memset(resp, 0, sizeof(resp)); /* auth_token must not linger in memory */
+}
+
+static void handle_node_register_self(vw_admin_server_t *srv, int fd,
+                                       const uint8_t *p, uint32_t plen)
+{
+    uint64_t node_id;
+    uint8_t  token[32];
+    uint16_t hlen;
+    char     hostname[128];
+    vw_err_t rc;
+
+    if (!srv->ctx.cluster) {
+        send_u32_resp(fd, VW_ADMIN_NODE_REGISTER_SELF_RESP, VW_ERR_INVALID_ARG);
+        return;
+    }
+    if (plen < 8u + 32u + 2u) {
+        send_u32_resp(fd, VW_ADMIN_NODE_REGISTER_SELF_RESP, VW_ERR_INVALID_ARG);
+        return;
+    }
+
+    node_id = r64le(p);
+    memcpy(token, p + 8, 32);
+    hlen = r16le(p + 40);
+    if (hlen == 0 || hlen > 127u || plen < (uint32_t)(42u + hlen)) {
+        memset(token, 0, sizeof(token));
+        send_u32_resp(fd, VW_ADMIN_NODE_REGISTER_SELF_RESP, VW_ERR_INVALID_ARG);
+        return;
+    }
+    memcpy(hostname, p + 42, hlen);
+    hostname[hlen] = '\0';
+
+    rc = vw_cluster_node_add_self(srv->ctx.cluster, node_id, token, hostname);
+    memset(token, 0, sizeof(token));
+    send_u32_resp(fd, VW_ADMIN_NODE_REGISTER_SELF_RESP, rc);
+}
+
+/* u64 file_id(8) + i64 deleted_at(8) + u8[64] name(64) = 80 */
+#define DELETED_ENTRY_SIZE 80u
+
+typedef struct {
+    uint8_t  *buf;
+    size_t    cap;
+    size_t    len;
+    uint32_t  count;
+    uint64_t  owner_id;
+} deleted_collect_ctx_t;
+
+static int deleted_list_cb(const vw_file_record_t *rec, void *ud)
+{
+    deleted_collect_ctx_t *c = (deleted_collect_ctx_t *)ud;
+    uint8_t entry[DELETED_ENTRY_SIZE];
+    size_t  n;
+
+    if (rec->owner_id != c->owner_id) return 0;
+
+    if (c->len + DELETED_ENTRY_SIZE > c->cap) {
+        size_t   new_cap = c->cap ? c->cap * 2 : 4096u;
+        uint8_t *p = (uint8_t *)realloc(c->buf, new_cap);
+        if (!p) return 1; /* stop — OOM */
+        c->buf = p; c->cap = new_cap;
+    }
+
+    memset(entry, 0, sizeof(entry));
+    w64le(entry, rec->file_id);
+    w64le(entry + 8, (uint64_t)rec->deleted_at);
+    n = strnlen(rec->name, sizeof(rec->name));
+    memcpy(entry + 16, rec->name, n);
+
+    memcpy(c->buf + c->len, entry, DELETED_ENTRY_SIZE);
+    c->len += DELETED_ENTRY_SIZE;
+    c->count++;
+    return 0;
+}
+
+static void handle_list_deleted(vw_admin_server_t *srv, int fd,
+                                 const uint8_t *p, uint32_t plen)
+{
+    uint16_t         uname_len;
+    char             username[65];
+    vw_user_record_t urec;
+    vw_err_t         rc;
+    deleted_collect_ctx_t dc;
+
+    if (plen < 2u) {
+        uint8_t resp[8];
+        w32le(resp, (uint32_t)VW_ERR_INVALID_ARG); w32le(resp + 4, 0u);
+        send_frame(fd, VW_ADMIN_LIST_DELETED_RESP, resp, sizeof(resp));
+        return;
+    }
+    uname_len = r16le(p);
+    if (uname_len == 0 || uname_len > 63u || plen < (uint32_t)(2u + uname_len)) {
+        uint8_t resp[8];
+        w32le(resp, (uint32_t)VW_ERR_INVALID_ARG); w32le(resp + 4, 0u);
+        send_frame(fd, VW_ADMIN_LIST_DELETED_RESP, resp, sizeof(resp));
+        return;
+    }
+    memcpy(username, p + 2, uname_len);
+    username[uname_len] = '\0';
+
+    rc = vw_store_user_get_by_username(srv->ctx.store, username, &urec);
+    if (rc == VW_OK && !srv->ctx.file_store) rc = VW_ERR_INVALID_ARG;
+    if (rc != VW_OK) {
+        uint8_t resp[8];
+        w32le(resp, (uint32_t)rc); w32le(resp + 4, 0u);
+        send_frame(fd, VW_ADMIN_LIST_DELETED_RESP, resp, sizeof(resp));
+        return;
+    }
+
+    memset(&dc, 0, sizeof(dc));
+    dc.owner_id = urec.user_id;
+
+    rc = vw_store_file_scan_deleted(srv->ctx.file_store, deleted_list_cb, &dc);
+    if (rc != VW_OK) {
+        free(dc.buf);
+        uint8_t resp[8];
+        w32le(resp, (uint32_t)rc); w32le(resp + 4, 0u);
+        send_frame(fd, VW_ADMIN_LIST_DELETED_RESP, resp, sizeof(resp));
+        return;
+    }
+
+    {
+        uint8_t  frm_hdr[ADMIN_HDR_SIZE];
+        uint8_t  hdr8[8];
+        uint32_t total = (uint32_t)(ADMIN_HDR_SIZE + 8u + dc.len);
+
+        w32le(frm_hdr,     total);
+        w16le(frm_hdr + 4, (uint16_t)VW_ADMIN_LIST_DELETED_RESP);
+        w16le(frm_hdr + 6, ADMIN_PROTO_VER);
+        send_all(fd, frm_hdr, ADMIN_HDR_SIZE);
+
+        w32le(hdr8,     (uint32_t)VW_OK);
+        w32le(hdr8 + 4, dc.count);
+        send_all(fd, hdr8, 8);
+        if (dc.len) send_all(fd, dc.buf, dc.len);
+    }
+
+    free(dc.buf);
+}
+
+#undef DELETED_ENTRY_SIZE
+
+static void handle_restore_file(vw_admin_server_t *srv, int fd,
+                                 const uint8_t *p, uint32_t plen)
+{
+    uint64_t file_id;
+    vw_err_t rc;
+
+    if (plen < 8u) {
+        send_u32_resp(fd, VW_ADMIN_RESTORE_FILE_RESP, VW_ERR_INVALID_ARG);
+        return;
+    }
+    file_id = r64le(p);
+
+    if (!srv->ctx.file_store) {
+        send_u32_resp(fd, VW_ADMIN_RESTORE_FILE_RESP, VW_ERR_INVALID_ARG);
+        return;
+    }
+
+    rc = vw_store_file_restore(srv->ctx.file_store, file_id);
+    send_u32_resp(fd, VW_ADMIN_RESTORE_FILE_RESP, rc);
+}
+
+static void handle_cluster_status(vw_admin_server_t *srv, int fd)
+{
+    vw_node_record_t *recs = NULL;
+    uint32_t           count = 0;
+    vw_err_t           rc;
+
+/* u64 node_id(8) + u8 role(1) + u8 is_active(1) + u8[2] pad(2)
+ * + u8[128] hostname(128) + u64 sync_watermark(8) = 148 */
+#define NODE_ENTRY_SIZE 148u
+
+    if (!srv->ctx.cluster) {
+        uint8_t resp[8];
+        w32le(resp,     (uint32_t)VW_ERR_INVALID_ARG);
+        w32le(resp + 4, 0u);
+        send_frame(fd, VW_ADMIN_CLUSTER_STATUS_RESP, resp, sizeof(resp));
+        return;
+    }
+
+    rc = vw_cluster_node_list(srv->ctx.cluster, &recs, &count);
+    if (rc != VW_OK) {
+        uint8_t resp[8];
+        w32le(resp,     (uint32_t)rc);
+        w32le(resp + 4, 0u);
+        send_frame(fd, VW_ADMIN_CLUSTER_STATUS_RESP, resp, sizeof(resp));
+        return;
+    }
+
+    {
+        uint8_t  frm_hdr[ADMIN_HDR_SIZE];
+        uint8_t  hdr8[8];
+        uint32_t total = (uint32_t)(ADMIN_HDR_SIZE + 8u + count * NODE_ENTRY_SIZE);
+        uint32_t i;
+
+        w32le(frm_hdr,     total);
+        w16le(frm_hdr + 4, (uint16_t)VW_ADMIN_CLUSTER_STATUS_RESP);
+        w16le(frm_hdr + 6, ADMIN_PROTO_VER);
+        send_all(fd, frm_hdr, ADMIN_HDR_SIZE);
+
+        w32le(hdr8,     (uint32_t)VW_OK);
+        w32le(hdr8 + 4, count);
+        send_all(fd, hdr8, 8);
+
+        for (i = 0; i < count; i++) {
+            uint8_t entry[NODE_ENTRY_SIZE];
+            memset(entry, 0, sizeof(entry));
+            w64le(entry, recs[i].node_id);
+            entry[8] = recs[i].role;
+            entry[9] = recs[i].is_active;
+            memcpy(entry + 12, recs[i].hostname, 128);
+            w64le(entry + 140, recs[i].sync_watermark);
+            send_all(fd, entry, sizeof(entry));
+        }
+    }
+#undef NODE_ENTRY_SIZE
+
+    free(recs);
 }
 
 /* ── Connection handler ────────────────────────────────────────────────────── */
@@ -452,6 +802,12 @@ static void handle_admin_connection(vw_admin_server_t *srv, int fd)
     case VW_ADMIN_OPLOG_TAIL_REQ:  handle_oplog_tail(srv, fd, payload, plen);  break;
     case VW_ADMIN_CONN_LIST_REQ:   handle_conn_list(srv, fd);                  break;
     case VW_ADMIN_RELOAD_CERT_REQ: handle_reload_cert(srv, fd);                break;
+    case VW_ADMIN_NODE_ADD_REQ:            handle_node_add(srv, fd, payload, plen);            break;
+    case VW_ADMIN_CLUSTER_STATUS_REQ:      handle_cluster_status(srv, fd);                     break;
+    case VW_ADMIN_NODE_REGISTER_SELF_REQ:  handle_node_register_self(srv, fd, payload, plen);  break;
+    case VW_ADMIN_LIST_DELETED_REQ:        handle_list_deleted(srv, fd, payload, plen);        break;
+    case VW_ADMIN_RESTORE_FILE_REQ:        handle_restore_file(srv, fd, payload, plen);        break;
+    case VW_ADMIN_SET_CAPS_REQ:            handle_set_admin_caps(srv, fd, payload, plen);      break;
     default: break;
     }
 

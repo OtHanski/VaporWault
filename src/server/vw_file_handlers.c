@@ -1044,9 +1044,19 @@ static vw_err_t handle_user_quota_set(vw_store_t *store,
     vw_user_record_t urec;
     err = vw_store_user_get_by_id(store, user_id, &urec);
     if (err != VW_OK || !urec.is_admin) {
+        secure_zero(&urec, sizeof(urec));
         send_error(conn, VW_ERR_AUTH_REQUIRED);
         return VW_OK;
     }
+    /* TASK-092: authenticated admin, but does this one have quota-management
+     * capability specifically? Distinct error code from the "not an admin at
+     * all" case above — VW_ERR_PERMISSION, not VW_ERR_AUTH_REQUIRED. */
+    if (!vw_admin_has_cap(&urec, VW_CAP_QUOTA_MGMT)) {
+        secure_zero(&urec, sizeof(urec));
+        send_error(conn, VW_ERR_PERMISSION);
+        return VW_OK;
+    }
+    secure_zero(&urec, sizeof(urec));
 
     uint64_t target_uid  = vw_read_u64le(payload + VW_TOKEN_BYTES);
     uint64_t quota_bytes = vw_read_u64le(payload + VW_TOKEN_BYTES + 8u);
@@ -1134,8 +1144,16 @@ static vw_err_t handle_user_list(vw_store_t *store, vw_conn_t *conn,
     /* Admin check. */
     vw_user_record_t urec;
     err = vw_store_user_get_by_id(store, caller_uid, &urec);
-    if (err != VW_OK || !urec.is_admin)
+    if (err != VW_OK || !urec.is_admin) {
+        secure_zero(&urec, sizeof(urec));
         return (send_error(conn, VW_ERR_AUTH_REQUIRED), VW_OK);
+    }
+    /* TASK-092: user listing is user-management territory. */
+    if (!vw_admin_has_cap(&urec, VW_CAP_USER_MGMT)) {
+        secure_zero(&urec, sizeof(urec));
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+    }
+    secure_zero(&urec, sizeof(urec));
 
     /* Minimum payload: token(32) + offset(4) + limit(4) = 40 */
     uint32_t offset = 0, limit = 50;
@@ -1187,8 +1205,16 @@ static vw_err_t handle_user_suspend(vw_store_t *store, vw_conn_t *conn,
 
     vw_user_record_t urec;
     err = vw_store_user_get_by_id(store, caller_uid, &urec);
-    if (err != VW_OK || !urec.is_admin)
+    if (err != VW_OK || !urec.is_admin) {
+        secure_zero(&urec, sizeof(urec));
         return (send_error(conn, VW_ERR_AUTH_REQUIRED), VW_OK);
+    }
+    /* TASK-092: suspending/unsuspending a user is user-management territory. */
+    if (!vw_admin_has_cap(&urec, VW_CAP_USER_MGMT)) {
+        secure_zero(&urec, sizeof(urec));
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+    }
+    secure_zero(&urec, sizeof(urec));
 
     uint64_t target_uid = vw_read_u64le(payload + VW_TOKEN_BYTES);
     uint8_t  is_active  = payload[VW_TOKEN_BYTES + 8u];
@@ -1233,8 +1259,18 @@ static vw_err_t handle_audit_query(vw_store_t *store, vw_oplog_t *oplog,
 
     vw_user_record_t urec;
     err = vw_store_user_get_by_id(store, caller_uid, &urec);
-    if (err != VW_OK || !urec.is_admin)
+    if (err != VW_OK || !urec.is_admin) {
+        secure_zero(&urec, sizeof(urec));
         return (send_error(conn, VW_ERR_AUTH_REQUIRED), VW_OK);
+    }
+    /* TASK-092: reading the oplog/audit log is its own capability — a
+     * helpdesk admin managing users/quotas need not also be able to read
+     * the full audit trail. */
+    if (!vw_admin_has_cap(&urec, VW_CAP_AUDIT_READ)) {
+        secure_zero(&urec, sizeof(urec));
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+    }
+    secure_zero(&urec, sizeof(urec));
 
     /* Minimum: token(32) + max_entries(4) = 36 */
     uint32_t max_entries = 100;
@@ -1323,6 +1359,11 @@ static vw_err_t handle_cluster_status(vw_store_t    *store,
     err = vw_store_user_get_by_id(store, caller_uid, &urec);
     if (err != VW_OK || !urec.is_admin) {
         secure_zero(&urec, sizeof(urec));
+        return (send_error(conn, VW_ERR_AUTH_REQUIRED), VW_OK);
+    }
+    /* TASK-092: cluster visibility is its own capability. */
+    if (!vw_admin_has_cap(&urec, VW_CAP_CLUSTER_MGMT)) {
+        secure_zero(&urec, sizeof(urec));
         return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
     }
     secure_zero(&urec, sizeof(urec));
@@ -1402,9 +1443,18 @@ static vw_err_t handle_invite_create(vw_store_t *store,
     vw_user_record_t urec;
     err = vw_store_user_get_by_id(store, user_id, &urec);
     if (err != VW_OK || !urec.is_admin) {
+        secure_zero(&urec, sizeof(urec));
         send_error(conn, VW_ERR_AUTH_REQUIRED);
         return VW_OK;
     }
+    /* TASK-092: minting invites creates new user accounts, so it's gated by
+     * the same capability as USER_LIST/USER_SUSPEND. */
+    if (!vw_admin_has_cap(&urec, VW_CAP_USER_MGMT)) {
+        secure_zero(&urec, sizeof(urec));
+        send_error(conn, VW_ERR_PERMISSION);
+        return VW_OK;
+    }
+    secure_zero(&urec, sizeof(urec));
 
     if (!invite_store) {
         send_error(conn, VW_ERR_NOT_IMPL);

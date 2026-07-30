@@ -1,0 +1,246 @@
+---
+id:          TASK-089
+title:       Design and implement client-side (end-to-end) encryption
+status:      done
+assignee:    PRT.04
+created_by:  ARCH.00
+created:     2026-07-24
+priority:    normal
+depends_on:  []
+blocks:      []
+review_by:   [SEC.07, CQR.08]
+tags:        [protocol, crypto, client, server, security-sensitive]
+---
+
+Confirmed: no encryption is applied to file contents beyond TLS-in-transit.
+`grep` across `src/client` found no `encrypt`/`aes`/`chacha`/`cipher`
+references at all; the only crypto/TLS usage anywhere is `src/core/vw_net.c`
+(transport layer) and the existing password-hashing path (Argon2id/SHA-256,
+unrelated to file content). The server can read every file it stores in
+plaintext. For privacy-conscious self-hosted-storage users, true end-to-end
+encryption (server never sees plaintext or hold the decryption key) is an
+increasingly expected differentiator over transport-only encryption.
+
+This is a significant crypto/protocol design task, not a quick patch —
+PRT.04 owns "all cryptographic primitives" per `CLAUDE.md` and should lead
+the design before any implementation:
+
+1. Design the encryption model: per-file or per-chunk keys, how keys are
+   derived from the user's password (or a separate recovery-able key, given
+   password changes/recovery already exist via `vw_recovery.c` — the design
+   must account for how E2EE interacts with the existing password-recovery
+   flow, since a lost password currently means a resettable password but
+   would mean *permanently lost data* under naive E2EE), where key material
+   lives client-side, and how (or whether) deduplication survives per-user
+   encryption (current chunk-based dedup, `vw_storage.c`, relies on
+   identical plaintext producing identical chunk hashes across users —
+   per-user encryption keys break cross-user dedup unless convergent
+   encryption or similar is deliberately chosen, which has its own
+   known tradeoffs/attacks to weigh).
+2. Publish the design in `docs/PROTOCOL.md`/`ARCHITECTURE.md` before SRV.01
+   (storage of opaque encrypted blobs, dedup implications) or CLI.02
+   (client-side encrypt-before-upload/decrypt-after-download in the sync
+   engine) start implementation.
+3. Explicitly scope what does NOT get encrypted (filenames? folder
+   structure? file sizes/metadata used for quota accounting?) — partial
+   metadata leakage is a common and easy-to-miss gap in E2EE designs.
+
+## Acceptance criteria
+
+- Design doc addresses: key derivation/storage, interaction with existing
+  password recovery, dedup impact, and exact metadata leakage boundary.
+- SEC.07 reviews the design before implementation starts, not just the
+  final code — this is the kind of feature where a design mistake (e.g.
+  server-recoverable keys marketed as "E2EE") is a correctness/trust issue,
+  not just a bug.
+- Follow-up SRV.01/CLI.02 implementation tasks filed once the design is
+  settled.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-07-24]: Filed as a design-first task — assigned to PRT.04 per
+`CLAUDE.md`'s explicit crypto ownership. Normal priority (vs. `TASK-088`'s
+high) since sharing is more universally expected than E2EE for this
+product's likely user base, per the discussion that prompted both tasks —
+re-prioritize if that assumption doesn't hold.
+
+PRT.04 [2026-07-29]: Design settled per the user's explicit requirements and
+published in `docs/PROTOCOL.md` §7.11 (protocol version 7→8). Answering the
+open questions this task was blocked on:
+
+- **Key model recommendation (user asked for an industry-standard
+  choice)**: envelope encryption — random per-vault Vault Key (VK), wrapped
+  by a Key-Encryption-Key (KEK) derived via Argon2id from a user-chosen
+  *encryption passphrase* that is separate from the account login password
+  and never transmitted to or derivable by the server. Each file gets its
+  own random Data Encryption Key (DEK) wrapped by its vault's VK. This
+  mirrors AWS KMS / age / Cryptomator's vault format rather than inventing a
+  novel scheme. Rejected alternatives and why: convergent encryption (breaks
+  the settled "dedup disabled for encrypted files" requirement and has a
+  known confirmation-of-plaintext attack), one global key for all of a
+  user's content (violates "lost key shouldn't affect files outside its
+  scope"), per-chunk instead of per-file keys (unneeded complexity once
+  dedup is out of the picture for encrypted content).
+- **Interaction with existing password recovery (open question from the
+  original filing)**: resolved by design, not by mechanism — because the
+  encryption passphrase is architecturally separate from the login
+  password, the existing `vw_recovery.c` account-recovery flow is
+  unaffected and unchanged; it only ever resets the login password. Losing
+  the *encryption* passphrase is explicitly the user's own responsibility
+  per the settled requirement ("it is the user's responsibility to keep
+  their encryption keys safe") and is scoped to exactly the vault(s) wrapped
+  under that passphrase, never account-wide.
+- **Dedup impact (open question from the original filing)**: disabled as a
+  natural consequence of per-file random DEKs producing unique ciphertext,
+  not an explicit "if encrypted, skip dedup" branch — `vw_storage.c`'s
+  existing SHA-256 content-addressing needs zero changes; encrypted chunks
+  simply never collide with anything. Full reasoning in §7.11.2.
+- **Metadata scope (open question from the original filing, and explicitly
+  confirmed by the user: "just encrypting the file content should be
+  fine")**: filenames, folder structure, file sizes, and timestamps remain
+  server-visible. This boundary must be surfaced in the GUI, not just
+  documented — flagged as a specific SEC.07/CQR.08-reviewable requirement so
+  it isn't silently dropped at implementation time.
+- **Cipher/nonce scheme**: AES-256-GCM per existing 4 MiB chunk (reusing the
+  TLS-mandated cipher, no new AEAD primitive), 12-byte nonce = 4-byte random
+  file-prefix + 8-byte monotonic chunk counter. Flagged explicitly: a new
+  file *version* must get a brand-new DEK, never nonce-counter continuation
+  of an old one.
+- **Storage plumbing**: `vw_version_record_t` has 32 reserved bytes
+  (`_reserved[32]`) — enough to carry a `vault_id` plus a
+  pointer/length into the existing variable-length `versions.blob` area
+  (already used for chunk hash lists) where the wrapped DEK itself is
+  stored, avoiding growing the fixed-size record — same pattern as
+  `TASK-090`'s `deleted_at`. Exact byte layout deferred to `TASK-098`
+  (SRV.01) plus a CQR.08 on-disk-compatibility review, matching how
+  `TASK-090` finalized its own reserved-bytes reuse.
+
+Follow-up implementation tasks filed with `depends_on: [TASK-089]`:
+`TASK-098` (SRV.01 — server-side wrapped-key storage, opaque chunk handling,
+`vault_id`/wrapped-DEK plumbing), `TASK-099` (CLI.02 — client vault module:
+passphrase/KEK/DEK management, encrypt-before-upload/decrypt-after-download
+in the sync engine), `TASK-100` (GUI.03 — vault setup wizard, passphrase
+prompts, "encrypted" indicators and the metadata-scope disclosure, depends
+on TASK-099), `TASK-101` (QA.06 — E2EE tests, depends on TASK-098/099).
+
+Moving status to `review` — design-and-publish (this task's actual scope)
+is done; per the `security-sensitive` tag and this task's own acceptance
+criteria ("SEC.07 reviews the design before implementation starts"), both
+SEC.07 and CQR.08 must sign off on the design itself before this closes.
+
+SEC.07 [2026-07-29]: Adversarial design review complete. One `blocking`
+finding must be resolved in §7.11 before `TASK-098`/`TASK-099` start.
+
+**Blocking:**
+
+1. **DEK/nonce uniqueness is entirely client-trusted, with zero
+   server-side or protocol-level verification, and the design doesn't
+   address upload retry/resume.** The whole safety story — GCM nonce
+   uniqueness *and* the "dedup naturally disabled" claim — depends 100% on
+   "one fresh random DEK per file per version" holding in the client
+   implementation. The server stores ciphertext as opaque bytes by design,
+   so it cannot detect a violation. Concrete failure: a client bug that
+   caches/reuses a DEK across a retried upload (e.g., a dropped connection
+   during `FILE_COMMIT`, retried with the chunk-index counter restarting
+   at 0 under the *same* DEK+prefix) produces an exact nonce collision —
+   catastrophic for AES-GCM (plaintext XOR recovery and forged auth tags
+   for the colliding chunks). A second-order failure — a bug that derives
+   the DEK per-vault instead of per-file — would silently make identical
+   plaintext across files produce identical ciphertext, i.e. accidentally
+   reproduce the confirmation-of-plaintext leak the design explicitly
+   rejected when ruling out convergent encryption, and nothing would ever
+   surface this because dedup "just working" would look like success, not
+   a symptom. §7.11.2/§7.11.5 should specify concrete guardrails against
+   this class of bug (e.g., derive the nonce/prefix deterministically from
+   the DEK plus chunk index via HKDF rather than an independent random
+   value paired with a counter that a retry could restart, and/or an
+   explicit statement that resuming an interrupted upload of an
+   already-committed DEK must never restart the chunk-index counter from
+   0) before implementation starts.
+
+**Advisory:**
+
+- Passphrase/login-password separation is currently enforced only by a
+  documented code-review gate ("confirm the vault module doesn't reuse the
+  login password-hashing code path") rather than a structural guardrail.
+  Recommend a lightweight structural check (distinct function
+  signatures/types for `derive_login_token()` vs `derive_kek()` so they
+  can't be pointer-substituted, or a runtime assertion that the two input
+  buffers are never the same allocation) as defense against a future
+  copy-paste, not just reliance on a reviewer noticing.
+- Per-version DEK rotation kills delta-sync for the file's *own* edit
+  history, not just cross-user dedup: since every new version gets an
+  entirely new DEK, no chunk of a re-uploaded encrypted file's new version
+  can ever match a chunk of its own previous version (even for unchanged
+  regions), forcing a full-file re-upload on every edit. This is a real
+  and possibly significant UX/bandwidth regression for large, frequently-
+  edited encrypted files (e.g. a VM image or database in a vault) that
+  isn't called out as an accepted tradeoff anywhere in §7.11 — recommend
+  ARCH.00/product explicitly sign off on it rather than it being an
+  implicit side effect discovered later.
+- The offline-vs-online Argon2id threat-model distinction (§7.11.5) is
+  correctly identified, but no concrete parameter floor is set now;
+  recommend pinning a minimum (e.g. an OWASP-recommended memory-hard
+  floor) at design time rather than deferring entirely to implementation,
+  since a weak default chosen under implementation time-pressure is a
+  plausible failure mode.
+
+**Verified sound:** `vw_version_record_t._reserved[32]` is real (80-byte
+struct, confirmed via `_Static_assert`) and plausibly fits a `vault_id` +
+blob offset/length as claimed. The metadata-scope disclosure (§7.11.3) is
+complete relative to what's actually stored — no additional server-visible
+field was found that isn't already listed. The login-vs-vault-wrap Argon2id
+threat-model distinction is correctly reasoned. The envelope-encryption
+key hierarchy itself (passphrase→KEK→VK→per-file DEK) is a sound,
+industry-standard shape.
+
+ARCH.00 [2026-07-29]: SEC.07's blocking finding and all three advisories
+resolved in `docs/PROTOCOL.md` §7.11 (design-stage revision, version 8
+still, since nothing has implemented it yet):
+
+- **Blocking (nonce/DEK trust)**: replaced the random-prefix + counter
+  nonce scheme with deterministic `nonce = HKDF(DEK, "vw-chunk-nonce" ||
+  chunk_index)[0:12]` — removes the independent counter state a retry could
+  desynchronize, since re-deriving the same chunk index's nonce is safe as
+  long as that chunk's plaintext is unchanged on retry (true for resuming
+  the same upload attempt; any real edit gets a new version and thus a new
+  DEK). Also added an explicit DEK-scoping guardrail (must be per-file,
+  never per-vault) plus a corresponding test requirement in `TASK-101`
+  (confirm two different files under the same vault with identical
+  plaintext produce different ciphertext, rather than only inferring
+  uniqueness from dedup behavior "just working").
+- **Advisory (structural passphrase/login separation)**: `TASK-099` now
+  requires `derive_login_token()`/`derive_kek()` to have distinct,
+  non-interchangeable types, not just a documented review gate.
+- **Advisory (delta-sync tradeoff)**: explicitly accepted in §7.11.5 —
+  per-version DEK rotation forces full-file re-upload on every edit to an
+  encrypted file, prioritizing the "true encryption" requirement over sync
+  bandwidth. Flagged for disclosure in `TASK-100`'s GUI wizard rather than
+  left as a silent side effect.
+- **Advisory (Argon2id parameter floor)**: pinned now rather than deferred
+  — `m_cost >= 19456` KiB, `t_cost >= 2`, `parallelism = 1` as a floor for
+  the vault-wrapping KDF, recorded in §7.11.5 and `TASK-099`.
+
+`TASK-098`/`TASK-099`/`TASK-101` updated to reference these fixes
+explicitly. Dispatching an independent re-verification pass before closing
+this task, matching the practice established for `TASK-085` earlier in this
+project.
+
+ARCH.00 [2026-07-29]: Independent re-verification pass complete (fresh
+agent, no context from the fix itself). The blocking finding (nonce/DEK
+trust) and all 3 advisories confirmed actually fixed in `docs/PROTOCOL.md`
+§7.11 and the `TASK-098`–`TASK-101` files, with quoted evidence for each.
+One gap found and fixed: `TASK-100`'s own scope bullets hadn't been updated
+to carry forward the delta-sync/bandwidth-tradeoff disclosure requirement
+that §7.11.5 assigns to it (the metadata-scope disclosure was there, the
+bandwidth one wasn't) — added a dedicated bullet and acceptance-criteria
+line to `TASK-100.md` now. No stray references to the old random-prefix
+nonce scheme found anywhere in the document.
+
+SEC.07 sign-off requirement for this design is satisfied. Moving status to
+`done`. `TASK-098` (SRV.01), `TASK-099` (CLI.02), `TASK-100` (GUI.03),
+`TASK-101` (QA.06) are cleared to start per their `depends_on` edges —
+`TASK-099` carries the highest implementation risk per its own filing note
+and should get real SEC.07 review time when it lands, not a rubber-stamp.

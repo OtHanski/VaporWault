@@ -19,6 +19,7 @@
 #include "../core/vw_proto.h"
 #include "vw_auth.h"
 #include "vw_cluster.h"
+#include "vw_conn_registry.h"
 #include "vw_invite.h"
 #include "vw_recovery.h"
 #include "vw_smtp.h"
@@ -112,6 +113,15 @@ vw_oplog_t *vw_server_ctx_oplog(const vw_server_ctx_t *ctx);
  */
 void          vw_server_ctx_set_cluster(vw_server_ctx_t *ctx, vw_cluster_t *cluster);
 vw_cluster_t *vw_server_ctx_cluster(const vw_server_ctx_t *ctx);
+
+/*
+ * Attach the connection registry for admin CONN_LIST support.
+ * Borrowed; caller keeps it alive until vw_server_ctx_close.
+ * May be NULL — CONN_LIST will return an empty list.
+ */
+void                vw_server_ctx_set_conn_registry(vw_server_ctx_t *ctx,
+                                                      vw_conn_registry_t *reg);
+vw_conn_registry_t *vw_server_ctx_conn_registry(const vw_server_ctx_t *ctx);
 
 void vw_server_ctx_close(vw_server_ctx_t *ctx);
 

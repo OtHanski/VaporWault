@@ -85,11 +85,26 @@ typedef struct {
     uint64_t *ids;
     uint32_t  count;
     uint32_t  cap;
+    int64_t   now;
+    uint32_t  retention_secs;
 } del_collect_t;
 
 static int collect_deleted_cb(const vw_file_record_t *rec, void *ud)
 {
     del_collect_t *dc = (del_collect_t *)ud;
+
+    /* Retention window: skip files still within their trash grace period.
+     * deleted_at == 0 means a soft-delete recorded before this field existed
+     * (or retention is disabled) — treat as immediately eligible, matching
+     * the pre-retention-window behavior for those records. A negative age
+     * (deleted_at in the future — clock skew) is treated as "still
+     * protected" rather than "eligible", erring toward not deleting. */
+    if (rec->deleted_at != 0 && dc->retention_secs != 0) {
+        int64_t age = dc->now - rec->deleted_at;
+        if (age < (int64_t)dc->retention_secs)
+            return 0; /* still in trash — not yet eligible for GC */
+    }
+
     if (dc->count >= dc->cap) {
         if (dc->cap > UINT32_MAX / 2) return -1; /* cap at ~2 billion files */
         uint32_t new_cap = dc->cap ? dc->cap * 2 : 16;
@@ -153,6 +168,8 @@ vw_err_t vw_gc_run_once(vw_gc_ctx_t *ctx)
     if (ctx->file_store && ctx->chunk_store) {
         del_collect_t dc;
         memset(&dc, 0, sizeof(dc));
+        dc.now            = (int64_t)now;
+        dc.retention_secs = ctx->cfg.trash_retention_secs;
 
         rc = vw_store_file_scan_deleted(ctx->file_store, collect_deleted_cb, &dc);
         if (rc != VW_OK)

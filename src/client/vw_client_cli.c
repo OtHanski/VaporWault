@@ -326,6 +326,39 @@ static int cmd_ls(vw_ipc_conn_t *conn, const char *prefix, uint8_t filter) {
     return 0;
 }
 
+/* ── Subcommand: login ───────────────────────────────────────────────────── */
+
+/* LOGIN_REQ payload: string password, string otp (empty if not supplying one). */
+static int cmd_login(vw_ipc_conn_t *conn, const char *password, const char *otp) {
+    uint8_t payload[600];
+    uint32_t off = 0;
+    vw_ipc_write_str(payload, sizeof(payload), &off,
+                      password, (uint16_t)strnlen(password, 255));
+    const char *o = otp ? otp : "";
+    vw_ipc_write_str(payload, sizeof(payload), &off, o, (uint16_t)strnlen(o, 16));
+
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_LOGIN_REQ, payload, off,
+                             VW_IPC_LOGIN_RESP, resp, sizeof(resp), &rlen);
+    memset(payload, 0, sizeof(payload)); /* payload held the raw password */
+    if (err != VW_OK) { fprintf(stderr, "login: IPC error %d\n", (int)err); return 1; }
+
+    if (rlen < 4) { fprintf(stderr, "login: truncated response\n"); return 1; }
+    uint32_t code = vw_read_u32le(resp);
+    if (code == (uint32_t)VW_ERR_AUTH_2FA_REQUIRED) {
+        fprintf(stderr, "login: this account requires a 2FA code — re-run:\n"
+                        "  %s login <password> <otp-code>\n", "vapourwault-cli");
+        return 1;
+    }
+    if (code != 0) {
+        fprintf(stderr, "login: failed (code %u)\n", code);
+        return 1;
+    }
+    printf("logged in\n");
+    return 0;
+}
+
 /* ── Subcommand: shutdown ────────────────────────────────────────────────── */
 
 static int cmd_shutdown(vw_ipc_conn_t *conn) {
@@ -354,6 +387,9 @@ static void print_usage(const char *prog) {
         "  remove-folder <local>         Remove a sync folder\n"
         "  ls [<virtual_path>]           List synced files\n"
         "  conflicts                     List conflicted files only\n"
+        "  login <password|-|--stdin-password> [otp-code]\n"
+        "                                Authenticate to the server configured\n"
+        "                                in daemon.conf (username comes from there)\n"
         "  shutdown                      Ask the daemon to stop\n"
         "\n"
         "Options:\n"
@@ -489,6 +525,42 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         if (!c) return 1;
         int rc = cmd_ls(c, NULL, (uint8_t)VW_SYNC_CONFLICT);
         vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "login") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr,
+                "Usage: %s login <password|-|--stdin-password> [otp-code]\n"
+                "  Pass '-' or '--stdin-password' to read the password from stdin.\n",
+                argv[0]);
+            return 1;
+        }
+        const char *pw_arg = argv[argi++];
+        const char *otp    = (argi < argc) ? argv[argi++] : NULL;
+
+        /* Read password from stdin when '-' or '--stdin-password' is specified,
+         * to avoid exposing it in /proc/<pid>/cmdline and ps output — same
+         * convention as the server admin CLI's user-create. */
+        static char stdin_pw[256];
+        const char *pw;
+        if (strcmp(pw_arg, "-") == 0 || strcmp(pw_arg, "--stdin-password") == 0) {
+            if (!fgets(stdin_pw, (int)sizeof(stdin_pw), stdin)) {
+                fprintf(stderr, "error: failed to read password from stdin\n");
+                return 1;
+            }
+            size_t plen = strlen(stdin_pw);
+            if (plen > 0 && stdin_pw[plen - 1] == '\n') stdin_pw[--plen] = '\0';
+            pw = stdin_pw;
+        } else {
+            pw = pw_arg;
+        }
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) { memset(stdin_pw, 0, sizeof(stdin_pw)); return 1; }
+        int rc = cmd_login(c, pw, otp);
+        vw_ipc_conn_close(c);
+        memset(stdin_pw, 0, sizeof(stdin_pw));
         return rc;
     }
 

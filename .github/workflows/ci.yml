@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Windows GUI job vendors the same pinned SDL2 build release.yml ships —
+  # TASK-082: keep these two values in sync with release.yml's when bumping
+  # either one (a mismatch would mean CI validates a different SDL2 build
+  # than what actually ships).
+  SDL2_VERSION: "2.32.10"
+  SDL2_ZIP_SHA256: "af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e"
+
 # ── Linux matrix: GCC + Clang × Debug + Release ─────────────────────────────
 jobs:
   build-linux:
@@ -29,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -103,7 +111,7 @@ jobs:
 
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -111,7 +119,7 @@ jobs:
       # ilammy/msvc-dev-cmd uses vswhere to locate any installed VS version,
       # so this works with VS 2022 and VS 2026 alike.
       - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
@@ -138,6 +146,90 @@ jobs:
           CTEST_TEST_TIMEOUT: "30"
         run: ctest --output-on-failure --no-tests=error -R unit --timeout 30
 
+# ── GUI build coverage (TASK-082) ────────────────────────────────────────────
+#
+# The main matrix above always builds with VW_BUILD_GUI=OFF (SDL2 isn't
+# vendored there), so a GUI build/link regression previously surfaced for the
+# first time when cutting a real release, not on a regular PR (this is
+# exactly what happened before v0.1.0 shipped — see TASK-081's history). These
+# two jobs mirror release.yml's GUI build setup (apt SDL2 on Linux, vendored
+# VC devel zip on Windows) as a required check on every push/PR instead.
+  build-linux-gui:
+    name: Linux / gcc / Release / GUI=ON
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build python3 git libsdl2-dev
+
+      - name: Configure
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVW_BUILD_SERVER=ON  \
+            -DVW_BUILD_CLIENT=ON  \
+            -DVW_BUILD_GUI=ON     \
+            -DVW_BUILD_TOOLS=ON   \
+            -DVW_BUILD_TESTS=OFF  \
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+  build-windows-gui:
+    name: Windows / MSVC / Release / GUI=ON
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Vendor SDL2 (VC devel package)
+        shell: pwsh
+        run: |
+          $ver = $env:SDL2_VERSION
+          $url = "https://github.com/libsdl-org/SDL/releases/download/release-$ver/SDL2-devel-$ver-VC.zip"
+          Invoke-WebRequest -Uri $url -OutFile sdl2.zip
+
+          $actualHash = (Get-FileHash sdl2.zip -Algorithm SHA256).Hash
+          if ($actualHash -ne $env:SDL2_ZIP_SHA256) {
+            Write-Error "SDL2 zip checksum mismatch: expected $env:SDL2_ZIP_SHA256, got $actualHash"
+            exit 1
+          }
+
+          Expand-Archive -Path sdl2.zip -DestinationPath sdl2-extracted
+          Move-Item "sdl2-extracted/SDL2-$ver" "third_party/SDL2"
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DVW_BUILD_SERVER=ON  `
+            -DVW_BUILD_CLIENT=ON  `
+            -DVW_BUILD_GUI=ON     `
+            -DVW_BUILD_TOOLS=ON   `
+            -DVW_BUILD_TESTS=OFF  `
+            -DVW_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
 # ── Integration: real server + Python pytest suite ────────────────────────────
   integration:
     name: Integration / Linux / gcc / Release
@@ -146,7 +238,7 @@ jobs:
 
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -190,6 +282,21 @@ jobs:
           pytest tests/integration/ \
             -v -m "not cluster" \
             --timeout=60 \
+            --server-bin  build/bin/vapourwaultd \
+            --admin-cli   build/bin/vapourwault-server-cli \
+            --test-cert   tests/integration/test.crt \
+            --test-key    tests/integration/test.key
+
+      # Cluster tests stand up two real vapourwaultd instances and pair them
+      # (node-add + register-self, then poll for oplog replication), so they
+      # run noticeably slower than the rest of the suite (TASK-086) — kept as
+      # a separate step with its own generous timeout rather than folded into
+      # the main run above.
+      - name: Run pytest cluster integration tests
+        run: |
+          pytest tests/integration/test_cluster.py \
+            -v -m cluster \
+            --timeout=90 \
             --server-bin  build/bin/vapourwaultd \
             --admin-cli   build/bin/vapourwault-server-cli \
             --test-cert   tests/integration/test.crt \

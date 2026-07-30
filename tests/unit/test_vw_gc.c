@@ -127,7 +127,8 @@ static void gc_stack_open(gc_stack_t *s, const char *label,
     VW_ASSERT_OK(vw_oplog_open(s->tmpdir, &s->oplog));
     VW_ASSERT_OK(vw_store_open(s->tmpdir, s->oplog, &s->store));
 
-    cfg.interval_secs = 0; /* disabled — we call run_once manually */
+    cfg.interval_secs        = 0; /* disabled — we call run_once manually */
+    cfg.trash_retention_secs = 0; /* unused — this stack never opens file_store */
     VW_ASSERT_OK(vw_gc_create(&cfg, s->store,
                                NULL, /* file_store  — skips file GC pass */
                                NULL, /* chunk_store — skips chunk GC pass */
@@ -350,6 +351,98 @@ VW_TEST_SUITE("vw_gc") {
 
         gc_stack_close(&s_cluster);
         gc_stack_close(&s_solo);
+    }
+
+    /* ── Trash retention window (TASK-090) ────────────────────────────────── */
+
+    VW_TEST_CASE("run_once keeps a soft-deleted file within the retention window") {
+        char tmpdir[512];
+        vw_oplog_t       *oplog       = NULL;
+        vw_store_t       *store       = NULL;
+        vw_file_store_t  *file_store  = NULL;
+        vw_storage_t     *chunk_store = NULL;
+        vw_gc_ctx_t      *gc          = NULL;
+        vw_gc_cfg_t       cfg;
+        vw_file_record_t  rec;
+        uint64_t          file_id = 0;
+
+        make_tmpdir(tmpdir, sizeof(tmpdir), "trash_kept");
+        VW_ASSERT_OK(vw_oplog_open(tmpdir, &oplog));
+        VW_ASSERT_OK(vw_store_open(tmpdir, oplog, &store));
+        VW_ASSERT_OK(vw_file_store_open(tmpdir, oplog, &file_store));
+        VW_ASSERT_OK(vw_storage_open(tmpdir, &chunk_store));
+
+        /* No version/chunks on this record — hard-delete must tolerate a
+         * file with zero versions (ver_count == 0, decref loop never runs);
+         * irrelevant here since a 1-hour window can't elapse mid-test. */
+        memset(&rec, 0, sizeof(rec));
+        rec.owner_id   = 1;
+        rec.entry_type = VW_ENTRY_FILE;
+        snprintf(rec.name, sizeof(rec.name), "kept.txt");
+        VW_ASSERT_OK(vw_store_file_create(file_store, &rec, &file_id));
+        VW_ASSERT_OK(vw_store_file_soft_delete(file_store, file_id));
+
+        cfg.interval_secs        = 0;
+        cfg.trash_retention_secs = 3600; /* 1 hour */
+        VW_ASSERT_OK(vw_gc_create(&cfg, store, file_store, chunk_store, oplog, NULL, &gc));
+        VW_ASSERT_OK(vw_gc_run_once(gc));
+
+        /* Still recoverable — restore succeeding proves GC didn't hard-delete it. */
+        VW_ASSERT_OK(vw_store_file_restore(file_store, file_id));
+
+        vw_gc_destroy(gc);
+        vw_storage_close(chunk_store);
+        vw_file_store_close(file_store);
+        vw_store_close(store);
+        vw_oplog_close(oplog);
+        rm_rf(tmpdir);
+    }
+
+    VW_TEST_CASE("run_once hard-deletes a soft-deleted file once retention elapses") {
+        char tmpdir[512];
+        vw_oplog_t       *oplog       = NULL;
+        vw_store_t       *store       = NULL;
+        vw_file_store_t  *file_store  = NULL;
+        vw_storage_t     *chunk_store = NULL;
+        vw_gc_ctx_t      *gc          = NULL;
+        vw_gc_cfg_t       cfg;
+        vw_file_record_t  rec;
+        uint64_t          file_id = 0;
+
+        make_tmpdir(tmpdir, sizeof(tmpdir), "trash_purged");
+        VW_ASSERT_OK(vw_oplog_open(tmpdir, &oplog));
+        VW_ASSERT_OK(vw_store_open(tmpdir, oplog, &store));
+        VW_ASSERT_OK(vw_file_store_open(tmpdir, oplog, &file_store));
+        VW_ASSERT_OK(vw_storage_open(tmpdir, &chunk_store));
+
+        memset(&rec, 0, sizeof(rec));
+        rec.owner_id   = 1;
+        rec.entry_type = VW_ENTRY_FILE;
+        snprintf(rec.name, sizeof(rec.name), "purged.txt");
+        VW_ASSERT_OK(vw_store_file_create(file_store, &rec, &file_id));
+        VW_ASSERT_OK(vw_store_file_soft_delete(file_store, file_id));
+
+        /* Let real wall-clock time pass the 1-second retention window. */
+#ifdef _WIN32
+        Sleep(2000);
+#else
+        sleep(2);
+#endif
+
+        cfg.interval_secs        = 0;
+        cfg.trash_retention_secs = 1;
+        VW_ASSERT_OK(vw_gc_create(&cfg, store, file_store, chunk_store, oplog, NULL, &gc));
+        VW_ASSERT_OK(vw_gc_run_once(gc));
+
+        /* Gone for good — restore now fails because hard-delete already ran. */
+        VW_ASSERT_ERR(vw_store_file_restore(file_store, file_id), VW_ERR_NOT_FOUND);
+
+        vw_gc_destroy(gc);
+        vw_storage_close(chunk_store);
+        vw_file_store_close(file_store);
+        vw_store_close(store);
+        vw_oplog_close(oplog);
+        rm_rf(tmpdir);
     }
 }
 

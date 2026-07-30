@@ -355,7 +355,27 @@ typedef struct {
     uint32_t          error_count;
     int              *sync_now_flag;
     int              *shutdown_flag;
+    const vw_daemon_cfg_t *cfg;       /* for LOGIN_REQ: server_host/port/username */
+    vw_client_sess_t     **sess_out;  /* points at vw_daemon_run's own `sess` var —
+                                        * LOGIN_REQ writes the new session here so
+                                        * it survives past this dispatch call      */
 } ipc_dispatch_ctx_t;
+
+/* otp_cb userdata for VW_IPC_LOGIN_REQ: hands a pre-supplied OTP code (if any)
+ * to vw_client_connect() synchronously, since the whole login round-trip
+ * (including 2FA) happens within a single LOGIN_REQ/RESP exchange — the CLI
+ * re-issues LOGIN_REQ with the OTP filled in if the first attempt reports
+ * VW_ERR_AUTH_2FA_REQUIRED. */
+typedef struct { const char *otp; uint16_t otp_len; } login_otp_ctx_t;
+
+static vw_err_t login_otp_cb(void *userdata, char *otp_buf, uint16_t *otp_len) {
+    login_otp_ctx_t *c = (login_otp_ctx_t *)userdata;
+    if (!c->otp || c->otp_len == 0) return VW_ERR_AUTH_2FA_REQUIRED;
+    uint16_t n = c->otp_len > 8u ? 8u : c->otp_len;
+    memcpy(otp_buf, c->otp, n);
+    *otp_len = n;
+    return VW_OK;
+}
 
 static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     /* Set 1-second recv timeout */
@@ -365,7 +385,13 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     vw_ipc_msg_t type;
     uint32_t plen = 0;
     vw_err_t err = vw_ipc_recv(conn, &type, buf, sizeof(buf), &plen);
-    if (err != VW_OK) return; /* client disconnected or timeout */
+    if (err != VW_OK) {
+        vw_log(LOG_DEBUG, "IPC client recv failed (rc=%d) — disconnected or timed out", (int)err);
+        /* buf may hold a partially-received password (LOGIN_REQ) even on
+         * failure — zero it on this early-return path too. */
+        memset(buf, 0, sizeof(buf));
+        return;
+    }
 
     switch (type) {
 
@@ -535,9 +561,61 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         *dc->shutdown_flag = 1;
         break;
 
+    case VW_IPC_LOGIN_REQ: {
+        uint32_t off = 0;
+        const char *pw = NULL; uint16_t pw_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &pw, &pw_len);
+        const char *otp = NULL; uint16_t otp_len = 0;
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &otp, &otp_len);
+        if (err != VW_OK || pw_len == 0) {
+            ipc_send_u32(conn, VW_IPC_LOGIN_RESP,
+                         (uint32_t)(err != VW_OK ? err : VW_ERR_INVALID_ARG));
+            break;
+        }
+        if (!dc->cfg->server_host[0] || !dc->cfg->username[0]) {
+            ipc_send_u32(conn, VW_IPC_LOGIN_RESP, (uint32_t)VW_ERR_INVALID_ARG);
+            break;
+        }
+
+        vw_client_cfg_t cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.host             = dc->cfg->server_host;
+        cc.port             = dc->cfg->server_port;
+        cc.cert_verify      = VW_CERT_VERIFY_REQUIRED;
+        cc.ca_cert_pem_path = dc->cfg->ca_cert_pem_path[0] ? dc->cfg->ca_cert_pem_path : NULL;
+
+        login_otp_ctx_t octx;
+        octx.otp     = (otp_len > 0) ? otp : NULL;
+        octx.otp_len = otp_len;
+
+        vw_client_sess_t *new_sess = NULL;
+        vw_err_t rc = vw_client_connect(&cc, dc->cfg->username,
+                                         (uint16_t)strlen(dc->cfg->username),
+                                         pw, pw_len,
+                                         login_otp_cb, &octx, &new_sess);
+        if (rc == VW_OK) {
+            if (*dc->sess_out) vw_client_close(*dc->sess_out);
+            *dc->sess_out = new_sess;
+            vw_sync_set_session(dc->sync_ctx, new_sess);
+            uint8_t tok[VW_TOKEN_BYTES];
+            vw_client_get_token(new_sess, tok);
+            /* Best-effort persist; a failed save just means the next daemon
+             * restart falls back to offline mode until login is retried. */
+            (void)tok_save(dc->cfg->state_dir, tok);
+            memset(tok, 0, sizeof(tok));
+            vw_log(LOG_INFO, "login succeeded for user '%s'", dc->cfg->username);
+        }
+        ipc_send_u32(conn, VW_IPC_LOGIN_RESP, (uint32_t)rc);
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }
+
+    /* buf may have held a raw password (LOGIN_REQ) — zero it unconditionally,
+     * matching the admin IPC's payload-zeroing convention. */
+    memset(buf, 0, sizeof(buf));
 }
 
 /* ── Connection attempt ──────────────────────────────────────────────────── */
@@ -671,6 +749,8 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     dc.error_count   = 0;
     dc.sync_now_flag = &sync_now;
     dc.shutdown_flag = &shutdown;
+    dc.cfg           = cfg;
+    dc.sess_out      = &sess;
 
     vw_log(LOG_INFO, "daemon ready (ipc_port=%u sync_interval=%ums)",
            (unsigned)cfg->ipc_port, (unsigned)cfg->sync_interval_ms);

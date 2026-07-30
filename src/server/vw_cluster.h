@@ -135,6 +135,25 @@ vw_err_t vw_cluster_node_add(vw_cluster_t *ctx,
                               uint8_t  out_token[32]);
 
 /*
+ * Register THIS node's own self-record (role forced to VW_NODE_ROLE_SELF)
+ * using a node_id and auth_token already issued by the primary's call to
+ * vw_cluster_node_add() for this node. The primary and replica must agree on
+ * both values — the NODE_HELLO handshake authenticates by comparing them —
+ * so this does not generate a new token; it stores the one given.
+ *
+ * This is the second half of node pairing: run vw_cluster_node_add() once on
+ * the primary, then this once on the replica with the node_id/token it
+ * printed.
+ *
+ * Returns VW_ERR_ALREADY_EXISTS if node_id is already registered locally;
+ * VW_ERR_OOM on allocation failure; VW_ERR_IO on disk failure.
+ */
+vw_err_t vw_cluster_node_add_self(vw_cluster_t *ctx,
+                                   uint64_t node_id,
+                                   const uint8_t token[32],
+                                   const char *hostname);
+
+/*
  * Look up a node by node_id and copy the record into *out_rec.
  * Zeroes out_rec->auth_token before returning (security invariant).
  * Returns VW_ERR_NOT_FOUND if node_id does not exist.

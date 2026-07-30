@@ -115,14 +115,15 @@ Lines beginning with `#` are comments. The default location is:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `admin_socket` | path | `/run/vapourwault/admin.sock` | AF_UNIX socket for `vapourwault-server-cli`. Leave empty to disable (Windows only; Windows uses an alternative IPC channel). |
+| `admin_socket` | path | `/run/vapourwault/admin.sock` | AF_UNIX socket for `vapourwault-server-cli`. **POSIX only** — `vapourwault-server-cli` cannot connect to a Windows server at all yet (no admin IPC transport is implemented on Windows). Leave empty on Windows. |
 | `log_level` | string | `INFO` | Logging verbosity: `ERROR`, `WARN`, `INFO`, or `DEBUG`. |
 
 ### Garbage collection
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `gc_interval_secs` | integer | `300` | How often (seconds) to run the GC thread. Set to `0` to disable. GC removes expired sessions, orphaned chunks, and old oplog segments. |
+| `gc_interval_secs` | integer | `1800` | How often (seconds) to run the GC thread. Set to `0` to disable. GC removes expired sessions, orphaned chunks, old oplog segments, and files whose trash retention window (below) has elapsed. |
+| `trash_retention_days` | integer | `7` | How long a deleted file stays recoverable (`restore-file`) before GC purges it for good. Set to `0` to purge immediately (no recycle-bin grace period). A trashed file still counts against its owner's quota until purged. |
 
 ### ACME (automatic TLS via Let's Encrypt)
 
@@ -133,7 +134,7 @@ Lines beginning with `#` are comments. The default location is:
 | `acme_contact` | string | _(empty)_ | Contact email for expiry notifications (`mailto:` prefix required). |
 | `acme_domain` | string | _(empty)_ | Domain name for the certificate. Must match what clients connect to. |
 | `acme_account_key` | path | `/etc/vapourwault/acme-account.key` | ACME account private key. Created automatically on first run. |
-| `acme_dns_hook` | path | _(empty)_ | Script called to add/remove DNS TXT records for DNS-01 challenges. Called as: `hook add|remove <domain> <token>`. |
+| `acme_dns_hook` | path | _(empty)_ | Script called to add/remove DNS TXT records for DNS-01 challenges. Called as: `hook set <domain> <token>` to create the record, `hook clear <domain>` (no token argument) to remove it. |
 | `acme_http_root` | path | _(empty)_ | Directory served at `http://<domain>/.well-known/acme-challenge/` for HTTP-01 challenges. |
 | `acme_renew_days` | integer | `30` | Renew the certificate this many days before expiry. |
 
@@ -183,7 +184,7 @@ Choose a challenge method:
 acme_dns_hook = /usr/local/bin/my-dns-hook.sh
 ```
 
-The hook script must accept `add <domain> <token>` and `remove <domain> <token>` arguments and update your DNS provider's `_acme-challenge` TXT record accordingly.
+The hook script must accept `set <domain> <token>` (create the `_acme-challenge` TXT record) and `clear <domain>` (remove it — no token argument) and update your DNS provider accordingly.
 
 **HTTP-01** (requires port 80 to be publicly reachable):
 
@@ -259,46 +260,71 @@ vapourwault-server-cli --admin-socket /run/vapourwault/admin.sock user-list
 
 ## 6. Cluster setup
 
+Cluster mode is **on by default** (`cluster_port` defaults to `9010`) — set
+`cluster_port = 0` explicitly in `server.conf` if you don't intend to use it,
+to avoid leaving an unused TLS listener open.
+
 ### Primary node
 
-Enable clustering in `server.conf` on the primary:
+`server.conf` on the primary (this is the default — no change needed unless
+you'd previously disabled it):
 
 ```ini
-cluster_port      = 9010
+cluster_port       = 9010
 cluster_is_replica = 0
 ```
 
-Register each replica node:
+Register the replica (run once per replica, on the primary):
 
 ```bash
 vapourwault-server-cli \
     --admin-socket /run/vapourwault/admin.sock \
-    cluster node-add replica1.example.com 9010
+    cluster node-add replica1.example.com
 ```
 
-The command outputs a pre-shared authentication token. Record it — you will need it to configure the replica.
+This prints a `node_id` and a 256-bit authentication token — record both now,
+the token is never shown again. Pairing needs one more step on the replica
+itself (see below): the primary only mints the token, it doesn't push it
+anywhere.
 
 ### Replica node
 
 ```ini
-cluster_port               = 9010
+cluster_port               = 0
 cluster_is_replica         = 1
 cluster_primary_host       = primary.example.com
 cluster_primary_port       = 9010
 cluster_poll_interval_secs = 5
 ```
 
-Place the authentication token issued by the primary in the replica's `data_dir/cluster/nodes.bin` (created automatically when the replica first connects).
+Complete pairing by giving the replica the same `node_id`/token the primary
+printed:
+
+```bash
+echo '<token-from-primary>' | vapourwault-server-cli \
+    --admin-socket /run/vapourwault/admin.sock \
+    cluster register-self <node_id> - replica1.example.com
+```
+
+(`-` reads the token from stdin instead of argv, keeping it out of shell
+history and `ps` output — the token is a bearer credential, treat it like a
+password. You can also pass it directly as the third argument if you accept
+that tradeoff.) This writes the replica's own record to
+`data_dir/cluster/nodes.db`. The replica daemon retries the connection with
+exponential backoff (2s–60s) until this record exists.
 
 ### Verify replication
 
 ```bash
 vapourwault-server-cli \
     --admin-socket /run/vapourwault/admin.sock \
-    cluster-status
+    cluster status
 ```
 
-The output shows each replica's `node_id`, `last_sync_watermark`, and connection state.
+The output shows each node's `NODE_ID`, `ROLE` (`replica` on the primary's own
+list, `self` on a replica's own list), `ACTV`, `HOSTNAME`, and
+`SYNC_WATERMARK` (the last oplog entry_id confirmed applied — 0 until the
+replica has pulled anything).
 
 ---
 
@@ -319,6 +345,22 @@ All three directories must be consistent with each other. A snapshot of the enti
 1. Stop the server.
 2. Replace `data_dir` contents with the backup.
 3. Restart the server. On start-up it will recover any partially-written oplog tail automatically.
+
+### Recovering an accidentally deleted file (trash)
+
+A deleted file stays recoverable for `trash_retention_days` (default 7) before
+GC purges it for good — this is separate from the full-`data_dir` backup above
+and doesn't require restoring anything:
+
+```bash
+# See what's recoverable for a user (file_id, deletion time, name)
+vapourwault-server-cli --admin-socket /run/vapourwault/admin.sock \
+    list-deleted alice
+
+# Restore one by file_id
+vapourwault-server-cli --admin-socket /run/vapourwault/admin.sock \
+    restore-file 42
+```
 
 ---
 
@@ -354,6 +396,9 @@ Common causes:
 
 ### Admin CLI can't connect
 
+On Windows, this is expected — `vapourwault-server-cli` has no admin IPC
+transport there yet and always fails to connect. On Linux:
+
 ```bash
 ls -l /run/vapourwault/admin.sock    # must exist and be owned by vapourwault
 id                                   # must be running as the correct user
@@ -378,5 +423,21 @@ If the server crashed mid-write, it recovers automatically on next start: the op
 - [ ] Firewall: restrict port 4430 to intended client IP ranges; restrict port 9010 to replica node IPs only.
 - [ ] Enable 2FA (email OTP) for all admin accounts: configure `smtp_*` keys and have users enable 2FA in their client settings.
 - [ ] Use ACME or a CA-signed certificate — not a self-signed cert — in production.
-- [ ] Enable GC (`gc_interval_secs = 300`) so expired sessions are cleaned up.
+- [ ] Enable GC (`gc_interval_secs = 1800`, the default) so expired sessions are cleaned up.
 - [ ] On Linux: verify the systemd sandbox is active (`systemctl status vapourwaultd` should show `ProtectSystem=strict`).
+- [ ] **Client daemon hosts**: `vapourwault-daemon`'s IPC port (loopback TCP,
+      default 47832) binds to `127.0.0.1` only. **On Linux**, connections are
+      also verified against `/proc/net/tcp` to confirm the connecting
+      process shares the daemon's UID (TASK-093) — a different local user's
+      connection is rejected. **On Windows and macOS**, no such check exists
+      yet (tracked as a gap on Windows; macOS support is deferred
+      project-wide) — the daemon trusts loopback binding alone there. On a
+      single-user machine this is no different from any other local IPC
+      channel regardless of platform. **Do not run the client daemon on a
+      shared multi-user Windows or macOS host**: any local user could issue
+      `vapourwault-cli login <guess>` against the configured account,
+      effectively a local password-guessing oracle, or otherwise control the
+      daemon (pause sync, add/remove folders, etc.) without their own
+      credentials. Shared multi-user Linux hosts are no longer subject to
+      this specific risk, but running a personal sync daemon on a shared
+      host is still not a configuration this project targets or tests.

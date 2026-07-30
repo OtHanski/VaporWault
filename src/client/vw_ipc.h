@@ -7,8 +7,21 @@
  * Provides a localhost-only TCP channel between the daemon and its clients
  * (CLI, GUI). Uses the same 8-byte message framing as the server wire protocol
  * (vw_proto) but with message-type constants in the 0x8000–0x8FFF range and
- * plain TCP (no TLS). The channel is loopback-only; on Linux an SO_PEERCRED
- * UID check is performed on accept.
+ * plain TCP (no TLS). The channel is loopback-only (127.0.0.1).
+ *
+ * Peer-UID verification on accept (TASK-093): SO_PEERCRED (the mechanism an
+ * earlier version of this file tried to use on Linux) is an AF_UNIX-only
+ * facility and produces undefined, kernel-dependent results on an AF_INET
+ * socket like this one (confirmed empirically: at least one real Linux
+ * kernel returns success with a garbage uid instead of failing, which
+ * silently rejected every connection). On Linux, this is now replaced with
+ * a real check via /proc/net/tcp (see vw_ipc_linux_proc_net_tcp_uid() in
+ * vw_ipc.c), which exposes the owning uid of every TCP socket on the system
+ * without needing SO_PEERCRED. On Windows and macOS, no peer-UID check is
+ * performed yet — loopback binding (127.0.0.1) is the sole trust boundary
+ * there; Windows has a tracked TODO to use GetExtendedTcpTable (see
+ * vw_ipc_server_accept()'s doc comment below), macOS support is deferred
+ * project-wide so it isn't tracked further.
  *
  * vw_ipc_conn_t is a thin raw-socket wrapper distinct from vw_conn_t (which
  * is TLS-only). Use vw_ipc_send/vw_ipc_recv for framing; do not call
@@ -50,6 +63,8 @@ typedef enum {
     VW_IPC_FILE_LIST_RESP     = 0x8010, /* D→C: count + array of file entries     */
     VW_IPC_SHUTDOWN_REQ       = 0x8011, /* C→D: ask daemon to shut down           */
     VW_IPC_SHUTDOWN_RESP      = 0x8012, /* D→C: acknowledged                      */
+    VW_IPC_LOGIN_REQ          = 0x8013, /* C→D: authenticate with password (+OTP) */
+    VW_IPC_LOGIN_RESP         = 0x8014, /* D→C: error_code                        */
 } vw_ipc_msg_t;
 
 /*
@@ -90,6 +105,24 @@ typedef enum {
  * VW_IPC_FOLDER_ADD_RESP / VW_IPC_FOLDER_REMOVE_RESP / VW_IPC_SYNC_NOW_RESP /
  * VW_IPC_PAUSE_RESP / VW_IPC_RESUME_RESP / VW_IPC_SHUTDOWN_RESP:
  *   u32 error_code       vw_err_t; 0 = VW_OK
+ *
+ * VW_IPC_LOGIN_REQ:
+ *   string password      RAW password — the daemon derives SHA-256(password)
+ *                        itself via vw_client_connect(), same rationale as
+ *                        the server admin IPC's USER_CREATE_REQ: this socket
+ *                        is loopback-only (127.0.0.1), so sending the raw
+ *                        password here is not a new exposure — see this
+ *                        file's header comment for why no peer-UID check is
+ *                        performed. The username comes from the daemon's own
+ *                        already-configured daemon.conf, not from this
+ *                        payload.
+ *   string otp           TOTP/OTP code, if the caller already has one; empty
+ *                        if not (first attempt on a 2FA-enabled account).
+ * VW_IPC_LOGIN_RESP:
+ *   u32 error_code       vw_err_t; 0 = VW_OK. VW_ERR_AUTH_2FA_REQUIRED means
+ *                        retry with `otp` set (server requires 2FA and none
+ *                        was supplied). On success the daemon persists the
+ *                        new session token to state_dir/session.tok.
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */
@@ -142,10 +175,15 @@ void vw_ipc_server_close(vw_ipc_server_t *srv);
 /*
  * Accept one client connection (blocking).
  *
- * On Linux: SO_PEERCRED UID check — refuses connections from other users with
- *           VW_ERR_AUTH_REQUIRED.
- * On Windows: UID check is skipped (TODO Phase 6: use GetExtendedTcpTable).
- * On macOS: UID check is skipped (loopback binding limits exposure).
+ * On Linux, verifies the connecting process's uid via /proc/net/tcp
+ * (TASK-093) and returns VW_ERR_AUTH_REQUIRED if it doesn't match ours (or
+ * falls back to trusting loopback binding alone if /proc/net/tcp can't be
+ * read in this environment — see vw_ipc.c for the full reasoning). On
+ * Windows and macOS, no peer-UID check is performed yet — loopback binding
+ * (127.0.0.1) is the trust boundary there; Windows has a tracked TODO to use
+ * GetExtendedTcpTable for a real check. See this header's top comment for
+ * why SO_PEERCRED (used incorrectly here in an earlier version) doesn't
+ * work for an AF_INET socket.
  */
 vw_err_t vw_ipc_server_accept(vw_ipc_server_t *srv, vw_ipc_conn_t **out_conn);
 

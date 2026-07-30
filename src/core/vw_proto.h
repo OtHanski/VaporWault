@@ -197,6 +197,28 @@ typedef enum {
     VW_PERM_OWNER = 3,
 } vw_perm_t;
 
+/* ── Admin capability bits (TASK-092) ───────────────────────────────────────
+ *
+ * Fine-grained admin roles, layered underneath vw_user_record_t.is_admin —
+ * a record with is_admin == 0 has none of these regardless of admin_caps.
+ *
+ * admin_caps == 0 on an is_admin == 1 record means "full/legacy admin"
+ * (equivalent to VW_CAP_ALL), not "no capabilities": this field reuses bytes
+ * that were always-zero reserved padding before this feature existed, so
+ * every admin account created before TASK-092 shipped reads back
+ * admin_caps == 0 and must keep exactly the access it always had. To
+ * delegate a narrower role, set an explicit nonzero subset. There is
+ * deliberately no way to express "admin with zero capabilities" — that is a
+ * meaningless state; unset is_admin instead. */
+typedef enum {
+    VW_CAP_USER_MGMT    = 1u << 0,  /* create/suspend/list users, invites */
+    VW_CAP_QUOTA_MGMT   = 1u << 1,  /* set user storage quotas */
+    VW_CAP_AUDIT_READ   = 1u << 2,  /* read the oplog/audit log */
+    VW_CAP_CLUSTER_MGMT = 1u << 3,  /* view/manage cluster replication status */
+    VW_CAP_CERT_RELOAD  = 1u << 4,  /* reload the TLS certificate */
+    VW_CAP_ALL          = 0x1Fu,    /* all bits above */
+} vw_admin_cap_t;
+
 /* ── 2FA challenge types ─────────────────────────────────────────────────── */
 
 typedef enum {

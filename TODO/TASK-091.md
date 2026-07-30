@@ -1,0 +1,99 @@
+---
+id:          TASK-091
+title:       Replace list-connections stub with real live-connection tracking
+status:      done
+assignee:    SRV.01
+created_by:  ARCH.00
+created:     2026-07-24
+priority:    normal
+depends_on:  []
+blocks:      []
+review_by:   [CQR.08]
+tags:        [server, admin, observability]
+---
+
+`vapourwault-server-cli list-connections` always reports `0 active
+connection(s)` regardless of real traffic. Confirmed in
+`src/server/vw_admin.c`'s `handle_conn_list`: "Phase 5: active connections
+are not tracked centrally. Return empty list." This is a real gap for
+server admins — no visibility into who's currently connected, from where,
+or for how long, which is a basic expectation for any multi-user server
+admin tool.
+
+## Acceptance criteria
+
+- The main server accept/connection-handling path (`vw_server_core.c`/
+  `vw_server_main.c`'s accept loop) registers each active connection in a
+  shared, thread-safe structure (user_id if authenticated, peer address,
+  connected-since timestamp) and deregisters it on close.
+- `CONN_LIST_RESP`'s wire format (`vw_admin.h`) is extended to carry this
+  per-connection detail instead of just a count — bump the admin protocol
+  version if the format changes incompatibly, per existing `ADMIN_PROTO_VER`
+  handling.
+- `vapourwault-server-cli list-connections` prints a real per-connection
+  table (user, peer address, connected-since) instead of just a count.
+- No measurable performance regression on the connection accept/close hot
+  path (this data structure is touched on every connection).
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-07-24]: Filed after a feature-gap discussion; assigned to
+SRV.01 (connection handling + admin IPC are both their domain). Not tagged
+`security-sensitive` — this only surfaces existing connection metadata
+locally over the already-trusted admin socket, no new attack surface.
+Normal priority.
+
+SRV.01 [2026-07-29]: Implemented as scoped.
+- New module `src/server/vw_conn_registry.h`/`.c`: a small thread-safe
+  registry (rwlock-protected dynamic array, same rwlock macro pattern
+  already used in `vw_cluster.c`) mapping `conn_id -> {user_id, peer_addr,
+  connected_since}`. `conn_id` is monotonically increasing and never reused,
+  so a stale id from an already-closed connection can never collide with a
+  new one.
+- `vw_server_ctx_t` gained `set_conn_registry`/`conn_registry` accessors
+  (`vw_server_core.h`/`.c`), mirroring the existing `cluster`/`oplog`
+  attachment pattern exactly.
+- `vw_server_main.c`: opens the registry once at startup, attaches it to
+  `sctx` and to the admin ctx (`actx.conn_registry`); `handle_connection`
+  registers on entry (peer address via the already-used `vw_net_peer_addr`),
+  updates `user_id` once `vw_server_conn_handle` succeeds, and deregisters
+  on every exit path (restructured to a single `done:` label so this can't
+  be missed on any of the function's three exit points). Closed at shutdown
+  *after* `vw_admin_server_stop` (same use-after-free reasoning `TASK-085`
+  already established for `cluster` — the admin thread holds a reference
+  and must be fully joined first).
+- `vw_admin.h`/`vw_admin.c`: `CONN_LIST_RESP` now carries real per-connection
+  detail (conn_id, user_id, connected_since, peer_addr) instead of a bare
+  count; `handle_conn_list` reads from the registry (empty list if
+  unavailable, e.g. registry allocation failed at startup).
+- `vw_server_cli.c`: `list-connections` now prints a real table
+  (CONN_ID/USER_ID/CONNECTED_SINCE/PEER_ADDR), `USER_ID` shown as `-` before
+  authentication completes.
+- Did **not** bump `ADMIN_PROTO_VER` for this wire format change, consistent
+  with `TASK-085`'s precedent (which added three new message types without
+  bumping it either) — the admin CLI and server are always the same version
+  in practice (shipped from the same repo/release, no independent deployment
+  lifecycle), and no version-compatibility check exists on either side to
+  make a bump meaningful. Flagging for CQR.08 to confirm this reasoning
+  holds rather than deciding unilaterally.
+
+Validated end-to-end (WSL Ubuntu 24.04, real server + real client, not
+mocked): `list-connections` correctly shows 0 before any client connects;
+after a real client logs in (persistent TLS session), shows 1 entry with
+the correct user_id, a real timestamp, and peer address `127.0.0.1`. Full
+unit (9/9) + integration (2/2) suite passes.
+
+CQR.08 [2026-07-29]: Reviewed the diff (thread safety, the `handle_connection`
+`goto done` restructure, shutdown ordering, wire format on both sides, the
+`ADMIN_PROTO_VER` question, style consistency). No blocking findings; clean
+sign-off. Confirmed `ADMIN_PROTO_VER` is genuinely dead/unchecked on both
+sides today (server writes it, client never reads the byte back) — SRV.01's
+reasoning for not bumping it holds. Noted as a minor advisory (worth wiring
+up a real version check or documenting it as informational-only next time
+the admin wire format changes) but not blocking. Also noted the registry's
+O(n) linear scan for add/remove is fine at expected connection counts but
+worth revisiting if `max_connections` is ever raised substantially.
+
+ARCH.00 [2026-07-29]: No blocking findings. Closing — status: done.

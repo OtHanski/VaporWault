@@ -152,3 +152,26 @@ if(UNIX)
 endif()
 
 add_test(NAME unit_vw_gc COMMAND test_vw_gc)
+
+# ── vw_ipc (TASK-093: peer-UID verification) ─────────────────────────────
+#
+# vw_ipc.c lives in src/client and is not part of vw_core. Compile it
+# directly into the test binary (same pattern as test_vw_oplog/test_vw_smtp).
+add_executable(test_vw_ipc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_ipc.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_ipc.c
+)
+target_include_directories(test_vw_ipc PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_vw_ipc PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_ipc PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_vw_ipc PRIVATE ws2_32)
+endif()
+add_test(NAME unit_vw_ipc COMMAND test_vw_ipc)

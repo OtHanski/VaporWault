@@ -17,6 +17,7 @@ add_library(vw_server_lib STATIC
     vw_invite.c
     vw_recovery.c
     vw_cluster.c
+    vw_conn_registry.c
 )
 
 target_include_directories(vw_server_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -2,8 +2,10 @@
 #  define _GNU_SOURCE
 #endif
 #include "vw_ipc.h"
+#include "vw_ipc_internal.h"
 #include "../core/vw_proto.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,13 +22,69 @@ static int sock_close(SOCKET s) { return closesocket(s); }
 #  include <arpa/inet.h>
 #  include <unistd.h>
 #  include <errno.h>
-#  ifdef __linux__
-#    include <sys/un.h>   /* struct ucred */
-#  endif
 typedef int             sock_fd_t;
 #  define SOCK_INVALID  (-1)
 static int sock_close(int s) { return close(s); }
 #endif
+
+/* ── Linux peer-UID verification (TASK-093) ─────────────────────────────────
+ *
+ * This channel is AF_INET/TCP (unlike the admin.sock AF_UNIX channel in
+ * vw_admin.c), so SO_PEERCRED does not apply — see this file's header
+ * comment and vw_ipc.h for why an earlier version's use of it silently
+ * rejected every connection on at least one real kernel. /proc/net/tcp
+ * exposes the owning uid of every TCP socket on the system (loopback
+ * connections included) without needing SO_PEERCRED at all: each line is
+ * one socket, keyed by its local/remote address:port pair and state. */
+
+#ifdef __linux__
+#define VW_TCP_ESTABLISHED 1u
+
+/* See vw_ipc_internal.h for this function's full contract. */
+int vw_ipc_linux_proc_net_tcp_uid(FILE *f, uint16_t local_port, uint16_t peer_port,
+                                   unsigned long *out_uid)
+{
+    char line[512];
+    uint32_t loopback_be;
+
+    if (!f || !out_uid) return 1;
+
+    /* /proc/net/tcp prints each address as the raw in-memory bytes of the
+     * kernel's network-byte-order __be32, reinterpreted as an unsigned int
+     * in the host's own endianness — so the printed hex value is endian-
+     * dependent and must be computed the same way here, not hardcoded as
+     * "0100007F" (only true on little-endian hosts). */
+    {
+        struct in_addr ia;
+        ia.s_addr = htonl(INADDR_LOOPBACK);
+        memcpy(&loopback_be, &ia, sizeof(loopback_be));
+    }
+
+    /* Header line ("sl  local_address rem_address ..."); discard. */
+    if (!fgets(line, sizeof(line), f)) return 1;
+
+    while (fgets(line, sizeof(line), f)) {
+        unsigned local_addr, lport, rem_addr, rport, state;
+        unsigned long uid;
+
+        /* "  N: LLLLLLLL:PPPP RRRRRRRR:PPPP SS tx:rx tr:tm retrnsmt uid ..." */
+        int n = sscanf(line, " %*x: %x:%x %x:%x %x %*x:%*x %*x:%*x %*x %lu",
+                       &local_addr, &lport, &rem_addr, &rport, &state, &uid);
+        if (n != 6) continue;
+        if (state != VW_TCP_ESTABLISHED) continue;
+        if (lport != (unsigned)local_port || rport != (unsigned)peer_port) continue;
+        /* This channel is loopback-only by construction (vw_ipc_server_open
+         * binds INADDR_LOOPBACK) — reject any match against a non-loopback
+         * address rather than silently trusting a coincidental port match
+         * on a different interface. */
+        if (local_addr != loopback_be || rem_addr != loopback_be) continue;
+
+        *out_uid = uid;
+        return 0;
+    }
+    return 1;
+}
+#endif /* __linux__ */
 
 /* ── Internal structs ────────────────────────────────────────────────────── */
 
@@ -230,21 +288,61 @@ vw_err_t vw_ipc_server_accept(vw_ipc_server_t *srv, vw_ipc_conn_t **out_conn) {
                             (struct sockaddr *)&client_addr, &addr_len);
     if (cfd == SOCK_INVALID) return VW_ERR_NET_CLOSED;
 
-#if defined(__linux__)
-    /* UID check: refuse connections from processes owned by other users. */
-    struct ucred cred;
-    socklen_t cred_len = sizeof(cred);
-    if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0) {
-        if (cred.uid != getuid()) {
+#if defined(_WIN32)
+    /* TODO Phase 6: use GetExtendedTcpTable to verify connecting process UID.
+     * Risk is low for Phase 3; loopback binding limits exposure to localhost. */
+#endif
+#ifdef __linux__
+    /* TASK-093: real peer-UID verification via /proc/net/tcp. SO_PEERCRED
+     * doesn't apply to this AF_INET/TCP channel (see this file's header
+     * comment) — /proc/net/tcp instead exposes the owning uid of every TCP
+     * socket, keyed by local/remote port pair, without it.
+     *
+     * SUBTLE: a single loopback TCP connection has *two* rows in
+     * /proc/net/tcp, one per socket — and the two sockets can be (and here,
+     * always are) owned by different processes/uids. The row for *our own*
+     * just-accepted socket (local=our port, remote=client's port) is always
+     * owned by us, the daemon — accept() creates that socket in our own
+     * process regardless of who connected. The row that actually tells us
+     * who connected is the *client's* socket: local=client's port,
+     * remote=our port — i.e. the address pair swapped. Searching with the
+     * un-swapped pair is a tautology that always finds our own uid and
+     * verifies nothing; the swap below is the actual check.
+     *
+     * If /proc/net/tcp can't be read at all (e.g. some restricted container
+     * profiles), fall back to trusting loopback binding alone rather than
+     * rejecting every connection outright — regressing to that would be
+     * exactly the bug this task was filed to fix. But if it *can* be read
+     * and either no matching ESTABLISHED entry is found or the owning uid
+     * doesn't match ours, reject: retrying accept() is cheap for a local
+     * daemon, so failing closed on a genuine anomaly (or the very small
+     * TOCTOU window between accept() and this read) costs nothing. */
+    {
+        struct sockaddr_in local_addr;
+        socklen_t local_len = sizeof(local_addr);
+        int verified = 1;
+
+        if (getsockname(cfd, (struct sockaddr *)&local_addr, &local_len) == 0) {
+            uint16_t our_port   = ntohs(local_addr.sin_port);
+            uint16_t peer_port  = ntohs(client_addr.sin_port);
+            FILE *f = fopen("/proc/net/tcp", "r");
+            if (f) {
+                unsigned long uid = 0;
+                /* Swapped on purpose — see the comment above. */
+                int rc = vw_ipc_linux_proc_net_tcp_uid(f, peer_port, our_port, &uid);
+                fclose(f);
+                verified = (rc == 0 && (uid_t)uid == getuid());
+            }
+        }
+
+        if (!verified) {
             sock_close(cfd);
             return VW_ERR_AUTH_REQUIRED;
         }
     }
-#elif defined(_WIN32)
-    /* TODO Phase 6: use GetExtendedTcpTable to verify connecting process UID.
-     * Risk is low for Phase 3; loopback binding limits exposure to localhost. */
 #endif
-    /* macOS: SO_PEERCRED not available; UID check deferred (loopback only). */
+    /* macOS: no peer-UID check here (see vw_ipc.h header comment). macOS
+     * support is deferred project-wide, so this is not tracked further. */
 
     vw_ipc_conn_t *conn = malloc(sizeof(*conn));
     if (!conn) { sock_close(cfd); return VW_ERR_OOM; }

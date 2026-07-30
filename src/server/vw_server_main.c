@@ -30,6 +30,7 @@
 #include "vw_oplog.h"
 #include "vw_smtp.h"
 #include "vw_cluster.h"
+#include "vw_conn_registry.h"
 #include "../core/vw_net.h"
 #include "../core/vw_proto.h"
 #include "../core/vw_fs.h"
@@ -246,6 +247,7 @@ static void cfg_defaults(vw_server_main_cfg_t *c) {
             sizeof(c->acme.account_key) - 1);
     c->acme.renew_days  = VW_ACME_DEFAULT_RENEW_DAYS;
     c->gc.interval_secs             = VW_GC_DEFAULT_INTERVAL_SECS;
+    c->gc.trash_retention_secs      = VW_GC_DEFAULT_TRASH_RETENTION_SECS;
     c->cluster.cluster_port         = 9010;
     c->cluster.is_replica           = 0;
     c->cluster.replica_poll_interval_secs = 5;
@@ -314,6 +316,9 @@ vw_err_t vw_server_main_cfg_load(const char *path, vw_server_main_cfg_t *out) {
             out->acme.renew_days = (uint32_t)strtoul(val, NULL, 10); continue; }
         if (!strcmp(key, "gc_interval_secs")) {
             out->gc.interval_secs = (uint32_t)strtoul(val, NULL, 10); continue; }
+        if (!strcmp(key, "trash_retention_days")) {
+            out->gc.trash_retention_secs =
+                (uint32_t)strtoul(val, NULL, 10) * 24u * 3600u; continue; }
         U(out->cluster.cluster_port,    "cluster_port")
         if (!strcmp(key, "cluster_is_replica")) {
             out->cluster.is_replica = (uint8_t)strtoul(val, NULL, 10); continue; }
@@ -368,7 +373,10 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         "smtp_verify_cert  = 1\n"
         "smtp_ca_cert_path = \n\n"
         "# GC: set gc_interval_secs = 0 to disable the garbage-collection thread\n"
-        "gc_interval_secs  = %u\n\n"
+        "gc_interval_secs  = %u\n"
+        "# How long a deleted file stays recoverable before GC purges it for good.\n"
+        "# Set to 0 to purge immediately (no trash/recycle-bin grace period).\n"
+        "trash_retention_days = %u\n\n"
         "# Cluster: set cluster_port = 0 to disable cluster replication\n"
         "cluster_port              = %u\n"
         "cluster_is_replica        = 0\n"
@@ -383,6 +391,7 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         (unsigned)cfg->acme.renew_days,
         cfg->smtp.port,
         (unsigned)cfg->gc.interval_secs,
+        (unsigned)(cfg->gc.trash_retention_secs / (24u * 3600u)),
         (unsigned)cfg->cluster.cluster_port,
         (unsigned)cfg->cluster.replica_poll_interval_secs);
     fclose(f);
@@ -511,30 +520,45 @@ static void pool_shutdown_and_join(pthread_t *threads, uint32_t n) {
 /* ── Connection handler ──────────────────────────────────────────────────── */
 
 static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn) {
+    vw_conn_registry_t *reg = vw_server_ctx_conn_registry(sctx);
+    uint64_t conn_id = 0;
+    if (reg) {
+        char peer[64] = "";
+        vw_net_peer_addr(conn, peer, sizeof(peer));
+        (void)vw_conn_registry_add(reg, peer, &conn_id);
+    }
+
     /* Slow-loris guard: 30 s timeout during the auth phase. */
     vw_net_conn_set_recv_timeout(conn, 30000);
 
     vw_session_info_t info;
-    if (vw_server_conn_handle(sctx, conn, &info) != VW_OK) return;
+    if (vw_server_conn_handle(sctx, conn, &info) != VW_OK) goto done;
+
+    if (reg && conn_id) vw_conn_registry_set_user(reg, conn_id, info.user_id);
 
     /* Authenticated — extend timeout for file-transfer operations. */
     vw_net_conn_set_recv_timeout(conn, 120000);
 
-    uint8_t *buf = malloc(VW_MAX_MSG_BYTES);
-    if (!buf) return;
+    {
+        uint8_t *buf = malloc(VW_MAX_MSG_BYTES);
+        if (!buf) goto done;
 
-    for (;;) {
-        vw_msg_type_t type; uint32_t plen;
-        vw_err_t err = vw_proto_recv(conn, &type, buf, VW_MAX_MSG_BYTES, &plen);
-        if (err == VW_ERR_NET_CLOSED) break;
-        if (err != VW_OK) { vw_log(LOG_DEBUG, "recv error %d", (int)err); break; }
+        for (;;) {
+            vw_msg_type_t type; uint32_t plen;
+            vw_err_t err = vw_proto_recv(conn, &type, buf, VW_MAX_MSG_BYTES, &plen);
+            if (err == VW_ERR_NET_CLOSED) break;
+            if (err != VW_OK) { vw_log(LOG_DEBUG, "recv error %d", (int)err); break; }
 
-        err = vw_server_dispatch_file_op(sctx, conn, type, buf, plen);
-        if (err == VW_ERR_AUTH_REQUIRED || err == VW_ERR_PROTO_INVALID) break;
-        if (err == VW_ERR_NOT_IMPL)
-            vw_log(LOG_WARN, "unhandled msg type 0x%04x", (unsigned)type);
+            err = vw_server_dispatch_file_op(sctx, conn, type, buf, plen);
+            if (err == VW_ERR_AUTH_REQUIRED || err == VW_ERR_PROTO_INVALID) break;
+            if (err == VW_ERR_NOT_IMPL)
+                vw_log(LOG_WARN, "unhandled msg type 0x%04x", (unsigned)type);
+        }
+        free(buf);
     }
-    free(buf);
+
+done:
+    if (reg && conn_id) vw_conn_registry_remove(reg, conn_id);
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
@@ -603,6 +627,7 @@ int vw_server_main_run(int argc, char *argv[]) {
     vw_acme_ctx_t     *acme_ctx     = NULL;
     vw_gc_ctx_t       *gc_ctx       = NULL;
     vw_cluster_t      *cluster      = NULL;
+    vw_conn_registry_t *conn_registry = NULL;
     int                rc           = 1;
 
     if (vw_oplog_open(cfg.data_dir, &oplog) != VW_OK) {
@@ -632,6 +657,12 @@ int vw_server_main_run(int argc, char *argv[]) {
     vw_server_ctx_set_oplog(sctx, oplog);
     vw_storage_set_store(chunks, store);
 
+    if (vw_conn_registry_open(&conn_registry) != VW_OK) {
+        vw_log(LOG_WARN, "connection registry allocation failed — list-connections will be empty");
+    } else {
+        vw_server_ctx_set_conn_registry(sctx, conn_registry);
+    }
+
     if (vw_invite_store_open(cfg.data_dir, &invite_store) != VW_OK) {
         vw_log(LOG_WARN, "invite store open failed — invites disabled");
     } else {
@@ -660,10 +691,32 @@ int vw_server_main_run(int argc, char *argv[]) {
     }
     g_net_ctx = net_ctx;
 
+    /* Open and start cluster module before GC so the GC can use the cluster
+     * sync watermark when deciding how far to truncate the oplog, and before
+     * the admin server so its ctx can hand out a NODE_ADD/CLUSTER_STATUS
+     * reference to it. */
+    if (cfg.cluster.cluster_port != 0 || cfg.cluster.is_replica) {
+        if (vw_cluster_open(cfg.data_dir, &cfg.cluster,
+                            cfg.cert_pem_path, cfg.key_pem_path, oplog,
+                            &cluster) != VW_OK) {
+            vw_log(LOG_WARN, "vw_cluster_open failed — running without cluster replication");
+        } else if (vw_cluster_start(cluster) != VW_OK) {
+            vw_log(LOG_WARN, "cluster accept thread failed to start — running without cluster replication");
+            vw_cluster_close(cluster);
+            cluster = NULL;
+        } else {
+            vw_log(LOG_INFO, "cluster listener started on port %u",
+                   (unsigned)cfg.cluster.cluster_port);
+        }
+    }
+
     {
         vw_admin_ctx_t actx;
-        actx.store = store;
-        actx.oplog = oplog;
+        actx.store         = store;
+        actx.oplog         = oplog;
+        actx.cluster       = cluster;
+        actx.conn_registry = conn_registry;
+        actx.file_store    = file_store;
         if (vw_admin_server_start(cfg.admin_socket, &actx, &admin_srv) != VW_OK)
             vw_log(LOG_WARN, "admin IPC server failed to bind on '%s' — continuing without it",
                    cfg.admin_socket);
@@ -683,23 +736,6 @@ int vw_server_main_run(int argc, char *argv[]) {
         } else {
             vw_log(LOG_INFO, "ACME renewal enabled for %s (renew at <%u days)",
                    cfg.acme.domain, (unsigned)cfg.acme.renew_days);
-        }
-    }
-
-    /* Open and start cluster module before GC so the GC can use the cluster
-     * sync watermark when deciding how far to truncate the oplog. */
-    if (cfg.cluster.cluster_port != 0 || cfg.cluster.is_replica) {
-        if (vw_cluster_open(cfg.data_dir, &cfg.cluster,
-                            cfg.cert_pem_path, cfg.key_pem_path, oplog,
-                            &cluster) != VW_OK) {
-            vw_log(LOG_WARN, "vw_cluster_open failed — running without cluster replication");
-        } else if (vw_cluster_start(cluster) != VW_OK) {
-            vw_log(LOG_WARN, "cluster accept thread failed to start — running without cluster replication");
-            vw_cluster_close(cluster);
-            cluster = NULL;
-        } else {
-            vw_log(LOG_INFO, "cluster listener started on port %u",
-                   (unsigned)cfg.cluster.cluster_port);
         }
     }
 
@@ -811,12 +847,17 @@ int vw_server_main_run(int argc, char *argv[]) {
 shutdown:
     /* pid_file_remove is a no-op if the PID file was never created. */
     pid_file_remove();
+    /* Stop the admin server (blocks until its thread exits) before closing
+     * cluster — the admin ctx holds a `cluster` pointer, and an in-flight
+     * NODE_ADD/CLUSTER_STATUS/NODE_REGISTER_SELF request on that thread must
+     * not be able to dereference it after vw_cluster_close() frees it. */
+    if (admin_srv) vw_admin_server_stop(admin_srv);
     vw_cluster_close(cluster);
+    vw_conn_registry_close(conn_registry);
     vw_gc_stop(gc_ctx);
     vw_gc_destroy(gc_ctx);
     vw_acme_stop(acme_ctx);
     vw_acme_ctx_destroy(acme_ctx);
-    if (admin_srv) vw_admin_server_stop(admin_srv);
     g_net_ctx = NULL;
     if (net_ctx)    vw_net_ctx_close(net_ctx);
     if (sctx)       vw_server_ctx_close(sctx);

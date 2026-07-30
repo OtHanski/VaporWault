@@ -46,11 +46,35 @@ typedef struct {
     uint8_t  is_admin;
     uint8_t  is_active;
     uint8_t  otp_enabled;
-    uint8_t  _pad[5];           /* reserved; must be zero on write             */
+    uint8_t  _pad1;             /* reserved; must be zero on write             */
+    uint32_t admin_caps;        /* vw_admin_cap_t bitmask (TASK-092); only
+                                  * meaningful when is_admin == 1. Was
+                                  * _pad[5] — offset 252 is still 4-byte
+                                  * aligned after splitting off _pad1, so this
+                                  * is layout-compatible with any record
+                                  * already on disk (reads back as 0, which
+                                  * vw_admin_has_cap() below treats as "full
+                                  * capabilities" for backward compatibility —
+                                  * see vw_admin_cap_t's comment in vw_proto.h). */
 } vw_user_record_t;
 
 _Static_assert(sizeof(vw_user_record_t) == 256,
                "vw_user_record_t must be exactly 256 bytes");
+
+/*
+ * Returns non-zero if this user record has the given admin capability.
+ * Always false if is_admin == 0. admin_caps == 0 on an admin record is
+ * treated as VW_CAP_ALL (see the field comment above and vw_admin_cap_t in
+ * vw_proto.h) — callers must use this helper rather than testing
+ * `rec->admin_caps & cap` directly, or they will incorrectly deny every
+ * pre-TASK-092 admin account every capability.
+ */
+static inline int vw_admin_has_cap(const vw_user_record_t *rec, vw_admin_cap_t cap)
+{
+    if (!rec || !rec->is_admin) return 0;
+    uint32_t caps = rec->admin_caps ? rec->admin_caps : (uint32_t)VW_CAP_ALL;
+    return (caps & (uint32_t)cap) != 0;
+}
 
 /*
  * On-disk session record. Exactly 128 bytes; _Static_assert enforced.
@@ -91,7 +115,12 @@ typedef struct {
     uint8_t  deleted;             /* 1 = soft-deleted (GC pending)               */
     uint8_t  _pad[6];
     char     name[64];            /* leaf filename, UTF-8, NUL-padded            */
-    uint8_t  _reserved[8];
+    int64_t  deleted_at;          /* Unix timestamp of soft-delete; 0 = unset.
+                                    * Was _reserved[8] — same size, layout-compatible
+                                    * with records written before this field existed
+                                    * (deleted_at reads back as 0 for those; GC treats
+                                    * 0 as "immediately eligible", matching the old
+                                    * no-retention-window behavior for them). */
 } vw_file_record_t;
 
 _Static_assert(sizeof(vw_file_record_t) == 128,
@@ -320,10 +349,22 @@ vw_err_t vw_store_file_update(vw_file_store_t *fs,
                                const vw_file_record_t *new_rec);
 
 /*
- * Soft-delete: sets deleted=1 on the record. GC decrement chunk refs later.
+ * Soft-delete: sets deleted=1 and deleted_at=now on the record. The file
+ * stays recoverable via vw_store_file_restore until the GC trash-retention
+ * window elapses (vw_gc_cfg_t.trash_retention_secs), after which pass 3
+ * hard-deletes it and decrements chunk refs.
  * Returns VW_ERR_NOT_FOUND if absent or already deleted.
  */
 vw_err_t vw_store_file_soft_delete(vw_file_store_t *fs, uint64_t file_id);
+
+/*
+ * Restore a soft-deleted file: clears deleted/deleted_at, making it visible
+ * again via the normal lookup/list functions. Must be called before the GC
+ * retention window elapses and the file is hard-deleted.
+ * Returns VW_ERR_NOT_FOUND if file_id doesn't exist at all; VW_ERR_INVALID_ARG
+ * if it exists but isn't currently deleted.
+ */
+vw_err_t vw_store_file_restore(vw_file_store_t *fs, uint64_t file_id);
 
 /*
  * List all non-deleted records under a directory (shallow, one level).

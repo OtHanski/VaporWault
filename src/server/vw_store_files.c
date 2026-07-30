@@ -476,9 +476,9 @@ vw_err_t vw_store_file_create(vw_file_store_t *fs,
     slot    = fs->file_slots; /* append at end */
 
     w = *rec;
-    w.file_id = file_id;
+    w.file_id     = file_id;
+    w.deleted_at  = 0; /* freshly created — never deleted yet */
     memset(w._pad, 0, sizeof(w._pad));
-    memset(w._reserved, 0, sizeof(w._reserved));
 
     rc = vw_fs_append(fs->meta_path, &w, sizeof(w));
     if (rc != VW_OK) {
@@ -638,7 +638,9 @@ vw_err_t vw_store_file_update(vw_file_store_t *fs,
     vw_file_record_t w = *new_rec;
     w.file_id = file_id; /* preserve canonical ID */
     memset(w._pad, 0, sizeof(w._pad));
-    memset(w._reserved, 0, sizeof(w._reserved));
+    /* deleted_at is NOT zeroed here (unlike _pad) — it's a meaningful field
+     * (see vw_store.h) that callers like vw_store_file_soft_delete /
+     * vw_store_file_restore rely on this function to persist as-is. */
 
     rc = vw_fs_pwrite(fs->meta_path, off, &w, sizeof(w));
     if (rc != VW_OK) {
@@ -669,7 +671,40 @@ vw_err_t vw_store_file_soft_delete(vw_file_store_t *fs, uint64_t file_id)
     vw_err_t rc = vw_store_file_get_by_id(fs, file_id, &rec);
     if (rc != VW_OK) return rc;
 
-    rec.deleted = 1;
+    rec.deleted    = 1;
+    rec.deleted_at = (int64_t)time(NULL);
+    return vw_store_file_update(fs, file_id, &rec);
+}
+
+vw_err_t vw_store_file_restore(vw_file_store_t *fs, uint64_t file_id)
+{
+    if (!fs || file_id == 0) return VW_ERR_INVALID_ARG;
+
+    /* Can't use vw_store_file_get_by_id here — it deliberately hides
+     * soft-deleted records (returns NOT_FOUND), which is exactly the record
+     * we need to find. Do the same raw slot lookup without that filter. */
+    vw_file_record_t rec;
+    rwlock_rdlock(&fs->files_lock);
+    if (file_id >= (uint64_t)fs->fid_to_slot_cap ||
+        fs->fid_to_slot[file_id] == 0) {
+        rwlock_rdunlock(&fs->files_lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    {
+        uint64_t slot = fs->fid_to_slot[file_id];
+        uint64_t off  = slot * (uint64_t)sizeof(vw_file_record_t);
+        if (fs_pread(fs->meta_path, &rec, sizeof(rec), off) != 0) {
+            rwlock_rdunlock(&fs->files_lock);
+            return VW_ERR_IO;
+        }
+    }
+    rwlock_rdunlock(&fs->files_lock);
+
+    if (rec.file_id == 0) return VW_ERR_NOT_FOUND;
+    if (!rec.deleted) return VW_ERR_INVALID_ARG; /* not in trash */
+
+    rec.deleted    = 0;
+    rec.deleted_at = 0;
     return vw_store_file_update(fs, file_id, &rec);
 }
 

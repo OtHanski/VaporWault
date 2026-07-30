@@ -59,6 +59,14 @@ typedef volatile int vw_atomic_int_t;
 /* ── Rate-limit table ─────────────────────────────────────────────────────── */
 
 #define RATE_TABLE_SIZE 256
+
+/* TASK-086: sanity ceiling on client-supplied node_id (handle_node_register_self,
+ * via vw_cluster_node_add_self). Without this, a typo'd huge node_id passed
+ * straight to index_ensure() doubles ctx->nid_to_slot's capacity up to that
+ * value. Low severity — this only ever runs over the trusted local-only
+ * admin channel — but a ceiling costs nothing and avoids a large allocation
+ * from a simple typo. 2^20 is far beyond any real cluster's node count. */
+#define VW_CLUSTER_MAX_NODE_ID (1u << 20)
 #define RATE_WINDOW_SECS 60
 #define RATE_MAX_FAILURES 5
 
@@ -133,9 +141,12 @@ static void cluster_log(const char *level, const char *fmt, ...)
 
 /* ── Disk helpers ──────────────────────────────────────────────────────────── */
 
+/* slot is 1-based (slot 1 == the first record on disk) — matches
+ * vw_cluster_node_add's `ctx->node_slots + 1` and every scan loop in this
+ * file (`for (s = 1; s <= total; s++)`). */
 static int nodes_pread(const char *path, vw_node_record_t *out, uint64_t slot)
 {
-    uint64_t off = slot * (uint64_t)sizeof(vw_node_record_t);
+    uint64_t off = (slot - 1) * (uint64_t)sizeof(vw_node_record_t);
     /* Read via vw_fs_read_file would be slow; use platform pread/ReadFile. */
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -158,8 +169,35 @@ static int nodes_pread(const char *path, vw_node_record_t *out, uint64_t slot)
 
 /* ── nid_to_slot index helpers ─────────────────────────────────────────────── */
 
+/* TASK-086: shared append/sync/index-update tail of vw_cluster_node_add and
+ * vw_cluster_node_add_self — both build a vw_node_record_t, then append it,
+ * sync for durability, and record its slot in nid_to_slot the same way.
+ * Caller holds ctx->nodes_lock write-locked and is responsible for zeroing
+ * rec->auth_token, unlocking, and returning on failure — this only covers
+ * the on-disk part that used to be duplicated ~verbatim between the two. */
+static vw_err_t node_append_and_index(vw_cluster_t *ctx, vw_node_record_t *rec,
+                                       uint64_t slot)
+{
+    vw_err_t rc = vw_fs_append(ctx->nodes_path, rec, sizeof(*rec));
+    if (rc != VW_OK) return rc;
+
+    rc = vw_fs_sync_file(ctx->nodes_path);
+    if (rc != VW_OK) return rc;
+
+    ctx->nid_to_slot[rec->node_id] = (uint32_t)slot;
+    ctx->node_slots = slot;
+    return VW_OK;
+}
+
 static vw_err_t index_ensure(vw_cluster_t *ctx, uint64_t node_id)
 {
+    /* TASK-086: structural ceiling — every caller (the trusted startup scan
+     * in vw_cluster_open, which trusts whatever is on disk in nodes.db, and
+     * vw_cluster_node_add_self, which takes a client-supplied node_id over
+     * the admin socket) goes through here, so checking here protects both
+     * a corrupted/tampered nodes.db and a typo'd register-self call alike,
+     * rather than relying on every call site to remember its own guard. */
+    if (node_id > VW_CLUSTER_MAX_NODE_ID) return VW_ERR_INVALID_ARG;
     if (node_id < ctx->nid_to_slot_cap) return VW_OK;
     uint64_t new_cap = ctx->nid_to_slot_cap ? ctx->nid_to_slot_cap * 2 : 64;
     while (new_cap <= node_id) new_cap *= 2;
@@ -598,7 +636,7 @@ static void replica_repl_session(vw_cluster_t *ctx)
     memset(&copts, 0, sizeof(copts));
     copts.connect_timeout_ms = 10000;
     copts.recv_timeout_ms    = 15000;
-    vw_err_t rc = vw_net_connect(
+    vw_err_t rc = vw_net_connect_cluster(
         ctx->cfg.primary_host, ctx->cfg.primary_cluster_port,
         VW_CERT_VERIFY_REQUIRED, ctx->cert_pem_path, &copts, &conn);
     if (rc != VW_OK) {
@@ -1003,24 +1041,13 @@ vw_err_t vw_cluster_node_add(vw_cluster_t *ctx,
     rc = index_ensure(ctx, rec.node_id);
     if (rc != VW_OK) { rwlock_wrunlock(&ctx->nodes_lock); return rc; }
 
-    /* Append the record to the file */
-    rc = vw_fs_append(ctx->nodes_path, &rec, sizeof(rec));
+    rc = node_append_and_index(ctx, &rec, slot);
     if (rc != VW_OK) {
         memset(rec.auth_token, 0, sizeof(rec.auth_token));
         rwlock_wrunlock(&ctx->nodes_lock);
         return rc;
     }
 
-    /* Sync to ensure durability before returning the token */
-    rc = vw_fs_sync_file(ctx->nodes_path);
-    if (rc != VW_OK) {
-        memset(rec.auth_token, 0, sizeof(rec.auth_token));
-        rwlock_wrunlock(&ctx->nodes_lock);
-        return rc;
-    }
-
-    ctx->nid_to_slot[rec.node_id] = (uint32_t)slot;
-    ctx->node_slots  = slot;
     *out_node_id     = rec.node_id;
     ctx->next_node_id++;
 
@@ -1028,6 +1055,52 @@ vw_err_t vw_cluster_node_add(vw_cluster_t *ctx,
     memcpy(out_token, rec.auth_token, 32);
     memset(rec.auth_token, 0, sizeof(rec.auth_token));
 
+    rwlock_wrunlock(&ctx->nodes_lock);
+    return VW_OK;
+}
+
+vw_err_t vw_cluster_node_add_self(vw_cluster_t *ctx,
+                                   uint64_t node_id,
+                                   const uint8_t token[32],
+                                   const char *hostname)
+{
+    if (!ctx || node_id == 0 || !token || !hostname) return VW_ERR_INVALID_ARG;
+    /* node_id is client-supplied here (via the admin socket's
+     * NODE_REGISTER_SELF_REQ) — index_ensure() below enforces the
+     * VW_CLUSTER_MAX_NODE_ID ceiling (TASK-086) structurally, for every
+     * caller, rather than being re-checked at each call site. */
+
+    vw_node_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+
+    rwlock_wrlock(&ctx->nodes_lock);
+
+    vw_err_t rc = index_ensure(ctx, node_id);
+    if (rc != VW_OK) { rwlock_wrunlock(&ctx->nodes_lock); return rc; }
+
+    if (ctx->nid_to_slot[node_id] != 0) {
+        rwlock_wrunlock(&ctx->nodes_lock);
+        return VW_ERR_ALREADY_EXISTS;
+    }
+
+    rec.node_id   = node_id;
+    rec.is_active = 1;
+    rec.role      = VW_NODE_ROLE_SELF;
+    memcpy(rec.auth_token, token, 32);
+    snprintf((char *)rec.hostname, sizeof(rec.hostname), "%s", hostname);
+
+    uint64_t slot = ctx->node_slots + 1;
+
+    rc = node_append_and_index(ctx, &rec, slot);
+    if (rc != VW_OK) {
+        memset(rec.auth_token, 0, sizeof(rec.auth_token));
+        rwlock_wrunlock(&ctx->nodes_lock);
+        return rc;
+    }
+
+    if (node_id >= ctx->next_node_id) ctx->next_node_id = node_id + 1;
+
+    memset(rec.auth_token, 0, sizeof(rec.auth_token));
     rwlock_wrunlock(&ctx->nodes_lock);
     return VW_OK;
 }
@@ -1068,8 +1141,9 @@ vw_err_t vw_cluster_node_update_watermark(vw_cluster_t *ctx,
     uint64_t slot = ctx->nid_to_slot[node_id];
     rwlock_rdunlock(&ctx->nodes_lock);
 
-    /* sync_watermark is at offset 40 in vw_node_record_t (8+32 = 40) */
-    uint64_t field_off = slot * sizeof(vw_node_record_t)
+    /* sync_watermark is at offset 40 in vw_node_record_t (8+32 = 40).
+     * slot is 1-based — see nodes_pread's comment. */
+    uint64_t field_off = (slot - 1) * sizeof(vw_node_record_t)
                          + offsetof(vw_node_record_t, sync_watermark);
 
     uint8_t le[8];
@@ -1095,7 +1169,8 @@ vw_err_t vw_cluster_node_set_active(vw_cluster_t *ctx,
         return VW_ERR_NOT_FOUND;
     }
     uint64_t slot      = ctx->nid_to_slot[node_id];
-    uint64_t field_off = slot * sizeof(vw_node_record_t)
+    /* slot is 1-based — see nodes_pread's comment. */
+    uint64_t field_off = (slot - 1) * sizeof(vw_node_record_t)
                          + offsetof(vw_node_record_t, is_active);
 
     vw_err_t rc = vw_fs_pwrite(ctx->nodes_path, field_off, &is_active, 1);

@@ -765,7 +765,10 @@ vw_err_t vw_store_user_create(vw_store_t *ctx,
     /* Build the on-disk record. */
     memcpy(&rec, record, sizeof(rec));
     rec.user_id = user_id;
-    memset(rec._pad, 0, sizeof(rec._pad));
+    rec._pad1 = 0;
+    /* admin_caps is intentionally NOT zeroed here — it is caller-supplied
+     * (via `record`, already memcpy'd above) so callers can create an admin
+     * with restricted capabilities in one step; see vw_admin_has_cap(). */
 
     /* Phase 1: append oplog entry (confirmed=0). */
     rc = vw_oplog_append(ctx->oplog, VW_OPLOG_USER_WRITE,

@@ -32,9 +32,13 @@ extern "C" {
 /* ── Configuration ───────────────────────────────────────────────────────── */
 
 #define VW_GC_DEFAULT_INTERVAL_SECS 1800u
+#define VW_GC_DEFAULT_TRASH_RETENTION_SECS (7u * 24u * 3600u) /* 7 days */
 
 typedef struct {
-    uint32_t interval_secs; /* GC cycle period; 0 = disabled */
+    uint32_t interval_secs;         /* GC cycle period; 0 = disabled */
+    uint32_t trash_retention_secs;  /* how long a soft-deleted file stays
+                                      * recoverable before pass 3 hard-deletes
+                                      * it; 0 = purge immediately (no trash) */
 } vw_gc_cfg_t;
 
 /* ── Opaque context ──────────────────────────────────────────────────────── */

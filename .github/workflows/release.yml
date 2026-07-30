@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -62,6 +62,22 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # TASK-082: a binary that links but crashes on startup (missing shared
+      # lib, bad rpath, etc.) would otherwise still ship undetected. The two
+      # GUI binaries (vapourwault-gui, vapourwault-server-gui) are excluded —
+      # they call SDL_Init(SDL_INIT_VIDEO) unconditionally with no arg
+      # parsing at all (no --help to smoke-test with), so exercising them
+      # would need a virtual display (Xvfb) and a working software GL
+      # renderer in CI, which is its own project — not attempted here.
+      - name: Smoke-test built binaries
+        run: |
+          set -e
+          for bin in vapourwaultd vapourwault-daemon vapourwault-cli vapourwault-server-cli; do
+            echo "::group::$bin --help"
+            build/bin/"$bin" --help
+            echo "::endgroup::"
+          done
+
       # TAG comes from workflow-level `env:` (never interpolated directly from a
       # `${{ }}` expression into a shell script — avoids template/script
       # injection via an attacker-controlled ref/tag name).
@@ -75,7 +91,7 @@ jobs:
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release
           path: |
@@ -88,7 +104,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -96,7 +112,7 @@ jobs:
       # ilammy/msvc-dev-cmd uses vswhere to locate any installed VS version,
       # so this works with VS 2022 and VS 2026 alike (matches ci.yml).
       - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
@@ -130,6 +146,24 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # TASK-082: same rationale as the Linux job's smoke-test step. The two
+      # GUI binaries are excluded there too (no --help, requires a real
+      # display); the four smoke-tested binaries here are pure C and don't
+      # link SDL2, so this doesn't need SDL2.dll on PATH.
+      - name: Smoke-test built binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($bin in "vapourwaultd", "vapourwault-daemon", "vapourwault-cli", "vapourwault-server-cli") {
+            Write-Host "::group::$bin --help"
+            & "build/bin/$bin.exe" --help
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "$bin --help exited $LASTEXITCODE"
+              exit 1
+            }
+            Write-Host "::endgroup::"
+          }
+
       # TAG comes from workflow-level `env:` (see note in the Linux job's staging step).
       - name: Stage release archive
         shell: pwsh
@@ -144,7 +178,7 @@ jobs:
           Set-Content -Path "$stage.zip.sha256" -Value "$hash  $stage.zip" -NoNewline -Encoding ascii
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-release
           path: |
@@ -163,7 +197,7 @@ jobs:
       contents: write   # only this job needs write access, for gh release create/upload
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
 

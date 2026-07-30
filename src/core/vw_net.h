@@ -102,6 +102,19 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
                          const vw_conn_opts_t *opts,
                          vw_conn_t **out_conn);
 
+/*
+ * Same as vw_net_connect but offers ALPN "vw-cluster/1" — use this to connect
+ * to a peer's vw_net_listen_cluster() listener (e.g. a replica dialing its
+ * primary). Using vw_net_connect for this instead will fail the TLS
+ * handshake: the server's ALPN config requires a match, and the two listener
+ * kinds don't accept each other's protocol string.
+ */
+vw_err_t vw_net_connect_cluster(const char *host, uint16_t port,
+                                 vw_cert_verify_t verify,
+                                 const char *ca_cert_pem_path,
+                                 const vw_conn_opts_t *opts,
+                                 vw_conn_t **out_conn);
+
 /* ── Per-connection API ──────────────────────────────────────────────────── */
 
 /*

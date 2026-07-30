@@ -1,8 +1,8 @@
 # VaporWault Wire Protocol Specification
 
 **Owner:** PRT.04  
-**Current version:** 6  
-**Status:** Draft — Phase 2 implementation
+**Current version:** 9  
+**Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8); §7.5/§7.10/§7.11 are design-stage (TASK-088/TASK-089), not yet implemented
 
 ---
 
@@ -442,35 +442,313 @@ Each op record:
 
 ### 7.5 Sharing / permissions
 
-| Code   | Name             | Direction | Description              |
-|--------|------------------|-----------|--------------------------|
-| 0x0501 | SHARE_GRANT      | C → S     | Grant access             |
-| 0x0502 | SHARE_GRANT_ACK  | S → C     | Granted                  |
-| 0x0503 | SHARE_REVOKE     | C → S     | Revoke access            |
-| 0x0504 | SHARE_REVOKE_ACK | S → C     | Revoked                  |
-| 0x0505 | SHARE_LIST       | C → S     | List sharing entries     |
-| 0x0506 | SHARE_LIST_RESP  | S → C     | Sharing entries          |
-| 0x0507 | SUB_CREATE       | C → S     | Subscribe to shared path |
-| 0x0508 | SUB_CREATE_ACK   | S → C     | Subscribed               |
-| 0x0509 | SUB_DELETE       | C → S     | Unsubscribe              |
-| 0x050A | SUB_DELETE_ACK   | S → C     | Done                     |
+**Design status (2026-07-29):** fully specified below per `TASK-088`; no
+implementation exists yet (`vw_share` module, permission-check integration in
+`vw_file_handlers.c`, and the CLI/GUI surfaces are tracked as `TASK-094`
+through `TASK-097`). This replaces the earlier unimplemented skeleton, which
+had only `SHARE_GRANT`'s payload defined and a speculative, never-built
+`SUB_CREATE`/`SUB_DELETE` "subscription" concept. That concept is dropped —
+nothing in the settled requirements needs it, and a client can always tell
+whether an item is shared-with-it via `SHARE_LIST`/`FILE_LIST` without a
+separate subscribe step. `SUB_CREATE`/`SUB_CREATE_ACK`/`SUB_DELETE`/
+`SUB_DELETE_ACK`'s opcodes (0x0507–0x050A) are **repurposed** below for
+`LINK_CREATE`/`LINK_CREATE_ACK`/`LINK_REVOKE`/`LINK_REVOKE_ACK` — safe to
+reuse because no code anywhere ever implemented a handler for the old names
+(confirmed by source inspection during `TASK-088`'s design phase); the
+`VW_MSG_SUB_*` enumerators in `vw_proto.h` must be renamed to
+`VW_MSG_LINK_CREATE`/`VW_MSG_LINK_REVOKE` (same numeric values) as part of
+`TASK-094`.
+
+Two independent sharing mechanisms are supported, per the product
+requirement that both be available:
+
+1. **User-to-user grants** (`SHARE_GRANT`/`SHARE_REVOKE`/`SHARE_LIST`) — an
+   authenticated user grants another authenticated user access to a file or
+   folder they own.
+2. **Public links** (`LINK_CREATE`/`LINK_REVOKE`/`LINK_LIST`/`LINK_ACCESS`) —
+   an owner mints an unguessable token; anyone possessing it gets scoped,
+   anonymous (no account needed) read or edit access to that one item and
+   its descendants, mirroring the existing `INVITE_REDEEM` pattern of an
+   unauthenticated pre-`AUTH_REQUEST` message producing a session (§7.6).
+
+Both a file and a folder can be the target of either mechanism — folders are
+identified by `file_id` the same way files are (this codebase already
+represents directories as rows in the same file table,
+`vw_file_record_t.entry_type == VW_ENTRY_DIR`; there is no separate ID
+namespace to reconcile).
+
+**Reconciling with the existing `vw_perm_t` enum (CQR.08 finding, fixed
+2026-07-29):** `vw_proto.h` already defines `vw_perm_t` (`VW_PERM_NONE=0,
+VW_PERM_VIEW=1, VW_PERM_EDIT=2, VW_PERM_OWNER=3`), and it is already on the
+wire today — `FILE_LIST_RESP`/`FILE_STAT_RESP` each carry a per-entry `perm`
+byte, currently hardcoded to `VW_PERM_OWNER` in `vw_file_handlers.c` since no
+sharing exists yet. The `permission` field everywhere below in §7.5 **reuses
+`vw_perm_t` directly** — `VW_PERM_VIEW` (1) and `VW_PERM_EDIT` (2); a share
+or link is never created with `VW_PERM_NONE` or `VW_PERM_OWNER`, only VIEW or
+EDIT. `TASK-094` must also stop hardcoding `VW_PERM_OWNER` in
+`FILE_LIST_RESP`/`FILE_STAT_RESP` and instead populate that field from the
+caller's actually-resolved effective permission (own → `VW_PERM_OWNER`;
+via grant/scope → whatever permission the grant/scope carries) — this is
+also what `TASK-096`'s file-browser permission indicator reads from, so it
+must reflect reality rather than always claiming ownership.
+
+| Code   | Name              | Direction | Description                             |
+|--------|-------------------|-----------|------------------------------------------|
+| 0x0501 | SHARE_GRANT       | C → S     | Grant a user access to a file/folder     |
+| 0x0502 | SHARE_GRANT_ACK   | S → C     | Granted                                  |
+| 0x0503 | SHARE_REVOKE      | C → S     | Revoke a user-to-user grant              |
+| 0x0504 | SHARE_REVOKE_ACK  | S → C     | Revoked                                  |
+| 0x0505 | SHARE_LIST        | C → S     | List grants (created by me / to me)      |
+| 0x0506 | SHARE_LIST_RESP   | S → C     | Grant entries                            |
+| 0x0507 | LINK_CREATE       | C → S     | Mint a public link for a file/folder     |
+| 0x0508 | LINK_CREATE_ACK   | S → C     | Link created; token returned once        |
+| 0x0509 | LINK_REVOKE       | C → S     | Revoke a public link                     |
+| 0x050A | LINK_REVOKE_ACK   | S → C     | Revoked                                  |
+| 0x050B | LINK_LIST         | C → S     | List public links I've created           |
+| 0x050C | LINK_LIST_RESP    | S → C     | Link entries (no raw tokens included)    |
+| 0x050D | LINK_ACCESS       | C → S     | Redeem a public link (**unauthenticated**, sent before AUTH_REQUEST) |
+| 0x050E | LINK_ACCESS_ACK   | S → C     | Scoped session established               |
+
+**Server-side data model (`vw_share_record_t`, new `vw_share` module, 128
+bytes/slot — matches this codebase's fixed-size-record convention):**
+
+| Field            | Type      | Notes |
+|------------------|-----------|-------|
+| share_id         | uint64    | Monotonic; 0 = free slot |
+| file_id          | uint64    | The shared file or folder |
+| owner_id         | uint64    | Copied from the file's `owner_id` at grant time — the authority for the "can only grant up to your own permission level" rule below, and for quota resolution |
+| target_user_id   | uint64    | User-to-user grants only; 0 for public links |
+| link_token       | bytes[32] | Public links only; 256-bit CSPRNG (`vw_crypto_random`, same generator as cluster `auth_token`/session tokens). Zero for user grants. |
+| share_type       | uint8     | 0 = user grant, 1 = public link |
+| permission       | uint8     | `vw_perm_t`: `VW_PERM_VIEW` (1, = list/stat/download) or `VW_PERM_EDIT` (2, = VIEW + create/modify/delete). Never `VW_PERM_NONE`/`VW_PERM_OWNER`. |
+| revoked          | uint8     | 1 = revoked. Rows are never hard-deleted — kept for audit trail, matching this project's soft-delete convention elsewhere (`TASK-090`) |
+| created_at       | int64     | |
+| expires_at       | int64     | 0 = never expires |
+
+Two in-memory indexes are rebuilt on startup by scanning, matching every
+other table in this codebase: `file_id → [share_id...]` (permission checks)
+and `link_token → share_id` (O(1) `LINK_ACCESS` redemption, avoiding a linear
+scan over every link on every anonymous request).
 
 **SHARE_GRANT payload:**
 
-| Field          | Type   |
-|----------------|--------|
-| is_file        | uint8 (1=file, 0=folder) |
-| target_id      | uint64 (file_id or folder path hash) |
-| grantee_user_id | uint64 |
-| perm           | uint8 (1=VIEW, 2=EDIT) |
-| inherit        | uint8 (folder only: propagate to children) |
-| path           | string (folder path; empty for files) |
+| Field          | Type   | Notes |
+|----------------|--------|-------|
+| session_token  | bytes[32] | |
+| file_id        | uint64 | File or folder to share |
+| target_username | string | Server resolves to `user_id` internally — avoids a separate username-lookup round trip, consistent with how admin CLI commands already take usernames directly |
+| permission     | uint8  | `vw_perm_t`: `VW_PERM_VIEW` (1) or `VW_PERM_EDIT` (2) |
+| expires_at     | int64  | 0 = never |
 
-Permission checks on the server must verify both the target item **and** all parent folders. A user can only grant up to their own permission level.
+**SHARE_GRANT_ACK payload:** `error_code` (uint32), `share_id` (uint64).
+
+**SHARE_REVOKE payload:** `session_token[32]`, `share_id` (uint64). Only the
+`owner_id` of the underlying share may revoke it.
+
+**SHARE_LIST payload:** `session_token[32]`, `mode` (uint8: 0 = shares I
+created, 1 = shares granted to me).
+
+**SHARE_LIST_RESP payload:** `count` (uint32), then `count` repetitions of
+`{share_id, file_id, path, share_type, target_username-or-empty, permission,
+created_at, expires_at, revoked}`.
+
+**LINK_CREATE payload:** `session_token[32]`, `file_id` (uint64), `permission`
+(uint8), `expires_at` (int64, 0 = never).
+
+**LINK_CREATE_ACK payload:** `error_code` (uint32), `share_id` (uint64),
+`link_token[32]`. The raw token is returned **exactly once**, at creation —
+the server never re-displays it (same convention as `INVITE_CREATE_ACK`'s
+invite code and the cluster `auth_token`). If the owner loses the token they
+must revoke and re-create the link.
+
+**LINK_REVOKE payload:** `session_token[32]`, `share_id` (uint64).
+
+**LINK_LIST payload:** `session_token[32]`, `file_id` (uint64, 0 = all of my
+links).
+
+**LINK_LIST_RESP payload:** `count` (uint32), then `count` repetitions of
+`{share_id, file_id, path, permission, created_at, expires_at, revoked}` —
+**never** the raw `link_token` (same "never re-disclose a secret token"
+rule as CLUSTER_STATUS_RESP omitting `auth_token`, §7.9).
+
+**LINK_ACCESS payload (unauthenticated — sent before AUTH_REQUEST):**
+
+| Field      | Type      | Notes |
+|------------|-----------|-------|
+| link_token | bytes[32] | The token from `LINK_CREATE_ACK` |
+
+On success: same shape and semantics as `INVITE_REDEEM_ACK` — the server
+establishes a session immediately. Except this session is **scoped** (see
+§7.10) rather than a normal user session: `user_id = 0` (anonymous),
+`is_admin = 0`, and the session is bound to exactly the one `share_id` that
+was redeemed. On failure (unknown / expired / revoked token): `AUTH_FAIL`
+with the same generic error code used for bad credentials — a client must
+not be able to distinguish "token never existed" from "token was revoked"
+(enumeration resistance, same rationale as `NODE_HELLO_FAIL`, §7.9).
+
+**LINK_ACCESS_ACK payload:** Same as `AUTH_OK`, with `user_id = 0` and
+`is_admin = 0` signaling an anonymous scoped session; `quota_bytes`/
+`used_bytes` are zeroed (not meaningful for an anonymous caller — quota is
+always resolved against the file's real owner server-side, never the
+session's nominal user, see below).
+
+**Permission-check rule (extends the existing owner-only check in
+`vw_file_handlers.c`, §7.8.1):** for every file operation, access is granted
+if **any** of the following holds, checked in this order:
+
+1. `file.owner_id == session.user_id` (existing check, unchanged).
+2. An active (`revoked == 0`, not expired) `SHARE_GRANT` exists whose
+   `target_user_id == session.user_id` and whose `file_id` is `file_id`
+   itself **or an ancestor of it** (walk `parent_dir_id` up to the root,
+   checking each ancestor for a grant — matches the pre-existing skeleton
+   note "must verify both the target item and all parent folders"), with
+   `permission >= permission_needed_for_this_op`.
+3. The session is a scoped public-link session (`session.scope_file_id !=
+   0`) whose `scope_file_id` is `file_id` itself or an ancestor of it, and
+   `session.scope_permission >= permission_needed_for_this_op`.
+4. Otherwise: `VW_ERR_PERMISSION`.
+
+A user can only grant (`SHARE_GRANT`) or link (`LINK_CREATE`) up to their
+**own effective permission level** on the target — e.g. a user who only has
+`VW_PERM_VIEW` access via someone else's grant cannot `SHARE_GRANT`
+`VW_PERM_EDIT` to a third party. The server must compute the granter's own
+effective permission via this same rule before allowing `SHARE_GRANT`/
+`LINK_CREATE` to proceed on a file the caller does not own outright.
+
+**Required permission per operation (CQR.08 finding, added 2026-07-29 — the
+rule above referenced `permission_needed_for_this_op` without defining it):**
+
+| Operation | Required permission | Notes |
+|-----------|---------------------|-------|
+| `FILE_LIST`, `FILE_STAT`, `CHUNK_DOWNLOAD_REQ`, `VERSION_LIST`, `VERSION_CHUNKS` | `VW_PERM_VIEW` | Read-only ops |
+| `CHUNK_UPLOAD`, `FILE_COMMIT` (modifying an existing file) | `VW_PERM_EDIT` on the file | |
+| `FILE_COMMIT` (creating a new file under a shared folder) | `VW_PERM_EDIT` on the **parent folder** | The new file's `owner_id` is set to the **folder's** `owner_id` (matches the quota-resolution rule below) — the creator does not become the owner of a file it creates inside someone else's shared folder |
+| `FILE_DELETE` | `VW_PERM_EDIT` on the file | Public/grant EDIT includes delete, matching common product conventions (Dropbox/Drive-style "editor" access) |
+| `FILE_MOVE` | `VW_PERM_EDIT` on **both** the source file's current parent and the destination parent folder, **and** `destination_parent.owner_id == file.owner_id` | See "FILE_MOVE ownership and cycle rules" below (SEC.07 finding, 2026-07-29) |
+| `VERSION_RESTORE` | `VW_PERM_EDIT` on the file | Restoring content is a modification, not a read, even though it doesn't create a new version's bytes from scratch |
+| `SHARE_GRANT`, `LINK_CREATE` | Caller's own effective permission must be `>=` the permission being granted (see above) | |
+| `SHARE_REVOKE`, `LINK_REVOKE` | Caller must be the `owner_id` of the share/link row itself (not merely have EDIT on the file) | Only the person who created the grant/link — i.e. the file's owner at grant time — can revoke it; an EDIT grantee cannot revoke another grantee's access |
+
+**FILE_MOVE ownership and cycle rules (SEC.07 finding, added 2026-07-29):**
+the naive rule "EDIT on source parent + EDIT on destination parent" has a
+quota/visibility-hijack gap: a grantee with EDIT on Alice's shared folder
+could move one of Alice's files into their own private folder. The file's
+`owner_id` would stay Alice (so it still counts against her quota forever)
+while its `parent_dir_id` chain no longer passes through anything Alice can
+see — she silently loses all access to her own file. To close this:
+
+1. `FILE_MOVE` requires `VW_PERM_EDIT` on both the source item's current
+   parent and the destination parent, **and** requires
+   `destination_parent.owner_id == file.owner_id`. A grantee may reorganize
+   a file anywhere within the *same owner's* tree they have EDIT access to,
+   but can never move a file (or folder) into a tree with a different
+   `owner_id` — this applies symmetrically to the owner's own moves too
+   (trivially satisfied, since `destination_parent.owner_id` is always their
+   own `owner_id` for anything they own).
+2. `FILE_MOVE` of a directory must reject any destination that is the
+   directory itself or a descendant of it (walk the destination's
+   `parent_dir_id` chain up to the root; if the moving directory's `file_id`
+   appears anywhere in that chain, reject with `VW_ERR_INVALID_ARG`). This
+   is a general correctness requirement independent of sharing — the
+   walk-up permission check (§7.5 point 2) assumes an acyclic
+   `parent_dir_id` tree, and an undetected cycle would hang or misevaluate
+   every permission check for the affected subtree. `TASK-094` must
+   implement this check even though it isn't strictly a sharing-specific
+   bug, since it was discovered while specifying `FILE_MOVE`'s interaction
+   with shares.
+
+**Grant/link operations require a real authenticated session (SEC.07
+finding, added 2026-07-29):** `SHARE_GRANT`, `SHARE_REVOKE`, `LINK_CREATE`,
+and `LINK_REVOKE` all additionally require `session.user_id != 0` — an
+anonymous scoped session (one established via `LINK_ACCESS`) may never call
+any of these four messages, full stop, regardless of what
+`scope_permission` it carries. Without this restriction, anyone holding a
+leaked/forwarded EDIT public link could redeem it and then mint an
+independent, persistent `SHARE_GRANT` or a brand-new `LINK_CREATE` — a
+separate `share_id` from the one that leaked — which would survive
+revocation of the original leaked link, defeating the live-revocation
+property (§7.10) in precisely the scenario it exists to solve. The server
+must reject any of these four messages carrying a scoped session with
+`VW_ERR_PERMISSION`, checked before any other logic in the handler.
+
+**Write-count rate limiting for scoped sessions (SEC.07 finding, added
+2026-07-29):** quota resolution (below) bounds the *bytes* a scoped session
+can cause to be written against the owner's quota, but bounds nothing about
+the *count* of files/versions/oplog entries created — an anonymous holder
+of a public EDIT link could `FILE_COMMIT` unbounded numbers of near-zero-
+byte files, each consuming a storage slot and an oplog entry (replicated to
+every cluster node), which is a genuinely new unauthenticated write-DoS
+surface with no admin-suspend lever available (the actor has no account to
+suspend). The server must apply a per-scoped-session rate limit on
+write operations (`FILE_COMMIT`, `CHUNK_UPLOAD`, `FILE_DELETE`, `FILE_MOVE`)
+distinct from and in addition to the byte-quota check — concrete threshold
+(e.g. N writes per minute per scoped session, or a hard cap on total files
+created per share/link) is left to `TASK-094` to set, but the requirement
+that *some* count-based limit exists is not optional.
+
+**Scoped-session navigation (CQR.08 finding, added 2026-07-29):** an
+anonymous scoped session (redeemed via `LINK_ACCESS`) has no access to the
+global root. `FILE_LIST` with `parent_dir_id == 0` for a scoped session is
+special-cased: it returns exactly the single scoped item (`scope_file_id`)
+if it is a file, or the immediate children of `scope_file_id` if it is a
+folder — never the server's actual root. All subsequent `FILE_LIST` calls
+with a non-zero `parent_dir_id` go through the normal permission-check rule
+(§7.5 point 3), which already confines them to `scope_file_id` and its
+descendants.
+
+**Quota resolution:** storage always counts against the file's actual
+`owner_id`, **never** the acting session's `user_id` — this is true whether
+the acting session belongs to a different authenticated user via a
+user-to-user EDIT grant, or an anonymous scoped public-edit-link session.
+Every quota-check call site in the upload/commit path must resolve the quota
+owner from `file.owner_id` (or, for a brand-new file being created under a
+shared folder, from the **folder's** `owner_id`), not from the session.
+This directly implements the settled requirement "files should count against
+the owner's quota" and is also what bounds the abuse potential of a public
+edit link — the owner's existing quota is the only cap, by design.
 
 ### 7.6 Admin
 
 All messages in `0x06xx` require an admin session (`is_admin == 1` in AUTH_OK).
+
+**Fine-grained capability requirements (added 2026-07-29, TASK-092 — CQR.08
+finding: this section previously described only the blanket `is_admin`
+gate, which stopped being the whole story once capability bits shipped):**
+six of the admin-authenticated messages additionally require a specific
+`vw_admin_cap_t` bit (`vw_proto.h`) on the caller's account, checked via
+`vw_admin_has_cap()` (`vw_store.h`) after the base `is_admin` check. An
+authenticated admin who lacks the required capability for a given message
+receives `VW_ERR_PERMISSION` — distinct from `VW_ERR_AUTH_REQUIRED`, which
+is still what a genuinely non-admin session gets.
+
+| Message                          | Required capability   |
+|-----------------------------------|------------------------|
+| `USER_LIST` (0x0607)               | `VW_CAP_USER_MGMT`    |
+| `USER_SUSPEND` (0x0605)            | `VW_CAP_USER_MGMT`    |
+| `INVITE_CREATE` (0x0609)           | `VW_CAP_USER_MGMT`    |
+| `QUOTA_ADJUST` (0x060D)            | `VW_CAP_QUOTA_MGMT`   |
+| `AUDIT_QUERY` (0x060F)             | `VW_CAP_AUDIT_READ`   |
+| `CLUSTER_STATUS` (0x0706, §7.7)    | `VW_CAP_CLUSTER_MGMT` |
+
+`admin_caps == 0` on an admin account is treated as "full/legacy admin" (all
+capabilities) rather than "no capabilities" — see `vw_admin_cap_t`'s comment
+in `vw_proto.h` for why. `USER_CREATE`, `USER_MODIFY`, and `DRIVE_CONFIG`
+are not yet implemented in `vw_file_handlers.c` (they fall through to
+`VW_ERR_NOT_IMPL`), so they have no capability requirement to document yet;
+whichever developer implements them should add one at that time.
+
+This capability layer applies only to these network wire-protocol admin
+messages (authenticated via `AUTH_OK`/`is_admin` over `vw/1`, exactly the
+messages in this section and CLUSTER_STATUS in §7.7). It does **not** apply
+to the separate local admin IPC channel (`vw_admin.c`, AF_UNIX
+`admin.sock`, used by `vapourwault-server-cli`) — that channel is not part
+of this document (see its own header comment in `vw_admin.h`) and remains
+gated purely by OS-level trust (`SO_PEERCRED`, same UID as the server
+operator), which a per-account capability bitmask could not meaningfully
+narrow further. That local channel does gain one new message
+(`VW_ADMIN_SET_CAPS_REQ`/`_RESP`) for the trusted operator to grant/revoke
+these capabilities on other admin accounts — documented in `vw_admin.h`,
+not here.
 
 | Code   | Name               | Direction | Description              |
 |--------|--------------------|-----------|--------------------------|
@@ -688,6 +966,214 @@ on the primary, and securely communicated to the replica out-of-band
 
 ---
 
+## 7.10 Sharing & Public Link Security Model
+
+**Design status (2026-07-29):** specified per `TASK-088`; not yet
+implemented (see §7.5).
+
+| Property | Implementation |
+|----------|-----------------|
+| Link token secrecy | 256-bit CSPRNG (`vw_crypto_random`), shown once in `LINK_CREATE_ACK`, never re-displayed in `LINK_LIST_RESP` |
+| Link token guessing resistance | 256-bit space; `LINK_ACCESS` is IP rate-limited identically to `NODE_HELLO` (5 failures / 60 s → silent drop, §7.9) — reusing the existing rate-limit mechanism rather than inventing a second one |
+| Enumeration resistance | Unknown / expired / revoked `link_token` all produce the same `AUTH_FAIL`, indistinguishable from each other |
+| Live revocation | A scoped session's validity is re-checked against the live `vw_share_record_t.revoked`/`expires_at` fields on **every** request, not just cached at `LINK_ACCESS` time — revoking a link must take effect immediately even against an already-issued scoped session token, the same request later. This is a stronger property than a normal session token (which is only checked for its own expiry) and must be implemented as an explicit extra lookup keyed by the scoped session's `share_id`, not skipped as "the session is already valid." |
+| Privilege escalation via re-grant | Restricted to authenticated, non-scoped sessions only (`session.user_id != 0`) — an anonymous scoped session can never call `SHARE_GRANT`/`SHARE_REVOKE`/`LINK_CREATE`/`LINK_REVOKE` (§7.5), closing the path where a leaked link could mint an independent grant surviving revocation of the original. Among authenticated grantors, a user can only `SHARE_GRANT`/`LINK_CREATE` up to their own effective permission on the target — prevents a VIEW-only grantee from re-sharing EDIT access to themselves or a third party. |
+| Quota abuse via public edit link | Storage bytes are bounded by the owner's existing quota (§7.5). Storage **counts** (files/versions/oplog entries) are separately bounded by a per-scoped-session write-count rate limit (§7.5), independent of the byte quota — closes an unauthenticated write-DoS surface where an anonymous editor could create unbounded near-zero-byte files without meaningfully touching the owner's byte quota. |
+| Cross-owner move hijack | `FILE_MOVE` requires `destination_parent.owner_id == file.owner_id` in addition to EDIT on both parents (§7.5) — prevents a grantee from moving a shared file out of the owner's tree into their own, which would otherwise leave the file permanently consuming the owner's quota while the owner loses all visibility/access to it. |
+| Anonymous write attribution | Oplog/audit entries for writes made through a scoped session must record the acting identity as anonymous (`user_id = 0`) **and** the `share_id`/owner separately, so the file's real owner can see "modified via link X" in their own audit trail rather than the write appearing to come from themselves. Exact oplog payload shape is an implementation detail for `TASK-094`, not fixed here. |
+| Cross-user data exposure via mis-scoped grant | Every file operation must re-derive access via the full ordered rule in §7.5 (own the file → walk-up share grant → scoped-session match → deny) on **every** request; nothing may be cached across requests except within a single already-validated session's lifetime. |
+
+**What this model does NOT protect against:**
+- **Link sharing outside the application** (forwarding a public link's token
+  via email/chat): by design — a public link's entire security model is
+  "possession of the token grants access," identical to how e.g. Dropbox/
+  Google Drive public links work. This must be disclosed in the GUI at link
+  creation time (e.g. "anyone with this link can access this item").
+- **Revocation of already-downloaded content**: if a recipient (grantee or
+  link holder) already downloaded a file before access was revoked, nothing
+  can retroactively delete their local copy. This is inherent to any
+  file-sharing design and should be disclosed, not solved.
+
+## 7.11 Vault / End-to-End Encryption
+
+**Design status (2026-07-29):** specified per `TASK-089`; not yet
+implemented (`vw_vault` client module, server-side wrapped-key storage, and
+chunk-pipeline integration are tracked as `TASK-098` through `TASK-101`).
+
+### 7.11.1 Key model
+
+Recommendation (industry-standard **envelope encryption**, the same shape
+used by AWS KMS, age, and Cryptomator's vault format — chosen over
+alternatives below):
+
+| Term | Definition |
+|------|------------|
+| **Encryption passphrase** | A secret the user chooses, entered only client-side. **Never** transmitted to the server in any form — not raw, not hashed, not derived — this is what makes the encryption genuinely end-to-end rather than server-recoverable. Deliberately a *separate* secret from the account login password (which the server *does* verify a derivation of, per §8.1); reusing the login password here would make the "true encryption" requirement false the moment an admin or attacker obtains the server-side Argon2id verifier. |
+| **Vault** | One encrypted folder, or a single encrypted file treated as a one-item vault. The unit the user opts in at ("the user can decide to opt in to encrypt specific files/folders"). |
+| **Vault Key (VK)** | A random 256-bit key, one per vault, generated client-side the moment a folder/file is first opted into encryption. Never leaves the client in unwrapped form. |
+| **Key-Encryption-Key (KEK)** | Derived client-side from the encryption passphrase via Argon2id (reusing the primitive already vendored for password hashing — no new KDF implementation needed). Never transmitted or stored anywhere. |
+| **Wrapped Vault Key** | `VK` encrypted under the `KEK` (AES-256-GCM), stored alongside the Argon2id salt and parameters. This blob — and *only* this blob — is what may be stored server-side; to the server it is opaque random-looking bytes. Multi-device access works by fetching this blob to a new device and re-deriving the KEK from a locally re-entered passphrase. |
+| **Data Encryption Key (DEK)** | A fresh random 256-bit key generated per **file** (not reused across versions — see security note below), wrapped by that file's vault's VK, travels with the file's version metadata. |
+
+A user may protect multiple vaults with the *same* passphrase (convenience)
+or different passphrases per vault (compartmentalization) — this is a
+client-side UX choice, not an architectural constraint, because each vault's
+VK is independently random and independently wrapped. This directly
+satisfies the settled requirement "lost keys shouldn't result in loss of
+data beyond the files/folders that specific key was used for": losing
+passphrase A only loses access to vaults wrapped under A.
+
+**Why envelope encryption over the alternatives considered:**
+- *Convergent encryption* (deriving the key from the plaintext hash, as some
+  E2EE-plus-dedup systems do) was rejected: it is explicitly incompatible
+  with the settled requirement to disable dedup for encrypted content, and
+  it has a well-known confirmation-of-plaintext attack (an attacker who
+  guesses a candidate plaintext can confirm a match without decrypting).
+- *One global key for all of a user's encrypted content* was rejected: it
+  violates "lost keys shouldn't result in loss of data beyond the specific
+  key's files" — a single lost/compromised key would affect everything.
+- *Per-chunk keys instead of per-file* were rejected as unnecessary
+  complexity: chunk-level granularity exists for dedup and delta-sync, which
+  encrypted content deliberately does not participate in (§7.11.2); a
+  per-file DEK is the natural unit once dedup is out of the picture.
+
+### 7.11.2 Content encryption & dedup interaction
+
+- **Cipher:** AES-256-GCM, matching the cipher suite already mandated for
+  TLS (§2) — reuses an already-audited primitive rather than introducing a
+  second AEAD construction.
+- **Granularity:** applied per existing 4 MiB chunk (§9), using the file's
+  DEK, with a 12-byte GCM nonce.
+- **Nonce derivation (revised 2026-07-29, SEC.07 finding):** the original
+  design ("4-byte random per-file prefix + 8-byte monotonic chunk-index
+  counter") is **rejected** — it is entirely client-trusted with zero
+  protocol-level guardrail, and an upload retry/resume that restarts the
+  chunk-index counter under the same DEK+prefix (e.g. after a dropped
+  connection mid-`FILE_COMMIT`) produces an exact GCM nonce reuse, which is
+  catastrophic (plaintext recovery via XOR, forged auth tags for the
+  colliding chunks). Instead: **the nonce for chunk `i` of a file is derived
+  deterministically as `HKDF(DEK, info = "vw-chunk-nonce" || i)[0:12]`** —
+  a pure function of the (already-unique-per-file) DEK and the chunk index,
+  with no independent random or counter state to desynchronize across a
+  retry. Resuming an interrupted upload re-derives the identical nonce for
+  a given chunk index every time, which is safe *only if* that chunk's
+  plaintext (and therefore ciphertext) is also identical on retry — the
+  client must guarantee this by never changing a file's content mid-upload
+  without also rolling to a new DEK (i.e., a retry resumes the *same*
+  upload attempt; any edit to the file starts a genuinely new version with
+  a new DEK per the rule below, never a "resume" of the old one under the
+  old DEK).
+- **DEK scoping guardrail (SEC.07 finding):** a DEK must be generated fresh
+  **per file**, never per-vault. A per-vault DEK bug would make identical
+  plaintext across different files silently produce identical ciphertext —
+  reproducing exactly the confirmation-of-plaintext leak this design
+  explicitly rejected when ruling out convergent encryption (§7.11.1) — and
+  because dedup "succeeding" looks identical to normal operation, such a
+  bug would never surface on its own. `TASK-099`'s implementation and
+  `TASK-101`'s tests must both explicitly verify DEK uniqueness is per-file
+  (e.g. by confirming two different files under the same vault, with
+  identical plaintext, produce different ciphertext), not just infer it
+  from dedup behaving as expected.
+- **Dedup is disabled for encrypted content as a natural consequence, not a
+  special-cased flag:** each file gets a unique random DEK, so ciphertext is
+  unique per file even for byte-identical plaintext across users or
+  versions. The chunk store still content-addresses by SHA-256 of the
+  *stored* (ciphertext) bytes exactly as it does today (§9) — no change to
+  `vw_storage.c`'s dedup mechanism itself is needed; encrypted chunks simply
+  never collide with anything, satisfying "deduplication should be disabled
+  for files which have been opted in for encryption" with zero new
+  dedup-bypass logic to get wrong.
+- **Security note — DEK reuse across versions:** a new version of an
+  encrypted file must get a **new** random DEK, not the old DEK with a fresh
+  nonce counter — this avoids any possibility of nonce-counter overlap
+  between versions sharing a key, and keeps "delete/lose one version's key"
+  scoped to that version rather than the whole vault's history.
+
+### 7.11.3 Metadata scope
+
+Per the settled requirement ("just encrypting the file content should be
+fine"), the following are **NOT** encrypted and remain visible to the
+server: filenames, folder structure/hierarchy, file sizes, chunk counts,
+timestamps, and version history metadata. This must be disclosed plainly in
+the GUI wherever a vault's protection is described (e.g. "file names and
+folder structure are visible to the server; only file contents are
+encrypted") — an overstated security claim here is a trust bug in its own
+right, distinct from any implementation bug.
+
+### 7.11.4 Wire protocol
+
+| Code   | Name                  | Direction | Description                        |
+|--------|-----------------------|-----------|-------------------------------------|
+| 0x0801 | VAULT_CREATE          | C → S     | Register a new vault + wrapped VK   |
+| 0x0802 | VAULT_CREATE_ACK      | S → C     | Vault registered                    |
+| 0x0803 | VAULT_KEY_FETCH       | C → S     | Fetch wrapped VK (new-device unlock)|
+| 0x0804 | VAULT_KEY_FETCH_RESP  | S → C     | Wrapped VK blob returned            |
+| 0x0805 | VAULT_LIST            | C → S     | List my vaults                      |
+| 0x0806 | VAULT_LIST_RESP       | S → C     | Vault entries (opaque blobs never included) |
+
+**VAULT_CREATE payload:**
+
+| Field            | Type   | Notes |
+|------------------|--------|-------|
+| session_token    | bytes[32] | |
+| folder_file_id   | uint64 | The folder (or file) being opted into encryption |
+| wrapped_vk       | bytes  | AES-256-GCM(VK) — opaque to the server |
+| kdf_salt         | bytes[16] | Argon2id salt |
+| kdf_params       | bytes  | Argon2id (m_cost, t_cost, parallelism) — opaque, client-chosen; server stores as-is |
+
+**VAULT_CREATE_ACK payload:** `error_code` (uint32), `vault_id` (uint64).
+
+**VAULT_KEY_FETCH payload:** `session_token[32]`, `vault_id` (uint64).
+
+**VAULT_KEY_FETCH_RESP payload:** `error_code`, `wrapped_vk`, `kdf_salt`,
+`kdf_params` — same fields as `VAULT_CREATE`, letting a new device unwrap
+the VK locally after the user re-enters their encryption passphrase there.
+
+**VAULT_LIST / VAULT_LIST_RESP:** as named; list entries include `vault_id`,
+`folder_file_id`, `created_at` — never the wrapped-key material itself
+(no legitimate client need to enumerate other vaults' key blobs in a list
+view).
+
+File commit (`FILE_COMMIT`, §7.3 — not modified here in payload shape but
+extended in meaning) additionally carries, for files under a vault: the
+owning `vault_id` and the file's own wrapped DEK, stored alongside that
+file's version record. `vw_version_record_t` has 32 reserved bytes
+(`_reserved[32]`) available to carry a `vault_id` + an offset/length into
+the existing variable-length blob area (`versions.blob`, already used for
+the chunk hash list) where the wrapped DEK itself is stored — mirroring the
+existing pattern of using that blob area for per-version variable-length
+data rather than growing the fixed-size record. Exact byte layout is left to
+`TASK-098` (SRV.01) to finalize alongside a CQR.08 review of the on-disk
+compatibility claim, matching how `TASK-090`'s `deleted_at` field was
+finalized and reviewed.
+
+### 7.11.5 Security properties for review
+
+| Property | Requirement |
+|----------|-------------|
+| Passphrase never transmitted | No wire message may carry the raw encryption passphrase or any value computed directly from it other than the final wrapped-VK ciphertext. `TASK-099` must give `derive_login_token()` and `derive_kek()` distinct, non-interchangeable function signatures/types (not just a naming convention) so the two code paths cannot be pointer-substituted or copy-pasted into each other undetected — a structural guardrail, not just a review checklist item, per SEC.07's advisory that a documented review gate alone is insufficient defense against a future copy-paste. |
+| KDF parameters tuned for a stolen-blob threat model | Unlike the server-side login Argon2id (which only needs to resist *online* guessing, since the server rate-limits attempts), the vault-wrapping Argon2id runs against a threat model where the wrapped blob itself may be exfiltrated wholesale (a compromised server is explicitly in-scope here, since the whole point of E2EE is protecting against that). **Minimum parameter floor (pinned 2026-07-29 rather than deferred to implementation, per SEC.07 advisory):** at least the OWASP-recommended memory-hard baseline for offline-attack resistance — Argon2id, `m_cost >= 19456` KiB (19 MiB), `t_cost >= 2`, `parallelism = 1` — as a floor; `TASK-099` may increase these but must not ship below them. Client-side latency at this floor (roughly sub-second on typical hardware) is an acceptable, one-time-per-vault-unlock cost. |
+| DEK freshness per version | New version ⇒ new DEK (§7.11.2) — never nonce-counter continuation of an old DEK. |
+| No server-side plaintext recoverability | The server must never see an unwrapped VK or DEK, or plaintext content, at any point in any code path — including crash-recovery/oplog replay, which must operate on already-encrypted bytes exactly as it does for any other opaque chunk today. |
+| DEK uniqueness is per-file, not per-vault | A per-vault-scoped DEK bug would silently reproduce the confirmation-of-plaintext leak this design rejected when ruling out convergent encryption (§7.11.1), and would never surface on its own since dedup "succeeding" looks identical to normal operation. `TASK-101` must explicitly test this (two different files, same vault, identical plaintext, distinct ciphertext) rather than inferring it from dedup behavior. |
+
+**Accepted tradeoff (ARCH.00 sign-off, 2026-07-29, per SEC.07 advisory):**
+per-version DEK rotation (required for the nonce-safety and key-scoping
+properties above) means no chunk of a re-uploaded encrypted file's new
+version can ever match a chunk of that same file's own previous version,
+even for byte-identical regions — every edit to an encrypted file forces a
+full-file re-upload, unlike plaintext files which benefit from delta sync.
+This is accepted as the correct tradeoff: the settled requirement was for
+"true encryption," and weakening DEK freshness to preserve delta-sync
+bandwidth would reintroduce exactly the nonce-reuse and key-scoping risks
+flagged above. Large, frequently-edited encrypted files (e.g. a database or
+VM image kept in a vault) will have materially worse sync bandwidth than
+the same file unencrypted — this should be disclosed in the GUI vault
+setup wizard (`TASK-100`) as a known characteristic, not hidden as a
+surprise.
+
+---
+
 ## 8. Authentication Design
 
 ### 8.1 Password transport
@@ -775,6 +1261,9 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 9       | 2026-07-29 | SRV.01  | §7.6 documents fine-grained admin capability requirements (TASK-092, implemented — not design-stage): `USER_LIST`/`USER_SUSPEND`/`INVITE_CREATE` require `VW_CAP_USER_MGMT`, `QUOTA_ADJUST` requires `VW_CAP_QUOTA_MGMT`, `AUDIT_QUERY` requires `VW_CAP_AUDIT_READ`, `CLUSTER_STATUS` (§7.7) requires `VW_CAP_CLUSTER_MGMT`; an authenticated admin lacking the required capability now gets `VW_ERR_PERMISSION` rather than succeeding. No wire payload shapes changed — this documents new server-side authorization behavior on existing messages. CQR.08 finding: the doc previously described only the blanket `is_admin` gate |
+| 8       | 2026-07-29 | ARCH.00 | Vault/E2EE design published (§7.11): `VAULT_CREATE`/`_ACK` (0x0801/0x0802), `VAULT_KEY_FETCH`/`_RESP` (0x0803/0x0804), `VAULT_LIST`/`_RESP` (0x0805/0x0806); envelope-encryption key model, per-file DEK/nonce scheme, dedup interaction, and metadata-scope boundary specified. Same-day revision after SEC.07 design review: nonce derivation changed from random-prefix+counter to deterministic `HKDF(DEK, chunk_index)` (closes a retry-triggered GCM-nonce-reuse gap); explicit DEK-per-file (not per-vault) guardrail added; Argon2id parameter floor pinned; per-version-DEK/delta-sync tradeoff explicitly accepted (ARCH.00 sign-off). Design-stage only — resolves the design half of `TASK-089`; implementation tracked as `TASK-098`–`TASK-101` |
+| 7       | 2026-07-29 | ARCH.00 | Sharing + public links design published (§7.5, §7.10): full `SHARE_GRANT`/`SHARE_REVOKE`/`SHARE_LIST` payloads specified (previously only `SHARE_GRANT` had a payload); `SUB_CREATE`/`SUB_DELETE` (0x0507–0x050A, never implemented) repurposed as `LINK_CREATE`/`LINK_REVOKE`; new `LINK_LIST`/`_RESP` (0x050B/0x050C) and unauthenticated `LINK_ACCESS`/`LINK_ACCESS_ACK` (0x050D/0x050E) added for public read/edit links, reusing the `INVITE_REDEEM` unauthenticated-session-establishment pattern; permission-check rule and quota-resolution rule specified. Same-day revision after CQR.08/SEC.07 design review: `permission` field reconciled with the existing `vw_perm_t` enum instead of a parallel READ/EDIT scheme; per-operation required-permission table added; `FILE_MOVE` ownership/cycle rules added (closes a quota/visibility-hijack gap); `SHARE_GRANT`/`_REVOKE`/`LINK_CREATE`/`_REVOKE` restricted to authenticated (non-scoped) sessions; scoped-session write-count rate limiting added (closes an unauthenticated write-DoS gap); scoped-session root-navigation behavior specified. Design-stage only — resolves the design half of `TASK-088`; implementation tracked as `TASK-094`–`TASK-097` |
 | 6       | 2026-07-13 | PRT.04  | Phase 7 cluster: full payload specs for `NODE_HELLO` (0x0701), `NODE_HELLO_OK` (0x0702), `NODE_HELLO_FAIL` (0x07FF, new), `OPLOG_PULL` (0x0703), `OPLOG_DATA` (0x0704), `OPLOG_ACK` (0x0705, new), `CLUSTER_STATUS_RESP` (0x0707, new); §7.9 cluster channel security model added; resolves TASK-047 |
 | 5       | 2026-07-12 | PRT.04  | Phase 6 invite + recovery: `AUTH_RECOVER_REQUEST` (0x0108), `AUTH_RECOVER_CONFIRM` (0x0109), `AUTH_RECOVER_OK` (0x010A), `AUTH_RECOVER_FAIL` (0x010B) added; `INVITE_CREATE`/`_ACK`/`INVITE_REDEEM`/`_ACK` (0x0609–0x060C) payload specs published; resolves TASK-044 |
 | 4       | 2026-07-11 | PRT.04  | Phase 2 file transfer spec: `session_token[32]` added to all C→S file op payloads; `CHUNK_QUERY` count widened from uint32 to uint16 (max 1024); `VERSION_CHUNKS` / `VERSION_CHUNKS_RESP` (0x0305/0x0306) added; §7.8 File Transfer Security Model added; error codes 305–306 and 600–604 added; resolves TASK-021 |

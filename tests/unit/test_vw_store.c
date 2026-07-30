@@ -394,6 +394,71 @@ VW_TEST_SUITE("vw_store") {
         }
         store_stack_close(&s);
     }
+
+    /* ── vw_admin_has_cap (TASK-092) ───────────────────────────────────────── */
+
+    VW_TEST_CASE("vw_admin_has_cap: non-admin never has any capability") {
+        vw_user_record_t u;
+        memset(&u, 0, sizeof(u));
+        u.is_admin   = 0;
+        u.admin_caps = (uint32_t)VW_CAP_ALL; /* even if set, must not matter */
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_USER_MGMT));
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_QUOTA_MGMT));
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_AUDIT_READ));
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_CLUSTER_MGMT));
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_CERT_RELOAD));
+    }
+
+    VW_TEST_CASE("vw_admin_has_cap: admin_caps==0 means full/legacy admin") {
+        vw_user_record_t u;
+        memset(&u, 0, sizeof(u));
+        u.is_admin   = 1;
+        u.admin_caps = 0; /* as any pre-TASK-092 on-disk record reads back */
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_USER_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_QUOTA_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_AUDIT_READ));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_CLUSTER_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_CERT_RELOAD));
+    }
+
+    VW_TEST_CASE("vw_admin_has_cap: restricted admin only has granted bits") {
+        vw_user_record_t u;
+        memset(&u, 0, sizeof(u));
+        u.is_admin   = 1;
+        u.admin_caps = (uint32_t)(VW_CAP_QUOTA_MGMT | VW_CAP_AUDIT_READ);
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_USER_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_QUOTA_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_AUDIT_READ));
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_CLUSTER_MGMT));
+        VW_ASSERT(!vw_admin_has_cap(&u, VW_CAP_CERT_RELOAD));
+    }
+
+    VW_TEST_CASE("vw_admin_has_cap: explicit VW_CAP_ALL grants everything") {
+        vw_user_record_t u;
+        memset(&u, 0, sizeof(u));
+        u.is_admin   = 1;
+        u.admin_caps = (uint32_t)VW_CAP_ALL;
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_USER_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_QUOTA_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_AUDIT_READ));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_CLUSTER_MGMT));
+        VW_ASSERT(vw_admin_has_cap(&u, VW_CAP_CERT_RELOAD));
+    }
+
+    VW_TEST_CASE("vw_admin_has_cap: admin_caps field is layout-compatible "
+                 "with pre-TASK-092 on-disk records (256 bytes, tail unchanged offset)") {
+        /* A record written before admin_caps existed has these bytes as
+         * always-zero _pad[5]. Simulate that by zeroing the whole struct
+         * (as any legacy on-disk read would produce) and confirm an
+         * is_admin==1 legacy record is still treated as fully capable. */
+        vw_user_record_t legacy;
+        memset(&legacy, 0, sizeof(legacy));
+        legacy.user_id  = 7;
+        legacy.is_admin = 1;
+        /* sizeof() == 256 is already enforced at compile time by the
+         * _Static_assert in vw_store.h; no need to re-check it here. */
+        VW_ASSERT(vw_admin_has_cap(&legacy, VW_CAP_CLUSTER_MGMT));
+    }
 }
 
 VW_TEST_SUITE_END()

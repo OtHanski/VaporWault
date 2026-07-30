@@ -1,1 +1,3 @@
 build/
+build-wsl/
+third_party/SDL2/

@@ -102,8 +102,10 @@ VaporWault/
 | `vw_server_core` | `src/server/vw_server_core.{h,c}` | SRV.01 | C | Request dispatcher, thread pool, connection management |
 | `vw_store` | `src/server/vw_store.{h,c}` | SRV.01 | C | Flat-file storage engine (heap + index + free-list per table) |
 | `vw_oplog` | `src/server/vw_oplog.{h,c}` | SRV.01 | C | Append-only operation log for replication and crash recovery |
-| `vw_storage_files` | `src/server/vw_storage_files.{h,c}` | SRV.01 | C | Chunk store, dedup ref-counting, version GC |
-| `vw_users` | `src/server/vw_users.{h,c}` | SRV.01 | C | User CRUD, sessions, 2FA state, quotas, permissions, subscriptions |
+| `vw_storage` | `src/server/vw_storage.{h,c}` | SRV.01 | C | Chunk store, dedup ref-counting, version GC |
+| `vw_store` (files) | `src/server/vw_store_files.{h,c}` | SRV.01 | C | File/version metadata records, soft-delete + trash retention (split out from `vw_store.c`, which owns users/sessions/quotas) |
+| `vw_file_handlers` | `src/server/vw_file_handlers.{h,c}` | SRV.01 | C | Phase 2 file-op dispatch (FILE_LIST/STAT, CHUNK_*, VERSION_*); owner_id-only access check today — see TASK-088 |
+| `vw_conn_registry` | `src/server/vw_conn_registry.{h,c}` | SRV.01 | C | Live-connection tracking for admin CONN_LIST (added TASK-091) |
 | `vw_auth` | `src/server/vw_auth.{h,c}` | PRT.04 | C | Argon2id hashing, session token lifecycle, 2FA orchestration |
 | `vw_auth_provider` | `src/server/vw_auth_provider.{h,c}` | PRT.04 | C | Abstract 2FA provider interface + email OTP implementation |
 | `vw_smtp` | `src/server/vw_smtp.{h,c}` | SRV.01 | C | Minimal SMTP relay client (TLS, EHLO, AUTH, MAIL/RCPT/DATA) |
@@ -215,12 +217,9 @@ data/
     {hex[0:2]}/
       {sha256hex}.chunk # Raw 4MB chunk data, named by SHA-256
     refcounts.db        # Hash table: sha256 (32 bytes) → ref_count (u32)
-  permissions/
-    perms.db            # Append-only log of permission grants/revocations
-    perms.idx           # (path_hash, grantee_id) → latest record offset (rebuilt on load)
-  subscriptions/
-    subs.db             # Fixed-size subscription records
-    subs.free           # Free-list
+  shares/               # NOT YET IMPLEMENTED — design in TASK-088, no code exists yet.
+    shares.db           # (planned) Fixed-size share/grant records — see TASK-088
+    shares.idx          # (planned) file_id / target_user_id / link_token indexes
   audit/
     audit-{seq}.log     # Segmented append-only log; each entry has CRC32
     audit.idx           # Timestamp → segment + offset (rebuilt on load)
@@ -304,6 +303,40 @@ Client                                  Server
 
 **No automatic failover**: Raft/Paxos in pure C without a battle-tested library introduces split-brain risk. For the target user base (personal cloud admin), manual promotion is safer and simpler. Clients fall back to their offline queue when the primary is unreachable.
 
+**Sharing model (2026-07-29, TASK-088)**: Both files and folders can be
+shared via two independent mechanisms — authenticated user-to-user grants
+and unguessable public links (read or edit) — full spec in
+`docs/PROTOCOL.md` §7.5/§7.10. Public links reuse the existing
+`INVITE_REDEEM` pattern: an unauthenticated pre-`AUTH_REQUEST` message
+(`LINK_ACCESS`) redeems a token and establishes a *scoped* session bound to
+one `share_id`, so all existing file-op dispatch, quota, and oplog machinery
+is reused unmodified rather than building a parallel unauthenticated
+code path. Storage always counts against the file's actual `owner_id`,
+never the acting/grantee session's `user_id` — this is what bounds abuse
+from a public edit link to the owner's own existing quota. A revoked share
+must invalidate an already-issued scoped session's access on its *next*
+request, not just at future `LINK_ACCESS` time — this is checked live
+against the share record, not cached at session-creation.
+
+**End-to-end encryption model (2026-07-29, TASK-089)**: Opt-in per
+file/folder ("vault"), industry-standard envelope encryption — full spec in
+`docs/PROTOCOL.md` §7.11. A random per-vault Vault Key is wrapped by a
+Key-Encryption-Key derived (Argon2id) from a user-chosen encryption
+passphrase that is **never** transmitted to or derivable by the server —
+this is deliberately a separate secret from the account login password,
+otherwise the encryption would be server-recoverable and not genuinely E2E.
+Only the wrapped-key blob is ever server-side, and it is opaque. Each file
+gets its own random Data Encryption Key (AES-256-GCM, matching the TLS
+cipher suite already in use), which as a direct consequence makes
+ciphertext unique per file — this naturally defeats cross-user/cross-version
+dedup for encrypted content without any special-case "skip dedup for
+encrypted files" logic. Losing one vault's passphrase only loses that
+vault's files, since vault keys are independently random and independently
+wrapped; users may reuse one passphrase across vaults or use different ones
+per vault as they choose. Only file *content* is encrypted — filenames,
+folder structure, and sizes remain visible to the server, and this
+boundary must be disclosed plainly in the GUI, not just documented here.
+
 ---
 
 ## Implementation Phases
@@ -316,11 +349,13 @@ See `TODO/` for the active task list. Phases in order:
 | 1 | Authentication | `vw_auth`, `vw_auth_provider`, `vw_store` (users/sessions), `vw_smtp` | PRT.04, SRV.01 | **complete** (TASK-007–020 done) |
 | 2 | File Transfer | `vw_store` (files/versions), `vw_storage` (chunks/dedup), `vw_file_handlers`, `vw_client_core` file transfer | SRV.01, CLI.02 | **complete** (TASK-021–025 done) |
 | 3 | Sync Engine | `vw_cache`, `vw_watch_*`, `vw_sync`, `vw_daemon`, `vw_ipc`, `vw_client_cli`; server quota enforcement | CLI.02, SRV.01 | **complete** (TASK-026–033 done) |
-| 4 | Sharing | `vw_store` (permissions/subs), permission checks, shared folder sync | SRV.01, CLI.02 | **complete** (TASK-034–035 done) |
+| 4 | Sharing | `vw_share` (new module), permission checks in `vw_file_handlers`, shared-folder sync | SRV.01, CLI.02 | **design complete, implementation not started** — corrected 2026-07-29: this row previously claimed "complete", citing TASK-034/035 as evidence; those tasks are actually CI setup and Dear ImGui vendoring, unrelated to sharing. No sharing/permission code exists in `src/server` today (confirmed by direct source inspection). Full design (data model, wire protocol, permission-check and quota rules) published 2026-07-29 in `docs/PROTOCOL.md` §7.5/§7.10; `TASK-088` closed `done` after SEC.07 + CQR.08 sign-off and an independent re-verification pass. Implementation split into `TASK-094` (SRV.01), `TASK-095` (CLI.02), `TASK-096` (GUI.03), `TASK-097` (QA.06), none started yet. |
 | 5 | DDNS, ACME, Admin | `vw_ddns`, `vw_acme`, thread pool, admin CLI, integration tests | SRV.01, PRT.04 | **complete** (TASK-036–041 done) |
 | 6 | GC, Invites, Recovery | `vw_gc`, invite tokens, recovery email | SRV.01, PRT.04 | **complete** (TASK-042–046 done) |
 | 7 | GUIs + Cluster | `vw_client_gui`, `vw_server_gui`, `vw_cluster` replication | GUI.03, SRV.01 | **complete** (TASK-047–053 done) |
-| 8 | Hardening | Security audit, fuzz testing, integration suite, CI | SEC.07, CQR.08, QA.06 | **in progress** (TASK-054–059) |
+| 8 | Hardening | Security audit, fuzz testing, integration suite, CI | SEC.07, CQR.08, QA.06 | **in progress** (TASK-054–059 and ongoing — this phase has no fixed end; real-world bugs keep surfacing as previously-untested features get exercised for the first time, e.g. TASK-085/087) |
+
+> **2026-07-29 audit note**: this table (and the Module Map / on-disk-layout sections above) was found to contain at least one fabricated completion claim (Phase 4, corrected above) that cited unrelated task IDs and referenced a module (`vw_users`) that was never created. The rest of this document has not been re-audited line-by-line against the current codebase — treat "complete" markers here as unverified until spot-checked against `TODO/` and the actual source tree, the same way Phase 4's was. `TODO/` task files (which get appended-to, never rewritten wholesale) are more trustworthy than this document's prose for "did X actually happen."
 
 ---
 

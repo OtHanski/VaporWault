@@ -65,7 +65,8 @@ acme_domain       =
 acme_account_key  = /etc/vapourwault/acme-account.key
 
 # DNS-01 challenge: path to a hook script that adds/removes the _acme-challenge
-# TXT record. The script is called with arguments: add|remove <domain> <token>.
+# TXT record. Called as: `hook set <domain> <token>` to create the record,
+# `hook clear <domain>` (no token argument) to remove it.
 acme_dns_hook     =
 
 # HTTP-01 challenge: directory served at http://<domain>/.well-known/acme-challenge/

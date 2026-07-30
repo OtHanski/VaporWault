@@ -528,11 +528,12 @@ void vw_net_ctx_close(vw_net_ctx_t *ctx) {
 
 /* ── Public client API ───────────────────────────────────────────────────── */
 
-vw_err_t vw_net_connect(const char *host, uint16_t port,
-                         vw_cert_verify_t verify,
-                         const char *ca_cert_pem_path,
-                         const vw_conn_opts_t *opts,
-                         vw_conn_t **out_conn) {
+static vw_err_t net_connect_impl(const char *host, uint16_t port,
+                                  vw_cert_verify_t verify,
+                                  const char *ca_cert_pem_path,
+                                  const vw_conn_opts_t *opts,
+                                  const char **alpn_protos,
+                                  vw_conn_t **out_conn) {
     if (verify == VW_CERT_VERIFY_REQUIRED && !ca_cert_pem_path)
         return VW_ERR_INVALID_ARG;
 
@@ -569,7 +570,7 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
     diag_step = 2;
     if (configure_ssl_defaults(&tls->conf, &tls->ctr_drbg,
                                 MBEDTLS_SSL_IS_CLIENT,
-                                VW_ALPN_CLIENT) != VW_OK)
+                                alpn_protos) != VW_OK)
         goto fail;
 
     if (verify == VW_CERT_VERIFY_NONE) {
@@ -661,6 +662,24 @@ fail:
 #endif
     free(conn);
     return VW_ERR_NET_TLS;
+}
+
+vw_err_t vw_net_connect(const char *host, uint16_t port,
+                         vw_cert_verify_t verify,
+                         const char *ca_cert_pem_path,
+                         const vw_conn_opts_t *opts,
+                         vw_conn_t **out_conn) {
+    return net_connect_impl(host, port, verify, ca_cert_pem_path, opts,
+                             VW_ALPN_CLIENT, out_conn);
+}
+
+vw_err_t vw_net_connect_cluster(const char *host, uint16_t port,
+                                 vw_cert_verify_t verify,
+                                 const char *ca_cert_pem_path,
+                                 const vw_conn_opts_t *opts,
+                                 vw_conn_t **out_conn) {
+    return net_connect_impl(host, port, verify, ca_cert_pem_path, opts,
+                             VW_ALPN_CLUSTER, out_conn);
 }
 
 /* ── Per-connection send / recv ──────────────────────────────────────────── */

@@ -38,6 +38,7 @@ struct vw_server_ctx {
     const vw_smtp_cfg_t *smtp_cfg;        /* NULL = no email             */
     vw_oplog_t          *oplog;           /* NULL = audit queries return empty */
     vw_cluster_t        *cluster;         /* NULL = cluster status returns empty list */
+    vw_conn_registry_t  *conn_registry;   /* NULL = connection list not tracked here */
     uint32_t             auth_timeout_ms;
 };
 
@@ -732,6 +733,16 @@ void vw_server_ctx_set_cluster(vw_server_ctx_t *ctx, vw_cluster_t *cluster)
 vw_cluster_t *vw_server_ctx_cluster(const vw_server_ctx_t *ctx)
 {
     return ctx ? ctx->cluster : NULL;
+}
+
+void vw_server_ctx_set_conn_registry(vw_server_ctx_t *ctx, vw_conn_registry_t *reg)
+{
+    if (ctx) ctx->conn_registry = reg;
+}
+
+vw_conn_registry_t *vw_server_ctx_conn_registry(const vw_server_ctx_t *ctx)
+{
+    return ctx ? ctx->conn_registry : NULL;
 }
 
 void vw_server_ctx_close(vw_server_ctx_t *ctx)
