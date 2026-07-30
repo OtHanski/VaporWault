@@ -11,7 +11,10 @@ bleed between test cases.
 import uuid
 import pytest
 
-from vw_client import VwClient, VwAuthError, VW_ERR_AUTH_BAD_CREDS, VW_ERR_AUTH_LOCKED
+from vw_client import (
+    VwClient, VwAuthError, VW_ERR_AUTH_BAD_CREDS, VW_ERR_AUTH_LOCKED,
+    MSG_AUTH_REQUEST, MSG_ERROR,
+)
 
 PASSWORD = "TestP@ssw0rd!"
 
@@ -144,3 +147,27 @@ def test_brute_force_lockout(server, admin_client, unique_username):
     assert err.lockout_secs > 0, (
         f"lockout_remaining_secs must be > 0, got {err.lockout_secs}"
     )
+
+
+def test_unrecognized_message_after_auth_gets_error_not_hang(server, admin_client, unique_username):
+    """
+    TASK-105 regression: re-sending a pre-auth-phase message type (here,
+    AUTH_REQUEST again) on an already-authenticated connection must get an
+    explicit ERROR response, not silence. Before the fix,
+    vw_server_dispatch_file_op's default case returned VW_ERR_NOT_IMPL
+    without ever calling send_error, and the server's per-connection loop
+    only logs a warning and waits for the *next* message on that code —
+    so the client hung until its own receive timeout, tying up a worker
+    thread the whole time with no feedback at all.
+    """
+    make_user(admin_client, server, unique_username)
+
+    with new_client(server) as c:
+        c.login(unique_username, PASSWORD)
+
+        # Send a second AUTH_REQUEST directly on the now-authenticated
+        # connection (bypassing login()'s normal pre-auth-phase-only use).
+        c._send(MSG_AUTH_REQUEST, b"\x00\x00" + b"\x00" * 32)
+        mt, resp = c._recv()  # must not raise a socket timeout
+
+    assert mt == MSG_ERROR, f"expected MSG_ERROR (0x{MSG_ERROR:04X}), got 0x{mt:04X}"

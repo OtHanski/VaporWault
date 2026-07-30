@@ -2313,6 +2313,15 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
     case VW_MSG_LINK_LIST:
         return handle_link_list(store, fs, ss, conn, payload, plen);
     default:
+        /* TASK-105: an unrecognized/misplaced message type on an
+         * authenticated connection (e.g. a pre-auth-phase type like
+         * AUTH_REQUEST re-sent after the handshake) must get an explicit
+         * error, not silence — the caller in vw_server_main.c's per-
+         * connection loop only logs a warning and waits for the *next*
+         * message on VW_ERR_NOT_IMPL, so a client that sent this message
+         * expecting a response would otherwise hang until its own
+         * receive timeout, tying up a worker thread the whole time. */
+        (void)send_error(conn, VW_ERR_PROTO_INVALID);
         return VW_ERR_NOT_IMPL;
     }
 }
