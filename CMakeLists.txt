@@ -15,7 +15,22 @@ option(VW_WERROR "Treat compiler warnings as errors" OFF)
 
 if(VW_WERROR)
     if(MSVC)
-        add_compile_options(/W4 /WX)
+        # TASK-071: /wd4200 suppresses C4200 ("nonstandard extension used:
+        # zero-sized array in struct/union") project-wide under MSVC. This
+        # isn't about our own code (which doesn't use zero-length arrays —
+        # this codebase's convention is fixed-size records with
+        # _Static_assert) — it fires on vendored mbedTLS's
+        # psa/crypto_struct.h whenever one of OUR translation units
+        # (vw_crypto.c, vw_net.c, vw_smtp.c) transitively #includes it.
+        # MBEDTLS_FATAL_WARNINGS is already forced off (see
+        # third_party/CMakeLists.txt) so this isn't mbedTLS's own -Werror/
+        # /WX bleeding in — /W4 /WX is applied to OUR targets, and the
+        # vendored header's content is parsed as part of compiling OUR
+        # file, under OUR flags. FetchContent-ing mbedTLS before this
+        # add_compile_options() call keeps /W4 /WX off mbedTLS's own build
+        # targets already; it can't do anything about a warning raised
+        # while compiling a file that is itself one of our targets.
+        add_compile_options(/W4 /WX /wd4200)
         add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
     else()
         add_compile_options(-Wall -Wextra -Wpedantic -Werror)

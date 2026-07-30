@@ -1,7 +1,7 @@
 ---
 id:          TASK-071
 title:       MSVC /WX build fails on vendored mbedTLS PSA header (C4200 zero-sized array)
-status:      todo
+status:      done
 assignee:    BLD.05
 created_by:  SRV.01
 created:     2026-07-19
@@ -80,3 +80,60 @@ SRV.01 [2026-07-19]: Discovered while locally verifying TASK-070 (build
 validation step). Reproduced on unmodified HEAD via `git stash` before
 filing — confirmed unrelated to the TASK-070 change. Not fixing myself per
 CLAUDE.md out-of-domain protocol; routing to BLD.05.
+
+BLD.05 [2026-07-30]: Confirmed still reproducible against current HEAD
+(mbedTLS is still FetchContent'd, not vendored as a submodule despite
+`.gitmodules` listing it — that entry is unused by the actual CMake
+config). Root cause is exactly as SRV.01 traced it, with one clarification:
+`third_party/CMakeLists.txt` already adds `third_party` as a subdirectory
+*before* the top-level `add_compile_options(/W4 /WX)` call, so mbedTLS's
+own build targets never receive `/W4 /WX` — that ordering was already
+correct and isn't the gap. The failure is that **our own** targets
+(`vw_core`, `vw_server_lib`) correctly *do* receive `/W4 /WX` (as intended),
+and `vw_crypto.c`/`vw_net.c`/`vw_smtp.c` transitively `#include` mbedTLS's
+`psa/crypto_struct.h` — the C4200 warning fires while compiling *our*
+translation unit under *our* flags, not mbedTLS's.
+
+Fix: added `/wd4200` alongside `/W4 /WX` in the top-level `CMakeLists.txt`'s
+`VW_WERROR && MSVC` branch. Chose this over marking the mbedTLS include
+directory `SYSTEM` (MSVC largely ignores `SYSTEM` include markings without
+additional `/external:I` + `/experimental:external` plumbing across the
+CMake/MSVC version in use here — meaningfully more moving parts for the
+same result) and over per-file pragma suppression around just
+`vw_crypto.c`/`vw_net.c`/`vw_smtp.c` (would need updating every time a new
+file starts including a PSA header transitively; a single project-wide
+flag doesn't have that maintenance burden). Confirmed this codebase never
+declares a real zero-length array itself (grepped `src/` for `[0];`/`[];`
+declarations — only false-positive array-index usages, no actual C99
+flexible-array-member or MSVC zero-sized-array patterns) — this codebase's
+own convention is fixed-size records with `_Static_assert`, so disabling
+C4200 project-wide costs nothing in real warning coverage.
+
+**Validation:**
+- MSVC (`ninja` in a fresh build dir, env from `vcvars64.bat`,
+  `-DCMAKE_BUILD_TYPE=Release -DVW_WERROR=ON -DVW_BUILD_GUI=OFF
+  -DVW_BUILD_TESTS=ON`): reproduced the exact failure first (three files,
+  matching SRV.01's report exactly), applied the fix, rebuilt from the same
+  configured tree — clean, 0 warnings/errors, all 11 ctest suites pass
+  (including `unit_vw_auth`/`unit_vw_ipc`, which happened to pick up
+  TASK-077/078/079/103's changes landing in the same session).
+- GCC/WSL Ubuntu, same flags translated (`-DVW_WERROR=ON`, non-MSVC branch
+  untouched): full clean build, all 12 ctest suites (unit + integration)
+  pass — confirms the fix is MSVC-only and doesn't perturb the
+  already-working Linux `-Werror` path.
+- `build-windows`/`integration` CI jobs (`.github/workflows/ci.yml`) both
+  build with `VW_WERROR=ON` per their existing config — this was latent,
+  undetected breakage on the Windows job specifically (the acceptance
+  criteria's open question); it's resolved now.
+
+CQR.08 [2026-07-30]: Reviewed the one-line `CMakeLists.txt` change plus its
+comment. Confirmed the fix is scoped to the `MSVC` branch only — the
+non-MSVC `-Wall -Wextra -Wpedantic -Werror` branch is untouched, so no risk
+to the already-green Linux/macOS warning posture. Confirmed via the PR
+diff that no source file changed behavior; this is a pure build-flag
+change. No blocking or advisory findings. Sign-off given.
+
+ARCH.00 [2026-07-30]: CQR.08 sign-off received. Both acceptance criteria
+satisfied (clean `VW_WERROR=ON` build on both platforms; `vw_crypto.c`/
+`vw_net.c`/`vw_smtp.c` compile clean under MSVC `/W4 /WX`). Closing as
+done.

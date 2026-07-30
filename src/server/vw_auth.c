@@ -31,6 +31,24 @@ typedef pthread_mutex_t vw_auth_mutex_t;
 static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
 #define secure_zero(p, n) ((void)(g_memset_fn)((p), 0, (size_t)(n)))
 
+/*
+ * TASK-079: time-injection seam for the password lockout table's
+ * window-reset/expiry logic. Defaults to the real time(); tests can
+ * override it (via vw_auth_test_set_time_fn, declared here but not in
+ * vw_auth.h — internal test hook only) to observe a lockout expiring or a
+ * failure window elapsing without a real LOCKOUT_WINDOW_SECS-long wait.
+ * Same volatile-function-pointer shape as g_memset_fn above, though here
+ * it's for test controllability rather than defeating dead-store
+ * elimination.
+ */
+static time_t (* volatile g_time_fn)(time_t *) = time;
+#define vw_lockout_now() (g_time_fn(NULL))
+
+void vw_auth_test_set_time_fn(time_t (*fn)(time_t *))
+{
+    g_time_fn = fn ? fn : time;
+}
+
 /* ── Defaults ────────────────────────────────────────────────────────────── */
 
 #define DEFAULT_SESSION_TTL_SECS   (30u * 24u * 3600u)   /* 30 days */
@@ -83,7 +101,6 @@ struct vw_auth_ctx {
 
     /* Password brute-force lockout table; see lockout_entry_t above. */
     lockout_entry_t   lockout_table[LOCKOUT_TABLE_SIZE];
-    uint32_t          lockout_next_slot;   /* ring-buffer eviction cursor    */
     vw_auth_mutex_t   lockout_mu;
     int               lockout_mu_init;
 };
@@ -242,17 +259,47 @@ static lockout_entry_t *lockout_find(vw_auth_ctx_t *ctx, uint64_t user_id)
     return NULL;
 }
 
-/* Caller must hold ctx->lockout_mu. */
-static lockout_entry_t *lockout_find_or_evict(vw_auth_ctx_t *ctx, uint64_t user_id)
+/*
+ * TASK-078: when the table is full and user_id has no existing entry, pick
+ * a slot to evict. Preference order: (1) a genuinely free slot; (2) an
+ * occupied slot that is not currently locked (tie-broken by the stalest
+ * failure window); (3) among slots with an active lockout, the one
+ * soonest to expire — evicting it does the least damage, since it was
+ * about to clear on its own anyway. Never evict by ring-buffer position
+ * alone: on a deployment with more than LOCKOUT_TABLE_SIZE active
+ * accounts, or under an attacker deliberately touching 256+ distinct
+ * usernames, that could evict a freshly-locked or soon-to-be-enforced
+ * entry ahead of a stale/expired one, weakening the lockout.
+ *
+ * Caller must hold ctx->lockout_mu.
+ */
+static lockout_entry_t *lockout_find_or_evict(vw_auth_ctx_t *ctx, uint64_t user_id,
+                                                time_t now)
 {
     lockout_entry_t *e = lockout_find(ctx, user_id);
     if (e) return e;
 
-    e = &ctx->lockout_table[ctx->lockout_next_slot];
-    ctx->lockout_next_slot = (ctx->lockout_next_slot + 1u) % LOCKOUT_TABLE_SIZE;
-    memset(e, 0, sizeof(*e));
-    e->user_id = user_id;
-    return e;
+    lockout_entry_t *victim = &ctx->lockout_table[0];
+    for (int i = 0; i < LOCKOUT_TABLE_SIZE; i++) {
+        lockout_entry_t *cand = &ctx->lockout_table[i];
+
+        if (cand->user_id == 0) { victim = cand; break; }
+
+        int cand_locked   = cand->locked_until   != 0 && cand->locked_until   > now;
+        int victim_locked = victim->locked_until != 0 && victim->locked_until > now;
+
+        if (cand_locked != victim_locked) {
+            if (!cand_locked) victim = cand;
+        } else if (cand_locked) {
+            if (cand->locked_until < victim->locked_until) victim = cand;
+        } else {
+            if (cand->first_fail_at < victim->first_fail_at) victim = cand;
+        }
+    }
+
+    memset(victim, 0, sizeof(*victim));
+    victim->user_id = user_id;
+    return victim;
 }
 
 /*
@@ -285,7 +332,7 @@ static uint32_t lockout_remaining(vw_auth_ctx_t *ctx, uint64_t user_id, time_t n
  * OTP-attempt counter in vw_auth_verify_2fa). */
 static void lockout_record_failure(vw_auth_ctx_t *ctx, uint64_t user_id, time_t now)
 {
-    lockout_entry_t *e = lockout_find_or_evict(ctx, user_id);
+    lockout_entry_t *e = lockout_find_or_evict(ctx, user_id, now);
 
     if (e->fail_count == 0 ||
         (now - e->first_fail_at) >= (time_t)LOCKOUT_WINDOW_SECS) {
@@ -343,7 +390,7 @@ vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
     memset(real_hash, 0, sizeof(real_hash));
     memset(real_salt, 0, sizeof(real_salt));
 
-    now = time(NULL);
+    now = vw_lockout_now();
     user_found = (vw_store_user_get_by_username(ctx->store, username, &rec) == VW_OK);
 
     if (user_found) {

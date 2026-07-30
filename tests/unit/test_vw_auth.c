@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -24,6 +25,19 @@
 #  include <dirent.h>
 #  define VW_PID() ((unsigned)getpid())
 #endif
+
+/* TASK-079: time-injection seam for the lockout table's window-reset/expiry
+ * logic. vw_auth_test_set_time_fn is an internal test-only hook exposed by
+ * vw_auth.c (not declared in vw_auth.h — production callers never use it). */
+extern void vw_auth_test_set_time_fn(time_t (*fn)(time_t *));
+
+static time_t g_fake_now;
+
+static time_t fake_time(time_t *tp)
+{
+    if (tp) *tp = g_fake_now;
+    return g_fake_now;
+}
 
 /* ── Temp-dir helpers ─────────────────────────────────────────────────────── */
 
@@ -314,6 +328,83 @@ VW_TEST_SUITE("vw_auth") {
                               VW_ERR_AUTH_BAD_CREDS);
                 VW_ASSERT_EQ(0, (int)lockout_secs);
             }
+        }
+        auth_stack_close(&s);
+    }
+
+    /* TASK-079: lockout window-reset/expiry coverage, using the fake_time
+     * seam above instead of a real ~600s (LOCKOUT_WINDOW_SECS) wait. */
+
+    VW_TEST_CASE("begin_login: lockout auto-clears once LOCKOUT_WINDOW_SECS elapses") {
+        auth_stack_t s = {0};
+        auth_stack_open(&s, "login_lockout_expiry");
+        {
+            (void)make_user(&s, "gina", "correctpw", 0);
+            vw_auth_state_t state;
+            uint16_t lockout_secs;
+
+            g_fake_now = 1000000;
+            vw_auth_test_set_time_fn(fake_time);
+
+            for (int i = 0; i < 5; i++) {
+                lockout_secs = 0;
+                VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "gina", "wrongpw!!", 9,
+                                                   &state, &lockout_secs),
+                              VW_ERR_AUTH_BAD_CREDS);
+            }
+
+            lockout_secs = 0;
+            VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "gina", "correctpw", 9,
+                                               &state, &lockout_secs),
+                          VW_ERR_AUTH_LOCKED);
+            VW_ASSERT(lockout_secs > 0);
+
+            /* Jump past the 600s lockout window. */
+            g_fake_now += 601;
+
+            lockout_secs = 0;
+            VW_ASSERT_OK(vw_auth_begin_login(s.auth, "gina", "correctpw", 9,
+                                              &state, &lockout_secs));
+            VW_ASSERT_EQ(0, (int)lockout_secs);
+
+            vw_auth_test_set_time_fn(NULL); /* restore real clock */
+        }
+        auth_stack_close(&s);
+    }
+
+    VW_TEST_CASE("begin_login: failure counter resets once the window elapses without reaching threshold") {
+        auth_stack_t s = {0};
+        auth_stack_open(&s, "login_lockout_window_reset");
+        {
+            (void)make_user(&s, "henry", "correctpw", 0);
+            vw_auth_state_t state;
+            uint16_t lockout_secs;
+
+            g_fake_now = 2000000;
+            vw_auth_test_set_time_fn(fake_time);
+
+            /* 4 failures — one short of the 5-attempt threshold. */
+            for (int i = 0; i < 4; i++) {
+                lockout_secs = 0;
+                VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "henry", "wrongpw!!", 9,
+                                                   &state, &lockout_secs),
+                              VW_ERR_AUTH_BAD_CREDS);
+            }
+
+            /* Jump past the window: the failure count must reset to zero
+             * rather than carry over (4 old + 4 new would otherwise exceed
+             * the threshold of 5 and incorrectly lock the account). */
+            g_fake_now += 601;
+
+            for (int i = 0; i < 4; i++) {
+                lockout_secs = 0;
+                VW_ASSERT_ERR(vw_auth_begin_login(s.auth, "henry", "wrongpw!!", 9,
+                                                   &state, &lockout_secs),
+                              VW_ERR_AUTH_BAD_CREDS);
+                VW_ASSERT_EQ(0, (int)lockout_secs);
+            }
+
+            vw_auth_test_set_time_fn(NULL); /* restore real clock */
         }
         auth_stack_close(&s);
     }

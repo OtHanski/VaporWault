@@ -45,6 +45,41 @@ static const char *PROC_NET_TCP_SAMPLE =
     "   3: 7F000001:5678 0100007F:BABE 01 00000000:00000000 00:00000000 00000000  9999        0 44444 1 0000000000000000 100 0 0 10 0\n";
 #endif
 
+#ifdef _WIN32
+#include "vw_ipc_internal.h"
+
+/*
+ * Windows analogue of the /proc/net/tcp fixture above, as an in-memory
+ * MIB_TCPROW_OWNER_PID array instead of parsed text — same two-rows-per-
+ * connection structure, same deliberately-different PIDs so a regression
+ * back to an un-swapped query is caught (it would return 1000, not 4242).
+ */
+#define WIN_LOOPBACK_BE     ((uint32_t)0x0100007Fu) /* 127.0.0.1, network byte order */
+#define WIN_NON_LOOPBACK_BE ((uint32_t)0x0100007Eu) /* deliberately not loopback */
+
+static MIB_TCPROW_OWNER_PID win_mk_row(DWORD state, uint32_t local_addr, uint16_t local_port,
+                                        uint32_t remote_addr, uint16_t remote_port, DWORD pid)
+{
+    MIB_TCPROW_OWNER_PID r;
+    memset(&r, 0, sizeof(r));
+    r.dwState      = state;
+    r.dwLocalAddr  = local_addr;
+    r.dwLocalPort  = (DWORD)htons(local_port);
+    r.dwRemoteAddr = remote_addr;
+    r.dwRemotePort = (DWORD)htons(remote_port);
+    r.dwOwningPid  = pid;
+    return r;
+}
+
+static void win_mk_table(MIB_TCPROW_OWNER_PID *rows)
+{
+    rows[0] = win_mk_row(MIB_TCP_STATE_LISTEN, WIN_LOOPBACK_BE, 0x9999, 0, 0, 1000);
+    rows[1] = win_mk_row(MIB_TCP_STATE_ESTAB,  WIN_LOOPBACK_BE, 0xBABE, WIN_LOOPBACK_BE, 0x1234, 1000);
+    rows[2] = win_mk_row(MIB_TCP_STATE_ESTAB,  WIN_LOOPBACK_BE, 0x1234, WIN_LOOPBACK_BE, 0xBABE, 4242);
+    rows[3] = win_mk_row(MIB_TCP_STATE_ESTAB,  WIN_NON_LOOPBACK_BE, 0x5678, WIN_LOOPBACK_BE, 0xBABE, 9999);
+}
+#endif
+
 VW_TEST_SUITE("vw_ipc") {
 
 #ifdef __linux__
@@ -103,6 +138,57 @@ VW_TEST_SUITE("vw_ipc") {
         VW_ASSERT_EQ(1, vw_ipc_linux_proc_net_tcp_uid(NULL, 1, 2, &uid));
     }
 #endif /* __linux__ */
+
+#ifdef _WIN32
+    VW_TEST_CASE("win_tcp_table_pid: un-swapped query returns the daemon's own pid (the tautology this task fixed)") {
+        MIB_TCPROW_OWNER_PID rows[4];
+        DWORD pid = 0;
+        win_mk_table(rows);
+        /* our_port=0xBABE, peer_port=0x1234, queried un-swapped (local=our_port) */
+        VW_ASSERT_EQ(0, vw_ipc_win_tcp_table_pid(rows, 4, 0xBABE, 0x1234, WIN_LOOPBACK_BE, &pid));
+        VW_ASSERT_EQ(1000, (int)pid);
+    }
+
+    VW_TEST_CASE("win_tcp_table_pid: swapped query (the fix) returns the actual connecting client's pid") {
+        MIB_TCPROW_OWNER_PID rows[4];
+        DWORD pid = 0;
+        win_mk_table(rows);
+        /* our_port=0xBABE, peer_port=0x1234, queried swapped (local=peer_port, rem=our_port)
+         * — this is exactly what vw_ipc_server_accept() now does. */
+        VW_ASSERT_EQ(0, vw_ipc_win_tcp_table_pid(rows, 4, 0x1234, 0xBABE, WIN_LOOPBACK_BE, &pid));
+        VW_ASSERT_EQ(4242, (int)pid);
+        VW_ASSERT(pid != 1000);
+    }
+
+    VW_TEST_CASE("win_tcp_table_pid: LISTEN-state entries never match (state filter)") {
+        MIB_TCPROW_OWNER_PID rows[4];
+        DWORD pid = 0;
+        win_mk_table(rows);
+        VW_ASSERT_EQ(1, vw_ipc_win_tcp_table_pid(rows, 4, 0x9999, 0x0000, WIN_LOOPBACK_BE, &pid));
+    }
+
+    VW_TEST_CASE("win_tcp_table_pid: a matching port pair on a non-loopback address is rejected") {
+        MIB_TCPROW_OWNER_PID rows[4];
+        DWORD pid = 0;
+        win_mk_table(rows);
+        /* Row 3 has local port 0x5678 but a non-loopback local address,
+         * paired with rem=BABE — must not match even though the port pair
+         * looks right. */
+        VW_ASSERT_EQ(1, vw_ipc_win_tcp_table_pid(rows, 4, 0x5678, 0xBABE, WIN_LOOPBACK_BE, &pid));
+    }
+
+    VW_TEST_CASE("win_tcp_table_pid: no matching port pair returns 1 (not found)") {
+        MIB_TCPROW_OWNER_PID rows[4];
+        DWORD pid = 0;
+        win_mk_table(rows);
+        VW_ASSERT_EQ(1, vw_ipc_win_tcp_table_pid(rows, 4, 0x0001, 0x0002, WIN_LOOPBACK_BE, &pid));
+    }
+
+    VW_TEST_CASE("win_tcp_table_pid: NULL rows returns 1 rather than crashing") {
+        DWORD pid = 0;
+        VW_ASSERT_EQ(1, vw_ipc_win_tcp_table_pid(NULL, 4, 1, 2, WIN_LOOPBACK_BE, &pid));
+    }
+#endif /* _WIN32 */
 
     VW_TEST_CASE("server_accept: same-uid loopback connection is accepted (regression: TASK-093's discovery broke every connection)") {
         vw_ipc_server_t *srv = NULL;

@@ -49,6 +49,13 @@ void vw_admin_server_stop(vw_admin_server_t *srv) { (void)srv; }
 #   include <sys/ucred.h>
 #endif
 
+/* TASK-077: secrets (password hashes/salts, tokens) must be cleared with a
+ * memset the optimizer cannot prove dead and elide — a plain memset()
+ * immediately followed by free()/return can be optimized away, leaving the
+ * secret in freed/stack memory. Same pattern as vw_auth.c's secure_zero. */
+static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
+#define secure_zero(p, n) ((void)(g_memset_fn)((p), 0, (size_t)(n)))
+
 /* ── Frame helpers ─────────────────────────────────────────────────────────── */
 
 #define ADMIN_HDR_SIZE      8u
@@ -165,14 +172,14 @@ static void handle_user_create(vw_admin_server_t *srv, int fd,
         uint8_t pw_token[32];
         rc = vw_crypto_sha256(p + 3 + uname_len + 2, pw_len, pw_token);
         if (rc != VW_OK) {
-            memset(pw_token, 0, sizeof(pw_token));
+            secure_zero(pw_token, sizeof(pw_token));
             send_u32_resp(fd, VW_ADMIN_USER_CREATE_RESP, rc); return;
         }
         rc = vw_auth_hash_password(pw_token, sizeof(pw_token), hash, salt);
-        memset(pw_token, 0, sizeof(pw_token));
+        secure_zero(pw_token, sizeof(pw_token));
     }
     if (rc != VW_OK) {
-        memset(hash, 0, sizeof(hash)); memset(salt, 0, sizeof(salt));
+        secure_zero(hash, sizeof(hash)); secure_zero(salt, sizeof(salt));
         send_u32_resp(fd, VW_ADMIN_USER_CREATE_RESP, rc); return;
     }
 
@@ -180,13 +187,13 @@ static void handle_user_create(vw_admin_server_t *srv, int fd,
     memcpy(rec.username, username, uname_len + 1);
     memcpy(rec.password_hash, hash, 32);
     memcpy(rec.password_salt, salt, 16);
-    memset(hash, 0, sizeof(hash)); memset(salt, 0, sizeof(salt));
+    secure_zero(hash, sizeof(hash)); secure_zero(salt, sizeof(salt));
     rec.is_admin  = is_admin ? 1 : 0;
     rec.is_active = 1;
 
     rc = vw_store_user_create(srv->ctx.store, &rec, &uid);
-    memset(rec.password_hash, 0, sizeof(rec.password_hash));
-    memset(rec.password_salt, 0, sizeof(rec.password_salt));
+    secure_zero(rec.password_hash, sizeof(rec.password_hash));
+    secure_zero(rec.password_salt, sizeof(rec.password_salt));
 
     w32le(resp,     (uint32_t)rc);
     w64le(resp + 4, uid);
@@ -295,7 +302,7 @@ static void handle_set_quota(vw_admin_server_t *srv, int fd,
 
     rc = vw_store_user_get_by_username(srv->ctx.store, username, &rec);
     if (rc != VW_OK) {
-        memset(&rec, 0, sizeof(rec)); /* rec may be partially written */
+        secure_zero(&rec, sizeof(rec)); /* rec may be partially written */
         send_u32_resp(fd, VW_ADMIN_SET_QUOTA_RESP, rc); return;
     }
 
@@ -324,7 +331,7 @@ static void handle_set_quota(vw_admin_server_t *srv, int fd,
                 (int)log_rc, (unsigned long long)rec.user_id);
     }
 
-    memset(&rec, 0, sizeof(rec)); /* zero password_hash/salt from the fetched record */
+    secure_zero(&rec, sizeof(rec)); /* zero password_hash/salt from the fetched record */
     send_u32_resp(fd, VW_ADMIN_SET_QUOTA_RESP, rc);
 }
 
@@ -352,7 +359,7 @@ static void handle_set_admin_caps(vw_admin_server_t *srv, int fd,
 
     rc = vw_store_user_get_by_username(srv->ctx.store, username, &rec);
     if (rc != VW_OK) {
-        memset(&rec, 0, sizeof(rec));
+        secure_zero(&rec, sizeof(rec));
         send_u32_resp(fd, VW_ADMIN_SET_CAPS_RESP, rc); return;
     }
 
@@ -379,7 +386,7 @@ static void handle_set_admin_caps(vw_admin_server_t *srv, int fd,
                 (int)log_rc, (unsigned long long)rec.user_id);
     }
 
-    memset(&rec, 0, sizeof(rec));
+    secure_zero(&rec, sizeof(rec));
     send_u32_resp(fd, VW_ADMIN_SET_CAPS_RESP, rc);
 }
 
@@ -549,8 +556,8 @@ static void handle_node_add(vw_admin_server_t *srv, int fd,
         memcpy(resp + 12, token, 32);
     }
     send_frame(fd, VW_ADMIN_NODE_ADD_RESP, resp, sizeof(resp));
-    memset(token, 0, sizeof(token));
-    memset(resp, 0, sizeof(resp)); /* auth_token must not linger in memory */
+    secure_zero(token, sizeof(token));
+    secure_zero(resp, sizeof(resp)); /* auth_token must not linger in memory */
 }
 
 static void handle_node_register_self(vw_admin_server_t *srv, int fd,
@@ -575,7 +582,7 @@ static void handle_node_register_self(vw_admin_server_t *srv, int fd,
     memcpy(token, p + 8, 32);
     hlen = r16le(p + 40);
     if (hlen == 0 || hlen > 127u || plen < (uint32_t)(42u + hlen)) {
-        memset(token, 0, sizeof(token));
+        secure_zero(token, sizeof(token));
         send_u32_resp(fd, VW_ADMIN_NODE_REGISTER_SELF_RESP, VW_ERR_INVALID_ARG);
         return;
     }
@@ -583,7 +590,7 @@ static void handle_node_register_self(vw_admin_server_t *srv, int fd,
     hostname[hlen] = '\0';
 
     rc = vw_cluster_node_add_self(srv->ctx.cluster, node_id, token, hostname);
-    memset(token, 0, sizeof(token));
+    secure_zero(token, sizeof(token));
     send_u32_resp(fd, VW_ADMIN_NODE_REGISTER_SELF_RESP, rc);
 }
 
@@ -811,7 +818,7 @@ static void handle_admin_connection(vw_admin_server_t *srv, int fd)
     default: break;
     }
 
-    if (payload) memset(payload, 0, plen); /* zero before free — may contain password */
+    if (payload) secure_zero(payload, plen); /* zero before free — may contain password */
     free(payload);
 }
 

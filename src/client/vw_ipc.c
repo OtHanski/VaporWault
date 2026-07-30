@@ -12,7 +12,11 @@
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <iphlpapi.h>
+#  include <windows.h>
 #  pragma comment(lib, "ws2_32.lib")
+#  pragma comment(lib, "iphlpapi.lib")
+#  pragma comment(lib, "advapi32.lib")
 typedef SOCKET          sock_fd_t;
 #  define SOCK_INVALID  INVALID_SOCKET
 static int sock_close(SOCKET s) { return closesocket(s); }
@@ -85,6 +89,82 @@ int vw_ipc_linux_proc_net_tcp_uid(FILE *f, uint16_t local_port, uint16_t peer_po
     return 1;
 }
 #endif /* __linux__ */
+
+/* ── Windows peer-UID (SID) verification (TASK-103) ─────────────────────────
+ *
+ * GetExtendedTcpTable(AF_INET, TCP_TABLE_OWNER_PID_ALL) is the Windows
+ * equivalent of /proc/net/tcp: a system-wide snapshot of TCP connections,
+ * each row carrying the owning PID. Same subtlety as Linux applies — see
+ * vw_ipc_server_accept() below for which way round to pass the ports. */
+
+#ifdef _WIN32
+
+/* See vw_ipc_internal.h for this function's full contract. */
+int vw_ipc_win_tcp_table_pid(const MIB_TCPROW_OWNER_PID *rows, DWORD row_count,
+                              uint16_t local_port, uint16_t peer_port,
+                              uint32_t loopback_be, DWORD *out_pid)
+{
+    DWORD i;
+
+    if (!rows || !out_pid) return 1;
+
+    for (i = 0; i < row_count; i++) {
+        const MIB_TCPROW_OWNER_PID *r = &rows[i];
+
+        if (r->dwState != MIB_TCP_STATE_ESTAB) continue;
+        /* dwLocalPort/dwRemotePort store the port in network byte order in
+         * the low 16 bits of the DWORD. */
+        if (ntohs((uint16_t)r->dwLocalPort)  != local_port) continue;
+        if (ntohs((uint16_t)r->dwRemotePort) != peer_port)  continue;
+        if ((uint32_t)r->dwLocalAddr != loopback_be) continue;
+        if ((uint32_t)r->dwRemoteAddr != loopback_be) continue;
+
+        *out_pid = r->dwOwningPid;
+        return 0;
+    }
+    return 1;
+}
+
+/* Fetches process `pid`'s token-user SID into a caller-owned buffer.
+ * Returns 0 on success (*out_sid points inside *out_buf; free *out_buf with
+ * free()), nonzero on any failure (insufficient privilege, PID already
+ * exited, etc.) — every failure here is meant to be non-fatal to the caller,
+ * which must fall back to "trust", not "reject", per this task's acceptance
+ * criteria. */
+static int win_get_process_user_sid(DWORD pid, uint8_t **out_buf, PSID *out_sid)
+{
+    HANDLE  proc = NULL, token = NULL;
+    DWORD   needed = 0;
+    uint8_t *buf = NULL;
+    int      ok = 1;
+
+    *out_buf = NULL;
+    *out_sid = NULL;
+
+    proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return 1;
+
+    if (!OpenProcessToken(proc, TOKEN_QUERY, &token)) goto done;
+
+    GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    if (needed == 0) goto done;
+    buf = (uint8_t *)malloc(needed);
+    if (!buf) goto done;
+    if (!GetTokenInformation(token, TokenUser, buf, needed, &needed)) goto done;
+
+    *out_sid = ((TOKEN_USER *)buf)->User.Sid;
+    *out_buf = buf;
+    buf = NULL; /* ownership transferred to *out_buf */
+    ok = 0;
+
+done:
+    if (buf) free(buf);
+    if (token) CloseHandle(token);
+    if (proc) CloseHandle(proc);
+    return ok;
+}
+
+#endif /* _WIN32 */
 
 /* ── Internal structs ────────────────────────────────────────────────────── */
 
@@ -289,8 +369,69 @@ vw_err_t vw_ipc_server_accept(vw_ipc_server_t *srv, vw_ipc_conn_t **out_conn) {
     if (cfd == SOCK_INVALID) return VW_ERR_NET_CLOSED;
 
 #if defined(_WIN32)
-    /* TODO Phase 6: use GetExtendedTcpTable to verify connecting process UID.
-     * Risk is low for Phase 3; loopback binding limits exposure to localhost. */
+    /* TASK-103: real peer-UID (SID) verification via GetExtendedTcpTable.
+     *
+     * Deliberately permissive on any failure to positively identify a
+     * *mismatched* SID: unlike /proc/net/tcp, GetExtendedTcpTable is a
+     * heavier whole-system snapshot with a real race window between our
+     * accept() and the table read, and PROCESS_QUERY_LIMITED_INFORMATION/
+     * token access can legitimately fail for reasons unrelated to the
+     * connecting process's identity. Rejecting on any of that would risk
+     * regressing to "every connection fails" — the exact class of bug
+     * TASK-093 fixed on Linux. So: only reject when we successfully
+     * resolve the peer's owning SID AND it does not match ours; every
+     * other outcome (table fetch failed, PID not found in the table,
+     * OpenProcess/OpenProcessToken/GetTokenInformation failed) falls back
+     * to trusting the loopback bind alone. */
+    {
+        struct sockaddr_in local_addr;
+        int      local_len = (int)sizeof(local_addr);
+        int      verified = 1;
+
+        if (getsockname(cfd, (struct sockaddr *)&local_addr, &local_len) == 0) {
+            uint16_t our_port  = ntohs(local_addr.sin_port);
+            uint16_t peer_port = ntohs(client_addr.sin_port);
+            uint32_t loopback_be = htonl(INADDR_LOOPBACK);
+            DWORD    table_size = 0;
+            DWORD    rc = GetExtendedTcpTable(NULL, &table_size, FALSE, AF_INET,
+                                               TCP_TABLE_OWNER_PID_ALL, 0);
+            if (rc == ERROR_INSUFFICIENT_BUFFER && table_size > 0) {
+                PMIB_TCPTABLE_OWNER_PID table =
+                    (PMIB_TCPTABLE_OWNER_PID)malloc(table_size);
+                if (table) {
+                    rc = GetExtendedTcpTable(table, &table_size, FALSE, AF_INET,
+                                              TCP_TABLE_OWNER_PID_ALL, 0);
+                    if (rc == NO_ERROR) {
+                        DWORD pid = 0;
+                        /* Swapped on purpose — see the Linux branch's comment
+                         * above for why (same two-rows-per-connection issue). */
+                        int found = vw_ipc_win_tcp_table_pid(
+                            table->table, table->dwNumEntries,
+                            peer_port, our_port, loopback_be, &pid);
+                        if (found == 0) {
+                            uint8_t *sid_buf = NULL, *self_sid_buf = NULL;
+                            PSID     peer_sid = NULL, self_sid = NULL;
+
+                            if (win_get_process_user_sid(pid, &sid_buf, &peer_sid) == 0 &&
+                                win_get_process_user_sid(GetCurrentProcessId(),
+                                                          &self_sid_buf, &self_sid) == 0) {
+                                if (!EqualSid(peer_sid, self_sid))
+                                    verified = 0;
+                            }
+                            free(sid_buf);
+                            free(self_sid_buf);
+                        }
+                    }
+                    free(table);
+                }
+            }
+        }
+
+        if (!verified) {
+            sock_close(cfd);
+            return VW_ERR_AUTH_REQUIRED;
+        }
+    }
 #endif
 #ifdef __linux__
     /* TASK-093: real peer-UID verification via /proc/net/tcp. SO_PEERCRED

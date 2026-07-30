@@ -429,15 +429,22 @@ If the server crashed mid-write, it recovers automatically on next start: the op
       default 47832) binds to `127.0.0.1` only. **On Linux**, connections are
       also verified against `/proc/net/tcp` to confirm the connecting
       process shares the daemon's UID (TASK-093) — a different local user's
-      connection is rejected. **On Windows and macOS**, no such check exists
-      yet (tracked as a gap on Windows; macOS support is deferred
+      connection is rejected. **On Windows** (TASK-103), connections are
+      verified against `GetExtendedTcpTable` plus a PID-to-SID lookup;
+      deliberately more permissive than the Linux check on any failure to
+      positively resolve a *mismatched* SID (API unavailable, insufficient
+      privilege, a race between `accept()` and the table snapshot falls back
+      to trusting loopback binding alone, rather than rejecting the
+      connection). **On macOS**, no such check exists (support is deferred
       project-wide) — the daemon trusts loopback binding alone there. On a
       single-user machine this is no different from any other local IPC
       channel regardless of platform. **Do not run the client daemon on a
-      shared multi-user Windows or macOS host**: any local user could issue
+      shared multi-user macOS host**: any local user could issue
       `vapourwault-cli login <guess>` against the configured account,
       effectively a local password-guessing oracle, or otherwise control the
       daemon (pause sync, add/remove folders, etc.) without their own
-      credentials. Shared multi-user Linux hosts are no longer subject to
-      this specific risk, but running a personal sync daemon on a shared
-      host is still not a configuration this project targets or tests.
+      credentials. Shared multi-user Linux and Windows hosts are no longer
+      subject to this specific risk (Windows' check is best-effort — see
+      above — but strictly better than trusting loopback binding alone), but
+      running a personal sync daemon on a shared host is still not a
+      configuration this project targets or tests.
