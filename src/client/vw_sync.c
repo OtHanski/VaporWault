@@ -170,15 +170,33 @@ typedef struct {
 static vw_err_t walk_recursive(lfiles_t *lf,
                                 const char *dir_local, const char *dir_virtual);
 
+/*
+ * Append name (never starting with '/') as a child of dir_virtual into out.
+ * dir_virtual == "/" is a special case: a naive "dir_virtual/name"
+ * concatenation double-slashes there, since "/" already IS the separator —
+ * every other dir_virtual value (e.g. "/sub") has no trailing slash, so the
+ * normal concatenation is correct as-is.
+ */
+static void vpath_child(char *out, size_t outsz, const char *dir_virtual, const char *name) {
+    int root = (dir_virtual[0] == '/' && dir_virtual[1] == '\0');
+    size_t dv = root ? 0 : strlen(dir_virtual);
+    size_t nl = strlen(name);
+    /* +1 for the '/' separator, +1 for the NUL terminator */
+    size_t avail = (outsz > dv + 2u) ? outsz - dv - 2u : 0u;
+    if (nl > avail) nl = avail;
+    memcpy(out, dir_virtual, dv);
+    out[dv] = '/';
+    memcpy(out + dv + 1u, name, nl);
+    out[dv + 1u + nl] = '\0';
+}
+
 static int walk_cb(const char *name, void *ud) {
     walk_ctx_t *wc = ud;
     char lpath[512], vpath[512];
     { size_t _dl = strlen(wc->dir_local),   _nl = strlen(name);
-      size_t _dv = strlen(wc->dir_virtual);
       size_t _ll = _dl + 1 + _nl < sizeof(lpath) - 1 ? _nl : sizeof(lpath) - _dl - 2;
-      size_t _vl = _dv + 1 + _nl < sizeof(vpath) - 1 ? _nl : sizeof(vpath) - _dv - 2;
-      memcpy(lpath, wc->dir_local,   _dl); lpath[_dl] = '/'; memcpy(lpath + _dl + 1, name, _ll); lpath[_dl + 1 + _ll] = '\0';
-      memcpy(vpath, wc->dir_virtual, _dv); vpath[_dv] = '/'; memcpy(vpath + _dv + 1, name, _vl); vpath[_dv + 1 + _vl] = '\0'; }
+      memcpy(lpath, wc->dir_local,   _dl); lpath[_dl] = '/'; memcpy(lpath + _dl + 1, name, _ll); lpath[_dl + 1 + _ll] = '\0'; }
+    vpath_child(vpath, sizeof(vpath), wc->dir_virtual, name);
 
     if (is_directory(lpath)) {
         wc->lf->err = walk_recursive(wc->lf, lpath, vpath);
@@ -274,7 +292,7 @@ static vw_err_t srv_collect(vw_client_sess_t *sess,
         }
         for (uint32_t i = 0; i < n; i++) {
             char vpath[512];
-            snprintf(vpath, sizeof(vpath), "%s/%s", cur, entries[i].name);
+            vpath_child(vpath, sizeof(vpath), cur, entries[i].name);
             if (entries[i].entry_type == VW_ENTRY_DIR) {
                 /* Enqueue subdirectory */
                 if (q_tail >= q_cap) {
@@ -905,7 +923,12 @@ vw_err_t vw_sync_mark_local_modified(vw_sync_ctx_t *ctx, const char *local_path)
 
         const char *rel = local_path + rlen;
         char vpath[512];
-        snprintf(vpath, sizeof(vpath), "%s%s", folders[i].virtual_root, rel);
+        /* rel already carries the separator ('/' or '\\') from local_path;
+         * virtual_root == "/" would otherwise double it up ("//name"). */
+        if (folders[i].virtual_root[0] == '/' && folders[i].virtual_root[1] == '\0')
+            snprintf(vpath, sizeof(vpath), "%s", rel);
+        else
+            snprintf(vpath, sizeof(vpath), "%s%s", folders[i].virtual_root, rel);
 
         vw_cache_entry_t ce;
         vw_err_t cerr = vw_cache_get(ctx->cache, vpath, &ce);

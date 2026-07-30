@@ -372,6 +372,185 @@ static int cmd_shutdown(vw_ipc_conn_t *conn) {
     return 0;
 }
 
+/* ── Sharing (TASK-095; server side: TASK-094, docs/PROTOCOL.md §7.5) ────── */
+
+static int parse_permission(const char *s, uint8_t *out) {
+    if (strcmp(s, "view") == 0)      { *out = (uint8_t)VW_PERM_VIEW; return 0; }
+    if (strcmp(s, "edit") == 0)      { *out = (uint8_t)VW_PERM_EDIT; return 0; }
+    fprintf(stderr, "error: permission must be 'view' or 'edit', got '%s'\n", s);
+    return 1;
+}
+
+/* SHARE_GRANT_REQ: string path, string target_username, u8 permission, i64 expires_at.
+ * SHARE_GRANT_RESP: u32 error_code, u64 share_id. */
+static int cmd_share(vw_ipc_conn_t *conn, const char *path, const char *username,
+                      uint8_t permission, int64_t expires_at) {
+    uint8_t req[2u + VW_MAX_PATH_BYTES + 2u + VW_MAX_USERNAME_BYTES + 1u + 8u];
+    uint32_t off = 0;
+    vw_ipc_write_str(req, sizeof(req), &off, path, (uint16_t)strlen(path));
+    vw_ipc_write_str(req, sizeof(req), &off, username, (uint16_t)strlen(username));
+    req[off++] = permission;
+    vw_write_u64le(req + off, (uint64_t)expires_at); off += 8;
+
+    uint8_t resp[12];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_SHARE_GRANT_REQ, req, off,
+                             VW_IPC_SHARE_GRANT_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "share: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "share")) return 1;
+    printf("shared: share_id=%llu\n", (unsigned long long)vw_read_u64le(resp + 4u));
+    return 0;
+}
+
+/* SHARE_REVOKE_REQ / LINK_REVOKE_REQ: u64 share_id. RESP: u32 error_code. */
+static int cmd_revoke(vw_ipc_conn_t *conn, uint64_t share_id,
+                       vw_ipc_msg_t req_type, vw_ipc_msg_t resp_type, const char *cmd_name) {
+    uint8_t req[8];
+    vw_write_u64le(req, share_id);
+
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, req_type, req, sizeof(req), resp_type, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "%s: IPC error %d\n", cmd_name, (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, cmd_name)) return 1;
+    printf("revoked\n");
+    return 0;
+}
+
+static const char *perm_str(uint8_t p) {
+    switch ((vw_perm_t)p) {
+    case VW_PERM_VIEW:  return "view";
+    case VW_PERM_EDIT:  return "edit";
+    case VW_PERM_OWNER: return "owner";
+    default:            return "none";
+    }
+}
+
+/* SHARE_LIST_REQ: u8 mode. SHARE_LIST_RESP: u32 error_code, u32 count, entries. */
+static int cmd_list_shares(vw_ipc_conn_t *conn, uint8_t mode) {
+    uint8_t req[1] = { mode };
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "list-shares: out of memory\n"); return 1; }
+
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_SHARE_LIST_REQ, req, sizeof(req),
+                             VW_IPC_SHARE_LIST_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) { fprintf(stderr, "list-shares: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "list-shares")) { free(resp); return 1; }
+    if (rlen < 8u) { free(resp); return 0; }
+
+    uint32_t count = vw_read_u32le(resp + 4u);
+    uint32_t off = 8u;
+
+    printf("%-10s  %-6s  %-10s  %-8s  %-20s  %-19s  %s\n",
+           "SHARE_ID", "FILE", "TYPE", "PERM", "TARGET", "EXPIRES (UTC)", "NAME");
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 8u + 8u > rlen) break;
+        uint64_t share_id = vw_read_u64le(resp + off); off += 8;
+        uint64_t file_id  = vw_read_u64le(resp + off); off += 8;
+
+        const char *name = NULL; uint16_t name_len = 0;
+        if (vw_ipc_read_str(resp, rlen, &off, &name, &name_len) != VW_OK) break;
+        if (off + 1u > rlen) break;
+        uint8_t share_type = resp[off++];
+        const char *tgt = NULL; uint16_t tgt_len = 0;
+        if (vw_ipc_read_str(resp, rlen, &off, &tgt, &tgt_len) != VW_OK) break;
+        if (off + 1u + 8u + 8u + 1u > rlen) break;
+        uint8_t permission = resp[off++];
+        off += 8u; /* created_at, unused here */
+        int64_t expires_at = (int64_t)vw_read_u64le(resp + off); off += 8;
+        off += 1u; /* revoked, unused here */
+
+        char name_buf[65]; size_t nc = name_len < sizeof(name_buf) - 1u ? name_len : sizeof(name_buf) - 1u;
+        memcpy(name_buf, name, nc); name_buf[nc] = '\0';
+        char tgt_buf[66]; size_t tc = tgt_len < sizeof(tgt_buf) - 1u ? tgt_len : sizeof(tgt_buf) - 1u;
+        memcpy(tgt_buf, tgt, tc); tgt_buf[tc] = '\0';
+        char exp_buf[24]; format_ts(expires_at, exp_buf, sizeof(exp_buf), 1);
+
+        printf("%-10llu  %-6llu  %-10s  %-8s  %-20s  %-19s  %s\n",
+               (unsigned long long)share_id, (unsigned long long)file_id,
+               share_type == 0 ? "grant" : "link",
+               perm_str(permission), tgt_buf[0] ? tgt_buf : "-", exp_buf, name_buf);
+    }
+
+    free(resp);
+    return 0;
+}
+
+/* LINK_CREATE_REQ: string path, u8 permission, i64 expires_at.
+ * LINK_CREATE_RESP: u32 error_code, u64 share_id, bytes[32] link_token. */
+static int cmd_create_link(vw_ipc_conn_t *conn, const char *path,
+                            uint8_t permission, int64_t expires_at) {
+    uint8_t req[2u + VW_MAX_PATH_BYTES + 1u + 8u];
+    uint32_t off = 0;
+    vw_ipc_write_str(req, sizeof(req), &off, path, (uint16_t)strlen(path));
+    req[off++] = permission;
+    vw_write_u64le(req + off, (uint64_t)expires_at); off += 8;
+
+    uint8_t resp[4u + 8u + 32u];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_LINK_CREATE_REQ, req, off,
+                             VW_IPC_LINK_CREATE_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "create-link: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "create-link")) { memset(resp, 0, sizeof(resp)); return 1; }
+    if (rlen < sizeof(resp)) { memset(resp, 0, sizeof(resp)); fprintf(stderr, "create-link: truncated response\n"); return 1; }
+
+    uint64_t share_id = vw_read_u64le(resp + 4u);
+    printf("link created: share_id=%llu\n", (unsigned long long)share_id);
+    printf("token (save this now — it is never shown again): ");
+    for (int i = 0; i < 32; i++) printf("%02x", resp[12u + (uint32_t)i]);
+    printf("\n");
+    memset(resp, 0, sizeof(resp));
+    return 0;
+}
+
+/* LINK_LIST_REQ: u64 file_id_filter (always 0 from the CLI — no per-file
+ * filtering surfaced yet). LINK_LIST_RESP: u32 error_code, u32 count, entries. */
+static int cmd_list_links(vw_ipc_conn_t *conn) {
+    uint8_t req[8] = {0};
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "list-links: out of memory\n"); return 1; }
+
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_LINK_LIST_REQ, req, sizeof(req),
+                             VW_IPC_LINK_LIST_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) { fprintf(stderr, "list-links: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "list-links")) { free(resp); return 1; }
+    if (rlen < 8u) { free(resp); return 0; }
+
+    uint32_t count = vw_read_u32le(resp + 4u);
+    uint32_t off = 8u;
+
+    printf("%-10s  %-6s  %-8s  %-19s  %-8s  %s\n",
+           "SHARE_ID", "FILE", "PERM", "EXPIRES (UTC)", "REVOKED", "NAME");
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 8u + 8u > rlen) break;
+        uint64_t share_id = vw_read_u64le(resp + off); off += 8;
+        uint64_t file_id  = vw_read_u64le(resp + off); off += 8;
+
+        const char *name = NULL; uint16_t name_len = 0;
+        if (vw_ipc_read_str(resp, rlen, &off, &name, &name_len) != VW_OK) break;
+        if (off + 1u + 8u + 8u + 1u > rlen) break;
+        uint8_t permission = resp[off++];
+        off += 8u; /* created_at, unused here */
+        int64_t expires_at = (int64_t)vw_read_u64le(resp + off); off += 8;
+        uint8_t revoked = resp[off++];
+
+        char name_buf[65]; size_t nc = name_len < sizeof(name_buf) - 1u ? name_len : sizeof(name_buf) - 1u;
+        memcpy(name_buf, name, nc); name_buf[nc] = '\0';
+        char exp_buf[24]; format_ts(expires_at, exp_buf, sizeof(exp_buf), 1);
+
+        printf("%-10llu  %-6llu  %-8s  %-19s  %-8s  %s\n",
+               (unsigned long long)share_id, (unsigned long long)file_id,
+               perm_str(permission), exp_buf, revoked ? "yes" : "no", name_buf);
+    }
+
+    free(resp);
+    return 0;
+}
+
 /* ── Usage ───────────────────────────────────────────────────────────────── */
 
 static void print_usage(const char *prog) {
@@ -390,6 +569,14 @@ static void print_usage(const char *prog) {
         "  login <password|-|--stdin-password> [otp-code]\n"
         "                                Authenticate to the server configured\n"
         "                                in daemon.conf (username comes from there)\n"
+        "  share <path> <user> <view|edit> [expires_unix]\n"
+        "                                Grant a user access to a file/folder\n"
+        "  unshare <share_id>            Revoke a user-to-user grant\n"
+        "  list-shares [--to-me]         List grants (created by me, or to me)\n"
+        "  create-link <path> <view|edit> [expires_unix]\n"
+        "                                Mint a public link; token shown once\n"
+        "  revoke-link <share_id>        Revoke a public link\n"
+        "  list-links                    List public links I've created\n"
         "  shutdown                      Ask the daemon to stop\n"
         "\n"
         "Options:\n"
@@ -561,6 +748,89 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         int rc = cmd_login(c, pw, otp);
         vw_ipc_conn_close(c);
         memset(stdin_pw, 0, sizeof(stdin_pw));
+        return rc;
+    }
+
+    if (strcmp(cmd, "share") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi + 2 >= argc) {
+            fprintf(stderr, "Usage: %s share <path> <username> <view|edit> [expires_unix]\n", argv[0]);
+            return 1;
+        }
+        const char *path = argv[argi++];
+        const char *username = argv[argi++];
+        uint8_t permission;
+        if (parse_permission(argv[argi++], &permission)) return 1;
+        int64_t expires_at = (argi < argc) ? (int64_t)strtoll(argv[argi++], NULL, 10) : 0;
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_share(c, path, username, permission, expires_at);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "unshare") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s unshare <share_id>\n", argv[0]);
+            return 1;
+        }
+        uint64_t share_id = strtoull(argv[argi++], NULL, 10);
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_revoke(c, share_id, VW_IPC_SHARE_REVOKE_REQ, VW_IPC_SHARE_REVOKE_RESP, "unshare");
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "list-shares") == 0) {
+        HELP_IF_REQUESTED();
+        uint8_t mode = 0;
+        if (argi < argc && strcmp(argv[argi], "--to-me") == 0) { mode = 1; argi++; }
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_list_shares(c, mode);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "create-link") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi + 1 >= argc) {
+            fprintf(stderr, "Usage: %s create-link <path> <view|edit> [expires_unix]\n", argv[0]);
+            return 1;
+        }
+        const char *path = argv[argi++];
+        uint8_t permission;
+        if (parse_permission(argv[argi++], &permission)) return 1;
+        int64_t expires_at = (argi < argc) ? (int64_t)strtoll(argv[argi++], NULL, 10) : 0;
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_create_link(c, path, permission, expires_at);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "revoke-link") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s revoke-link <share_id>\n", argv[0]);
+            return 1;
+        }
+        uint64_t share_id = strtoull(argv[argi++], NULL, 10);
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_revoke(c, share_id, VW_IPC_LINK_REVOKE_REQ, VW_IPC_LINK_REVOKE_RESP, "revoke-link");
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "list-links") == 0) {
+        HELP_IF_REQUESTED();
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_list_links(c);
+        vw_ipc_conn_close(c);
         return rc;
     }
 

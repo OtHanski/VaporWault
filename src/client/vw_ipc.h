@@ -69,6 +69,27 @@ typedef enum {
     VW_IPC_SHUTDOWN_RESP      = 0x8012, /* D→C: acknowledged                      */
     VW_IPC_LOGIN_REQ          = 0x8013, /* C→D: authenticate with password (+OTP) */
     VW_IPC_LOGIN_RESP         = 0x8014, /* D→C: error_code                        */
+
+    /* Sharing (TASK-095; server side: TASK-094, docs/PROTOCOL.md §7.5).
+     * Every _REQ below requires an active daemon session (dc->sess) — the
+     * daemon forwards to the real server via the vw_client_share_ and
+     * vw_client_link_ functions, resolving the given virtual_path to a
+     * file_id via vw_client_file_stat first. Every _RESP is prefixed with
+     * error_code(u32) since these are genuine network round-trips that can
+     * fail (unlike the local-cache-only FOLDER_LIST/FILE_LIST responses
+     * above) — VW_ERR_AUTH_REQUIRED if there is no active session. */
+    VW_IPC_SHARE_GRANT_REQ    = 0x8015, /* C→D: grant a user access to a path     */
+    VW_IPC_SHARE_GRANT_RESP   = 0x8016, /* D→C: error_code + share_id             */
+    VW_IPC_SHARE_REVOKE_REQ   = 0x8017, /* C→D: revoke a grant or link by share_id */
+    VW_IPC_SHARE_REVOKE_RESP  = 0x8018, /* D→C: error_code                        */
+    VW_IPC_SHARE_LIST_REQ     = 0x8019, /* C→D: list user-to-user grants          */
+    VW_IPC_SHARE_LIST_RESP    = 0x801A, /* D→C: error_code + count + entries      */
+    VW_IPC_LINK_CREATE_REQ    = 0x801B, /* C→D: mint a public link for a path     */
+    VW_IPC_LINK_CREATE_RESP   = 0x801C, /* D→C: error_code + share_id + token[32] */
+    VW_IPC_LINK_REVOKE_REQ    = 0x801D, /* C→D: revoke a public link by share_id  */
+    VW_IPC_LINK_REVOKE_RESP   = 0x801E, /* D→C: error_code                        */
+    VW_IPC_LINK_LIST_REQ      = 0x801F, /* C→D: list public links I've created    */
+    VW_IPC_LINK_LIST_RESP     = 0x8020, /* D→C: error_code + count + entries      */
 } vw_ipc_msg_t;
 
 /*
@@ -127,6 +148,62 @@ typedef enum {
  *                        retry with `otp` set (server requires 2FA and none
  *                        was supplied). On success the daemon persists the
  *                        new session token to state_dir/session.tok.
+ *
+ * VW_IPC_SHARE_GRANT_REQ:
+ *   string virtual_path
+ *   string target_username
+ *   u8     permission     vw_perm_t: VW_PERM_VIEW (1) or VW_PERM_EDIT (2)
+ *   i64    expires_at     0 = never
+ * VW_IPC_SHARE_GRANT_RESP:
+ *   u32 error_code
+ *   u64 share_id          only meaningful if error_code == 0
+ *
+ * VW_IPC_SHARE_REVOKE_REQ / VW_IPC_LINK_REVOKE_REQ:
+ *   u64 share_id
+ * VW_IPC_SHARE_REVOKE_RESP / VW_IPC_LINK_REVOKE_RESP:
+ *   u32 error_code
+ *
+ * VW_IPC_SHARE_LIST_REQ:
+ *   u8  mode              0 = grants I created, 1 = grants granted to me
+ * VW_IPC_SHARE_LIST_RESP:
+ *   u32 error_code
+ *   u32 count             0 if error_code != 0
+ *   count * {
+ *     u64    share_id
+ *     u64    file_id
+ *     string name              shared item's leaf name; display-only
+ *     u8     share_type        0 = user grant, 1 = public link
+ *     string target_username   empty for links
+ *     u8     permission
+ *     i64    created_at
+ *     i64    expires_at        0 = never
+ *     u8     revoked
+ *   }
+ *
+ * VW_IPC_LINK_CREATE_REQ:
+ *   string virtual_path
+ *   u8     permission
+ *   i64    expires_at
+ * VW_IPC_LINK_CREATE_RESP:
+ *   u32       error_code
+ *   u64       share_id       only meaningful if error_code == 0
+ *   bytes[32] link_token     raw token, returned exactly once; only
+ *                            meaningful if error_code == 0
+ *
+ * VW_IPC_LINK_LIST_REQ:
+ *   u64 file_id_filter    0 = all of my links
+ * VW_IPC_LINK_LIST_RESP:
+ *   u32 error_code
+ *   u32 count             0 if error_code != 0
+ *   count * {
+ *     u64    share_id
+ *     u64    file_id
+ *     string name           display-only leaf name
+ *     u8     permission
+ *     i64    created_at
+ *     i64    expires_at     0 = never
+ *     u8     revoked
+ *   }                       never includes the raw link_token
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

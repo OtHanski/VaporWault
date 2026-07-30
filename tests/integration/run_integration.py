@@ -64,7 +64,9 @@ IPC_PORT      = 14832
 # ADMIN_SOCKET is set at runtime relative to the per-run tmpdir.
 TEST_USERNAME = "testuser"
 TEST_PASSWORD = "TestP@ssw0rd!"
-PROTO_VERSION = 4
+SHARE_USERNAME = "shareuser"
+SHARE_PASSWORD = "ShareP@ssw0rd!"
+PROTO_VERSION = 6  # must match VW_PROTO_VERSION_CURRENT in vw_proto.h
 
 # Wire protocol message types
 MSG_HELLO         = 0x0001
@@ -262,7 +264,7 @@ def run_tests(args):
 
     server_proc = None
     daemon_proc = None
-    n_tests     = 8
+    n_tests     = 15
 
     tap_plan(n_tests)
 
@@ -358,7 +360,17 @@ def run_tests(args):
         file_synced = False
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            rc, out, _ = cli_cmd(args.cli, IPC_PORT, "ls", timeout=5)
+            try:
+                # The daemon's main loop only dequeues pending IPC connections
+                # once per iteration, gated by vw_watcher_wait(sync_interval_ms)
+                # (daemon.conf here sets 5000ms) — a request arriving just as
+                # that wait begins can sit briefly before being served, so a
+                # generous timeout (well above sync_interval_ms) avoids a
+                # spurious TimeoutExpired here from aborting the whole suite.
+                rc, out, _ = cli_cmd(args.cli, IPC_PORT, "ls", timeout=8)
+            except subprocess.TimeoutExpired:
+                time.sleep(1)
+                continue
             if rc == 0 and "integration_test.bin" in out:
                 file_synced = True
                 break
@@ -467,6 +479,74 @@ def run_tests(args):
             else:
                 not_ok("IT-8: brute-force — server enforces auth attempt limits after 5 failures",
                        lockout_diag or "lockout not confirmed")
+
+        # ── Sharing (TASK-095): exercise the new CLI subcommands end to end
+        # against real binaries. Server-side behavior itself is already
+        # covered in depth by tests/integration/test_sharing.py (TASK-094);
+        # these tests are CLI/daemon-plumbing smoke tests, matching this
+        # file's existing style of checking rc + stdout substrings rather
+        # than re-verifying wire-level protocol details.
+        share_path = "/integration_test.bin"
+        share_id = None
+        link_share_id = None
+
+        rc, out, err = admin_cmd(args.admin_cli, admin_socket,
+                                  "user-create", SHARE_USERNAME, SHARE_PASSWORD,
+                                  timeout=60)
+        if rc != 0:
+            not_ok("IT-9: second user created for sharing tests", f"user-create failed (rc={rc})\n{err}")
+            for i in range(10, n_tests + 1):
+                skip(f"IT-{i}: (skipped — second user creation failed)", "setup failure")
+        else:
+            ok("IT-9: second user created for sharing tests")
+
+            rc, out, err = cli_cmd(args.cli, IPC_PORT, "share", share_path, SHARE_USERNAME, "view")
+            if rc == 0 and "share_id=" in out:
+                share_id = out.split("share_id=")[1].strip().split()[0]
+                ok("IT-10: share — grants shareuser VIEW access to the synced file")
+            else:
+                not_ok("IT-10: share — grants shareuser VIEW access to the synced file",
+                       f"rc={rc}, out='{out}', err='{err}'")
+
+            rc, out, _ = cli_cmd(args.cli, IPC_PORT, "list-shares")
+            if rc == 0 and SHARE_USERNAME in out and (share_id or "") in out:
+                ok("IT-11: list-shares — shows the grant just created")
+            else:
+                not_ok("IT-11: list-shares — shows the grant just created",
+                       f"rc={rc}, out='{out}', share_id={share_id!r}")
+
+            if share_id:
+                rc, out, err = cli_cmd(args.cli, IPC_PORT, "unshare", share_id)
+                if rc == 0 and "revoked" in out:
+                    ok("IT-12: unshare — revokes the grant")
+                else:
+                    not_ok("IT-12: unshare — revokes the grant", f"rc={rc}, out='{out}', err='{err}'")
+            else:
+                skip("IT-12: unshare — revokes the grant", "no share_id from IT-10")
+
+            rc, out, err = cli_cmd(args.cli, IPC_PORT, "create-link", share_path, "view")
+            if rc == 0 and "share_id=" in out and "token" in out.lower():
+                link_share_id = out.split("share_id=")[1].splitlines()[0].strip()
+                ok("IT-13: create-link — mints a public link for the synced file")
+            else:
+                not_ok("IT-13: create-link — mints a public link for the synced file",
+                       f"rc={rc}, out='{out}', err='{err}'")
+
+            rc, out, _ = cli_cmd(args.cli, IPC_PORT, "list-links")
+            if rc == 0 and (link_share_id or "") in out:
+                ok("IT-14: list-links — shows the link just created")
+            else:
+                not_ok("IT-14: list-links — shows the link just created",
+                       f"rc={rc}, out='{out}', link_share_id={link_share_id!r}")
+
+            if link_share_id:
+                rc, out, err = cli_cmd(args.cli, IPC_PORT, "revoke-link", link_share_id)
+                if rc == 0 and "revoked" in out:
+                    ok("IT-15: revoke-link — revokes the public link")
+                else:
+                    not_ok("IT-15: revoke-link — revokes the public link", f"rc={rc}, out='{out}', err='{err}'")
+            else:
+                skip("IT-15: revoke-link — revokes the public link", "no share_id from IT-13")
 
     finally:
         # ── Teardown ────────────────────────────────────────────────────────────

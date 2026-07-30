@@ -233,6 +233,179 @@ vw_err_t vw_client_version_restore(vw_client_sess_t *sess,
                                      const char *virtual_path,
                                      uint64_t version_id);
 
+/* ── File-id-based operations (TASK-095) ─────────────────────────────────── */
+/*
+ * All of the above (vw_client_file_list/_stat/_upload/_download/_delete) are
+ * path-based, and vw_store_file_get_by_path/vw_store_file_list are namespaced
+ * by owner_id server-side (see docs/PROTOCOL.md §7.5's implementation note on
+ * SHARE_LIST_RESP) — a virtual_path only ever resolves within the caller's
+ * OWN tree. Shared items (grants or scoped-link sessions) are reached by
+ * file_id instead, learned from vw_client_share_list/vw_client_link_list, or
+ * — for a scoped session specifically — via vw_client_file_list(sess, "/",
+ * ...) at the root, which the server resolves from session state without any
+ * client-supplied id at all (§7.5's scoped-session root navigation).
+ *
+ * A known gap, not fixed here: there is no way to shallow-browse a SHARED
+ * FOLDER's children by file_id for an authenticated grant holder (only the
+ * scoped-session root case above works) — FILE_LIST's wire payload has no
+ * file_id field. See TASK-104's sibling note; filed as a follow-up rather
+ * than extending FILE_LIST's wire format here.
+ */
+
+/*
+ * Stat a file/folder directly by file_id — works for content the caller
+ * doesn't own (a grant or scope target), unlike vw_client_file_stat.
+ */
+vw_err_t vw_client_file_stat_by_id(vw_client_sess_t *sess,
+                                    uint64_t file_id,
+                                    vw_file_entry_t *out);
+
+/*
+ * Download a file directly by file_id (skips the path-based FILE_STAT that
+ * vw_client_file_download does internally). Same chunk-verification and
+ * atomic-rename behavior as vw_client_file_download.
+ */
+vw_err_t vw_client_file_download_by_id(vw_client_sess_t *sess,
+                                        uint64_t file_id,
+                                        const char *local_path,
+                                        vw_client_progress_cb_t progress_cb,
+                                        void *userdata);
+
+/*
+ * Upload a new VERSION of an existing file identified by file_id (an
+ * update, not a create) — the file_id-addressed equivalent of
+ * vw_client_file_upload's "path resolves to an existing file I own" case,
+ * usable through an EDIT grant/scope on a file this caller doesn't own.
+ */
+vw_err_t vw_client_file_upload_to_id(vw_client_sess_t *sess,
+                                      uint64_t file_id,
+                                      const char *local_path,
+                                      vw_client_progress_cb_t progress_cb,
+                                      void *userdata);
+
+/*
+ * Create a NEW file named leaf_name inside the folder identified by
+ * folder_file_id — the file_id-addressed equivalent of creating a file at
+ * an owned path, usable through an EDIT grant/scope on a shared folder
+ * this caller doesn't own. leaf_name must not contain '/' (server-side
+ * requirement, checked here first to fail fast).
+ */
+vw_err_t vw_client_file_upload_into_folder(vw_client_sess_t *sess,
+                                            uint64_t folder_file_id,
+                                            const char *leaf_name,
+                                            const char *local_path,
+                                            vw_client_progress_cb_t progress_cb,
+                                            void *userdata);
+
+/*
+ * Move and/or rename a file or folder identified by file_id.
+ * new_parent_dir_id == 0 means "move to the file's owner's own root".
+ * new_name == NULL or "" keeps the current name (move-only).
+ */
+vw_err_t vw_client_file_move(vw_client_sess_t *sess,
+                              uint64_t file_id,
+                              uint64_t new_parent_dir_id,
+                              const char *new_name);
+
+/* ── Sharing (TASK-095; server side: TASK-094, docs/PROTOCOL.md §7.5) ────── */
+
+typedef struct {
+    uint64_t share_id;
+    uint64_t file_id;
+    char     name[64];             /* shared item's leaf name; display-only */
+    uint8_t  share_type;           /* 0 = user grant, 1 = public link       */
+    char     target_username[65];  /* grants only; empty for links          */
+    uint8_t  permission;           /* vw_perm_t                             */
+    int64_t  created_at;
+    int64_t  expires_at;           /* 0 = never                             */
+    uint8_t  revoked;
+} vw_share_entry_t;
+
+typedef struct {
+    uint64_t share_id;
+    uint64_t file_id;
+    char     name[64];
+    uint8_t  permission;
+    int64_t  created_at;
+    int64_t  expires_at;
+    uint8_t  revoked;
+} vw_link_entry_t;
+
+/*
+ * Grant target_username VIEW/EDIT access to file_id.
+ * expires_at == 0 means never. *out_share_id receives the new share's id.
+ * Returns VW_ERR_PERMISSION if the caller's own effective permission on
+ * file_id is lower than `permission`.
+ */
+vw_err_t vw_client_share_grant(vw_client_sess_t *sess,
+                                uint64_t file_id,
+                                const char *target_username,
+                                vw_perm_t permission,
+                                int64_t expires_at,
+                                uint64_t *out_share_id);
+
+/*
+ * Revoke a grant or link by share_id. Returns VW_ERR_PERMISSION if the
+ * caller isn't the share's creator (§7.5: only the creator may revoke,
+ * not merely an EDIT grantee).
+ */
+vw_err_t vw_client_share_revoke(vw_client_sess_t *sess, uint64_t share_id);
+
+/*
+ * List user-to-user grants. mode: 0 = grants I created, 1 = grants
+ * granted to me. Returns a malloc'd array; caller frees.
+ */
+vw_err_t vw_client_share_list(vw_client_sess_t *sess,
+                               uint8_t mode,
+                               vw_share_entry_t **out,
+                               uint32_t *out_count);
+
+/*
+ * Mint a public link for file_id. out_link_token[32] receives the raw
+ * token — the only time it is ever available; relay it to the user
+ * immediately (e.g. print it once) and never persist it locally beyond
+ * that, matching the server's own "never re-display" convention.
+ */
+vw_err_t vw_client_link_create(vw_client_sess_t *sess,
+                                uint64_t file_id,
+                                vw_perm_t permission,
+                                int64_t expires_at,
+                                uint64_t *out_share_id,
+                                uint8_t out_link_token[32]);
+
+/* Revoke a public link by share_id. Same ownership rule as share_revoke. */
+vw_err_t vw_client_link_revoke(vw_client_sess_t *sess, uint64_t share_id);
+
+/*
+ * List public links I've created. file_id_filter == 0 lists all of them.
+ * Returns a malloc'd array; caller frees. Never includes the raw token.
+ */
+vw_err_t vw_client_link_list(vw_client_sess_t *sess,
+                              uint64_t file_id_filter,
+                              vw_link_entry_t **out,
+                              uint32_t *out_count);
+
+/*
+ * Redeem a public link — a separate connect flow from vw_client_connect,
+ * since no username/password is involved: connects, negotiates the
+ * protocol version, then sends LINK_ACCESS instead of AUTH_REQUEST.
+ *
+ * On success, *out_sess is a scoped (anonymous) session — user_id is
+ * always 0 for it (vw_client_user_id_of returns 0), and its quota_bytes/
+ * used_bytes are meaningless (always 0; quota is resolved against the
+ * link's real owner server-side, never surfaced to the anonymous holder).
+ * Use it with vw_client_file_list(sess, "/", ...) to browse the linked
+ * item's scope (server-resolved root navigation, §7.5) and the other
+ * file-op functions to read/write within it, subject to the link's
+ * permission level.
+ *
+ * Returns VW_ERR_AUTH_BAD_CREDS for an unknown, revoked, or expired token
+ * (indistinguishable, by design — anti-enumeration).
+ */
+vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
+                                const uint8_t link_token[32],
+                                vw_client_sess_t **out_sess);
+
 #ifdef __cplusplus
 }
 #endif

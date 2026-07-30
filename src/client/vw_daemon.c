@@ -609,6 +609,169 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_SHARE_GRANT_REQ: {
+        uint32_t off = 0;
+        const char *path = NULL; uint16_t path_len = 0;
+        const char *tgt = NULL; uint16_t tgt_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &path, &path_len);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &tgt, &tgt_len);
+        uint8_t permission = 0; int64_t expires_at = 0;
+        if (err == VW_OK && off + 1u + 8u <= plen) {
+            permission = buf[off]; off += 1u;
+            expires_at = (int64_t)vw_read_u64le(buf + off); off += 8u;
+        } else if (err == VW_OK) {
+            err = VW_ERR_PROTO_TRUNCATED;
+        }
+        if (err != VW_OK || !dc->sess) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? err : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_SHARE_GRANT_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        char path_buf[VW_MAX_PATH_BYTES + 1];
+        char tgt_buf[VW_MAX_USERNAME_BYTES + 1];
+        size_t pcopy = path_len < sizeof(path_buf) - 1u ? path_len : sizeof(path_buf) - 1u;
+        memcpy(path_buf, path, pcopy); path_buf[pcopy] = '\0';
+        size_t tcopy = tgt_len < sizeof(tgt_buf) - 1u ? tgt_len : sizeof(tgt_buf) - 1u;
+        memcpy(tgt_buf, tgt, tcopy); tgt_buf[tcopy] = '\0';
+
+        vw_file_entry_t entry;
+        vw_err_t rc = vw_client_file_stat(dc->sess, path_buf, &entry);
+        uint64_t share_id = 0;
+        if (rc == VW_OK)
+            rc = vw_client_share_grant(dc->sess, entry.file_id, tgt_buf,
+                                        (vw_perm_t)permission, expires_at, &share_id);
+        uint8_t rbuf[12];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u64le(rbuf + 4u, share_id);
+        vw_ipc_send(conn, VW_IPC_SHARE_GRANT_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
+    case VW_IPC_SHARE_REVOKE_REQ:
+    case VW_IPC_LINK_REVOKE_REQ: {
+        vw_ipc_msg_t resp_type = (type == VW_IPC_SHARE_REVOKE_REQ)
+                                  ? VW_IPC_SHARE_REVOKE_RESP : VW_IPC_LINK_REVOKE_RESP;
+        if (plen < 8u || !dc->sess) {
+            ipc_send_u32(conn, resp_type,
+                         (uint32_t)(!dc->sess ? VW_ERR_AUTH_REQUIRED : VW_ERR_PROTO_TRUNCATED));
+            break;
+        }
+        uint64_t share_id = vw_read_u64le(buf);
+        vw_err_t rc = (type == VW_IPC_SHARE_REVOKE_REQ)
+                      ? vw_client_share_revoke(dc->sess, share_id)
+                      : vw_client_link_revoke(dc->sess, share_id);
+        ipc_send_u32(conn, resp_type, (uint32_t)rc);
+        break;
+    }
+
+    case VW_IPC_SHARE_LIST_REQ: {
+        uint8_t mode = (plen >= 1u) ? buf[0] : 0;
+        if (!dc->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            vw_ipc_send(conn, VW_IPC_SHARE_LIST_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        vw_share_entry_t *entries = NULL; uint32_t count = 0;
+        vw_err_t rc = vw_client_share_list(dc->sess, mode, &entries, &count);
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_SHARE_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4;
+        vw_write_u32le(rbuf + roff, (rc == VW_OK) ? count : 0u); roff += 4;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count && roff + 256 < 65536; i++) {
+                vw_write_u64le(rbuf + roff, entries[i].share_id); roff += 8;
+                vw_write_u64le(rbuf + roff, entries[i].file_id);  roff += 8;
+                uint16_t nlen = (uint16_t)strnlen(entries[i].name, sizeof(entries[i].name));
+                vw_ipc_write_str(rbuf, 65536, &roff, entries[i].name, nlen);
+                rbuf[roff++] = entries[i].share_type;
+                uint16_t tlen = (uint16_t)strnlen(entries[i].target_username, sizeof(entries[i].target_username));
+                vw_ipc_write_str(rbuf, 65536, &roff, entries[i].target_username, tlen);
+                rbuf[roff++] = entries[i].permission;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].created_at); roff += 8;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].expires_at); roff += 8;
+                rbuf[roff++] = entries[i].revoked;
+            }
+        }
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_SHARE_LIST_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
+    case VW_IPC_LINK_CREATE_REQ: {
+        uint32_t off = 0;
+        const char *path = NULL; uint16_t path_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &path, &path_len);
+        uint8_t permission = 0; int64_t expires_at = 0;
+        if (err == VW_OK && off + 1u + 8u <= plen) {
+            permission = buf[off]; off += 1u;
+            expires_at = (int64_t)vw_read_u64le(buf + off); off += 8u;
+        } else if (err == VW_OK) {
+            err = VW_ERR_PROTO_TRUNCATED;
+        }
+        if (err != VW_OK || !dc->sess) {
+            uint8_t rbuf[44] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? err : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_LINK_CREATE_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        char path_buf[VW_MAX_PATH_BYTES + 1];
+        size_t pcopy = path_len < sizeof(path_buf) - 1u ? path_len : sizeof(path_buf) - 1u;
+        memcpy(path_buf, path, pcopy); path_buf[pcopy] = '\0';
+
+        vw_file_entry_t entry;
+        vw_err_t rc = vw_client_file_stat(dc->sess, path_buf, &entry);
+        uint64_t share_id = 0;
+        uint8_t link_token[32] = {0};
+        if (rc == VW_OK)
+            rc = vw_client_link_create(dc->sess, entry.file_id, (vw_perm_t)permission,
+                                        expires_at, &share_id, link_token);
+        uint8_t rbuf[4u + 8u + 32u];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u64le(rbuf + 4u, share_id);
+        memcpy(rbuf + 12u, link_token, 32u);
+        vw_ipc_send(conn, VW_IPC_LINK_CREATE_RESP, rbuf, sizeof(rbuf));
+        memset(rbuf, 0, sizeof(rbuf));
+        memset(link_token, 0, sizeof(link_token));
+        break;
+    }
+
+    case VW_IPC_LINK_LIST_REQ: {
+        uint64_t file_id_filter = (plen >= 8u) ? vw_read_u64le(buf) : 0u;
+        if (!dc->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            vw_ipc_send(conn, VW_IPC_LINK_LIST_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        vw_link_entry_t *entries = NULL; uint32_t count = 0;
+        vw_err_t rc = vw_client_link_list(dc->sess, file_id_filter, &entries, &count);
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_LINK_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4;
+        vw_write_u32le(rbuf + roff, (rc == VW_OK) ? count : 0u); roff += 4;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count && roff + 256 < 65536; i++) {
+                vw_write_u64le(rbuf + roff, entries[i].share_id); roff += 8;
+                vw_write_u64le(rbuf + roff, entries[i].file_id);  roff += 8;
+                uint16_t nlen = (uint16_t)strnlen(entries[i].name, sizeof(entries[i].name));
+                vw_ipc_write_str(rbuf, 65536, &roff, entries[i].name, nlen);
+                rbuf[roff++] = entries[i].permission;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].created_at); roff += 8;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].expires_at); roff += 8;
+                rbuf[roff++] = entries[i].revoked;
+            }
+        }
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_LINK_LIST_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }
