@@ -530,6 +530,63 @@ vw_err_t vw_storage_chunk_addref(vw_storage_t *st,
     return rc;
 }
 
+/* ── vw_storage_chunk_reattribute (TASK-094) ─────────────────────────────── */
+
+vw_err_t vw_storage_chunk_reattribute(vw_storage_t *st,
+                                       const uint8_t hash[VW_HASH_BYTES],
+                                       uint64_t from_user_id,
+                                       uint64_t to_user_id)
+{
+    if (!st || !hash) return VW_ERR_INVALID_ARG;
+    if (from_user_id == to_user_id) return VW_OK;
+
+    rwlock_wrlock(&st->lock);
+
+    rc_ht_entry_t *entry = ht_find(st->ht, st->ht_cap, hash);
+    if (!entry || entry->ref_count == 0) {
+        rwlock_wrunlock(&st->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+
+    if (entry->owner_user_id != from_user_id) {
+        /* Not charged to from_user_id (e.g. a dedup hit against a chunk a
+         * third party uploaded) — nothing to move. */
+        rwlock_wrunlock(&st->lock);
+        return VW_OK;
+    }
+
+    char cpath[768];
+    uint64_t chunk_len = 0;
+    if (build_chunk_path(st->chunks_dir, hash, cpath, sizeof(cpath)) != 0 ||
+        vw_fs_file_size(cpath, &chunk_len) != VW_OK) {
+        rwlock_wrunlock(&st->lock);
+        return VW_ERR_IO;
+    }
+
+    if (st->store) {
+        vw_err_t qrc = vw_store_quota_add(st->store, to_user_id, (int64_t)chunk_len);
+        if (qrc != VW_OK) {
+            /* Owner's quota can't absorb it — leave attribution unchanged
+             * rather than debiting from_user_id for bytes the owner's
+             * quota rejects. */
+            rwlock_wrunlock(&st->lock);
+            return qrc;
+        }
+        (void)vw_store_quota_add(st->store, from_user_id, -(int64_t)chunk_len);
+    }
+
+    entry->owner_user_id = to_user_id;
+    refcount_record_t rec;
+    memcpy(rec.hash, hash, VW_HASH_BYTES);
+    rec.ref_count = entry->ref_count;
+    rec._pad = 0;
+    rec.owner_user_id = to_user_id;
+    vw_err_t rc = rcdb_write(st, entry->slot, &rec);
+
+    rwlock_wrunlock(&st->lock);
+    return rc;
+}
+
 /* ── vw_storage_chunk_decref ─────────────────────────────────────────────── */
 
 vw_err_t vw_storage_chunk_decref(vw_storage_t *st,

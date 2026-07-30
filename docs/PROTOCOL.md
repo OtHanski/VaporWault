@@ -1,8 +1,8 @@
 # VaporWault Wire Protocol Specification
 
 **Owner:** PRT.04  
-**Current version:** 9  
-**Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8); §7.5/§7.10/§7.11 are design-stage (TASK-088/TASK-089), not yet implemented
+**Current version:** 10  
+**Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8); §7.5/§7.10 implemented server-side (TASK-094); client (TASK-095) and GUI (TASK-096) support still pending. §7.11 is design-stage (TASK-089), not yet implemented — see TASK-098/099
 
 ---
 
@@ -317,6 +317,22 @@ Server must verify `SHA-256(data) == chunk_hash` and reject with `VW_ERR_CHUNK_H
 | version_id | uint64            |
 | error_code | uint32 (vw_err_t) |
 
+**FILE_MOVE payload (TASK-094 — 0x020F/0x0210 existed as reserved opcodes
+with no payload or handler defined before this; defined here):**
+
+| Field             | Type                                          |
+|-------------------|------------------------------------------------|
+| session_token     | bytes[32]                                      |
+| file_id           | uint64 (the file or folder to move)            |
+| new_parent_dir_id | uint64 (0 = mover's own root)                  |
+| new_name          | string (empty = keep the current name)         |
+
+Supports move-only, rename-only, or both in one call. See §7.5's
+"FILE_MOVE ownership and cycle rules" for the permission/ownership/cycle
+checks applied before the move is performed.
+
+**FILE_MOVE_ACK payload:** `error_code` (uint32).
+
 **Download flow:**
 
 ```
@@ -442,10 +458,16 @@ Each op record:
 
 ### 7.5 Sharing / permissions
 
-**Design status (2026-07-29):** fully specified below per `TASK-088`; no
-implementation exists yet (`vw_share` module, permission-check integration in
-`vw_file_handlers.c`, and the CLI/GUI surfaces are tracked as `TASK-094`
-through `TASK-097`). This replaces the earlier unimplemented skeleton, which
+**Design status (2026-07-29):** fully specified below per `TASK-088`.
+**Implementation status (2026-07-30):** the server side (`vw_share` module,
+permission-check integration in `vw_file_handlers.c`, all messages below)
+is implemented — `TASK-094`. Client (`TASK-095`) and GUI (`TASK-096`)
+support, and the joint integration test suite (`TASK-097`), are still
+pending. One implementation note not in the original design: `FILE_MOVE`
+(0x020F/0x0210) had never had a payload defined or a handler implemented
+before `TASK-094` — see its entry below for the wire format, defined as
+part of this task since the sharing rules explicitly govern it. This
+replaces the earlier unimplemented skeleton, which
 had only `SHARE_GRANT`'s payload defined and a speculative, never-built
 `SUB_CREATE`/`SUB_DELETE` "subscription" concept. That concept is dropped —
 nothing in the settled requirements needs it, and a client can always tell
@@ -549,8 +571,13 @@ scan over every link on every anonymous request).
 created, 1 = shares granted to me).
 
 **SHARE_LIST_RESP payload:** `count` (uint32), then `count` repetitions of
-`{share_id, file_id, path, share_type, target_username-or-empty, permission,
-created_at, expires_at, revoked}`.
+`{share_id, file_id, name, share_type, target_username-or-empty, permission,
+created_at, expires_at, revoked}`. `name` is the shared item's own leaf name
+(`vw_file_record_t.name`), not a full path — implementation note added
+2026-07-30 (`TASK-094`): path lookups in this codebase are namespaced by
+`owner_id` (see `vw_store_file_get_by_path`), so a full path wouldn't be
+resolvable in a non-owner viewer's own namespace anyway; this field is
+display-only.
 
 **LINK_CREATE payload:** `session_token[32]`, `file_id` (uint64), `permission`
 (uint8), `expires_at` (int64, 0 = never).
@@ -567,9 +594,10 @@ must revoke and re-create the link.
 links).
 
 **LINK_LIST_RESP payload:** `count` (uint32), then `count` repetitions of
-`{share_id, file_id, path, permission, created_at, expires_at, revoked}` —
+`{share_id, file_id, name, permission, created_at, expires_at, revoked}` —
 **never** the raw `link_token` (same "never re-disclose a secret token"
-rule as CLUSTER_STATUS_RESP omitting `auth_token`, §7.9).
+rule as CLUSTER_STATUS_RESP omitting `auth_token`, §7.9). `name` is the
+same display-only leaf name as `SHARE_LIST_RESP` (see its note above).
 
 **LINK_ACCESS payload (unauthenticated — sent before AUTH_REQUEST):**
 
@@ -1252,6 +1280,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 | 602  | `VW_ERR_PATH_CONFLICT`       | File transfer  | File/directory type collision at path        |
 | 603  | `VW_ERR_VERSION_NOT_FOUND`   | File transfer  | Version ID absent or belongs to another file |
 | 604  | `VW_ERR_DIR_NOT_EMPTY`       | File transfer  | Directory delete: non-empty directory        |
+| 605  | `VW_ERR_RATE_LIMITED`        | File transfer  | Scoped-session write-count rate limit exceeded (§7.5, `TASK-094`) |
 
 **Wire encoding:** `error_code` is transmitted as a `uint32` (LE). Unknown codes must be treated as fatal errors by the receiver; the connection should be closed.
 
@@ -1261,6 +1290,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 10      | 2026-07-30 | SRV.01  | Sharing (§7.5/§7.10) implemented server-side, resolving `TASK-094`. No existing message's wire byte layout changed — every SHARE_*/LINK_* message here is newly used (previous `SUB_CREATE`/`SUB_DELETE` never had a handler), and existing messages (`FILE_LIST`, `FILE_STAT`, `FILE_COMMIT`, `FILE_DELETE`, `VERSION_LIST`/`_RESTORE`/`_CHUNKS`, `CHUNK_UPLOAD`/`_DOWNLOAD_REQ`) keep their exact prior byte layout — only the server's permission-check and quota-attribution logic behind them changed. Two purely additive definitions: `FILE_MOVE`/`FILE_MOVE_ACK` (0x020F/0x0210) gets its first-ever payload (see §7.2) — the opcode existed but no handler did; error code 605 (`VW_ERR_RATE_LIMITED`, §10.1) added for the new scoped-session write-count limit. No protocol version bump required since no existing client-observable byte layout changed. |
 | 9       | 2026-07-29 | SRV.01  | §7.6 documents fine-grained admin capability requirements (TASK-092, implemented — not design-stage): `USER_LIST`/`USER_SUSPEND`/`INVITE_CREATE` require `VW_CAP_USER_MGMT`, `QUOTA_ADJUST` requires `VW_CAP_QUOTA_MGMT`, `AUDIT_QUERY` requires `VW_CAP_AUDIT_READ`, `CLUSTER_STATUS` (§7.7) requires `VW_CAP_CLUSTER_MGMT`; an authenticated admin lacking the required capability now gets `VW_ERR_PERMISSION` rather than succeeding. No wire payload shapes changed — this documents new server-side authorization behavior on existing messages. CQR.08 finding: the doc previously described only the blanket `is_admin` gate |
 | 8       | 2026-07-29 | ARCH.00 | Vault/E2EE design published (§7.11): `VAULT_CREATE`/`_ACK` (0x0801/0x0802), `VAULT_KEY_FETCH`/`_RESP` (0x0803/0x0804), `VAULT_LIST`/`_RESP` (0x0805/0x0806); envelope-encryption key model, per-file DEK/nonce scheme, dedup interaction, and metadata-scope boundary specified. Same-day revision after SEC.07 design review: nonce derivation changed from random-prefix+counter to deterministic `HKDF(DEK, chunk_index)` (closes a retry-triggered GCM-nonce-reuse gap); explicit DEK-per-file (not per-vault) guardrail added; Argon2id parameter floor pinned; per-version-DEK/delta-sync tradeoff explicitly accepted (ARCH.00 sign-off). Design-stage only — resolves the design half of `TASK-089`; implementation tracked as `TASK-098`–`TASK-101` |
 | 7       | 2026-07-29 | ARCH.00 | Sharing + public links design published (§7.5, §7.10): full `SHARE_GRANT`/`SHARE_REVOKE`/`SHARE_LIST` payloads specified (previously only `SHARE_GRANT` had a payload); `SUB_CREATE`/`SUB_DELETE` (0x0507–0x050A, never implemented) repurposed as `LINK_CREATE`/`LINK_REVOKE`; new `LINK_LIST`/`_RESP` (0x050B/0x050C) and unauthenticated `LINK_ACCESS`/`LINK_ACCESS_ACK` (0x050D/0x050E) added for public read/edit links, reusing the `INVITE_REDEEM` unauthenticated-session-establishment pattern; permission-check rule and quota-resolution rule specified. Same-day revision after CQR.08/SEC.07 design review: `permission` field reconciled with the existing `vw_perm_t` enum instead of a parallel READ/EDIT scheme; per-operation required-permission table added; `FILE_MOVE` ownership/cycle rules added (closes a quota/visibility-hijack gap); `SHARE_GRANT`/`_REVOKE`/`LINK_CREATE`/`_REVOKE` restricted to authenticated (non-scoped) sessions; scoped-session write-count rate limiting added (closes an unauthenticated write-DoS gap); scoped-session root-navigation behavior specified. Design-stage only — resolves the design half of `TASK-088`; implementation tracked as `TASK-094`–`TASK-097` |

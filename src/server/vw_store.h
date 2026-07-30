@@ -88,7 +88,32 @@ typedef struct {
     uint64_t expires_at;      /* Unix timestamp; 0 = never                    */
     uint8_t  is_active;       /* 0 = free / logged-out                        */
     uint8_t  awaiting_otp;    /* 1 = password OK, OTP not yet verified        */
-    uint8_t  _pad[70];        /* reserved; must be zero on write              */
+    uint8_t  _pad_align[6];   /* reserved; must be zero on write — was part of
+                                * the original _pad[70]; kept here (rather
+                                * than eliminated) so scope_share_id below
+                                * lands on an 8-byte-aligned offset without
+                                * relying on struct packing, and so every
+                                * field at/before this point keeps its
+                                * original byte offset unchanged. */
+    uint64_t scope_share_id;  /* TASK-094: 0 = normal session; non-zero = a
+                                * scoped session created via LINK_ACCESS,
+                                * bound to this vw_share_record_t. user_id
+                                * == 0 for every scoped session (anonymous).
+                                * Deliberately the share_id, not a denormalized
+                                * copy of its file_id/permission — every
+                                * scoped-session check re-reads the live share
+                                * record via this id, which is what makes
+                                * live revocation (a revoked/expired share
+                                * immediately blocking an already-issued
+                                * session) automatic rather than a separate
+                                * mechanism to keep in sync. Was part of
+                                * _pad[70] — reusing always-zero reserved
+                                * bytes, same precedent as TASK-090's
+                                * deleted_at reuse in vw_file_record_t. A
+                                * pre-existing session record predating this
+                                * field reads back scope_share_id == 0,
+                                * correctly behaving as a normal session. */
+    uint8_t  _pad[56];        /* reserved; must be zero on write              */
 } vw_session_record_t;
 
 _Static_assert(sizeof(vw_session_record_t) == 128,

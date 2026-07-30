@@ -22,6 +22,7 @@
 #include "vw_conn_registry.h"
 #include "vw_invite.h"
 #include "vw_recovery.h"
+#include "vw_share.h"
 #include "vw_smtp.h"
 #include "vw_store.h"
 #include "vw_storage.h"
@@ -97,6 +98,15 @@ vw_store_t        *vw_server_ctx_store(const vw_server_ctx_t *ctx);
 vw_file_store_t   *vw_server_ctx_file_store(const vw_server_ctx_t *ctx);
 vw_storage_t      *vw_server_ctx_chunk_store(const vw_server_ctx_t *ctx);
 vw_invite_store_t *vw_server_ctx_invite_store(const vw_server_ctx_t *ctx);
+
+/*
+ * Attach the share store (TASK-094). Borrowed; caller keeps it alive until
+ * vw_server_ctx_close. May be NULL — sharing messages return VW_ERR_NOT_IMPL
+ * and LINK_ACCESS in the pre-auth phase is rejected like an unknown token.
+ */
+void              vw_server_ctx_set_share_store(vw_server_ctx_t *ctx,
+                                                 vw_share_store_t *share_store);
+vw_share_store_t *vw_server_ctx_share_store(const vw_server_ctx_t *ctx);
 
 /*
  * Attach the oplog for AUDIT_QUERY support over TLS.

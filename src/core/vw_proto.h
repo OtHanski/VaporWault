@@ -85,6 +85,7 @@ typedef enum {
     VW_ERR_PATH_CONFLICT       = 602,  /* file/directory type collision at path      */
     VW_ERR_VERSION_NOT_FOUND   = 603,  /* version_id absent or belongs to other file */
     VW_ERR_DIR_NOT_EMPTY       = 604,  /* directory delete: children still exist     */
+    VW_ERR_RATE_LIMITED        = 605,  /* TASK-094: scoped-session write-count cap hit */
 
     /* IPC */
     VW_ERR_IPC_NOT_RUNNING     = 700,  /* daemon not listening on IPC port           */
@@ -145,17 +146,24 @@ typedef enum {
     VW_MSG_SYNC_DIFF          = 0x0402,  /* server sends delta ops to apply */
     VW_MSG_SYNC_ACK           = 0x0403,
 
-    /* Sharing / permissions */
+    /* Sharing / permissions (TASK-094; see docs/PROTOCOL.md §7.5) */
     VW_MSG_SHARE_GRANT        = 0x0501,
     VW_MSG_SHARE_GRANT_ACK    = 0x0502,
     VW_MSG_SHARE_REVOKE       = 0x0503,
     VW_MSG_SHARE_REVOKE_ACK   = 0x0504,
     VW_MSG_SHARE_LIST         = 0x0505,
     VW_MSG_SHARE_LIST_RESP    = 0x0506,
-    VW_MSG_SUB_CREATE         = 0x0507,  /* subscribe to a shared path */
-    VW_MSG_SUB_CREATE_ACK     = 0x0508,
-    VW_MSG_SUB_DELETE         = 0x0509,
-    VW_MSG_SUB_DELETE_ACK     = 0x050A,
+    /* Repurposed from the never-implemented SUB_CREATE/SUB_DELETE
+     * "subscription" skeleton — same numeric values, no wire compatibility
+     * concern since no handler for the old names ever existed. */
+    VW_MSG_LINK_CREATE        = 0x0507,  /* mint a public link for a file/folder */
+    VW_MSG_LINK_CREATE_ACK    = 0x0508,
+    VW_MSG_LINK_REVOKE        = 0x0509,
+    VW_MSG_LINK_REVOKE_ACK    = 0x050A,
+    VW_MSG_LINK_LIST          = 0x050B,  /* list public links I've created */
+    VW_MSG_LINK_LIST_RESP     = 0x050C,
+    VW_MSG_LINK_ACCESS        = 0x050D,  /* redeem a public link (**unauthenticated**) */
+    VW_MSG_LINK_ACCESS_ACK    = 0x050E,
 
     /* Admin (admin session only) */
     VW_MSG_USER_CREATE        = 0x0601,
@@ -450,15 +458,12 @@ typedef struct {
     /* raw bytes: chunk_count * VW_HASH_BYTES (ordered SHA-256 chunk hashes) */
 } vw_payload_version_chunks_resp_t;
 
-/* Sharing */
-typedef struct {
-    uint8_t  is_file;         /* 1 = file, 0 = folder */
-    uint64_t target_id;       /* file_id or folder path hash */
-    uint64_t grantee_user_id;
-    uint8_t  perm;            /* VW_PERM_VIEW or VW_PERM_EDIT */
-    uint8_t  inherit;         /* for folders: apply to children */
-    /* variable: string path (if folder) */
-} vw_payload_share_grant_t;
+/* Sharing (TASK-094): all SHARE_ and LINK_ payloads are hand-decoded
+ * directly in vw_file_handlers.c, following the same convention already
+ * used for FILE_LIST/FILE_STAT/etc. below rather than dedicated
+ * vw_proto_encode/decode_* helpers (those exist only for the Auth message
+ * family above). See docs/PROTOCOL.md section 7.5 for the exact wire
+ * layout of each message. */
 
 /* Cluster (v6) */
 

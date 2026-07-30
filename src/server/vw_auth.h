@@ -115,6 +115,18 @@ vw_err_t vw_auth_validate_session(vw_auth_ctx_t *ctx,
                                    uint64_t *out_user_id);
 
 /*
+ * TASK-094: create an anonymous, scoped session bound to share_id (a public
+ * link redeemed via LINK_ACCESS) — user_id is always 0. Unlike
+ * vw_auth_create_session, this does not look up or require any
+ * vw_user_record_t; share_id's validity (existence, not revoked, not
+ * expired) must already have been checked by the caller (vw_share_*) before
+ * calling this — this function only persists the session, it does not
+ * itself re-validate the share.
+ */
+vw_err_t vw_auth_create_scoped_session(vw_auth_ctx_t *ctx, uint64_t share_id,
+                                        uint8_t out_token[32]);
+
+/*
  * Revoke a session (logout). Returns VW_ERR_NOT_FOUND if the token is unknown.
  */
 vw_err_t vw_auth_revoke_session(vw_auth_ctx_t *ctx, const uint8_t token[32]);

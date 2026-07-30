@@ -132,6 +132,32 @@ vw_err_t vw_storage_chunk_decref(vw_storage_t *st,
                                   const uint8_t hash[VW_HASH_BYTES]);
 
 /*
+ * TASK-094: move a chunk's quota attribution from from_user_id to
+ * to_user_id, if and only if the chunk's currently-recorded owner_user_id
+ * (the party charged for its bytes) is exactly from_user_id. A no-op
+ * (returns VW_OK) if the chunk's owner is anyone else — e.g. a dedup hit
+ * against a chunk some third party uploaded long ago, which from_user_id
+ * was never charged for in the first place, so there is nothing to move.
+ *
+ * Used by FILE_COMMIT to correct quota attribution when the acting session
+ * (from_user_id — the uploader, possibly an EDIT grantee or an anonymous
+ * scoped-link session with user_id 0) differs from the file's resolved
+ * real owner (to_user_id): every chunk-level charge that CHUNK_UPLOAD made
+ * against the uploader is transferred to the owner, exactly for the bytes
+ * that upload actually put on disk (looked up via vw_fs_file_size on the
+ * chunk file, not the wire-supplied logical_size, so dedup'd chunks that
+ * were never charged to from_user_id are correctly excluded).
+ *
+ * Updates the refcount record's owner_user_id to to_user_id so future GC
+ * decrements (and any later reattribution) charge the correct party.
+ * Returns VW_ERR_NOT_FOUND if the chunk is absent or ref_count == 0.
+ */
+vw_err_t vw_storage_chunk_reattribute(vw_storage_t *st,
+                                       const uint8_t hash[VW_HASH_BYTES],
+                                       uint64_t from_user_id,
+                                       uint64_t to_user_id);
+
+/*
  * Batch chunk-exists query (used by CHUNK_QUERY handler).
  *
  *   hashes      : array of `count` SHA-256 hashes (each VW_HASH_BYTES bytes)

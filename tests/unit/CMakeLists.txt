@@ -122,6 +122,18 @@ if(TARGET vw_server_lib)
     )
     target_link_libraries(test_vw_store PRIVATE vw_server_lib)
     add_test(NAME unit_vw_store COMMAND test_vw_store)
+
+    add_executable(test_vw_share
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_share.c
+    )
+    target_include_directories(test_vw_share PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/core
+        ${CMAKE_SOURCE_DIR}/src/server
+        ${CMAKE_SOURCE_DIR}/src/client
+        ${CMAKE_SOURCE_DIR}/tests/unit
+    )
+    target_link_libraries(test_vw_share PRIVATE vw_server_lib)
+    add_test(NAME unit_vw_share COMMAND test_vw_share)
 endif()
 
 # test_vw_gc: compiled directly (no vw_server_lib) so VW_OPLOG_SEGMENT_MAX

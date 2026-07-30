@@ -1,6 +1,7 @@
 #include "vw_file_handlers.h"
 #include "vw_cluster.h"
 #include "vw_invite.h"
+#include "vw_share.h"
 #include "vw_store.h"
 #include "vw_storage.h"
 #include "vw_oplog.h"
@@ -79,7 +80,12 @@ vw_err_t vw_path_validate(const char *path, uint32_t len)
 /*
  * Extract session_token from the first VW_TOKEN_BYTES of payload and validate.
  * On failure sends VW_MSG_ERROR(VW_ERR_AUTH_REQUIRED) and returns non-OK.
- * On success sets *out_user_id and zeroes the local session copy.
+ * On success sets *out_user_id and *out_scope_share_id and zeroes the local
+ * session copy.
+ *
+ * TASK-094: *out_scope_share_id is 0 for a normal session, or the share_id
+ * a scoped (anonymous, LINK_ACCESS-issued) session is bound to — callers
+ * that don't care about scoped sessions may pass NULL.
  *
  * SEC.07-A-2: token validated before any other payload field is parsed.
  */
@@ -87,7 +93,8 @@ static vw_err_t validate_session(vw_store_t    *store,
                                   vw_conn_t     *conn,
                                   const uint8_t *payload,
                                   uint32_t       plen,
-                                  uint64_t      *out_user_id)
+                                  uint64_t      *out_user_id,
+                                  uint64_t      *out_scope_share_id)
 {
     if (plen < VW_TOKEN_BYTES) {
         (void)send_error(conn, VW_ERR_PROTO_TRUNCATED);
@@ -102,21 +109,58 @@ static vw_err_t validate_session(vw_store_t    *store,
         return VW_ERR_AUTH_REQUIRED;
     }
     *out_user_id = sess.user_id;
+    if (out_scope_share_id) *out_scope_share_id = sess.scope_share_id;
     secure_zero(&sess, sizeof(sess));  /* contains token — wipe after reading user_id */
     return VW_OK;
 }
 
+/*
+ * TASK-094: resolve the caller's effective vw_perm_t on file_rec.
+ * Owner check first (unchanged §7.8.1 behavior); falls through to
+ * vw_share_resolve_permission for grants (real user_id) or scoped-session
+ * access (scope_share_id != 0) — see docs/PROTOCOL.md §7.5's ordered rule.
+ * ss may be NULL (sharing disabled) — then only the owner check applies.
+ */
+static vw_perm_t effective_permission(vw_share_store_t *ss, vw_file_store_t *fs,
+                                       const vw_file_record_t *file_rec,
+                                       uint64_t user_id, uint64_t scope_share_id)
+{
+    if (user_id != 0 && file_rec->owner_id == user_id) return VW_PERM_OWNER;
+    if (!ss) return VW_PERM_NONE;
+    return vw_share_resolve_permission(ss, fs, file_rec->file_id, user_id, scope_share_id);
+}
+
+/*
+ * Enforce `needed` against `effective`, sending the appropriate error and
+ * returning 0 on failure (1 on success — caller proceeds).
+ *
+ * VW_ERR_NOT_FOUND when the caller has NO access at all (hides the file's
+ * existence — matches this codebase's existing SEC.07-B-1 convention for
+ * "not yours"). VW_ERR_PERMISSION when the caller has SOME access (e.g.
+ * VIEW via a grant) but not enough for this operation — existence is
+ * already visible to them via FILE_LIST/STAT, so there's nothing left to
+ * hide, and PERMISSION is the honest answer.
+ */
+static int require_permission(vw_conn_t *conn, vw_perm_t effective, vw_perm_t needed)
+{
+    if (effective >= needed) return 1;
+    if (effective == VW_PERM_NONE) (void)send_error(conn, VW_ERR_NOT_FOUND);
+    else                           (void)send_error(conn, VW_ERR_PERMISSION);
+    return 0;
+}
+
 /* ── FILE_LIST ───────────────────────────────────────────────────────────── */
 
-static vw_err_t handle_file_list(vw_store_t      *store,
-                                  vw_file_store_t *fs,
-                                  vw_conn_t       *conn,
-                                  const uint8_t   *payload,
-                                  uint32_t         plen)
+static vw_err_t handle_file_list(vw_store_t       *store,
+                                  vw_file_store_t  *fs,
+                                  vw_share_store_t *ss,
+                                  vw_conn_t        *conn,
+                                  const uint8_t    *payload,
+                                  uint32_t          plen)
 {
     /* SEC.07-A-2: session first */
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
 
     /* Decode fixed fields after token */
@@ -137,10 +181,55 @@ static vw_err_t handle_file_list(vw_store_t      *store,
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
 
+    int path_is_root = (path_len == 0) || (path_len == 1 && path[0] == '/');
+
     /* Resolve path → parent directory file_id.
-     * Empty path or "/" means root (parent_dir_id = 0). */
-    uint64_t root_dir_id = 0;
-    if (path_len > 0 && !(path_len == 1 && path[0] == '/')) {
+     * Empty path or "/" means root (parent_dir_id = 0).
+     * TASK-094: list_owner_id is the owner_id vw_store_file_list must filter
+     * by — this codebase's path/listing namespaces are per-owner, so it is
+     * NOT always user_id: a scoped session's root resolves to someone
+     * else's item, and every descendant in that subtree is owned by that
+     * same someone-else (ownership is per-owner-tree, unaffected by
+     * sharing), never by the acting session. */
+    uint64_t  root_dir_id   = 0;
+    uint64_t  list_owner_id = user_id;
+    uint8_t   entry_perm    = (uint8_t)VW_PERM_OWNER;
+    vw_file_record_t single_item; /* used only when the scope target is a file, not a dir */
+    memset(&single_item, 0, sizeof(single_item)); /* MSVC /W4: silence C4701 */
+    int       single_item_only = 0;
+
+    if (scope_share_id != 0) {
+        /* TASK-094 (CQR.08 finding): a scoped session has no access to the
+         * global root. parent_dir_id == 0 (empty/root path) resolves to the
+         * scope's own target instead — never the server's actual root. A
+         * non-root path from a scoped session isn't supported by this
+         * wire message today (FILE_LIST has no file_id field to name a
+         * deeper subfolder outside the caller's own path namespace;
+         * recursive=1 from the scope root already returns the whole
+         * subtree in one call without needing one) — rejected explicitly
+         * rather than silently misbehaving. */
+        if (!path_is_root)
+            return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+
+        vw_share_record_t share;
+        int64_t now = (int64_t)time(NULL);
+        if (vw_share_get_by_id(ss, scope_share_id, &share) != VW_OK ||
+            share.revoked || (share.expires_at != 0 && share.expires_at <= now))
+            return (send_error(conn, VW_ERR_AUTH_REQUIRED), VW_OK);
+
+        vw_file_record_t scope_rec;
+        if (vw_store_file_get_by_id(fs, share.file_id, &scope_rec) != VW_OK)
+            return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+        entry_perm = share.permission;
+        if (scope_rec.entry_type == VW_ENTRY_FILE) {
+            single_item      = scope_rec;
+            single_item_only = 1;
+        } else {
+            root_dir_id   = scope_rec.file_id;
+            list_owner_id = scope_rec.owner_id;
+        }
+    } else if (!path_is_root) {
         char path_buf[VW_MAX_PATH_BYTES + 1];
         if (path_len > VW_MAX_PATH_BYTES)
             return (send_error(conn, VW_ERR_PATH_INVALID), VW_ERR_PATH_INVALID);
@@ -149,6 +238,12 @@ static vw_err_t handle_file_list(vw_store_t      *store,
         err = vw_path_validate(path_buf, (uint32_t)path_len);
         if (err != VW_OK)
             return (send_error(conn, VW_ERR_PATH_INVALID), VW_ERR_PATH_INVALID);
+        /* Path lookups are namespaced by owner_id == user_id — this can
+         * only ever resolve within the caller's own tree (shared items are
+         * reached by file_id, via SHARE_LIST/LINK_LIST, not by path; see
+         * TASK-095 for how the client maps those into its local virtual
+         * path tree). No permission check needed beyond this: a non-owned
+         * directory is structurally unreachable here. */
         vw_file_record_t dir_rec;
         err = vw_store_file_get_by_path(fs, user_id, path_buf, &dir_rec);
         if (err != VW_OK)
@@ -162,9 +257,16 @@ static vw_err_t handle_file_list(vw_store_t      *store,
     vw_file_record_t *all      = NULL;
     uint32_t          all_len  = 0;
     uint32_t          all_cap  = 0;
+    uint64_t         *dir_queue = NULL;
+    uint32_t          q_head = 0, q_tail = 0, q_cap = 0;
 
-    uint64_t *dir_queue = NULL;
-    uint32_t  q_head = 0, q_tail = 0, q_cap = 0;
+    if (single_item_only) {
+        all = malloc(sizeof(*all));
+        if (!all) return (send_error(conn, VW_ERR_OOM), VW_OK);
+        all[0]  = single_item;
+        all_len = 1;
+        goto done;
+    }
 
     /* Push starting directory */
     dir_queue = malloc(sizeof(uint64_t) * 16);
@@ -177,7 +279,7 @@ static vw_err_t handle_file_list(vw_store_t      *store,
 
         vw_file_record_t *entries = NULL;
         uint32_t count = 0;
-        err = vw_store_file_list(fs, user_id, dir_id, &entries, &count);
+        err = vw_store_file_list(fs, list_owner_id, dir_id, &entries, &count);
         if (err != VW_OK) { free(entries); break; }
 
         for (uint32_t i = 0; i < count && all_len < 65535u; i++) {
@@ -230,7 +332,7 @@ done:
         vw_write_u64le(resp + roff, r->size_bytes);  roff += 8;
         vw_write_u64le(resp + roff, (uint64_t)r->mtime_unix); roff += 8;
         resp[roff++] = r->entry_type;
-        resp[roff++] = (uint8_t)VW_PERM_OWNER;
+        resp[roff++] = entry_perm;
     }
 
     free(all);
@@ -245,14 +347,15 @@ done:
 
 /* ── FILE_STAT ───────────────────────────────────────────────────────────── */
 
-static vw_err_t handle_file_stat(vw_store_t      *store,
-                                  vw_file_store_t *fs,
-                                  vw_conn_t       *conn,
-                                  const uint8_t   *payload,
-                                  uint32_t         plen)
+static vw_err_t handle_file_stat(vw_store_t       *store,
+                                  vw_file_store_t  *fs,
+                                  vw_share_store_t *ss,
+                                  vw_conn_t        *conn,
+                                  const uint8_t    *payload,
+                                  uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
 
     /* [token 32][file_id u64][path string if file_id==0] */
@@ -287,8 +390,8 @@ static vw_err_t handle_file_stat(vw_store_t      *store,
 
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
-    if (rec.owner_id != user_id) /* SEC.07-B-1 */
-        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    vw_perm_t perm = effective_permission(ss, fs, &rec, user_id, scope_share_id);
+    if (!require_permission(conn, perm, VW_PERM_VIEW)) return VW_OK;
 
     /* Encode FILE_STAT_RESP:
      * u8 entry_type + u64 file_id + u64 size_bytes + i64 mtime_unix +
@@ -301,7 +404,7 @@ static vw_err_t handle_file_stat(vw_store_t      *store,
     vw_write_u64le(resp + roff, (uint64_t)rec.mtime_unix); roff += 8;
     vw_write_u64le(resp + roff, rec.current_version_id);   roff += 8;
     vw_write_u64le(resp + roff, rec.owner_id);             roff += 8;
-    resp[roff++] = (uint8_t)VW_PERM_OWNER;
+    resp[roff++] = (uint8_t)perm;
 
     uint16_t nlen = (uint16_t)strnlen(rec.name, sizeof(rec.name));
     err = vw_proto_write_str(resp, sizeof(resp), &roff, rec.name, nlen);
@@ -324,7 +427,7 @@ static vw_err_t handle_chunk_query(vw_store_t    *store,
                                     uint32_t       plen)
 {
     uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, NULL);
     if (err != VW_OK) return err;
 
     /* [token 32][count u16][count * 32 bytes] */
@@ -363,15 +466,24 @@ static vw_err_t handle_chunk_query(vw_store_t    *store,
 
 /* ── CHUNK_UPLOAD ────────────────────────────────────────────────────────── */
 
-static vw_err_t handle_chunk_upload(vw_store_t    *store,
-                                     vw_storage_t  *cs,
-                                     vw_conn_t     *conn,
-                                     const uint8_t *payload,
-                                     uint32_t       plen)
+static vw_err_t handle_chunk_upload(vw_store_t       *store,
+                                     vw_storage_t     *cs,
+                                     vw_share_store_t *ss,
+                                     vw_conn_t        *conn,
+                                     const uint8_t    *payload,
+                                     uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
+
+    /* TASK-094 (SEC.07 finding): per-scoped-session write-count rate limit,
+     * independent of the byte-quota check below. Checked before parsing
+     * any further payload fields — a rejected scoped session shouldn't
+     * even get partial parsing feedback. */
+    if (scope_share_id != 0 && ss &&
+        vw_share_scoped_write_ratelimit_check(ss, payload) != VW_OK)
+        return (send_error(conn, VW_ERR_RATE_LIMITED), VW_OK);
 
     /* [token 32][chunk_hash 32][chunk_len u32][chunk_data chunk_len] */
     if (plen < VW_TOKEN_BYTES + VW_HASH_BYTES + 4u)
@@ -389,9 +501,25 @@ static vw_err_t handle_chunk_upload(vw_store_t    *store,
 
     const uint8_t *data = payload + VW_TOKEN_BYTES + VW_HASH_BYTES + 4u;
 
+    /* TASK-094: quota resolution. A scoped session's own user_id is always
+     * 0 (anonymous) — charging chunk_put's quota check against 0 would
+     * silently create an unlimited-by-default quota record and let an
+     * anonymous public-edit-link holder upload without limit. Resolve the
+     * scope's real target owner instead: for a scoped session this is
+     * always known up front (the scope's own file/folder), unlike an
+     * authenticated grantee's upload, whose eventual file/folder target
+     * isn't known until FILE_COMMIT — that case is instead corrected after
+     * the fact via vw_storage_chunk_reattribute in handle_file_commit. */
+    uint64_t quota_owner_id = user_id;
+    if (scope_share_id != 0 && ss) {
+        vw_share_record_t share;
+        if (vw_share_get_by_id(ss, scope_share_id, &share) == VW_OK)
+            quota_owner_id = share.owner_id;
+    }
+
     /* Quota enforcement is done atomically inside vw_storage_chunk_put under the
      * write lock, preventing TOCTOU double-charging on concurrent uploads. */
-    err = vw_storage_chunk_put(cs, hash, data, data_len, user_id);
+    err = vw_storage_chunk_put(cs, hash, data, data_len, quota_owner_id);
     if (err == VW_ERR_QUOTA_EXCEEDED) {
         send_error(conn, VW_ERR_QUOTA_EXCEEDED);
         return VW_OK;
@@ -412,21 +540,22 @@ static vw_err_t handle_chunk_upload(vw_store_t    *store,
 /* ── CHUNK_DOWNLOAD ──────────────────────────────────────────────────────── */
 
 /*
- * BFS ownership check: returns VW_OK if user owns any current-version file
- * that references hash.
+ * BFS over the tree owned by owner_id, starting at start_dir_id (0 = that
+ * owner's root): returns VW_OK if any current-version file in that subtree
+ * references hash.
  *
  * SEC.07-A-1: both "chunk absent" and "chunk not owned" map to VW_ERR_NOT_FOUND
  * so the caller cannot distinguish ownership from existence.
  */
-static vw_err_t check_chunk_ownership(vw_file_store_t *fs,
-                                       uint64_t         user_id,
+static vw_err_t bfs_subtree_has_chunk(vw_file_store_t *fs,
+                                       uint64_t         owner_id,
+                                       uint64_t         start_dir_id,
                                        const uint8_t    hash[VW_HASH_BYTES])
 {
-    /* BFS over the user's virtual file tree via parent_dir_id expansion. */
     uint64_t *dir_q = malloc(sizeof(uint64_t) * 64u);
     if (!dir_q) return VW_ERR_OOM;
     uint32_t q_head = 0, q_tail = 0, q_cap = 64u;
-    dir_q[q_tail++] = 0; /* root */
+    dir_q[q_tail++] = start_dir_id;
 
     vw_err_t result = VW_ERR_NOT_FOUND;
 
@@ -435,7 +564,7 @@ static vw_err_t check_chunk_ownership(vw_file_store_t *fs,
 
         vw_file_record_t *entries = NULL;
         uint32_t count = 0;
-        if (vw_store_file_list(fs, user_id, dir_id, &entries, &count) != VW_OK)
+        if (vw_store_file_list(fs, owner_id, dir_id, &entries, &count) != VW_OK)
             continue;
 
         for (uint32_t i = 0; i < count && result != VW_OK; i++) {
@@ -475,15 +604,103 @@ done:
     /* TODO(Phase 4): replace BFS with a chunk→version reverse index. */
 }
 
-static vw_err_t handle_chunk_download(vw_store_t      *store,
-                                       vw_file_store_t *fs,
-                                       vw_storage_t    *cs,
-                                       vw_conn_t       *conn,
-                                       const uint8_t   *payload,
-                                       uint32_t         plen)
+/*
+ * TASK-094: extends the above to also cover shared access — a grantee's
+ * granted subtrees, or a scoped session's single subtree — not just the
+ * caller's own tree. Same O(n)-per-subtree tradeoff already acknowledged
+ * above; a grant-holder with many active grants pays one BFS per grant.
+ */
+static vw_err_t check_chunk_access(vw_file_store_t *fs, vw_share_store_t *ss,
+                                    uint64_t user_id, uint64_t scope_share_id,
+                                    const uint8_t hash[VW_HASH_BYTES])
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    if (user_id != 0 &&
+        bfs_subtree_has_chunk(fs, user_id, 0, hash) == VW_OK)
+        return VW_OK;
+
+    if (!ss) return VW_ERR_NOT_FOUND;
+
+    if (scope_share_id != 0) {
+        vw_share_record_t share;
+        int64_t now = (int64_t)time(NULL);
+        if (vw_share_get_by_id(ss, scope_share_id, &share) == VW_OK &&
+            !share.revoked && (share.expires_at == 0 || share.expires_at > now)) {
+            vw_file_record_t rec;
+            if (vw_store_file_get_by_id(fs, share.file_id, &rec) == VW_OK) {
+                if (rec.entry_type == VW_ENTRY_FILE) {
+                    if (rec.current_version_id != 0) {
+                        vw_version_record_t ver;
+                        if (vw_store_version_get(fs, rec.current_version_id, &ver) == VW_OK) {
+                            uint8_t *hashes = NULL;
+                            if (vw_store_version_get_chunks(fs, &ver, &hashes) == VW_OK) {
+                                for (uint32_t c = 0; c < ver.chunk_count; c++) {
+                                    if (memcmp(hashes + (size_t)c * VW_HASH_BYTES,
+                                               hash, VW_HASH_BYTES) == 0) {
+                                        free(hashes);
+                                        return VW_OK;
+                                    }
+                                }
+                                free(hashes);
+                            }
+                        }
+                    }
+                } else if (bfs_subtree_has_chunk(fs, rec.owner_id, rec.file_id, hash) == VW_OK) {
+                    return VW_OK;
+                }
+            }
+        }
+        return VW_ERR_NOT_FOUND;
+    }
+
+    if (user_id != 0) {
+        /* Scan every active grant targeting this user (share_id doubles as
+         * the slot index — see vw_share.c — so this needs no separate
+         * index) and BFS each one's subtree in turn. Stops at the first
+         * hit. */
+        vw_share_record_t rec;
+        uint64_t share_id;
+        for (share_id = 1; vw_share_get_by_id(ss, share_id, &rec) == VW_OK; share_id++) {
+            if (rec.revoked || rec.share_type != VW_SHARE_TYPE_GRANT) continue;
+            if (rec.target_user_id != user_id) continue;
+            if (rec.expires_at != 0 && rec.expires_at <= (int64_t)time(NULL)) continue;
+
+            vw_file_record_t grec;
+            if (vw_store_file_get_by_id(fs, rec.file_id, &grec) != VW_OK) continue;
+
+            if (grec.entry_type == VW_ENTRY_FILE) {
+                if (grec.current_version_id == 0) continue;
+                vw_version_record_t ver;
+                if (vw_store_version_get(fs, grec.current_version_id, &ver) != VW_OK) continue;
+                uint8_t *hashes = NULL;
+                if (vw_store_version_get_chunks(fs, &ver, &hashes) != VW_OK) continue;
+                int hit = 0;
+                for (uint32_t c = 0; c < ver.chunk_count; c++) {
+                    if (memcmp(hashes + (size_t)c * VW_HASH_BYTES, hash, VW_HASH_BYTES) == 0) {
+                        hit = 1;
+                        break;
+                    }
+                }
+                free(hashes);
+                if (hit) return VW_OK;
+            } else if (bfs_subtree_has_chunk(fs, grec.owner_id, grec.file_id, hash) == VW_OK) {
+                return VW_OK;
+            }
+        }
+    }
+
+    return VW_ERR_NOT_FOUND;
+}
+
+static vw_err_t handle_chunk_download(vw_store_t       *store,
+                                       vw_file_store_t  *fs,
+                                       vw_storage_t     *cs,
+                                       vw_share_store_t *ss,
+                                       vw_conn_t        *conn,
+                                       const uint8_t    *payload,
+                                       uint32_t          plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
 
     /* [token 32][chunk_hash 32] */
@@ -494,7 +711,7 @@ static vw_err_t handle_chunk_download(vw_store_t      *store,
 
     /* SEC.07-A-1: authorization check before chunk retrieval.
      * Returns VW_ERR_NOT_FOUND for both absent and non-owned chunks. */
-    err = check_chunk_ownership(fs, user_id, hash);
+    err = check_chunk_access(fs, ss, user_id, scope_share_id, hash);
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
 
@@ -526,16 +743,22 @@ static vw_err_t handle_chunk_download(vw_store_t      *store,
 
 /* ── FILE_COMMIT ─────────────────────────────────────────────────────────── */
 
-static vw_err_t handle_file_commit(vw_store_t      *store,
-                                    vw_file_store_t *fs,
-                                    vw_storage_t    *cs,
-                                    vw_conn_t       *conn,
-                                    const uint8_t   *payload,
-                                    uint32_t         plen)
+static vw_err_t handle_file_commit(vw_store_t       *store,
+                                    vw_file_store_t  *fs,
+                                    vw_storage_t     *cs,
+                                    vw_share_store_t *ss,
+                                    vw_conn_t        *conn,
+                                    const uint8_t    *payload,
+                                    uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
+
+    /* TASK-094 (SEC.07 finding): per-scoped-session write-count rate limit. */
+    if (scope_share_id != 0 && ss &&
+        vw_share_scoped_write_ratelimit_check(ss, payload) != VW_OK)
+        return (send_error(conn, VW_ERR_RATE_LIMITED), VW_OK);
 
     /* [token 32][file_id u64][logical_size u64][chunk_count u32]
      * [path string][chunk_count * 32 bytes] */
@@ -604,11 +827,48 @@ static vw_err_t handle_file_commit(vw_store_t      *store,
     int is_new = 0;
 
     if (file_id != 0) {
-        err = vw_store_file_get_by_id(fs, file_id, &file_rec);
+        vw_file_record_t target_rec;
+        err = vw_store_file_get_by_id(fs, file_id, &target_rec);
         if (err != VW_OK)
             return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
-        if (file_rec.owner_id != user_id) /* SEC.07-B-1 */
-            return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+        if (target_rec.entry_type == VW_ENTRY_DIR) {
+            /* TASK-094: file_id names a FOLDER — "create a new file under
+             * this folder" (needed for a grantee/scoped session to create
+             * a file inside a shared folder, which they can't reach by
+             * path since path lookups are namespaced by the caller's own
+             * owner_id). A directory file_id was never meaningful as a
+             * FILE_COMMIT target before this — old clients never sent one
+             * here — so this reinterpretation doesn't collide with any
+             * pre-existing valid usage. `path` is the new file's bare leaf
+             * name in this case, not an absolute path. */
+            vw_perm_t parent_perm = effective_permission(ss, fs, &target_rec, user_id, scope_share_id);
+            if (!require_permission(conn, parent_perm, VW_PERM_EDIT)) return VW_OK;
+
+            if (path_len == 0 || path_len >= sizeof(file_rec.name))
+                return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+            for (uint16_t i = 0; i < path_len; i++)
+                if (path_buf[i] == '/' || path_buf[i] == '\0')
+                    return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+
+            memset(&file_rec, 0, sizeof(file_rec));
+            /* Quota-resolution rule (§7.5): a new file created under a
+             * shared folder is owned by the FOLDER's owner, not the
+             * creating session — matches "the creator does not become the
+             * owner of a file it creates inside someone else's shared
+             * folder." */
+            file_rec.owner_id      = target_rec.owner_id;
+            file_rec.parent_dir_id = target_rec.file_id;
+            file_rec.entry_type    = VW_ENTRY_FILE;
+            memcpy(file_rec.name, path_buf, path_len);
+            file_rec.name[path_len] = '\0';
+            is_new  = 1;
+            file_id = 0; /* new_file_id is assigned below on create */
+        } else {
+            file_rec = target_rec;
+            vw_perm_t perm = effective_permission(ss, fs, &file_rec, user_id, scope_share_id);
+            if (!require_permission(conn, perm, VW_PERM_EDIT)) return VW_OK;
+        }
     } else if (path_len > 0) {
         err = vw_store_file_get_by_path(fs, user_id, path_buf, &file_rec);
         if (err == VW_OK && file_rec.owner_id == user_id) {
@@ -694,6 +954,25 @@ static vw_err_t handle_file_commit(vw_store_t      *store,
         return (send_error(conn, err), VW_OK);
     }
 
+    /* TASK-094: quota resolution. Every chunk in chunk_hashes was verified
+     * present by CHUNK_QUERY above; any of them that were freshly charged
+     * to this acting session at CHUNK_UPLOAD time (rather than to a
+     * pre-existing owner via dedup) must be re-attributed to the file's
+     * real owner now that it's known — a no-op for chunks not currently
+     * charged to user_id (dedup hits against someone else's content, or
+     * (for a scoped session) chunks already charged directly to the right
+     * owner by handle_chunk_upload's own resolution). Best-effort: a
+     * reattribution failure (e.g. the owner's quota can't absorb it) does
+     * not roll back the commit — the version is already durable, and
+     * failing the whole commit over a billing-attribution nuance would be
+     * a worse outcome than a transiently stale quota. */
+    if (file_rec.owner_id != user_id) {
+        for (uint32_t c = 0; c < chunk_count; c++) {
+            (void)vw_storage_chunk_reattribute(cs, chunk_hashes + (size_t)c * VW_HASH_BYTES,
+                                                user_id, file_rec.owner_id);
+        }
+    }
+
     /* Update file record: current_version_id, size, mtime. */
     vw_file_record_t updated;
     if (is_new) {
@@ -731,15 +1010,21 @@ static vw_err_t handle_file_commit(vw_store_t      *store,
 
 /* ── FILE_DELETE ─────────────────────────────────────────────────────────── */
 
-static vw_err_t handle_file_delete(vw_store_t      *store,
-                                    vw_file_store_t *fs,
-                                    vw_conn_t       *conn,
-                                    const uint8_t   *payload,
-                                    uint32_t         plen)
+static vw_err_t handle_file_delete(vw_store_t       *store,
+                                    vw_file_store_t  *fs,
+                                    vw_share_store_t *ss,
+                                    vw_conn_t        *conn,
+                                    const uint8_t    *payload,
+                                    uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
+
+    /* TASK-094 (SEC.07 finding): per-scoped-session write-count rate limit. */
+    if (scope_share_id != 0 && ss &&
+        vw_share_scoped_write_ratelimit_check(ss, payload) != VW_OK)
+        return (send_error(conn, VW_ERR_RATE_LIMITED), VW_OK);
 
     /* [token 32][file_id u64][path string if file_id==0] */
     if (plen < VW_TOKEN_BYTES + 8u)
@@ -772,14 +1057,17 @@ static vw_err_t handle_file_delete(vw_store_t      *store,
 
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
-    if (rec.owner_id != user_id) /* SEC.07-B-1 */
-        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    vw_perm_t perm = effective_permission(ss, fs, &rec, user_id, scope_share_id);
+    if (!require_permission(conn, perm, VW_PERM_EDIT)) return VW_OK;
 
-    /* For directories, reject if children exist. */
+    /* For directories, reject if children exist. Children are owned by
+     * rec.owner_id (ownership is per-owner-tree, unaffected by sharing —
+     * see handle_file_list's list_owner_id comment), not necessarily
+     * user_id. */
     if (rec.entry_type == VW_ENTRY_DIR) {
         vw_file_record_t *children = NULL;
         uint32_t child_count = 0;
-        err = vw_store_file_list(fs, user_id, rec.file_id,
+        err = vw_store_file_list(fs, rec.owner_id, rec.file_id,
                                   &children, &child_count);
         free(children);
         if (err == VW_OK && child_count > 0u)
@@ -802,14 +1090,15 @@ static vw_err_t handle_file_delete(vw_store_t      *store,
 
 /* ── VERSION_LIST ────────────────────────────────────────────────────────── */
 
-static vw_err_t handle_version_list(vw_store_t      *store,
-                                     vw_file_store_t *fs,
-                                     vw_conn_t       *conn,
-                                     const uint8_t   *payload,
-                                     uint32_t         plen)
+static vw_err_t handle_version_list(vw_store_t       *store,
+                                     vw_file_store_t  *fs,
+                                     vw_share_store_t *ss,
+                                     vw_conn_t        *conn,
+                                     const uint8_t    *payload,
+                                     uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
 
     /* [token 32][file_id u64][offset u32][limit u32] */
@@ -825,8 +1114,8 @@ static vw_err_t handle_version_list(vw_store_t      *store,
     err = vw_store_file_get_by_id(fs, file_id, &file_rec);
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
-    if (file_rec.owner_id != user_id) /* SEC.07-B-1 */
-        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    vw_perm_t perm = effective_permission(ss, fs, &file_rec, user_id, scope_share_id);
+    if (!require_permission(conn, perm, VW_PERM_VIEW)) return VW_OK;
 
     vw_version_record_t *versions = NULL;
     uint32_t total = 0;
@@ -867,15 +1156,16 @@ static vw_err_t handle_version_list(vw_store_t      *store,
 
 /* ── VERSION_RESTORE ─────────────────────────────────────────────────────── */
 
-static vw_err_t handle_version_restore(vw_store_t      *store,
-                                        vw_file_store_t *fs,
-                                        vw_storage_t    *cs,
-                                        vw_conn_t       *conn,
-                                        const uint8_t   *payload,
-                                        uint32_t         plen)
+static vw_err_t handle_version_restore(vw_store_t       *store,
+                                        vw_file_store_t  *fs,
+                                        vw_storage_t     *cs,
+                                        vw_share_store_t *ss,
+                                        vw_conn_t        *conn,
+                                        const uint8_t    *payload,
+                                        uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
 
     /* [token 32][version_id u64][path string] */
@@ -907,11 +1197,18 @@ static vw_err_t handle_version_restore(vw_store_t      *store,
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_VERSION_NOT_FOUND), VW_OK);
 
-    /* Verify the owning file belongs to this user. */
+    /* Verify the caller has EDIT access to the owning file — restoring
+     * content is a modification, not a read (§7.5's required-permission
+     * table). */
     vw_file_record_t file_rec;
     err = vw_store_file_get_by_id(fs, src_ver.file_id, &file_rec);
-    if (err != VW_OK || file_rec.owner_id != user_id) /* SEC.07-B-1 */
+    if (err != VW_OK)
         return (send_error(conn, VW_ERR_VERSION_NOT_FOUND), VW_OK);
+    {
+        vw_perm_t perm = effective_permission(ss, fs, &file_rec, user_id, scope_share_id);
+        if (perm < VW_PERM_EDIT)
+            return (send_error(conn, VW_ERR_VERSION_NOT_FOUND), VW_OK);
+    }
 
     /* Retrieve the chunk hash list from the source version. */
     uint8_t *src_hashes = NULL;
@@ -971,14 +1268,15 @@ static vw_err_t handle_version_restore(vw_store_t      *store,
 
 /* ── VERSION_CHUNKS ──────────────────────────────────────────────────────── */
 
-static vw_err_t handle_version_chunks(vw_store_t      *store,
-                                       vw_file_store_t *fs,
-                                       vw_conn_t       *conn,
-                                       const uint8_t   *payload,
-                                       uint32_t         plen)
+static vw_err_t handle_version_chunks(vw_store_t       *store,
+                                       vw_file_store_t  *fs,
+                                       vw_share_store_t *ss,
+                                       vw_conn_t        *conn,
+                                       const uint8_t    *payload,
+                                       uint32_t          plen)
 {
-    uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
     if (err != VW_OK) return err;
 
     /* [token 32][version_id u64] */
@@ -992,10 +1290,12 @@ static vw_err_t handle_version_chunks(vw_store_t      *store,
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_VERSION_NOT_FOUND), VW_OK);
 
-    /* Verify the owning file belongs to this user. SEC.07-B-2. */
+    /* Verify the caller has VIEW+ access to the owning file. SEC.07-B-2. */
     vw_file_record_t file_rec;
     err = vw_store_file_get_by_id(fs, ver.file_id, &file_rec);
-    if (err != VW_OK || file_rec.owner_id != user_id)
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_VERSION_NOT_FOUND), VW_OK);
+    if (effective_permission(ss, fs, &file_rec, user_id, scope_share_id) < VW_PERM_VIEW)
         return (send_error(conn, VW_ERR_VERSION_NOT_FOUND), VW_OK);
 
     uint8_t *hashes = NULL;
@@ -1033,7 +1333,7 @@ static vw_err_t handle_user_quota_set(vw_store_t *store,
                                        uint32_t       plen)
 {
     uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, NULL);
     if (err != VW_OK) return err;
 
     /* Minimum payload: token[32] + target_user_id(8) + quota_bytes(8) = 48 */
@@ -1138,7 +1438,7 @@ static vw_err_t handle_user_list(vw_store_t *store, vw_conn_t *conn,
                                    const uint8_t *payload, uint32_t plen)
 {
     uint64_t caller_uid;
-    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid);
+    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid, NULL);
     if (err != VW_OK) return err;
 
     /* Admin check. */
@@ -1196,7 +1496,7 @@ static vw_err_t handle_user_suspend(vw_store_t *store, vw_conn_t *conn,
                                      const uint8_t *payload, uint32_t plen)
 {
     uint64_t caller_uid;
-    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid);
+    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid, NULL);
     if (err != VW_OK) return err;
 
     /* Minimum: token(32) + target_user_id(8) + is_active(1) = 41 */
@@ -1254,7 +1554,7 @@ static vw_err_t handle_audit_query(vw_store_t *store, vw_oplog_t *oplog,
                                     const uint8_t *payload, uint32_t plen)
 {
     uint64_t caller_uid;
-    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid);
+    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid, NULL);
     if (err != VW_OK) return err;
 
     vw_user_record_t urec;
@@ -1351,7 +1651,7 @@ static vw_err_t handle_cluster_status(vw_store_t    *store,
 {
     /* Validate session token (SEC.07-A-2: token first). */
     uint64_t caller_uid;
-    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid);
+    vw_err_t err = validate_session(store, conn, payload, plen, &caller_uid, NULL);
     if (err != VW_OK) return err;
 
     /* Admin check. */
@@ -1436,7 +1736,7 @@ static vw_err_t handle_invite_create(vw_store_t *store,
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
 
     uint64_t user_id;
-    vw_err_t err = validate_session(store, conn, payload, plen, &user_id);
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, NULL);
     if (err != VW_OK) return err;
 
     /* Verify admin status. */
@@ -1474,6 +1774,467 @@ static vw_err_t handle_invite_create(vw_store_t *store,
     return vw_proto_send(conn, VW_MSG_INVITE_CREATE_ACK, code, sizeof(code));
 }
 
+/* ── FILE_MOVE (TASK-094 — new; docs/PROTOCOL.md §7.5) ────────────────────── */
+
+/*
+ * FILE_MOVE never had a payload defined before this task (the opcodes
+ * 0x020F/0x0210 existed but no handler did) — wire format defined here:
+ *
+ *   Request:  session_token[32] + file_id(u64) + new_parent_dir_id(u64,
+ *             0 = mover's own root) + new_name (string, empty = keep the
+ *             current name — supports move-only, rename-only, or both in
+ *             one call).
+ *   Response: error_code(u32).
+ */
+
+/*
+ * Effective permission on a directory identified by dir_id, where dir_id
+ * == 0 means "the root of the tree owned by root_owner_id" — there is no
+ * on-disk record for the root, and no grant can target it directly (every
+ * grant/link names a real file_id), so the only way to have EDIT-
+ * equivalent access to a root is to literally own it.
+ */
+static vw_perm_t permission_on_dir_or_root(vw_share_store_t *ss, vw_file_store_t *fs,
+                                            uint64_t dir_id, uint64_t root_owner_id,
+                                            uint64_t user_id, uint64_t scope_share_id)
+{
+    if (dir_id == 0)
+        return (user_id != 0 && user_id == root_owner_id) ? VW_PERM_OWNER : VW_PERM_NONE;
+    vw_file_record_t dir_rec;
+    if (vw_store_file_get_by_id(fs, dir_id, &dir_rec) != VW_OK) return VW_PERM_NONE;
+    return effective_permission(ss, fs, &dir_rec, user_id, scope_share_id);
+}
+
+static vw_err_t handle_file_move(vw_store_t       *store,
+                                  vw_file_store_t  *fs,
+                                  vw_share_store_t *ss,
+                                  vw_conn_t        *conn,
+                                  const uint8_t    *payload,
+                                  uint32_t          plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+
+    /* TASK-094 (SEC.07 finding): per-scoped-session write-count rate limit. */
+    if (scope_share_id != 0 && ss &&
+        vw_share_scoped_write_ratelimit_check(ss, payload) != VW_OK)
+        return (send_error(conn, VW_ERR_RATE_LIMITED), VW_OK);
+
+    if (plen < VW_TOKEN_BYTES + 8u + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint64_t file_id          = vw_read_u64le(payload + VW_TOKEN_BYTES);
+    uint64_t new_parent_dir_id = vw_read_u64le(payload + VW_TOKEN_BYTES + 8u);
+
+    const uint8_t *var = payload + VW_TOKEN_BYTES + 16u;
+    uint32_t var_len   = plen - VW_TOKEN_BYTES - 16u;
+    uint32_t off = 0;
+    const char *new_name; uint16_t new_name_len;
+    err = vw_proto_read_str(var, var_len, &off, &new_name, &new_name_len);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    if (new_name_len >= 64u)
+        return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+    for (uint16_t i = 0; i < new_name_len; i++)
+        if (new_name[i] == '/' || new_name[i] == '\0')
+            return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+
+    vw_file_record_t rec;
+    err = vw_store_file_get_by_id(fs, file_id, &rec);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+    vw_perm_t file_perm = effective_permission(ss, fs, &rec, user_id, scope_share_id);
+    if (file_perm == VW_PERM_NONE)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+    /* §7.5 "FILE_MOVE ownership and cycle rules": EDIT on both the current
+     * and destination parent, AND destination_parent.owner_id ==
+     * file.owner_id — prevents a grantee from moving a shared file out of
+     * the owner's tree. */
+    vw_perm_t src_parent_perm = permission_on_dir_or_root(ss, fs, rec.parent_dir_id,
+                                                           rec.owner_id, user_id, scope_share_id);
+    if (src_parent_perm < VW_PERM_EDIT)
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+
+    uint64_t dest_owner_id = rec.owner_id; /* root (dir_id==0) always belongs to rec.owner_id here */
+    if (new_parent_dir_id != 0) {
+        vw_file_record_t dest_rec;
+        err = vw_store_file_get_by_id(fs, new_parent_dir_id, &dest_rec);
+        if (err != VW_OK || dest_rec.entry_type != VW_ENTRY_DIR)
+            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+        dest_owner_id = dest_rec.owner_id;
+    }
+    if (dest_owner_id != rec.owner_id)
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+
+    vw_perm_t dest_parent_perm = permission_on_dir_or_root(ss, fs, new_parent_dir_id,
+                                                            rec.owner_id, user_id, scope_share_id);
+    if (dest_parent_perm < VW_PERM_EDIT)
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+
+    /* Cycle check (general correctness requirement, independent of
+     * sharing): a directory can never be moved into itself or one of its
+     * own descendants — walk the destination's parent_dir_id chain up to
+     * the root; if `file_id` appears in it, reject. */
+    if (rec.entry_type == VW_ENTRY_DIR) {
+        uint64_t cur = new_parent_dir_id;
+        for (uint32_t hops = 0; hops < 2048u && cur != 0; hops++) {
+            if (cur == file_id)
+                return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+            vw_file_record_t anc;
+            if (vw_store_file_get_by_id(fs, cur, &anc) != VW_OK) break;
+            cur = anc.parent_dir_id;
+        }
+    }
+
+    vw_file_record_t updated = rec;
+    updated.parent_dir_id = new_parent_dir_id;
+    if (new_name_len > 0) {
+        memcpy(updated.name, new_name, new_name_len);
+        updated.name[new_name_len] = '\0';
+        memset(updated.name + new_name_len + 1, 0, sizeof(updated.name) - new_name_len - 1);
+    }
+
+    err = vw_store_file_update(fs, file_id, &updated);
+
+    uint8_t ack[4];
+    vw_write_u32le(ack, (uint32_t)(err == VW_OK ? 0u : (uint32_t)err));
+    vw_err_t send_err = vw_proto_send(conn, VW_MSG_FILE_MOVE_ACK, ack, sizeof(ack));
+
+    LOG_DEBUG("FILE_MOVE uid=%llu fid=%llu new_parent=%llu rc=%d",
+              (unsigned long long)user_id, (unsigned long long)file_id,
+              (unsigned long long)new_parent_dir_id, (int)err);
+    return send_err;
+}
+
+/* ── Sharing (TASK-094; docs/PROTOCOL.md §7.5) ────────────────────────────── */
+
+/*
+ * SHARE_GRANT/SHARE_REVOKE/LINK_CREATE/LINK_REVOKE all additionally
+ * require session.user_id != 0 (SEC.07 finding) — a scoped (anonymous)
+ * session must never be able to mint an independent grant/link, or one
+ * that would survive revocation of the link they used to get in. Checked
+ * before any other handler logic, per the spec's explicit ordering.
+ */
+static int reject_if_scoped(vw_conn_t *conn, uint64_t scope_share_id)
+{
+    if (scope_share_id == 0) return 0;
+    (void)send_error(conn, VW_ERR_PERMISSION);
+    return 1;
+}
+
+/* SHARE_GRANT: session_token[32] + file_id(u64) + target_username(string)
+ * + permission(u8) + expires_at(i64). ACK: error_code(u32) + share_id(u64). */
+static vw_err_t handle_share_grant(vw_store_t *store, vw_file_store_t *fs,
+                                    vw_share_store_t *ss, vw_conn_t *conn,
+                                    const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!ss) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u + 2u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint64_t file_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+    const uint8_t *var = payload + VW_TOKEN_BYTES + 8u;
+    uint32_t var_len   = plen - VW_TOKEN_BYTES - 8u;
+    uint32_t off = 0;
+    const char *tgt_name; uint16_t tgt_name_len;
+    err = vw_proto_read_str(var, var_len, &off, &tgt_name, &tgt_name_len);
+    if (err != VW_OK || tgt_name_len == 0 || tgt_name_len > VW_MAX_USERNAME_BYTES ||
+        off + 1u + 8u > var_len)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint8_t  permission = var[off]; off += 1u;
+    int64_t  expires_at = (int64_t)vw_read_u64le(var + off);
+
+    if (permission != (uint8_t)VW_PERM_VIEW && permission != (uint8_t)VW_PERM_EDIT)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    vw_file_record_t file_rec;
+    if (vw_store_file_get_by_id(fs, file_id, &file_rec) != VW_OK)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+    /* A user can only grant up to their own effective permission (§7.5). */
+    vw_perm_t granter_perm = effective_permission(ss, fs, &file_rec, user_id, 0);
+    if (granter_perm == VW_PERM_NONE)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    if ((vw_perm_t)permission > granter_perm)
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+
+    char uname[VW_MAX_USERNAME_BYTES + 1];
+    memcpy(uname, tgt_name, tgt_name_len);
+    uname[tgt_name_len] = '\0';
+    vw_user_record_t target_user;
+    err = vw_store_user_get_by_username(store, uname, &target_user);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+    uint64_t share_id = 0;
+    err = vw_share_grant_create(ss, file_id, file_rec.owner_id, target_user.user_id,
+                                 (vw_perm_t)permission, expires_at, &share_id);
+    if (err != VW_OK)
+        return (send_error(conn, err), VW_OK);
+
+    uint8_t ack[4 + 8];
+    vw_write_u32le(ack, 0u);
+    vw_write_u64le(ack + 4, share_id);
+    return vw_proto_send(conn, VW_MSG_SHARE_GRANT_ACK, ack, sizeof(ack));
+}
+
+/* SHARE_REVOKE / LINK_REVOKE share the same wire shape:
+ * session_token[32] + share_id(u64). ACK: error_code(u32). */
+static vw_err_t handle_share_or_link_revoke(vw_store_t *store, vw_share_store_t *ss,
+                                             vw_conn_t *conn, const uint8_t *payload,
+                                             uint32_t plen, vw_msg_type_t ack_type)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!ss) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint64_t share_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+    /* vw_share_revoke itself enforces "caller must be the share's owner_id"
+     * (§7.5: only the creator, not merely an EDIT grantee, may revoke). */
+    err = vw_share_revoke(ss, share_id, user_id);
+
+    uint8_t ack[4];
+    vw_write_u32le(ack, (uint32_t)(err == VW_OK ? 0u : (uint32_t)err));
+    return vw_proto_send(conn, ack_type, ack, sizeof(ack));
+}
+
+/*
+ * SHARE_LIST: session_token[32] + mode(u8: 0=created by me, 1=granted to
+ * me). SHARE_LIST_RESP: count(u32) + count * {share_id(u64), file_id(u64),
+ * name(string — the shared item's leaf name; see task notes on why this
+ * is a name, not a full path), share_type(u8), target_username-or-empty
+ * (string), permission(u8), created_at(i64), expires_at(i64), revoked(u8)}.
+ */
+typedef struct {
+    vw_store_t      *store;
+    vw_file_store_t *fs;
+    uint64_t         user_id;
+    uint8_t          mode;
+    uint8_t         *buf;
+    uint32_t         cap, len, count;
+} share_list_ctx_t;
+
+static int share_list_cb(const vw_share_record_t *rec, void *ud)
+{
+    share_list_ctx_t *c = (share_list_ctx_t *)ud;
+    if (rec->share_type != VW_SHARE_TYPE_GRANT) return 0;
+    if (c->mode == 0 && rec->owner_id != c->user_id) return 0;
+    if (c->mode == 1 && rec->target_user_id != c->user_id) return 0;
+
+    /* "name" is the shared item's own leaf name (vw_file_record_t.name),
+     * not a full path — path lookups are namespaced by owner_id (see
+     * handle_file_list's list_owner_id comment), so a full path wouldn't
+     * be resolvable in the viewer's own namespace anyway; this is a
+     * display-only field. */
+    char name[64] = {0};
+    vw_file_record_t frec;
+    if (vw_store_file_get_by_id(c->fs, rec->file_id, &frec) == VW_OK)
+        snprintf(name, sizeof(name), "%s", frec.name);
+    uint16_t name_len = (uint16_t)strnlen(name, sizeof(name) - 1);
+
+    char tgt_name[65] = {0};
+    if (rec->target_user_id != 0) {
+        vw_user_record_t urec;
+        if (vw_store_user_get_by_id(c->store, rec->target_user_id, &urec) == VW_OK)
+            snprintf(tgt_name, sizeof(tgt_name), "%s", (const char *)urec.username);
+    }
+    uint16_t tgt_len = (uint16_t)strnlen(tgt_name, sizeof(tgt_name) - 1);
+
+    uint32_t entry_cap = 8u + 8u + 2u + name_len + 1u + 2u + tgt_len + 1u + 8u + 8u + 1u;
+    if (c->len + entry_cap > c->cap) {
+        uint32_t new_cap = c->cap ? c->cap * 2u : 4096u;
+        while (c->len + entry_cap > new_cap) new_cap *= 2u;
+        uint8_t *p = (uint8_t *)realloc(c->buf, new_cap);
+        if (!p) return 1;
+        c->buf = p; c->cap = new_cap;
+    }
+
+    uint32_t off = c->len;
+    vw_write_u64le(c->buf + off, rec->share_id); off += 8;
+    vw_write_u64le(c->buf + off, rec->file_id);  off += 8;
+    (void)vw_proto_write_str(c->buf, c->cap, &off, name, name_len);
+    c->buf[off++] = rec->share_type;
+    (void)vw_proto_write_str(c->buf, c->cap, &off, tgt_name, tgt_len);
+    c->buf[off++] = rec->permission;
+    vw_write_u64le(c->buf + off, (uint64_t)rec->created_at); off += 8;
+    vw_write_u64le(c->buf + off, (uint64_t)rec->expires_at); off += 8;
+    c->buf[off++] = rec->revoked;
+
+    c->len = off;
+    c->count++;
+    return 0;
+}
+
+static vw_err_t handle_share_list(vw_store_t *store, vw_file_store_t *fs,
+                                   vw_share_store_t *ss, vw_conn_t *conn,
+                                   const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, NULL);
+    if (err != VW_OK) return err;
+    if (!ss) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 1u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    uint8_t mode = payload[VW_TOKEN_BYTES];
+
+    share_list_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.store = store; c.fs = fs; c.user_id = user_id; c.mode = mode;
+    err = vw_share_scan(ss, share_list_cb, &c);
+    if (err != VW_OK) { free(c.buf); return (send_error(conn, err), VW_OK); }
+
+    uint8_t *resp = (uint8_t *)malloc(4u + c.len);
+    if (!resp) { free(c.buf); return (send_error(conn, VW_ERR_OOM), VW_OK); }
+    vw_write_u32le(resp, c.count);
+    if (c.len) memcpy(resp + 4, c.buf, c.len);
+    free(c.buf);
+
+    err = vw_proto_send(conn, VW_MSG_SHARE_LIST_RESP, resp, 4u + c.len);
+    free(resp);
+    return err;
+}
+
+/* LINK_CREATE: session_token[32] + file_id(u64) + permission(u8) +
+ * expires_at(i64). ACK: error_code(u32) + share_id(u64) + link_token[32]. */
+static vw_err_t handle_link_create(vw_store_t *store, vw_file_store_t *fs,
+                                    vw_share_store_t *ss, vw_conn_t *conn,
+                                    const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!ss) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u + 1u + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint64_t file_id     = vw_read_u64le(payload + VW_TOKEN_BYTES);
+    uint8_t  permission  = payload[VW_TOKEN_BYTES + 8u];
+    int64_t  expires_at  = (int64_t)vw_read_u64le(payload + VW_TOKEN_BYTES + 9u);
+
+    if (permission != (uint8_t)VW_PERM_VIEW && permission != (uint8_t)VW_PERM_EDIT)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    vw_file_record_t file_rec;
+    if (vw_store_file_get_by_id(fs, file_id, &file_rec) != VW_OK)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+    vw_perm_t granter_perm = effective_permission(ss, fs, &file_rec, user_id, 0);
+    if (granter_perm == VW_PERM_NONE)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    if ((vw_perm_t)permission > granter_perm)
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+
+    uint8_t  link_token[32];
+    uint64_t share_id = 0;
+    err = vw_share_link_create(ss, file_id, file_rec.owner_id, (vw_perm_t)permission,
+                                expires_at, link_token, &share_id);
+    if (err != VW_OK)
+        return (send_error(conn, err), VW_OK);
+
+    uint8_t ack[4 + 8 + 32];
+    vw_write_u32le(ack, 0u);
+    vw_write_u64le(ack + 4, share_id);
+    memcpy(ack + 12, link_token, 32);
+    vw_err_t send_err = vw_proto_send(conn, VW_MSG_LINK_CREATE_ACK, ack, sizeof(ack));
+    secure_zero(ack, sizeof(ack)); /* raw link_token must not linger */
+    secure_zero(link_token, sizeof(link_token));
+    return send_err;
+}
+
+/* LINK_LIST: session_token[32] + file_id(u64, 0 = all my links).
+ * LINK_LIST_RESP: count(u32) + count * {share_id(u64), file_id(u64),
+ * name(string — leaf name, same display-only convention as
+ * SHARE_LIST_RESP), permission(u8), created_at(i64), expires_at(i64),
+ * revoked(u8)} — never the raw link_token. */
+typedef struct {
+    vw_file_store_t *fs;
+    uint64_t          user_id;
+    uint64_t          file_filter;
+    uint8_t          *buf;
+    uint32_t          cap, len, count;
+} link_list_ctx_t;
+
+static int link_list_cb(const vw_share_record_t *rec, void *ud)
+{
+    link_list_ctx_t *c = (link_list_ctx_t *)ud;
+    if (rec->share_type != VW_SHARE_TYPE_LINK) return 0;
+    if (rec->owner_id != c->user_id) return 0;
+    if (c->file_filter != 0 && rec->file_id != c->file_filter) return 0;
+
+    char name[64] = {0};
+    vw_file_record_t frec;
+    if (vw_store_file_get_by_id(c->fs, rec->file_id, &frec) == VW_OK)
+        snprintf(name, sizeof(name), "%s", frec.name);
+    uint16_t name_len = (uint16_t)strnlen(name, sizeof(name) - 1);
+
+    uint32_t entry_cap = 8u + 8u + 2u + name_len + 1u + 8u + 8u + 1u;
+    if (c->len + entry_cap > c->cap) {
+        uint32_t new_cap = c->cap ? c->cap * 2u : 4096u;
+        while (c->len + entry_cap > new_cap) new_cap *= 2u;
+        uint8_t *p = (uint8_t *)realloc(c->buf, new_cap);
+        if (!p) return 1;
+        c->buf = p; c->cap = new_cap;
+    }
+    uint32_t off = c->len;
+    vw_write_u64le(c->buf + off, rec->share_id); off += 8;
+    vw_write_u64le(c->buf + off, rec->file_id);  off += 8;
+    (void)vw_proto_write_str(c->buf, c->cap, &off, name, name_len);
+    c->buf[off++] = rec->permission;
+    vw_write_u64le(c->buf + off, (uint64_t)rec->created_at); off += 8;
+    vw_write_u64le(c->buf + off, (uint64_t)rec->expires_at); off += 8;
+    c->buf[off++] = rec->revoked;
+    c->len = off;
+    c->count++;
+    return 0;
+}
+
+static vw_err_t handle_link_list(vw_store_t *store, vw_file_store_t *fs,
+                                  vw_share_store_t *ss, vw_conn_t *conn,
+                                  const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, NULL);
+    if (err != VW_OK) return err;
+    if (!ss) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    uint64_t file_filter = vw_read_u64le(payload + VW_TOKEN_BYTES);
+
+    link_list_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.fs = fs; c.user_id = user_id; c.file_filter = file_filter;
+    err = vw_share_scan(ss, link_list_cb, &c);
+    if (err != VW_OK) { free(c.buf); return (send_error(conn, err), VW_OK); }
+
+    uint8_t *resp = (uint8_t *)malloc(4u + c.len);
+    if (!resp) { free(c.buf); return (send_error(conn, VW_ERR_OOM), VW_OK); }
+    vw_write_u32le(resp, c.count);
+    if (c.len) memcpy(resp + 4, c.buf, c.len);
+    free(c.buf);
+
+    err = vw_proto_send(conn, VW_MSG_LINK_LIST_RESP, resp, 4u + c.len);
+    free(resp);
+    return err;
+}
+
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
 vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
@@ -1490,6 +2251,7 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
     vw_invite_store_t *invs    = vw_server_ctx_invite_store(ctx);
     vw_oplog_t        *oplog   = vw_server_ctx_oplog(ctx);
     vw_cluster_t      *cluster = vw_server_ctx_cluster(ctx);
+    vw_share_store_t  *ss      = vw_server_ctx_share_store(ctx);
 
     /* Admin-only messages that do not require file/chunk stores. */
     switch (type) {
@@ -1517,25 +2279,39 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
 
     switch (type) {
     case VW_MSG_FILE_LIST:
-        return handle_file_list(store, fs, conn, payload, plen);
+        return handle_file_list(store, fs, ss, conn, payload, plen);
     case VW_MSG_FILE_STAT:
-        return handle_file_stat(store, fs, conn, payload, plen);
+        return handle_file_stat(store, fs, ss, conn, payload, plen);
     case VW_MSG_CHUNK_QUERY:
         return handle_chunk_query(store, cs, conn, payload, plen);
     case VW_MSG_CHUNK_UPLOAD:
-        return handle_chunk_upload(store, cs, conn, payload, plen);
+        return handle_chunk_upload(store, cs, ss, conn, payload, plen);
     case VW_MSG_CHUNK_DOWNLOAD_REQ:
-        return handle_chunk_download(store, fs, cs, conn, payload, plen);
+        return handle_chunk_download(store, fs, cs, ss, conn, payload, plen);
     case VW_MSG_FILE_COMMIT:
-        return handle_file_commit(store, fs, cs, conn, payload, plen);
+        return handle_file_commit(store, fs, cs, ss, conn, payload, plen);
     case VW_MSG_FILE_DELETE:
-        return handle_file_delete(store, fs, conn, payload, plen);
+        return handle_file_delete(store, fs, ss, conn, payload, plen);
+    case VW_MSG_FILE_MOVE:
+        return handle_file_move(store, fs, ss, conn, payload, plen);
     case VW_MSG_VERSION_LIST:
-        return handle_version_list(store, fs, conn, payload, plen);
+        return handle_version_list(store, fs, ss, conn, payload, plen);
     case VW_MSG_VERSION_RESTORE:
-        return handle_version_restore(store, fs, cs, conn, payload, plen);
+        return handle_version_restore(store, fs, cs, ss, conn, payload, plen);
     case VW_MSG_VERSION_CHUNKS:
-        return handle_version_chunks(store, fs, conn, payload, plen);
+        return handle_version_chunks(store, fs, ss, conn, payload, plen);
+    case VW_MSG_SHARE_GRANT:
+        return handle_share_grant(store, fs, ss, conn, payload, plen);
+    case VW_MSG_SHARE_REVOKE:
+        return handle_share_or_link_revoke(store, ss, conn, payload, plen, VW_MSG_SHARE_REVOKE_ACK);
+    case VW_MSG_SHARE_LIST:
+        return handle_share_list(store, fs, ss, conn, payload, plen);
+    case VW_MSG_LINK_CREATE:
+        return handle_link_create(store, fs, ss, conn, payload, plen);
+    case VW_MSG_LINK_REVOKE:
+        return handle_share_or_link_revoke(store, ss, conn, payload, plen, VW_MSG_LINK_REVOKE_ACK);
+    case VW_MSG_LINK_LIST:
+        return handle_link_list(store, fs, ss, conn, payload, plen);
     default:
         return VW_ERR_NOT_IMPL;
     }

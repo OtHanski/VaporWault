@@ -48,12 +48,35 @@ MSG_FILE_COMMIT        = 0x020B
 MSG_FILE_COMMIT_ACK    = 0x020C
 MSG_FILE_DELETE        = 0x020D
 MSG_FILE_DELETE_ACK    = 0x020E
+MSG_FILE_MOVE          = 0x020F
+MSG_FILE_MOVE_ACK      = 0x0210
 MSG_VERSION_LIST       = 0x0301
 MSG_VERSION_LIST_RESP  = 0x0302
 MSG_VERSION_RESTORE    = 0x0303
 MSG_VERSION_RESTORE_ACK = 0x0304
 MSG_VERSION_CHUNKS     = 0x0305
 MSG_VERSION_CHUNKS_RESP = 0x0306
+
+# Sharing (TASK-094)
+MSG_SHARE_GRANT        = 0x0501
+MSG_SHARE_GRANT_ACK    = 0x0502
+MSG_SHARE_REVOKE       = 0x0503
+MSG_SHARE_REVOKE_ACK   = 0x0504
+MSG_SHARE_LIST         = 0x0505
+MSG_SHARE_LIST_RESP    = 0x0506
+MSG_LINK_CREATE        = 0x0507
+MSG_LINK_CREATE_ACK    = 0x0508
+MSG_LINK_REVOKE        = 0x0509
+MSG_LINK_REVOKE_ACK    = 0x050A
+MSG_LINK_LIST          = 0x050B
+MSG_LINK_LIST_RESP     = 0x050C
+MSG_LINK_ACCESS        = 0x050D
+MSG_LINK_ACCESS_ACK    = 0x050E
+
+VW_PERM_NONE  = 0
+VW_PERM_VIEW  = 1
+VW_PERM_EDIT  = 2
+VW_PERM_OWNER = 3
 
 # Admin message types (AF_UNIX admin socket, same 8-byte frame format)
 ADMIN_USER_CREATE_REQ  = 0x9001
@@ -389,6 +412,137 @@ class VwClient:
         error_code = struct.unpack_from("<I", resp, 0)[0]
         if error_code != VW_OK:
             raise VwProtocolError(error_code, "file delete failed")
+
+    def file_move(self, session_token, file_id, new_parent_dir_id=0, new_name=""):
+        """Move and/or rename a file or folder by file_id."""
+        payload = (
+            bytes(session_token)
+            + struct.pack("<QQ", file_id, new_parent_dir_id)
+            + _encode_str(new_name)
+        )
+        self._send(MSG_FILE_MOVE, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_FILE_MOVE_ACK, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "file move failed")
+
+    # ── Sharing (TASK-094) ──────────────────────────────────────────────────
+
+    def share_grant(self, session_token, file_id, target_username, permission, expires_at=0):
+        """Grant target_username VIEW/EDIT access to file_id. Returns share_id."""
+        payload = (
+            bytes(session_token)
+            + struct.pack("<Q", file_id)
+            + _encode_str(target_username)
+            + struct.pack("<BQ", permission, expires_at)
+        )
+        self._send(MSG_SHARE_GRANT, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_SHARE_GRANT_ACK, mt, resp)
+        error_code, share_id = struct.unpack_from("<IQ", resp, 0)
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "share grant failed")
+        return share_id
+
+    def share_revoke(self, session_token, share_id):
+        payload = bytes(session_token) + struct.pack("<Q", share_id)
+        self._send(MSG_SHARE_REVOKE, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_SHARE_REVOKE_ACK, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "share revoke failed")
+
+    def share_list(self, session_token, mode=0):
+        """mode: 0 = shares I created, 1 = shares granted to me."""
+        payload = bytes(session_token) + struct.pack("<B", mode)
+        self._send(MSG_SHARE_LIST, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_SHARE_LIST_RESP, mt, resp)
+        count = struct.unpack_from("<I", resp, 0)[0]
+        off = 4
+        entries = []
+        for _ in range(count):
+            share_id, file_id = struct.unpack_from("<QQ", resp, off); off += 16
+            name_len = struct.unpack_from("<H", resp, off)[0]; off += 2
+            name = resp[off:off + name_len].decode("utf-8"); off += name_len
+            share_type = resp[off]; off += 1
+            tgt_len = struct.unpack_from("<H", resp, off)[0]; off += 2
+            target_username = resp[off:off + tgt_len].decode("utf-8"); off += tgt_len
+            permission = resp[off]; off += 1
+            created_at, expires_at = struct.unpack_from("<qq", resp, off); off += 16
+            revoked = resp[off]; off += 1
+            entries.append({
+                "share_id": share_id, "file_id": file_id, "name": name,
+                "share_type": share_type, "target_username": target_username,
+                "permission": permission, "created_at": created_at,
+                "expires_at": expires_at, "revoked": bool(revoked),
+            })
+        return entries
+
+    def link_create(self, session_token, file_id, permission, expires_at=0):
+        """Returns (share_id, link_token)."""
+        payload = bytes(session_token) + struct.pack("<QBQ", file_id, permission, expires_at)
+        self._send(MSG_LINK_CREATE, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_LINK_CREATE_ACK, mt, resp)
+        error_code, share_id = struct.unpack_from("<IQ", resp, 0)
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "link create failed")
+        link_token = resp[12:44]
+        return share_id, link_token
+
+    def link_revoke(self, session_token, share_id):
+        payload = bytes(session_token) + struct.pack("<Q", share_id)
+        self._send(MSG_LINK_REVOKE, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_LINK_REVOKE_ACK, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "link revoke failed")
+
+    def link_list(self, session_token, file_id=0):
+        payload = bytes(session_token) + struct.pack("<Q", file_id)
+        self._send(MSG_LINK_LIST, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_LINK_LIST_RESP, mt, resp)
+        count = struct.unpack_from("<I", resp, 0)[0]
+        off = 4
+        entries = []
+        for _ in range(count):
+            share_id, file_id_ = struct.unpack_from("<QQ", resp, off); off += 16
+            name_len = struct.unpack_from("<H", resp, off)[0]; off += 2
+            name = resp[off:off + name_len].decode("utf-8"); off += name_len
+            permission = resp[off]; off += 1
+            created_at, expires_at = struct.unpack_from("<qq", resp, off); off += 16
+            revoked = resp[off]; off += 1
+            entries.append({
+                "share_id": share_id, "file_id": file_id_, "name": name,
+                "permission": permission, "created_at": created_at,
+                "expires_at": expires_at, "revoked": bool(revoked),
+            })
+        return entries
+
+    def link_access(self, link_token):
+        """
+        Redeem a public link — unauthenticated, sent as the first message
+        after HELLO/HELLO_OK instead of AUTH_REQUEST. Only valid immediately
+        after connecting (mirrors login()'s position in the handshake).
+
+        Returns the same shape as login(): session_token, expires_at,
+        is_admin (always False), quota_bytes/used_bytes (always 0),
+        user_id (always 0).
+
+        Raises VwAuthError on an unknown/revoked/expired token.
+        """
+        self._send(MSG_LINK_ACCESS, bytes(link_token))
+        mt, resp = self._recv()
+        if mt == MSG_AUTH_FAIL:
+            code = struct.unpack_from("<I", resp, 0)[0] if len(resp) >= 4 else 0
+            raise VwAuthError(code, 0)
+        self._expect(MSG_LINK_ACCESS_ACK, mt, resp)
+        return self._parse_auth_ok(resp)
 
     # ── Version history ─────────────────────────────────────────────────────
 

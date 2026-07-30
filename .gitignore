@@ -1,3 +1,8 @@
 build/
 build-wsl/
+build-wsl-werror/
+build-msvc*/
 third_party/SDL2/
+*.log
+__pycache__/
+.pytest_cache/

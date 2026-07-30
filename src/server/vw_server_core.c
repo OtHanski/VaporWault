@@ -39,6 +39,7 @@ struct vw_server_ctx {
     vw_oplog_t          *oplog;           /* NULL = audit queries return empty */
     vw_cluster_t        *cluster;         /* NULL = cluster status returns empty list */
     vw_conn_registry_t  *conn_registry;   /* NULL = connection list not tracked here */
+    vw_share_store_t    *share_store;     /* NULL = sharing disabled            */
     uint32_t             auth_timeout_ms;
 };
 
@@ -650,6 +651,99 @@ static vw_err_t handle_invite_redeem(vw_server_ctx_t *ctx, vw_conn_t *conn,
     return build_and_send_auth_ok(ctx, conn, token, uid, out_info);
 }
 
+/* ── LINK_ACCESS handler (TASK-094) ──────────────────────────────────────── */
+
+/*
+ * LINK_ACCESS payload: link_token[32]. Unauthenticated, handled in the
+ * pre-auth phase alongside AUTH_REQUEST/INVITE_REDEEM because it also
+ * produces a session — here, an anonymous scoped one (docs/PROTOCOL.md
+ * §7.5/§7.10).
+ *
+ * Security: every failure path (unknown/revoked/expired token, disabled
+ * sharing) sends AUTH_FAIL with the same generic BAD_CREDS code, so a
+ * caller cannot distinguish "token never existed" from "token was revoked"
+ * (same anti-enumeration rationale as NODE_HELLO_FAIL, §7.9). IP-based rate
+ * limiting on failures mirrors the existing NODE_HELLO pattern in
+ * vw_cluster.c (5 failures/60s -> silent drop, i.e. the connection is
+ * simply closed with no response at all once blocked).
+ */
+static vw_err_t handle_link_access(vw_server_ctx_t *ctx, vw_conn_t *conn,
+                                    const uint8_t *payload, uint32_t plen,
+                                    const char *peer_ip,
+                                    vw_session_info_t *out_info)
+{
+    if (!ctx->share_store) {
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
+        return VW_ERR_NOT_IMPL;
+    }
+
+    if (peer_ip[0] && vw_share_link_access_is_blocked(ctx->share_store, peer_ip)) {
+        /* Silent drop — no response at all, matching NODE_HELLO's posture
+         * for a blocked source: a response (even a generic failure) would
+         * still confirm the server is there and reacting to further guesses. */
+        return VW_ERR_AUTH_REQUIRED;
+    }
+
+    if (plen != 32u) {
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
+        if (peer_ip[0]) vw_share_link_access_record_failure(ctx->share_store, peer_ip);
+        return VW_ERR_PROTO_INVALID;
+    }
+
+    vw_share_record_t share;
+    vw_err_t err = vw_share_get_by_token(ctx->share_store, payload, &share);
+    if (err != VW_OK) {
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
+        if (peer_ip[0]) vw_share_link_access_record_failure(ctx->share_store, peer_ip);
+        return err;
+    }
+
+    if (peer_ip[0]) vw_share_link_access_reset_on_success(ctx->share_store, peer_ip);
+
+    uint8_t token[VW_TOKEN_BYTES];
+    err = vw_auth_create_scoped_session(ctx->auth, share.share_id, token);
+    if (err != VW_OK) {
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
+        return err;
+    }
+
+    vw_session_record_t sess_rec;
+    err = vw_store_session_get(ctx->store, token, &sess_rec);
+    if (err != VW_OK) {
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
+        return err;
+    }
+
+    /* LINK_ACCESS_ACK: same wire shape as AUTH_OK (§7.5), with user_id=0,
+     * is_admin=0, and quota_bytes/used_bytes zeroed — not meaningful for an
+     * anonymous caller; quota is always resolved against the file's real
+     * owner server-side, never a scoped session's nominal identity. */
+    vw_payload_auth_ok_t ok;
+    memcpy(ok.session_token, token, VW_TOKEN_BYTES);
+    ok.expires_at  = (int64_t)sess_rec.expires_at;
+    ok.is_admin    = 0;
+    ok.quota_bytes = 0;
+    ok.used_bytes  = 0;
+    ok.user_id     = 0;
+    secure_zero(&sess_rec, sizeof(sess_rec));
+
+    uint8_t buf[72];
+    uint32_t len;
+    err = vw_proto_encode_auth_ok(&ok, buf, sizeof(buf), &len);
+    if (err != VW_OK) return err;
+
+    err = vw_proto_send(conn, VW_MSG_LINK_ACCESS_ACK, buf, len);
+    if (err != VW_OK) return err;
+
+    if (out_info) {
+        out_info->user_id = 0;
+        memcpy(out_info->session_token, token, VW_TOKEN_BYTES);
+        out_info->expires_at = ok.expires_at;
+        out_info->is_admin   = 0;
+    }
+    return VW_OK;
+}
+
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 vw_err_t vw_server_ctx_open(vw_auth_ctx_t *auth, vw_store_t *store,
@@ -745,6 +839,16 @@ vw_conn_registry_t *vw_server_ctx_conn_registry(const vw_server_ctx_t *ctx)
     return ctx ? ctx->conn_registry : NULL;
 }
 
+void vw_server_ctx_set_share_store(vw_server_ctx_t *ctx, vw_share_store_t *share_store)
+{
+    if (ctx) ctx->share_store = share_store;
+}
+
+vw_share_store_t *vw_server_ctx_share_store(const vw_server_ctx_t *ctx)
+{
+    return ctx ? ctx->share_store : NULL;
+}
+
 void vw_server_ctx_close(vw_server_ctx_t *ctx)
 {
     free(ctx);
@@ -787,6 +891,9 @@ vw_err_t vw_server_conn_handle(vw_server_ctx_t *ctx,
     }
     if (type == VW_MSG_INVITE_REDEEM) {
         return handle_invite_redeem(ctx, conn, buf, plen, peer_ip, out_info);
+    }
+    if (type == VW_MSG_LINK_ACCESS) {
+        return handle_link_access(ctx, conn, buf, plen, peer_ip, out_info);
     }
     return VW_ERR_PROTO_INVALID;
 }

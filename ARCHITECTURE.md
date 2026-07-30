@@ -104,7 +104,8 @@ VaporWault/
 | `vw_oplog` | `src/server/vw_oplog.{h,c}` | SRV.01 | C | Append-only operation log for replication and crash recovery |
 | `vw_storage` | `src/server/vw_storage.{h,c}` | SRV.01 | C | Chunk store, dedup ref-counting, version GC |
 | `vw_store` (files) | `src/server/vw_store_files.{h,c}` | SRV.01 | C | File/version metadata records, soft-delete + trash retention (split out from `vw_store.c`, which owns users/sessions/quotas) |
-| `vw_file_handlers` | `src/server/vw_file_handlers.{h,c}` | SRV.01 | C | Phase 2 file-op dispatch (FILE_LIST/STAT, CHUNK_*, VERSION_*); owner_id-only access check today — see TASK-088 |
+| `vw_file_handlers` | `src/server/vw_file_handlers.{h,c}` | SRV.01 | C | Phase 2 file-op dispatch (FILE_LIST/STAT, CHUNK_*, VERSION_*, FILE_MOVE, SHARE_*/LINK_*); permission resolution goes through `vw_share` (grants + scoped sessions), not owner_id-only, since TASK-094 |
+| `vw_share` | `src/server/vw_share.{h,c}` | SRV.01 | C | User-to-user grants + public links: CRUD, permission resolution (ancestor walk-up), scoped-session write-count and LINK_ACCESS IP rate limiting (added TASK-094) |
 | `vw_conn_registry` | `src/server/vw_conn_registry.{h,c}` | SRV.01 | C | Live-connection tracking for admin CONN_LIST (added TASK-091) |
 | `vw_auth` | `src/server/vw_auth.{h,c}` | PRT.04 | C | Argon2id hashing, session token lifecycle, 2FA orchestration |
 | `vw_auth_provider` | `src/server/vw_auth_provider.{h,c}` | PRT.04 | C | Abstract 2FA provider interface + email OTP implementation |
@@ -217,9 +218,11 @@ data/
     {hex[0:2]}/
       {sha256hex}.chunk # Raw 4MB chunk data, named by SHA-256
     refcounts.db        # Hash table: sha256 (32 bytes) → ref_count (u32)
-  shares/               # NOT YET IMPLEMENTED — design in TASK-088, no code exists yet.
-    shares.db           # (planned) Fixed-size share/grant records — see TASK-088
-    shares.idx          # (planned) file_id / target_user_id / link_token indexes
+  shares/               # Implemented TASK-094 (design: TASK-088).
+    shares.db           # Fixed-size vw_share_record_t rows (128 bytes/slot); user grants and
+                         # public links share one table (share_type discriminates). No separate
+                         # index file — the in-memory link_token hash table and share_id-as-slot
+                         # direct index are rebuilt on open, same convention as every other table.
   audit/
     audit-{seq}.log     # Segmented append-only log; each entry has CRC32
     audit.idx           # Timestamp → segment + offset (rebuilt on load)

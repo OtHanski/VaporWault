@@ -190,6 +190,26 @@ vw_err_t vw_auth_create_session(vw_auth_ctx_t *ctx, uint64_t user_id,
     return vw_store_session_create(ctx->store, &rec, out_token);
 }
 
+vw_err_t vw_auth_create_scoped_session(vw_auth_ctx_t *ctx, uint64_t share_id,
+                                        uint8_t out_token[32])
+{
+    vw_session_record_t rec;
+    uint64_t             now;
+
+    if (!ctx || !out_token || share_id == 0) return VW_ERR_INVALID_ARG;
+
+    now = (uint64_t)time(NULL);
+
+    memset(&rec, 0, sizeof(rec));
+    rec.user_id        = 0;   /* anonymous */
+    rec.created_at      = now;
+    rec.expires_at      = now + ctx->cfg.session_ttl_secs;
+    rec.is_active       = 1;
+    rec.scope_share_id  = share_id;
+
+    return vw_store_session_create(ctx->store, &rec, out_token);
+}
+
 vw_err_t vw_auth_validate_session(vw_auth_ctx_t *ctx,
                                    const uint8_t token[32],
                                    uint64_t *out_user_id)
