@@ -592,13 +592,34 @@ class VwClient:
     # ── Version history ─────────────────────────────────────────────────────
 
     def version_chunks(self, session_token, version_id):
-        """Return ordered list of chunk hashes (bytes[32]) for a version."""
+        """
+        Return ordered list of chunk hashes (bytes[32]) for a version.
+
+        For backward compatibility this returns just the hash list; use
+        version_chunks_ex() to also get the TASK-099 vault_id/wrapped_dek
+        trailing fields.
+        """
+        return self.version_chunks_ex(session_token, version_id)[0]
+
+    def version_chunks_ex(self, session_token, version_id):
+        """
+        Like version_chunks(), but also returns (vault_id, wrapped_dek).
+        vault_id is 0 and wrapped_dek is None for an unencrypted version.
+        """
         payload = bytes(session_token) + struct.pack("<Q", version_id)
         self._send(MSG_VERSION_CHUNKS, payload)
         mt, resp = self._recv()
         self._expect(MSG_VERSION_CHUNKS_RESP, mt, resp)
         count = struct.unpack_from("<I", resp, 0)[0]
-        return [resp[4 + i * 32:4 + (i + 1) * 32] for i in range(count)]
+        hashes = [resp[4 + i * 32:4 + (i + 1) * 32] for i in range(count)]
+        off = 4 + count * 32
+        vault_id = 0
+        wrapped_dek = None
+        if off < len(resp):
+            vault_id = struct.unpack_from("<Q", resp, off)[0]
+            off += 8
+            wrapped_dek, off = _read_str(resp, off)
+        return hashes, vault_id, wrapped_dek
 
     def version_list(self, session_token, file_id, offset=0, limit=0):
         """
