@@ -102,6 +102,14 @@ typedef struct {
     char     local_root[512];  /* registered root (security anchor for DEL_LOCAL) */
     int      action;
     uint64_t size;
+    int      shared;         /* TASK-106: 1 = target folder is shared (file-id
+                                 addressed); 0 = owned (path-addressed), the
+                                 pre-TASK-106 behavior, byte-for-byte unchanged */
+    uint64_t file_id;        /* TASK-106: target file's own file_id; 0 if it
+                                 doesn't exist on the server yet (new upload) */
+    uint64_t parent_dir_id;  /* TASK-106: immediate parent folder's file_id —
+                                 only meaningful for a shared-folder ACT_UPLOAD
+                                 with file_id == 0 (vw_client_file_upload_into_folder) */
 } action_t;
 
 typedef struct {
@@ -112,7 +120,8 @@ typedef struct {
 
 static vw_err_t action_push(action_list_t *al, int act,
                              const char *vpath, const char *lpath,
-                             const char *lroot, uint64_t size) {
+                             const char *lroot, uint64_t size,
+                             int shared, uint64_t file_id, uint64_t parent_dir_id) {
     if (al->count >= al->cap) {
         uint32_t nc = al->cap ? al->cap * 2u : 32u;
         action_t *tmp = realloc(al->arr, nc * sizeof(action_t));
@@ -124,8 +133,11 @@ static vw_err_t action_push(action_list_t *al, int act,
     snprintf(a->virtual_path, sizeof(a->virtual_path), "%s", vpath);
     snprintf(a->local_path,   sizeof(a->local_path),   "%s", lpath);
     snprintf(a->local_root,   sizeof(a->local_root),   "%s", lroot ? lroot : "");
-    a->action = act;
-    a->size   = size;
+    a->action        = act;
+    a->size          = size;
+    a->shared        = shared;
+    a->file_id       = file_id;
+    a->parent_dir_id = parent_dir_id;
     return VW_OK;
 }
 
@@ -318,6 +330,115 @@ done:
     return err;
 }
 
+/* ── Directory id map (shared-folder sync, TASK-106) ─────────────────────── */
+
+/*
+ * Maps a shared folder's directories (client-local virtual_path → server
+ * file_id), populated during srv_collect_by_id's BFS. Needed so compute_actions
+ * can resolve the immediate parent folder's file_id for a brand-new local file
+ * (vw_client_file_upload_into_folder requires it) — unlike an owned folder,
+ * a shared folder has no path the client can address directly, so nothing
+ * short of "the id we discovered while listing this directory's parent" can
+ * name it.
+ */
+typedef struct {
+    char     virtual_path[512];
+    uint64_t dir_id;
+} dir_entry_t;
+
+typedef struct {
+    dir_entry_t *arr;
+    uint32_t     count;
+    uint32_t     cap;
+} dirmap_t;
+
+static vw_err_t dirmap_push(dirmap_t *dm, const char *vpath, uint64_t dir_id) {
+    if (dm->count >= dm->cap) {
+        uint32_t nc = dm->cap ? dm->cap * 2u : 16u;
+        dir_entry_t *tmp = realloc(dm->arr, nc * sizeof(dir_entry_t));
+        if (!tmp) return VW_ERR_OOM;
+        dm->arr = tmp; dm->cap = nc;
+    }
+    dir_entry_t *e = &dm->arr[dm->count++];
+    snprintf(e->virtual_path, sizeof(e->virtual_path), "%s", vpath);
+    e->dir_id = dir_id;
+    return VW_OK;
+}
+
+/* Returns 0 if vpath is not a known directory (caller treats as unresolvable). */
+static uint64_t dirmap_lookup(const dirmap_t *dm, const char *vpath) {
+    if (!dm) return 0;
+    for (uint32_t i = 0; i < dm->count; i++)
+        if (strcmp(dm->arr[i].virtual_path, vpath) == 0) return dm->arr[i].dir_id;
+    return 0;
+}
+
+/*
+ * Id-addressed counterpart of srv_collect for a shared folder: BFS via
+ * FILE_LIST's dir_file_id extension instead of path-based FILE_LIST, since a
+ * grantee's own FILE_LIST can never resolve into someone else's tree by path
+ * (docs/PROTOCOL.md §7.2). virtual_root/dir_root here name the shared
+ * folder's client-local naming root and its server-side file_id.
+ *
+ * Unlike srv_collect, VW_ERR_NOT_FOUND / VW_ERR_PERMISSION from ANY level are
+ * NOT swallowed — for a directory the client already knows the file_id of
+ * (either the folder's root, learned when the sync folder was added, or a
+ * subdirectory just discovered a moment ago in this same walk), a definitive
+ * "you can't see this" response only happens when the share has been
+ * revoked (or the item deleted) since — the caller treats this as a
+ * revocation signal, not a routine empty/missing directory (which FILE_LIST
+ * always reports as a normal zero-entry result, never NOT_FOUND).
+ */
+static vw_err_t srv_collect_by_id(vw_client_sess_t *sess,
+                                   const char *virtual_root, uint64_t dir_root,
+                                   srv_list_t *sl, dirmap_t *dm) {
+    typedef struct { char vpath[512]; uint64_t dir_id; } q_item_t;
+    q_item_t *queue = NULL;
+    uint32_t q_head = 0, q_tail = 0, q_cap = 16;
+
+    queue = malloc(q_cap * sizeof(q_item_t));
+    if (!queue) return VW_ERR_OOM;
+    snprintf(queue[q_tail].vpath, sizeof(queue[q_tail].vpath), "%s", virtual_root);
+    queue[q_tail].dir_id = dir_root;
+    q_tail++;
+
+    vw_err_t err = dirmap_push(dm, virtual_root, dir_root);
+    if (err != VW_OK) { free(queue); return err; }
+
+    while (q_head < q_tail) {
+        q_item_t cur = queue[q_head++];
+        vw_file_entry_t *entries = NULL;
+        uint32_t n = 0;
+        vw_err_t lerr = vw_client_file_list_by_id(sess, cur.dir_id, 0, &entries, &n);
+        if (lerr != VW_OK) { err = lerr; break; }
+
+        for (uint32_t i = 0; i < n; i++) {
+            char vpath[512];
+            vpath_child(vpath, sizeof(vpath), cur.vpath, entries[i].name);
+            if (entries[i].entry_type == VW_ENTRY_DIR) {
+                err = dirmap_push(dm, vpath, entries[i].file_id);
+                if (err != VW_OK) { free(entries); goto done; }
+                if (q_tail >= q_cap) {
+                    uint32_t nc = q_cap * 2u;
+                    q_item_t *nq = realloc(queue, nc * sizeof(q_item_t));
+                    if (!nq) { free(entries); err = VW_ERR_OOM; goto done; }
+                    queue = nq; q_cap = nc;
+                }
+                snprintf(queue[q_tail].vpath, sizeof(queue[q_tail].vpath), "%s", vpath);
+                queue[q_tail].dir_id = entries[i].file_id;
+                q_tail++;
+            } else {
+                err = srv_push(sl, vpath, &entries[i]);
+                if (err != VW_OK) { free(entries); goto done; }
+            }
+        }
+        free(entries);
+    }
+done:
+    free(queue);
+    return err;
+}
+
 /* ── Struct vw_sync_ctx ──────────────────────────────────────────────────── */
 
 struct vw_sync_ctx {
@@ -375,7 +496,8 @@ static int is_net_err(vw_err_t err) {
 
 /* Defined below, near exec_action(); forward-declared here for oq_drain(). */
 static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
-                                        const char *virtual_path, const char *local_path);
+                                        const char *virtual_path, const char *local_path,
+                                        uint64_t known_file_id);
 
 static void oq_drain(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
     uint32_t i = 0;
@@ -386,7 +508,7 @@ static void oq_drain(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
         case OQ_ACT_UPLOAD:
             err = vw_client_file_upload(sess, e->virtual_path, e->local_path, NULL, NULL);
             if (err == VW_OK)
-                update_cache_after_upload(ctx, sess, e->virtual_path, e->local_path);
+                update_cache_after_upload(ctx, sess, e->virtual_path, e->local_path, 0);
             break;
         case OQ_ACT_DOWNLOAD:
             err = vw_client_file_download(sess, e->virtual_path, e->local_path, NULL, NULL);
@@ -487,8 +609,17 @@ static void make_conflict_path(const char *local_path, int64_t ts,
  * file_id in that window. Fixed by resolving it immediately instead of
  * waiting.
  */
+/*
+ * known_file_id (TASK-106): 0 for an owned-folder upload (unchanged
+ * behavior — resolve via path-based FILE_STAT); nonzero for a shared-folder
+ * upload, where a path-based FILE_STAT can never resolve (the caller
+ * doesn't own that path) — the file_id learned from the upload itself
+ * (either already known, for an update, or just returned by
+ * vw_client_file_upload_into_folder for a create) is used instead.
+ */
 static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
-                                        const char *virtual_path, const char *local_path) {
+                                        const char *virtual_path, const char *local_path,
+                                        uint64_t known_file_id) {
     vw_cache_entry_t ce;
     if (vw_cache_get(ctx->cache, virtual_path, &ce) != VW_OK) return;
 
@@ -497,7 +628,10 @@ static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
     ce.sync_state  = VW_SYNC_SYNCED;
 
     vw_file_entry_t stat_entry;
-    if (vw_client_file_stat(sess, virtual_path, &stat_entry) == VW_OK) {
+    vw_err_t serr = known_file_id != 0
+        ? vw_client_file_stat_by_id(sess, known_file_id, &stat_entry)
+        : vw_client_file_stat(sess, virtual_path, &stat_entry);
+    if (serr == VW_OK) {
         ce.file_id           = stat_entry.file_id;
         ce.server_version_id = stat_entry.version_id;
         ce.server_mtime      = stat_entry.mtime_unix;
@@ -518,13 +652,41 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
     switch (a->action) {
 
     case ACT_UPLOAD:
-        err = vw_client_file_upload(sess, a->virtual_path, a->local_path,
-                                    sync_prog_cb, &prog);
-        if (err == VW_OK) {
-            update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path);
-        } else if (is_net_err(err)) {
-            (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
-            queued = 1;
+        if (a->shared) {
+            /* TASK-106: file-id-addressed upload for a shared folder. The
+             * offline queue is deliberately NOT used here (it's path-based
+             * only, by design) — a network error just fails this cycle and
+             * is retried on the next one. */
+            if (a->file_id != 0) {
+                err = vw_client_file_upload_to_id(sess, a->file_id, a->local_path,
+                                                  sync_prog_cb, &prog);
+                if (err == VW_OK)
+                    update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path,
+                                               a->file_id);
+            } else if (a->parent_dir_id != 0) {
+                const char *sl = strrchr(a->virtual_path, '/');
+                const char *leaf = sl ? sl + 1 : a->virtual_path;
+                uint64_t new_id = 0, new_ver = 0;
+                err = vw_client_file_upload_into_folder(sess, a->parent_dir_id, leaf,
+                                                        a->local_path, sync_prog_cb, &prog,
+                                                        &new_id, &new_ver);
+                if (err == VW_OK)
+                    update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path, new_id);
+            } else {
+                /* Parent directory unresolvable this cycle (e.g. a brand-new
+                 * local subdirectory with no server-side counterpart yet) —
+                 * not a network error, just not actionable yet. */
+                err = VW_ERR_NOT_FOUND;
+            }
+        } else {
+            err = vw_client_file_upload(sess, a->virtual_path, a->local_path,
+                                        sync_prog_cb, &prog);
+            if (err == VW_OK) {
+                update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path, 0);
+            } else if (is_net_err(err)) {
+                (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
+                queued = 1;
+            }
         }
         break;
 
@@ -537,7 +699,10 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         snprintf(parent, sizeof(parent), "%s", a->local_path);
         char *sl = strrchr(parent, '/');
         if (sl) { *sl = '\0'; vw_fs_ensure_dir(parent); }
-        err = vw_client_file_download(sess, a->virtual_path, a->local_path,
+        err = a->shared
+            ? vw_client_file_download_by_id(sess, a->file_id, a->local_path,
+                                            sync_prog_cb, &prog)
+            : vw_client_file_download(sess, a->virtual_path, a->local_path,
                                       sync_prog_cb, &prog);
         if (err == VW_OK) {
             vw_cache_entry_t ce;
@@ -547,7 +712,7 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                 ce.sync_state  = VW_SYNC_SYNCED;
                 (void)vw_cache_upsert(ctx->cache, &ce);
             }
-        } else if (is_net_err(err)) {
+        } else if (is_net_err(err) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_DOWNLOAD, a->virtual_path, a->local_path);
             queued = 1;
         }
@@ -555,11 +720,13 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
     }
 
     case ACT_DEL_REMOTE:
-        err = vw_client_file_delete(sess, a->virtual_path);
+        err = a->shared
+            ? vw_client_file_delete_by_id(sess, a->file_id)
+            : vw_client_file_delete(sess, a->virtual_path);
         if (err == VW_OK || err == VW_ERR_NOT_FOUND) {
             (void)vw_cache_delete(ctx->cache, a->virtual_path);
             err = VW_OK;
-        } else if (is_net_err(err)) {
+        } else if (is_net_err(err) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_DELETE, a->virtual_path, a->local_path);
             queued = 1;
         }
@@ -598,22 +765,31 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         if (csl) { *csl = '\0'; vw_fs_ensure_dir(cp_parent); }
 
         /* Download server version to conflict path */
-        err = vw_client_file_download(sess, a->virtual_path, conflict_path,
+        err = a->shared
+            ? vw_client_file_download_by_id(sess, a->file_id, conflict_path,
+                                            sync_prog_cb, &prog)
+            : vw_client_file_download(sess, a->virtual_path, conflict_path,
                                       sync_prog_cb, &prog);
-        if (is_net_err(err)) {
+        if (is_net_err(err) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
             queued = 1;
             break;
         }
         /* Even if download fails (e.g. not found), still upload local */
 
-        /* Upload local version as new server HEAD */
+        /* Upload local version as new server HEAD. A conflict always means
+         * the file already exists server-side (file_id known), so a shared
+         * folder always takes the update-by-id path here — never a create. */
         prog.prev = 0;
-        vw_err_t uerr = vw_client_file_upload(sess, a->virtual_path, a->local_path,
-                                               sync_prog_cb, &prog);
+        vw_err_t uerr = a->shared
+            ? vw_client_file_upload_to_id(sess, a->file_id, a->local_path,
+                                          sync_prog_cb, &prog)
+            : vw_client_file_upload(sess, a->virtual_path, a->local_path,
+                                    sync_prog_cb, &prog);
         if (uerr == VW_OK) {
-            update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path);
-        } else if (is_net_err(uerr)) {
+            update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path,
+                                       a->shared ? a->file_id : 0);
+        } else if (is_net_err(uerr) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
             queued = 1;
         }
@@ -632,8 +808,10 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
                                  const vw_sync_folder_t *folder,
                                  const lfiles_t *lfiles,
                                  const srv_list_t *srv,
+                                 const dirmap_t *dm,
                                  action_list_t *out) {
     size_t vroot_len = strlen(folder->virtual_root);
+    int shared = folder->remote_dir_id != 0;
     vw_err_t err = VW_OK;
 
     /* ── Pass 1: Update cache states from local walk ─────────────────── */
@@ -761,31 +939,50 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
         if (ce->entry_type != VW_ENTRY_FILE) continue;
         switch (ce->sync_state) {
         case VW_SYNC_LOCAL_MOD:
-        case VW_SYNC_NEW_LOCAL:
+        case VW_SYNC_NEW_LOCAL: {
+            uint64_t parent_dir_id = 0;
+            if (shared && ce->file_id == 0) {
+                /* New file inside a shared folder: resolve its immediate
+                 * parent's file_id from the dirmap built during this
+                 * cycle's BFS. dirname(ce->virtual_path) — strip the leaf. */
+                char parent_vpath[512];
+                snprintf(parent_vpath, sizeof(parent_vpath), "%s", ce->virtual_path);
+                char *psl = strrchr(parent_vpath, '/');
+                if (psl) *psl = '\0';
+                if (parent_vpath[0] == '\0')
+                    snprintf(parent_vpath, sizeof(parent_vpath), "/");
+                parent_dir_id = dirmap_lookup(dm, parent_vpath);
+            }
             err = action_push(out, ACT_UPLOAD,
                               ce->virtual_path, ce->local_path,
-                              folder->local_root, ce->local_size);
+                              folder->local_root, ce->local_size,
+                              shared, ce->file_id, parent_dir_id);
             break;
+        }
         case VW_SYNC_REMOTE_MOD:
             err = action_push(out, ACT_DOWNLOAD,
                               ce->virtual_path, ce->local_path,
-                              folder->local_root, ce->server_size);
+                              folder->local_root, ce->server_size,
+                              shared, ce->file_id, 0);
             break;
         case VW_SYNC_LOCAL_DEL:
             err = action_push(out, ACT_DEL_REMOTE,
                               ce->virtual_path, ce->local_path,
-                              folder->local_root, 0);
+                              folder->local_root, 0,
+                              shared, ce->file_id, 0);
             break;
         case VW_SYNC_REMOTE_DEL:
             err = action_push(out, ACT_DEL_LOCAL,
                               ce->virtual_path, ce->local_path,
-                              folder->local_root, 0);
+                              folder->local_root, 0,
+                              shared, ce->file_id, 0);
             break;
         case VW_SYNC_CONFLICT:
             err = action_push(out, ACT_CONFLICT,
                               ce->virtual_path, ce->local_path,
                               folder->local_root,
-                              ce->local_size + ce->server_size);
+                              ce->local_size + ce->server_size,
+                              shared, ce->file_id, 0);
             break;
         case VW_SYNC_SYNCED:
             break;
@@ -800,6 +997,8 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
 
 static vw_err_t sync_one_folder(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                   const vw_sync_folder_t *folder) {
+    int shared = folder->remote_dir_id != 0;
+
     /* Step 1: Local tree walk */
     lfiles_t lf = {0};
     vw_err_t err = walk_recursive(&lf, folder->local_root, folder->virtual_root);
@@ -813,20 +1012,39 @@ static vw_err_t sync_one_folder(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
 
     /* Step 2: Server BFS (if online) */
     srv_list_t srv = {0};
+    dirmap_t   dm  = {0};
     if (sess) {
-        err = srv_collect(sess, folder->virtual_root, &srv);
-        if (err == VW_ERR_NOT_FOUND) err = VW_OK;
-        else if (err != VW_OK && !is_net_err(err)) err = VW_OK; /* non-fatal server errors */
-        else if (is_net_err(err)) {
-            free(lf.arr); free(srv.arr); return err;
+        if (shared) {
+            err = srv_collect_by_id(sess, folder->virtual_root, folder->remote_dir_id,
+                                     &srv, &dm);
+            if (err == VW_ERR_NOT_FOUND || err == VW_ERR_PERMISSION) {
+                /* TASK-106 live revocation: the share no longer grants this
+                 * client any access. Auto-pause rather than retry forever —
+                 * the folder stays visible/inspectable but stops advancing. */
+                (void)vw_cache_folder_set_paused(ctx->cache, folder->local_root, 1);
+                free(lf.arr); free(srv.arr); free(dm.arr);
+                return VW_OK;
+            }
+            if (err != VW_OK && !is_net_err(err)) err = VW_OK;
+            else if (is_net_err(err)) {
+                free(lf.arr); free(srv.arr); free(dm.arr); return err;
+            }
+        } else {
+            err = srv_collect(sess, folder->virtual_root, &srv);
+            if (err == VW_ERR_NOT_FOUND) err = VW_OK;
+            else if (err != VW_OK && !is_net_err(err)) err = VW_OK; /* non-fatal server errors */
+            else if (is_net_err(err)) {
+                free(lf.arr); free(srv.arr); return err;
+            }
         }
     }
 
     /* Steps 3 and 4: compute + execute */
     action_list_t actions = {0};
-    err = compute_actions(ctx, folder, &lf, &srv, &actions);
+    err = compute_actions(ctx, folder, &lf, &srv, &dm, &actions);
     free(lf.arr);
     free(srv.arr);
+    free(dm.arr);
     if (err != VW_OK) { free(actions.arr); return err; }
 
     /* Accumulate bytes_total for progress */

@@ -899,7 +899,9 @@ vw_err_t vw_client_file_upload_into_folder(vw_client_sess_t *sess,
                                              const char *leaf_name,
                                              const char *local_path,
                                              vw_client_progress_cb_t progress_cb,
-                                             void *userdata)
+                                             void *userdata,
+                                             uint64_t *out_file_id,
+                                             uint64_t *out_version_id)
 {
     vw_err_t err;
     if (!sess || folder_file_id == 0 || !leaf_name || !leaf_name[0] || !local_path)
@@ -922,6 +924,10 @@ vw_err_t vw_client_file_upload_into_folder(vw_client_sess_t *sess,
                             logical_size, chunk_count, hashes, 0, NULL, 0,
                             &new_file_id, &new_version_id);
     free(hashes);
+    if (err == VW_OK) {
+        if (out_file_id)    *out_file_id    = new_file_id;
+        if (out_version_id) *out_version_id = new_version_id;
+    }
     return err;
 }
 

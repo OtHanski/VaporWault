@@ -318,13 +318,22 @@ vw_err_t vw_client_file_upload_to_id(vw_client_sess_t *sess,
  * an owned path, usable through an EDIT grant/scope on a shared folder
  * this caller doesn't own. leaf_name must not contain '/' (server-side
  * requirement, checked here first to fail fast).
+ *
+ * out_file_id/out_version_id (TASK-106) may be NULL; when non-NULL they
+ * receive the newly created file's id and initial version id. The sync
+ * engine needs this to address the file directly (upload_to_id/
+ * download_by_id/delete_by_id) on every subsequent sync cycle, since a
+ * path-based FILE_STAT can never resolve a file inside a folder this
+ * caller doesn't own.
  */
 vw_err_t vw_client_file_upload_into_folder(vw_client_sess_t *sess,
                                             uint64_t folder_file_id,
                                             const char *leaf_name,
                                             const char *local_path,
                                             vw_client_progress_cb_t progress_cb,
-                                            void *userdata);
+                                            void *userdata,
+                                            uint64_t *out_file_id,
+                                            uint64_t *out_version_id);
 
 /*
  * Move and/or rename a file or folder identified by file_id.

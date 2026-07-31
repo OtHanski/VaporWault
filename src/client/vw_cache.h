@@ -6,7 +6,7 @@
  *
  * Persists two files in {state_dir}:
  *   cache.db        — fixed-size vw_cache_entry_t records (1088 bytes each)
- *   sync_folders.db — fixed-size vw_sync_folder_t records (1032 bytes each)
+ *   sync_folders.db — fixed-size vw_sync_folder_t records (1040 bytes each)
  *
  * Thread-safe; all functions hold a rwlock internally.
  */
@@ -65,13 +65,19 @@ _Static_assert(sizeof(vw_cache_entry_t) == 1088,
 /* ── Sync-folder record ──────────────────────────────────────────────────── */
 
 typedef struct {
-    char    local_root[512];   /* absolute local path, NUL-terminated  */
-    char    virtual_root[512]; /* virtual path root, NUL-terminated    */
-    uint8_t paused;            /* 1 = sync paused for this folder      */
-    uint8_t _pad[7];
+    char     local_root[512];   /* absolute local path, NUL-terminated  */
+    char     virtual_root[512]; /* virtual path root, NUL-terminated    */
+    uint8_t  paused;            /* 1 = sync paused for this folder      */
+    uint8_t  _pad[7];
+    uint64_t remote_dir_id;     /* TASK-106: 0 = normal owned, path-addressed
+                                  * sync folder. Nonzero = a SHARED folder,
+                                  * rooted at this server file_id rather than
+                                  * a path this client owns — virtual_root is
+                                  * then purely a local naming/display value,
+                                  * never sent to the server. */
 } vw_sync_folder_t;
-_Static_assert(sizeof(vw_sync_folder_t) == 1032,
-               "vw_sync_folder_t must be 1032 bytes");
+_Static_assert(sizeof(vw_sync_folder_t) == 1040,
+               "vw_sync_folder_t must be 1040 bytes");
 
 /* ── Opaque context ──────────────────────────────────────────────────────── */
 

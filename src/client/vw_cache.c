@@ -3,7 +3,7 @@
  *
  * Two flat-file databases in {state_dir}/:
  *   cache.db        — array of vw_cache_entry_t (1088 bytes/slot)
- *   sync_folders.db — array of vw_sync_folder_t (1032 bytes/slot)
+ *   sync_folders.db — array of vw_sync_folder_t (1040 bytes/slot)
  *
  * Slot 0 is a reserved guard (all-zero). Free slots have virtual_path[0]=='\0'
  * (cache) or local_root[0]=='\0' (folders). In-memory indexes are rebuilt on
