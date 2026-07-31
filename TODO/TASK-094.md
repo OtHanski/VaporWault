@@ -375,3 +375,8 @@ C client's sharing support) hasn't started yet — reasonable and expected
 given the task decomposition, not a shortfall. Closing as done.
 `TASK-095`/`TASK-096` are now unblocked; `TASK-097` should build on this
 task's `vw_client.py` extensions rather than re-inventing them.
+
+QA.06 [2026-07-31]: `TASK-097` closed — extended `test_sharing.py` (this
+task's own suite) to the full regression matrix, building on the
+`vw_client.py` extensions from here as anticipated above. See `TASK-097`
+for the five new tests and sign-off notes.

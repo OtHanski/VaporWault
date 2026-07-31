@@ -90,8 +90,11 @@ ADMIN_OPLOG_TAIL_RESP  = 0x9008
 
 # Error codes
 VW_OK                  = 0
+VW_ERR_NOT_FOUND       = 5
+VW_ERR_PERMISSION      = 7
 VW_ERR_AUTH_BAD_CREDS  = 300
 VW_ERR_AUTH_LOCKED     = 304
+VW_ERR_RATE_LIMITED    = 605
 
 
 class VwProtocolError(RuntimeError):

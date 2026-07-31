@@ -216,3 +216,10 @@ consumer); shared items are NOT yet visible in the local sync tree
 (`TASK-106`), so a shared-item browser view should drive `SHARE_LIST`/
 `LINK_LIST`/file-id operations directly rather than expecting them to
 appear via `add-folder`/`ls`.
+
+QA.06 [2026-07-31]: `TASK-097` closed — its regression matrix exercises
+this task's `vw_client_core.c` sharing/file-id functions indirectly (via
+`vw_client.py`'s wire-level equivalents, matching this file's own test
+strategy) rather than directly against `vapourwault-cli`; the CLI/daemon
+plumbing itself is covered by `run_integration.py`'s IT-9…IT-15 (see this
+task's own notes above), so both layers now have integration coverage.
