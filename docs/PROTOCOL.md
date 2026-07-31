@@ -285,6 +285,31 @@ legitimate use for it. No protocol version bump: old clients never send
 this field, and reading it is gated on the payload actually being long
 enough to contain it.
 
+**FILE_LIST_RESP payload:**
+
+| Field  | Type                                                                  |
+|--------|-----------------------------------------------------------------------|
+| count  | uint32                                                                 |
+| —      | `count *` { string `name`, uint64 `file_id`, uint64 `size_bytes`, int64 `mtime_unix`, uint8 `entry_type`, uint8 `perm` } |
+| —      | `count *` uint64 `version_id` (TASK-109, trailing; 0 for a directory) |
+
+`version_id` is `current_version_id` — the exact same field `FILE_STAT_RESP`
+reports — appended as a **trailing, parallel array** after all `count`
+fixed-size entries, not interleaved into each entry's own byte range. This
+matters: `TASK-109` was originally filed because `FILE_LIST_RESP` shipped
+(`TASK-021`) with no `version_id` at all, silently breaking the sync
+engine's ongoing remote-change detection (`vw_sync.c`'s `compute_actions`
+compared it against a value that was always 0 on both sides — see
+`TODO/TASK-109.md`). Fixing a *repeated* structure's per-entry layout looked
+at first like it would need an entry-length wrapper (so an old client could
+skip unknown per-entry trailing bytes) and therefore a protocol version
+bump — but a trailing parallel array avoids that: an old client's decode
+loop reads exactly `count` fixed-size entries via its own hardcoded byte
+counts and simply stops, never touching bytes after them; a new client
+checks the payload is long enough for the trailing array before reading it.
+No protocol version bump required, same as every other extension in this
+document.
+
 **FILE_STAT payload:**
 
 | Field         | Type                                                        |
@@ -1428,6 +1453,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 16      | 2026-08-01 | CLI.02  | `FILE_LIST_RESP` (§7.2) gains a trailing `count * uint64 version_id` parallel array, resolving `TASK-109`: the response shipped with `TASK-021` never carried `version_id` at all, silently breaking `vw_sync.c`'s ongoing remote-change detection (both sides of its comparison were permanently 0). A trailing parallel array — rather than the entry-length wrapper originally assumed necessary — lets an old client's fixed-size-per-entry decode loop simply stop after `count` entries without ever touching the new bytes, so no protocol version bump is required, matching every other extension in this document. `compute_actions` now compares the real `version_id` (same source field as `FILE_STAT_RESP`'s) alongside `mtime_unix`/`size_bytes` as defense-in-depth. |
 | 15      | 2026-07-31 | CLI.02  | `FILE_LIST` (§7.2) gains an optional trailing `dir_file_id` field, resolving `TASK-106`'s core blocker: no wire mechanism let an authenticated grant-holder list a shared folder's children by file_id (only the anonymous scoped-link case could navigate a shared subtree, via its own fixed scope target). Resolved via `effective_permission()`, the same helper `FILE_COMMIT`'s directory-target branch already uses. Purely additive: old clients never send it, so `virtual_path`-based listing is unaffected; rejected for an already-scoped session, which has no legitimate use for it. No protocol version bump required. |
 | 14      | 2026-07-31 | GUI.03  | `FILE_STAT_RESP` (§7.2) gains a trailing `vault_id` field, resolving a gap found implementing `TASK-100`'s encrypted-item indicators: no existing response let a browser learn a file's vault_id without a `VERSION_CHUNKS` round-trip. Always present (not absent-when-zero like `FILE_COMMIT`/`VERSION_CHUNKS_RESP`, since nothing optional follows it). `FILE_LIST_RESP` deliberately does not get the same field — see §7.2's note on why a whole-directory listing doesn't populate per-entry `vault_id`. No protocol version bump required. |
 | 13      | 2026-07-31 | SRV.01  | `VERSION_CHUNKS_RESP` (§7.3) extended with optional trailing `vault_id`/`wrapped_dek` fields, resolving `TASK-099`'s download-direction wire gap flagged in version 12 (§7.11.4): a downloading client already calls `VERSION_CHUNKS` immediately before fetching chunks, so the wrapped DEK rides along on that existing round-trip rather than needing a new message. Purely additive/optional, mirroring the `FILE_COMMIT` extension exactly: an old client never reads past the hash array and is unaffected; an old server never emits the trailing fields, indistinguishable from an unencrypted version's response. No protocol version bump required. |

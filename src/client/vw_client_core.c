@@ -372,6 +372,18 @@ static vw_err_t recv_file_list_resp(vw_conn_t *conn, vw_file_entry_t **out, uint
         /* perm: consumed but not stored (vw_file_entry_t has no perm field) */
         off++;
     }
+
+    /* TASK-109: optional trailing parallel array of count * u64 version_id
+     * (server side: handle_file_list). Absent (an old server) or a short
+     * remainder both just leave version_id at its calloc-zeroed default —
+     * a best-effort, purely additive read, not a decode error, exactly
+     * like every other trailing-field extension in this protocol. */
+    if (rplen - off >= (uint32_t)count * 8u) {
+        for (uint32_t i = 0; i < count; i++) {
+            entries[i].version_id = vw_read_u64le(rbuf + off); off += 8;
+        }
+    }
+
     free(rbuf);
     *out = entries;
     *out_count = count;

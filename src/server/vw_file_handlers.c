@@ -354,8 +354,21 @@ done:
 
     /* Encode FILE_LIST_RESP.
      * Per-entry layout: string(name) + u64 file_id + u64 size_bytes +
-     *                   i64 mtime_unix + u8 entry_type + u8 perm. */
-    uint32_t resp_cap = 4u + (uint32_t)all_len * (2u + 64u + 8u + 8u + 8u + 2u);
+     *                   i64 mtime_unix + u8 entry_type + u8 perm.
+     * TASK-109: followed by a trailing, parallel array of all_len * u64
+     * version_id (0 for a directory) — current_version_id, the exact same
+     * field FILE_STAT_RESP already reports (see handle_file_stat), so a
+     * value learned from either message is now directly comparable. This
+     * is purely additive the same way every other extension in this
+     * protocol is: an old client's decode loop reads exactly all_len
+     * fixed-size entries via its own hardcoded byte counts and then simply
+     * stops, never touching the trailing block; a new client checks for
+     * enough remaining bytes before reading it. No entry-length wrapper or
+     * protocol version bump needed, unlike the per-entry-wrapping approach
+     * TODO/TASK-109.md originally sketched — a trailing parallel array
+     * sidesteps that entirely because it doesn't interleave new data
+     * inside each entry's own byte range. */
+    uint32_t resp_cap = 4u + (uint32_t)all_len * (2u + 64u + 8u + 8u + 8u + 2u + 8u);
     uint8_t *resp = malloc(resp_cap);
     if (!resp) { free(all); return (send_error(conn, VW_ERR_OOM), VW_OK); }
 
@@ -372,6 +385,13 @@ done:
         vw_write_u64le(resp + roff, (uint64_t)r->mtime_unix); roff += 8;
         resp[roff++] = r->entry_type;
         resp[roff++] = entry_perm;
+    }
+
+    if (err == VW_OK) {
+        for (uint32_t i = 0; i < all_len; i++) {
+            uint64_t vid = (all[i].entry_type == VW_ENTRY_DIR) ? 0u : all[i].current_version_id;
+            vw_write_u64le(resp + roff, vid); roff += 8;
+        }
     }
 
     free(all);

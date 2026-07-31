@@ -896,29 +896,27 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
                 ce.server_size       = se->size_bytes;
                 (void)vw_cache_upsert(ctx->cache, &ce);
             } else if (cerr == VW_OK) {
-                /* TASK-109 workaround: FILE_LIST_RESP never carries
-                 * version_id per entry (always 0 — see ARCHITECTURE.md's
-                 * "Sync engine awareness of shared folders" note), so
-                 * se->version_id here is always 0. ce.server_version_id,
-                 * however, is NOT always 0 — update_cache_after_upload
-                 * populates it from a real FILE_STAT/FILE_STAT_BY_ID call
-                 * after every upload, which does return the true value.
-                 * Comparing those two — a permanently-zero wire value
-                 * against a sometimes-real cache value from a different
-                 * source — produced a deterministic false "changed" on
-                 * every sync cycle immediately following any upload (SEC.07
-                 * finding during TASK-106 review: spuriously re-downloaded
-                 * unchanged files, or worse, manufactured a bogus CONFLICT
-                 * if the cycle happened to land while sync_state was
-                 * LOCAL_MOD/NEW_LOCAL). version_id is therefore not
-                 * compared at all here — only mtime_unix/size_bytes, which
-                 * FILE_LIST_RESP does carry correctly. A real fix
-                 * (extending FILE_LIST_RESP itself so it can be compared
-                 * consistently) is tracked separately (TODO/TASK-109.md),
-                 * since safely extending a repeated wire structure is a
-                 * bigger change than fits here. */
-                if (ce.server_mtime != se->mtime_unix ||
-                    ce.server_size  != se->size_bytes) {
+                /* TASK-109: FILE_LIST_RESP now carries a real version_id
+                 * per entry (a trailing parallel array — see
+                 * docs/PROTOCOL.md §7.2 version 16), the same
+                 * current_version_id field FILE_STAT_RESP reports, so
+                 * ce.server_version_id (set from either message) and
+                 * se->version_id are directly comparable again. Comparing
+                 * it alongside mtime_unix/size_bytes is defense-in-depth
+                 * against a version bump that happens to leave both mtime
+                 * and size unchanged (e.g. a restore to byte-identical
+                 * content). Before this fix, se->version_id was always 0
+                 * while ce.server_version_id could be real (populated by
+                 * update_cache_after_upload's FILE_STAT calls) — comparing
+                 * across those two provenances produced a deterministic
+                 * false "changed" on every cycle after any upload (an
+                 * independent review caught this during TASK-106's
+                 * closeout); that's why version_id was dropped from this
+                 * comparison for a while — now that both sides come from
+                 * the same source, it's safe to compare again. */
+                if (ce.server_version_id != se->version_id ||
+                    ce.server_mtime      != se->mtime_unix ||
+                    ce.server_size       != se->size_bytes) {
                     /* Server has a newer version */
                     if (ce.sync_state == VW_SYNC_LOCAL_MOD ||
                         ce.sync_state == VW_SYNC_NEW_LOCAL) {
