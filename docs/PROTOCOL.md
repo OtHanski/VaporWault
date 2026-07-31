@@ -448,10 +448,23 @@ The receiver must verify `SHA-256(data) == chunk_hash` and treat a mismatch as a
 
 **VERSION_CHUNKS_RESP payload:**
 
-| Field       | Type                                            |
-|-------------|-------------------------------------------------|
-| chunk_count | uint32                                          |
-| hashes      | bytes[chunk_count × 32] (ordered SHA-256 hashes) |
+| Field        | Type                                              |
+|--------------|---------------------------------------------------|
+| chunk_count  | uint32                                            |
+| hashes       | bytes[chunk_count × 32] (ordered SHA-256 hashes)  |
+| vault_id     | uint64 (TASK-099; **absent** if the version is unencrypted) |
+| wrapped_dek  | string (only present if `vault_id` is present and nonzero) |
+
+`vault_id`/`wrapped_dek` are optional trailing fields, added by TASK-099 to
+close the gap flagged in §7.11.4: a downloading client needs its version's
+wrapped DEK to decrypt the chunks it is about to fetch. Old clients never
+read past `hashes` and are unaffected; old servers never emit the trailing
+fields, so an old server's response is indistinguishable from an
+unencrypted version's response — this is safe because unencrypted versions
+were the only kind an old server could ever produce. Hashes in `hashes` are
+always of the bytes actually stored (ciphertext for an encrypted version,
+plaintext otherwise) — the server content-addresses whatever it is given
+and never distinguishes the two.
 
 If `version_id` does not exist or belongs to a file the caller does not own, the server responds with ERROR / `VW_ERR_VERSION_NOT_FOUND`.
 
@@ -1229,14 +1242,12 @@ vw_version_record_t) == 80, ...)` (unchanged) enforces the on-disk
 compatibility claim at compile time, reviewed by CQR.08 matching how
 `TASK-090`'s `deleted_at` field was finalized and reviewed.
 
-**Known gap, deliberately not addressed here (flagged for `TASK-099`):** no
-existing wire response (`FILE_STAT_RESP`, `VERSION_LIST_RESP`,
-`VERSION_CHUNKS_RESP`) surfaces a version's `vault_id`/wrapped DEK back to
-a *downloading* client — the extension above only covers the upload
-direction. `TASK-099` (client vault module) will need this to actually
-decrypt a downloaded file, and implementing it without a real client to
-validate the design against risked guessing wrong; better to let the
-consuming client's actual needs drive that extension's shape.
+**Gap closed by `TASK-099`:** `VERSION_CHUNKS_RESP` (§7.3) now carries
+optional trailing `vault_id`/`wrapped_dek` fields, mirroring this
+section's `FILE_COMMIT` extension exactly. A downloading client already
+calls `VERSION_CHUNKS` immediately before fetching chunks, so this was the
+natural place to surface the wrapped DEK rather than adding a new
+round-trip. See §7.3 for the wire layout.
 
 ### 7.11.5 Security properties for review
 
@@ -1353,6 +1364,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 13      | 2026-07-31 | SRV.01  | `VERSION_CHUNKS_RESP` (§7.3) extended with optional trailing `vault_id`/`wrapped_dek` fields, resolving `TASK-099`'s download-direction wire gap flagged in version 12 (§7.11.4): a downloading client already calls `VERSION_CHUNKS` immediately before fetching chunks, so the wrapped DEK rides along on that existing round-trip rather than needing a new message. Purely additive/optional, mirroring the `FILE_COMMIT` extension exactly: an old client never reads past the hash array and is unaffected; an old server never emits the trailing fields, indistinguishable from an unencrypted version's response. No protocol version bump required. |
 | 12      | 2026-07-31 | SRV.01  | Vault/E2EE (§7.11) implemented server-side, resolving `TASK-098`: `VAULT_CREATE`/`_ACK`, `VAULT_KEY_FETCH`/`_RESP`, `VAULT_LIST`/`_RESP` (0x0801–0x0806, first-ever handlers for opcodes reserved since version 8) plus the `FILE_COMMIT` `vault_id`/`wrapped_dek` extension and `vw_version_record_t`'s finalized `_reserved[32]` layout (see §7.11.4 for both). The server never sees unwrapped key material or plaintext at any point — SEC.07 confirmed no code path (including oplog replay) logs, caches, or persists anything beyond the opaque blobs the client sends. Purely additive/optional: no existing message's byte layout changed for any client that omits the two new optional `FILE_COMMIT` fields, no protocol version bump required. Client-side vault module (`TASK-099`) and the download-direction wire gap noted in §7.11.4 remain open. |
 | 11      | 2026-07-31 | PRT.04  | `FILE_MKDIR`/`FILE_MKDIR_ACK` (0x0211/0x0212) defined and implemented server-side, resolving `TASK-104` — the first wire mechanism to create a `VW_ENTRY_DIR` record at all (previously only reachable via direct `vw_store_file_create` calls, bypassing the wire; see §7.2 for the full payload spec and its permission/rate-limit rules). Purely additive: no existing message's byte layout changed, no protocol version bump required. |
 | 10      | 2026-07-30 | SRV.01  | Sharing (§7.5/§7.10) implemented server-side, resolving `TASK-094`. No existing message's wire byte layout changed — every SHARE_*/LINK_* message here is newly used (previous `SUB_CREATE`/`SUB_DELETE` never had a handler), and existing messages (`FILE_LIST`, `FILE_STAT`, `FILE_COMMIT`, `FILE_DELETE`, `VERSION_LIST`/`_RESTORE`/`_CHUNKS`, `CHUNK_UPLOAD`/`_DOWNLOAD_REQ`) keep their exact prior byte layout — only the server's permission-check and quota-attribution logic behind them changed. Two purely additive definitions: `FILE_MOVE`/`FILE_MOVE_ACK` (0x020F/0x0210) gets its first-ever payload (see §7.2) — the opcode existed but no handler did; error code 605 (`VW_ERR_RATE_LIMITED`, §10.1) added for the new scoped-session write-count limit. No protocol version bump required since no existing client-observable byte layout changed. |

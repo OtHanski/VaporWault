@@ -1383,13 +1383,39 @@ static vw_err_t handle_version_chunks(vw_store_t       *store,
     if (err != VW_OK)
         return (send_error(conn, err), VW_OK);
 
-    /* VERSION_CHUNKS_RESP: [chunk_count u32][hashes chunk_count*32] */
+    /* TASK-099 (E2EE): surface the version's vault_id/wrapped_dek so a
+     * downloading client knows whether and how to decrypt the chunks it is
+     * about to fetch. This was deliberately deferred by TASK-098 until a
+     * real consumer existed; the client-side vault module is that consumer.
+     * Optional trailing fields, absent when vault_id == 0 (unencrypted) —
+     * old clients never read past the hash array, so this is purely
+     * additive and requires no protocol version bump.
+     *
+     * VERSION_CHUNKS_RESP: [chunk_count u32][hashes chunk_count*32]
+     *                      [vault_id u64][wrapped_dek string] (only if vault_id != 0)
+     */
+    uint8_t *wrapped_dek = NULL;
+    if (ver.vault_id != 0) {
+        err = vw_store_version_get_wrapped_dek(fs, &ver, &wrapped_dek);
+        if (err != VW_OK) { free(hashes); return (send_error(conn, err), VW_OK); }
+    }
+
     uint32_t resp_size = 4u + ver.chunk_count * VW_HASH_BYTES;
+    if (ver.vault_id != 0)
+        resp_size += 8u + 2u + ver.wrapped_dek_len;
     uint8_t *resp = malloc(resp_size);
-    if (!resp) { free(hashes); return (send_error(conn, VW_ERR_OOM), VW_OK); }
-    vw_write_u32le(resp, ver.chunk_count);
-    memcpy(resp + 4u, hashes, (size_t)ver.chunk_count * VW_HASH_BYTES);
+    if (!resp) { free(hashes); free(wrapped_dek); return (send_error(conn, VW_ERR_OOM), VW_OK); }
+    uint32_t off = 0;
+    vw_write_u32le(resp + off, ver.chunk_count); off += 4u;
+    memcpy(resp + off, hashes, (size_t)ver.chunk_count * VW_HASH_BYTES);
+    off += ver.chunk_count * VW_HASH_BYTES;
     free(hashes);
+    if (ver.vault_id != 0) {
+        vw_write_u64le(resp + off, ver.vault_id); off += 8u;
+        vw_write_u16le(resp + off, (uint16_t)ver.wrapped_dek_len); off += 2u;
+        memcpy(resp + off, wrapped_dek, ver.wrapped_dek_len); off += ver.wrapped_dek_len;
+        free(wrapped_dek);
+    }
 
     err = vw_proto_send(conn, VW_MSG_VERSION_CHUNKS_RESP, resp, resp_size);
     free(resp);

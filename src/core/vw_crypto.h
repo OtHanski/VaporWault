@@ -38,6 +38,29 @@ static inline void vw_crypto_secure_zero(void *p, size_t n) {
 #define VW_TOTP_WINDOW            1u
 #define VW_TOTP_DIGITS            6u
 
+/* AES-256-GCM (TASK-099 vault content/key-wrap encryption) */
+#define VW_AES_GCM_KEY_BYTES      32u
+#define VW_AES_GCM_NONCE_BYTES    12u
+#define VW_AES_GCM_TAG_BYTES      16u
+
+/*
+ * Vault Argon2id KDF (TASK-099): derives the KEK that wraps a vault's VK
+ * from the user's Encryption Passphrase. Distinct threat model from the
+ * login-token Argon2id above (VW_ARGON2_*): this KDF must resist an
+ * *offline* attack against an exfiltrated wrapped-VK blob, since a
+ * compromised server is explicitly in-scope for E2EE. Floor pinned by
+ * SEC.07 (docs/PROTOCOL.md §7.11.5) — callers may exceed it, never go
+ * below it. `parallelism` must be exactly 1 (not merely >= 1): higher
+ * parallelism splits Argon2id's memory into independent lanes, which
+ * *reduces* effective memory-hardness against a parallel (GPU/ASIC)
+ * attacker for a fixed total memory budget.
+ */
+#define VW_VAULT_KDF_SALT_BYTES        16u
+#define VW_VAULT_KEK_BYTES             32u
+#define VW_VAULT_ARGON2_MIN_MEM_KB     19456u  /* 19 MiB floor */
+#define VW_VAULT_ARGON2_MIN_TIME_COST  2u
+#define VW_VAULT_ARGON2_PARALLELISM    1u
+
 /* ── Initialisation ─────────────────────────────────────────────────────── */
 
 /*
@@ -127,6 +150,90 @@ vw_err_t vw_crypto_argon2id_hash(const void *password, size_t pw_len,
 vw_err_t vw_crypto_argon2id_verify(const uint8_t hash[VW_ARGON2_HASH_BYTES],
                                     const uint8_t salt[VW_ARGON2_SALT_BYTES],
                                     const void *password, size_t pw_len);
+
+/* ── Vault Argon2id KDF (TASK-099) ──────────────────────────────────────── */
+
+/*
+ * Explicit Argon2id parameters for the vault KEK derivation. Deliberately
+ * a distinct type from vw_crypto_argon2id_hash's implicit/hardcoded
+ * VW_ARGON2_* constants — see the SEC.07 guardrail note above
+ * vw_crypto_vault_derive_kek: this struct's presence in the signature
+ * makes it impossible to pass this KDF's inputs to the login KDF (or vice
+ * versa) without a compile error, so the two derivation paths cannot be
+ * pointer-substituted or copy-pasted into each other unnoticed.
+ */
+typedef struct {
+    uint32_t mem_cost_kib;
+    uint32_t time_cost;
+    uint32_t parallelism;
+} vw_vault_kdf_params_t;
+
+/*
+ * Derive a vault KEK from an Encryption Passphrase. NOT the same code path
+ * as vw_crypto_argon2id_hash/_verify (login token derivation) — see the
+ * struct doc comment above and docs/PROTOCOL.md §7.11.5. Rejects params
+ * that fall below the pinned floor (VW_VAULT_ARGON2_MIN_MEM_KB/
+ * _MIN_TIME_COST) or that don't set parallelism == VW_VAULT_ARGON2_PARALLELISM
+ * with VW_ERR_INVALID_ARG, so a corrupted or tampered kdf_params blob
+ * (read back from the server, which stores it opaquely) can never
+ * silently weaken the derivation.
+ */
+vw_err_t vw_crypto_vault_derive_kek(const void *passphrase, size_t passphrase_len,
+                                     const uint8_t salt[VW_VAULT_KDF_SALT_BYTES],
+                                     const vw_vault_kdf_params_t *params,
+                                     uint8_t out_kek[VW_VAULT_KEK_BYTES]);
+
+/* ── AES-256-GCM (TASK-099) ──────────────────────────────────────────────── */
+
+/*
+ * Encrypt len bytes of plaintext with AES-256-GCM. key must be
+ * VW_AES_GCM_KEY_BYTES, nonce must be VW_AES_GCM_NONCE_BYTES and MUST NOT
+ * be reused with the same key (caller's responsibility — see
+ * vw_crypto_vault_chunk_nonce for the deterministic per-chunk scheme this
+ * project uses for content encryption). aad/aad_len may be NULL/0.
+ * out_ciphertext must be at least len bytes; may alias plaintext.
+ * out_tag must be VW_AES_GCM_TAG_BYTES.
+ */
+vw_err_t vw_crypto_aes256gcm_encrypt(const uint8_t key[VW_AES_GCM_KEY_BYTES],
+                                      const uint8_t nonce[VW_AES_GCM_NONCE_BYTES],
+                                      const void *aad, size_t aad_len,
+                                      const void *plaintext, size_t len,
+                                      uint8_t *out_ciphertext,
+                                      uint8_t out_tag[VW_AES_GCM_TAG_BYTES]);
+
+/*
+ * Decrypt and verify len bytes of ciphertext with AES-256-GCM. Must NOT
+ * alias ciphertext with out_plaintext (mbedTLS restriction). On
+ * authentication failure returns VW_ERR_CRYPTO and zeroes out_plaintext —
+ * callers must not use out_plaintext's contents unless VW_OK is returned.
+ * A generic VW_ERR_CRYPTO is returned rather than a more specific code
+ * because this primitive doesn't know its caller's context (VK-unwrap
+ * under a wrong passphrase vs. corrupted/tampered chunk content look
+ * identical here); callers add that semantic meaning at their own layer.
+ */
+vw_err_t vw_crypto_aes256gcm_decrypt(const uint8_t key[VW_AES_GCM_KEY_BYTES],
+                                      const uint8_t nonce[VW_AES_GCM_NONCE_BYTES],
+                                      const void *aad, size_t aad_len,
+                                      const void *ciphertext, size_t len,
+                                      const uint8_t tag[VW_AES_GCM_TAG_BYTES],
+                                      uint8_t *out_plaintext);
+
+/*
+ * Deterministic per-chunk nonce derivation for vault content encryption
+ * (docs/PROTOCOL.md §7.11.3): nonce = HKDF-SHA256(ikm=dek, salt=NULL,
+ * info="vw-chunk-nonce" || chunk_index as 8-byte LE)[0:12].
+ *
+ * This is the mandatory, SEC.07-revised scheme — deterministic from
+ * (dek, chunk_index) alone, NOT random-prefix+counter — specifically to
+ * make nonce reuse impossible across an interrupted-and-retried upload:
+ * re-encrypting chunk index i with the same dek always derives the exact
+ * same nonce, and since a fresh dek is required per file/version (never
+ * reused), the (key, nonce) pair as a whole is never reused across
+ * distinct plaintexts.
+ */
+vw_err_t vw_crypto_vault_chunk_nonce(const uint8_t dek[VW_AES_GCM_KEY_BYTES],
+                                      uint64_t chunk_index,
+                                      uint8_t out_nonce[VW_AES_GCM_NONCE_BYTES]);
 
 /* ── HMAC-SHA256 ─────────────────────────────────────────────────────────── */
 

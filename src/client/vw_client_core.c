@@ -495,6 +495,71 @@ vw_err_t vw_client_file_stat_by_id(vw_client_sess_t *sess,
  * chunking/dedup/upload logic and only need to build their own FILE_COMMIT
  * payload afterward.
  */
+/*
+ * Query the server for one chunk hash and upload it if missing. Exported
+ * for vw_vault.c (TASK-099): encrypted upload has no plaintext file to
+ * re-read for a batched pass2, since each chunk's ciphertext exists only
+ * transiently in memory as it is produced — so it queries/uploads one
+ * chunk at a time rather than reusing upload_chunks's batched
+ * CHUNK_QUERY-then-reread-the-file approach. A deliberate, documented
+ * efficiency tradeoff for the vault path only; plaintext uploads are
+ * unaffected. Callers must query and upload each chunk exactly once (no
+ * cross-vault-upload batching), same as this function does internally.
+ */
+vw_err_t vw_client_chunk_upload_if_missing(vw_client_sess_t *sess,
+                                            const uint8_t hash[VW_HASH_BYTES],
+                                            const void *data, uint32_t len)
+{
+    if (!sess || !hash || !data) return VW_ERR_INVALID_ARG;
+
+    /* CHUNK_QUERY: token[32] + count(u16=1) + hash[32] */
+    uint8_t qbuf[VW_TOKEN_BYTES + 2u + VW_HASH_BYTES];
+    memcpy(qbuf, sess->session_token, VW_TOKEN_BYTES);
+    vw_write_u16le(qbuf + VW_TOKEN_BYTES, 1u);
+    memcpy(qbuf + VW_TOKEN_BYTES + 2u, hash, VW_HASH_BYTES);
+
+    vw_err_t err = vw_proto_send(sess->conn, VW_MSG_CHUNK_QUERY, qbuf, sizeof(qbuf));
+    if (err != VW_OK) return err;
+
+    /* CHUNK_QUERY_RESP: count(u16) + bitmask(1 byte for a 1-hash query).
+     * Sized to 4, not 3: recv_expect's VW_MSG_ERROR fallback path reads a
+     * u32 error code out of this same buffer, and a 3-byte buffer would
+     * make that an out-of-bounds read (caught by -Warray-bounds). */
+    uint8_t rbuf[4];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_CHUNK_QUERY_RESP, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+    if (rplen < 3u) return VW_ERR_PROTO_TRUNCATED;
+    if (vw_read_u16le(rbuf) != 1u) return VW_ERR_PROTO_INVALID;
+
+    int already_present = (rbuf[2] >> 7) & 1u;
+    if (already_present) return VW_OK;
+
+    /* CHUNK_UPLOAD: token[32] + hash[32] + len(u32) + data */
+    uint32_t uplen = VW_TOKEN_BYTES + VW_HASH_BYTES + 4u + len;
+    uint8_t *ubuf = malloc(uplen);
+    if (!ubuf) return VW_ERR_OOM;
+    uint8_t *wp = ubuf;
+    memcpy(wp, sess->session_token, VW_TOKEN_BYTES); wp += VW_TOKEN_BYTES;
+    memcpy(wp, hash, VW_HASH_BYTES); wp += VW_HASH_BYTES;
+    vw_write_u32le(wp, len); wp += 4;
+    memcpy(wp, data, len);
+
+    err = vw_proto_send(sess->conn, VW_MSG_CHUNK_UPLOAD, ubuf, uplen);
+    free(ubuf);
+    if (err != VW_OK) return err;
+
+    /* CHUNK_UPLOAD_ACK: hash[32] + error_code(u32) */
+    uint8_t ackbuf[VW_HASH_BYTES + 4u];
+    uint32_t ackplen;
+    err = recv_expect(sess->conn, VW_MSG_CHUNK_UPLOAD_ACK, ackbuf, sizeof(ackbuf), &ackplen);
+    if (err != VW_OK) return err;
+    if (ackplen < VW_HASH_BYTES + 4u) return VW_ERR_PROTO_TRUNCATED;
+
+    uint32_t ec = vw_read_u32le(ackbuf + VW_HASH_BYTES);
+    return ec != 0 ? (vw_err_t)ec : VW_OK;
+}
+
 static vw_err_t upload_chunks(vw_client_sess_t *sess, const char *local_path,
                                uint8_t **out_hashes, uint32_t *out_chunk_count,
                                uint64_t *out_logical_size,
@@ -671,16 +736,28 @@ cleanup_upload:
  * a bare leaf name (file_id names an existing FILE: update; file_id names
  * a DIRECTORY the caller has EDIT on: create a new file under it — see
  * docs/PROTOCOL.md §7.5's FILE_COMMIT directory-file_id note, TASK-094).
+ *
+ * vault_id == 0 means an unencrypted commit (wrapped_dek/_len ignored, the
+ * optional trailing fields are omitted entirely — byte-identical to a
+ * pre-TASK-098 commit). vault_id != 0 requires a non-NULL, non-empty
+ * wrapped_dek — see docs/PROTOCOL.md §7.11.4. Exported (not static) so
+ * vw_vault.c (TASK-099) can commit encrypted versions through the same
+ * wire-encoding path plaintext uploads use, rather than duplicating it.
  */
-static vw_err_t send_file_commit(vw_client_sess_t *sess, uint64_t file_id,
-                                  const char *name_or_path, uint16_t name_len,
-                                  uint64_t logical_size, uint32_t chunk_count,
-                                  const uint8_t *hashes,
-                                  uint64_t *out_file_id, uint64_t *out_version_id)
+vw_err_t vw_client_file_commit_raw(vw_client_sess_t *sess, uint64_t file_id,
+                                    const char *name_or_path, uint16_t name_len,
+                                    uint64_t logical_size, uint32_t chunk_count,
+                                    const uint8_t *chunk_hashes,
+                                    uint64_t vault_id,
+                                    const uint8_t *wrapped_dek, uint16_t wrapped_dek_len,
+                                    uint64_t *out_file_id, uint64_t *out_version_id)
 {
+    if (vault_id != 0 && (!wrapped_dek || wrapped_dek_len == 0)) return VW_ERR_INVALID_ARG;
+
     uint32_t cplen = VW_TOKEN_BYTES + 8u + 8u + 4u + 2u
                    + (uint32_t)name_len
                    + (uint32_t)chunk_count * VW_HASH_BYTES;
+    if (vault_id != 0) cplen += 8u + 2u + (uint32_t)wrapped_dek_len;
     uint8_t *cbuf = malloc(cplen);
     if (!cbuf) return VW_ERR_OOM;
 
@@ -691,7 +768,13 @@ static vw_err_t send_file_commit(vw_client_sess_t *sess, uint64_t file_id,
     vw_write_u32le(cp, chunk_count);  cp += 4;
     vw_write_u16le(cp, name_len);     cp += 2;
     if (name_len > 0) { memcpy(cp, name_or_path, name_len); cp += name_len; }
-    memcpy(cp, hashes, (size_t)chunk_count * VW_HASH_BYTES);
+    memcpy(cp, chunk_hashes, (size_t)chunk_count * VW_HASH_BYTES);
+    cp += (size_t)chunk_count * VW_HASH_BYTES;
+    if (vault_id != 0) {
+        vw_write_u64le(cp, vault_id); cp += 8;
+        vw_write_u16le(cp, wrapped_dek_len); cp += 2;
+        memcpy(cp, wrapped_dek, wrapped_dek_len); cp += wrapped_dek_len;
+    }
 
     vw_err_t err = vw_proto_send(sess->conn, VW_MSG_FILE_COMMIT, cbuf, cplen);
     free(cbuf);
@@ -733,8 +816,8 @@ vw_err_t vw_client_file_upload(vw_client_sess_t *sess,
 
     /* ── Send FILE_COMMIT (file_id=0, path=virtual_path: new-or-owned-path) ── */
     uint64_t new_file_id, new_version_id;
-    err = send_file_commit(sess, 0, virtual_path, (uint16_t)strlen(virtual_path),
-                            logical_size, chunk_count, hashes,
+    err = vw_client_file_commit_raw(sess, 0, virtual_path, (uint16_t)strlen(virtual_path),
+                            logical_size, chunk_count, hashes, 0, NULL, 0,
                             &new_file_id, &new_version_id);
     free(hashes);
     return err;
@@ -760,8 +843,8 @@ vw_err_t vw_client_file_upload_to_id(vw_client_sess_t *sess,
     /* file_id names an existing file: path field is unused by the server
      * in this case (updates the file in place), so send it empty. */
     uint64_t new_file_id, new_version_id;
-    err = send_file_commit(sess, file_id, NULL, 0,
-                            logical_size, chunk_count, hashes,
+    err = vw_client_file_commit_raw(sess, file_id, NULL, 0,
+                            logical_size, chunk_count, hashes, 0, NULL, 0,
                             &new_file_id, &new_version_id);
     free(hashes);
     return err;
@@ -791,8 +874,8 @@ vw_err_t vw_client_file_upload_into_folder(vw_client_sess_t *sess,
      * file created inside it (server-side reinterpretation, see
      * handle_file_commit's file_id-names-a-DIR branch). */
     uint64_t new_file_id, new_version_id;
-    err = send_file_commit(sess, folder_file_id, leaf_name, (uint16_t)strlen(leaf_name),
-                            logical_size, chunk_count, hashes,
+    err = vw_client_file_commit_raw(sess, folder_file_id, leaf_name, (uint16_t)strlen(leaf_name),
+                            logical_size, chunk_count, hashes, 0, NULL, 0,
                             &new_file_id, &new_version_id);
     free(hashes);
     return err;
@@ -801,25 +884,27 @@ vw_err_t vw_client_file_upload_into_folder(vw_client_sess_t *sess,
 /* ── vw_client_file_download ─────────────────────────────────────────────── */
 
 /*
- * Shared by vw_client_file_download (resolves entry via path first) and
- * vw_client_file_download_by_id (entry already resolved via file_id).
- * Does steps 2-3: VERSION_CHUNKS, then per-chunk download/verify/assemble.
+ * VERSION_CHUNKS → ordered chunk hash list, plus the TASK-099 vault_id/
+ * wrapped_dek trailing fields (docs/PROTOCOL.md §7.3). *out_hashes is a
+ * malloc'd chunk_count*VW_HASH_BYTES array; caller frees. *out_vault_id is
+ * 0 and *out_wrapped_dek is set to NULL/0 for an unencrypted version.
+ * *out_wrapped_dek, when non-NULL, is malloc'd; caller frees. Exported so
+ * vw_vault.c's download path can learn which vault/DEK to decrypt with
+ * before fetching chunks, same as download_by_entry does for plaintext.
  */
-static vw_err_t download_by_entry(vw_client_sess_t *sess,
-                                   const vw_file_entry_t *entry,
-                                   const char *local_path,
-                                   vw_client_progress_cb_t progress_cb,
-                                   void *userdata)
+vw_err_t vw_client_version_chunks_raw(vw_client_sess_t *sess, uint64_t version_id,
+                                       uint8_t **out_hashes, uint32_t *out_chunk_count,
+                                       uint64_t *out_vault_id,
+                                       uint8_t **out_wrapped_dek, uint16_t *out_wrapped_dek_len)
 {
-    vw_err_t err;
+    if (!sess || !out_hashes || !out_chunk_count) return VW_ERR_INVALID_ARG;
 
-    /* ── Step 2: VERSION_CHUNKS {version_id} → chunk hash list ── */
     uint8_t vc_payload[VW_TOKEN_BYTES + 8u];
     memcpy(vc_payload, sess->session_token, VW_TOKEN_BYTES);
-    vw_write_u64le(vc_payload + VW_TOKEN_BYTES, entry->version_id);
+    vw_write_u64le(vc_payload + VW_TOKEN_BYTES, version_id);
 
-    err = vw_proto_send(sess->conn, VW_MSG_VERSION_CHUNKS,
-                         vc_payload, sizeof(vc_payload));
+    vw_err_t err = vw_proto_send(sess->conn, VW_MSG_VERSION_CHUNKS,
+                                  vc_payload, sizeof(vc_payload));
     if (err != VW_OK) return err;
 
     uint8_t *vc_rbuf = malloc(VW_MAX_MSG_BYTES);
@@ -831,82 +916,145 @@ static vw_err_t download_by_entry(vw_client_sess_t *sess,
 
     if (vc_rplen < 4u) { free(vc_rbuf); return VW_ERR_PROTO_TRUNCATED; }
     uint32_t chunk_count = vw_read_u32le(vc_rbuf);
-    if (vc_rplen < 4u + (uint64_t)chunk_count * VW_HASH_BYTES) {
-        free(vc_rbuf);
-        return VW_ERR_PROTO_TRUNCATED;
+    uint64_t hashes_end = 4u + (uint64_t)chunk_count * VW_HASH_BYTES;
+    if (vc_rplen < hashes_end) { free(vc_rbuf); return VW_ERR_PROTO_TRUNCATED; }
+
+    size_t hashes_bytes = (size_t)chunk_count * VW_HASH_BYTES;
+    uint8_t *hashes = malloc(hashes_bytes ? hashes_bytes : 1u);
+    if (!hashes) { free(vc_rbuf); return VW_ERR_OOM; }
+    memcpy(hashes, vc_rbuf + 4u, hashes_bytes);
+
+    uint64_t vault_id = 0;
+    uint8_t *wrapped_dek = NULL;
+    uint16_t wrapped_dek_len = 0;
+    if (vc_rplen > hashes_end) {
+        uint32_t off = (uint32_t)hashes_end;
+        if (vc_rplen < off + 8u + 2u) { err = VW_ERR_PROTO_TRUNCATED; goto fail; }
+        vault_id = vw_read_u64le(vc_rbuf + off); off += 8u;
+        wrapped_dek_len = vw_read_u16le(vc_rbuf + off); off += 2u;
+        if (vc_rplen < (uint64_t)off + wrapped_dek_len) { err = VW_ERR_PROTO_TRUNCATED; goto fail; }
+        wrapped_dek = malloc(wrapped_dek_len ? wrapped_dek_len : 1u);
+        if (!wrapped_dek) { err = VW_ERR_OOM; goto fail; }
+        memcpy(wrapped_dek, vc_rbuf + off, wrapped_dek_len);
     }
 
-    const uint8_t *remote_hashes = vc_rbuf + 4u;
+    free(vc_rbuf);
+    *out_hashes = hashes;
+    *out_chunk_count = chunk_count;
+    if (out_vault_id) *out_vault_id = vault_id;
+    if (out_wrapped_dek) *out_wrapped_dek = wrapped_dek; else free(wrapped_dek);
+    if (out_wrapped_dek_len) *out_wrapped_dek_len = wrapped_dek_len;
+    return VW_OK;
 
-    /* ── Step 3: download each chunk; assemble into temp file ── */
+fail:
+    free(hashes);
+    free(wrapped_dek);
+    free(vc_rbuf);
+    return err;
+}
+
+/*
+ * Fetch and verify one chunk by content hash. *out_data is malloc'd
+ * *out_len bytes; caller frees. Returns VW_ERR_PROTO_INVALID if the
+ * received bytes don't hash to `hash` (matches download_by_entry's
+ * existing verification). Exported for vw_vault.c's per-chunk decrypt
+ * loop, which needs the raw (still-encrypted) bytes rather than having
+ * them written straight to a plaintext output file.
+ */
+vw_err_t vw_client_chunk_download_raw(vw_client_sess_t *sess,
+                                       const uint8_t hash[VW_HASH_BYTES],
+                                       uint8_t **out_data, uint32_t *out_len)
+{
+    if (!sess || !hash || !out_data || !out_len) return VW_ERR_INVALID_ARG;
+
+    uint8_t dreq[VW_TOKEN_BYTES + VW_HASH_BYTES];
+    memcpy(dreq, sess->session_token, VW_TOKEN_BYTES);
+    memcpy(dreq + VW_TOKEN_BYTES, hash, VW_HASH_BYTES);
+
+    vw_err_t err = vw_proto_send(sess->conn, VW_MSG_CHUNK_DOWNLOAD_REQ, dreq, sizeof(dreq));
+    if (err != VW_OK) return err;
+
+    uint8_t *data_rbuf = malloc(VW_HASH_BYTES + 4u + VW_CHUNK_SIZE);
+    if (!data_rbuf) return VW_ERR_OOM;
+    uint32_t drplen;
+    err = recv_expect(sess->conn, VW_MSG_CHUNK_DATA,
+                       data_rbuf, VW_HASH_BYTES + 4u + VW_CHUNK_SIZE, &drplen);
+    if (err != VW_OK) { free(data_rbuf); return err; }
+
+    if (drplen < VW_HASH_BYTES + 4u) { free(data_rbuf); return VW_ERR_PROTO_TRUNCATED; }
+    uint32_t chunk_len = vw_read_u32le(data_rbuf + VW_HASH_BYTES);
+    if (drplen < VW_HASH_BYTES + 4u + chunk_len) { free(data_rbuf); return VW_ERR_PROTO_TRUNCATED; }
+
+    uint8_t got_hash[VW_HASH_BYTES];
+    vw_err_t herr = vw_crypto_sha256(data_rbuf + VW_HASH_BYTES + 4u, chunk_len, got_hash);
+    if (herr != VW_OK || !vw_crypto_constant_time_eq(got_hash, hash, VW_HASH_BYTES)) {
+        free(data_rbuf);
+        return VW_ERR_PROTO_INVALID;
+    }
+
+    uint8_t *data = malloc(chunk_len ? chunk_len : 1u);
+    if (!data) { free(data_rbuf); return VW_ERR_OOM; }
+    memcpy(data, data_rbuf + VW_HASH_BYTES + 4u, chunk_len);
+    free(data_rbuf);
+
+    *out_data = data;
+    *out_len = chunk_len;
+    return VW_OK;
+}
+
+/*
+ * Shared by vw_client_file_download (resolves entry via path first) and
+ * vw_client_file_download_by_id (entry already resolved via file_id).
+ * Does steps 2-3: VERSION_CHUNKS, then per-chunk download/verify/assemble,
+ * via vw_client_version_chunks_raw/vw_client_chunk_download_raw above.
+ * Ignores vault_id/wrapped_dek — this path always writes what it receives
+ * as plaintext; decrypting an encrypted version is vw_vault.c's job.
+ */
+static vw_err_t download_by_entry(vw_client_sess_t *sess,
+                                   const vw_file_entry_t *entry,
+                                   const char *local_path,
+                                   vw_client_progress_cb_t progress_cb,
+                                   void *userdata)
+{
+    uint8_t *remote_hashes = NULL;
+    uint32_t chunk_count = 0;
+    vw_err_t err = vw_client_version_chunks_raw(sess, entry->version_id,
+                                                 &remote_hashes, &chunk_count,
+                                                 NULL, NULL, NULL);
+    if (err != VW_OK) return err;
 
     /* Build temp path: local_path + ".tmp" */
     size_t tmp_len = strlen(local_path) + 5u;
     char *tmp_path = malloc(tmp_len);
-    if (!tmp_path) { free(vc_rbuf); return VW_ERR_OOM; }
+    if (!tmp_path) { free(remote_hashes); return VW_ERR_OOM; }
     snprintf(tmp_path, tmp_len, "%s.tmp", local_path);
 
     vw_fs_chunk_writer_ctx_t writer;
     err = vw_fs_chunk_writer_open(tmp_path, &writer);
-    if (err != VW_OK) { free(tmp_path); free(vc_rbuf); return err; }
-
-    /* Download request buffer: token[32] + hash[32] */
-    uint8_t dreq[VW_TOKEN_BYTES + VW_HASH_BYTES];
-    memcpy(dreq, sess->session_token, VW_TOKEN_BYTES);
-
-    /* Chunk data receive buffer */
-    uint8_t *data_rbuf = malloc(VW_HASH_BYTES + 4u + VW_CHUNK_SIZE);
-    if (!data_rbuf) {
-        vw_fs_chunk_writer_abort(&writer);
-        free(tmp_path);
-        free(vc_rbuf);
-        return VW_ERR_OOM;
-    }
+    if (err != VW_OK) { free(tmp_path); free(remote_hashes); return err; }
 
     uint64_t bytes_done = 0;
     for (uint32_t ci = 0; ci < chunk_count; ci++) {
         const uint8_t *chash = remote_hashes + (size_t)ci * VW_HASH_BYTES;
-        memcpy(dreq + VW_TOKEN_BYTES, chash, VW_HASH_BYTES);
 
-        err = vw_proto_send(sess->conn, VW_MSG_CHUNK_DOWNLOAD_REQ,
-                             dreq, sizeof(dreq));
+        uint8_t *data = NULL;
+        uint32_t data_len = 0;
+        err = vw_client_chunk_download_raw(sess, chash, &data, &data_len);
         if (err != VW_OK) break;
 
-        uint32_t drplen;
-        err = recv_expect(sess->conn, VW_MSG_CHUNK_DATA,
-                           data_rbuf, VW_HASH_BYTES + 4u + VW_CHUNK_SIZE, &drplen);
+        err = vw_fs_chunk_writer_append(&writer, data, data_len);
+        free(data);
         if (err != VW_OK) break;
 
-        /* CHUNK_DATA: hash[32] + chunk_len(u32) + data */
-        if (drplen < VW_HASH_BYTES + 4u) { err = VW_ERR_PROTO_TRUNCATED; break; }
-        uint32_t chunk_len = vw_read_u32le(data_rbuf + VW_HASH_BYTES);
-        if (drplen < VW_HASH_BYTES + 4u + chunk_len) {
-            err = VW_ERR_PROTO_TRUNCATED; break;
-        }
-
-        /* Verify SHA-256(data) == requested hash */
-        uint8_t got_hash[VW_HASH_BYTES];
-        vw_err_t herr = vw_crypto_sha256(data_rbuf + VW_HASH_BYTES + 4u,
-                                          chunk_len, got_hash);
-        if (herr != VW_OK || !vw_crypto_constant_time_eq(got_hash, chash, VW_HASH_BYTES)) {
-            err = VW_ERR_PROTO_INVALID; break;
-        }
-
-        err = vw_fs_chunk_writer_append(&writer,
-                                         data_rbuf + VW_HASH_BYTES + 4u,
-                                         chunk_len);
-        if (err != VW_OK) break;
-
-        bytes_done += chunk_len;
+        bytes_done += data_len;
         if (progress_cb) progress_cb(bytes_done, entry->size_bytes, userdata);
     }
 
-    free(data_rbuf);
+    free(remote_hashes);
 
     if (err != VW_OK) {
         vw_fs_chunk_writer_abort(&writer);
         free(tmp_path);
-        free(vc_rbuf);
         return err;
     }
 
@@ -915,7 +1063,6 @@ static vw_err_t download_by_entry(vw_client_sess_t *sess,
     if (err != VW_OK) vw_fs_delete(tmp_path);
 
     free(tmp_path);
-    free(vc_rbuf);
     return err;
 }
 
@@ -1026,6 +1173,42 @@ vw_err_t vw_client_file_move(vw_client_sess_t *sess,
         if (ec != 0) err = (vw_err_t)ec;
     }
     return err;
+}
+
+vw_err_t vw_client_file_mkdir(vw_client_sess_t *sess,
+                               uint64_t new_parent_dir_id,
+                               const char *name,
+                               uint64_t *out_dir_id)
+{
+    vw_err_t err;
+    if (!sess || !name || !name[0] || strchr(name, '/') != NULL) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    uint16_t name_len = (uint16_t)strlen(name);
+    uint32_t plen = VW_TOKEN_BYTES + 8u + 2u + (uint32_t)name_len;
+    uint8_t *pbuf = malloc(plen);
+    if (!pbuf) return VW_ERR_OOM;
+
+    uint32_t off = 0;
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES); off += VW_TOKEN_BYTES;
+    vw_write_u64le(pbuf + off, new_parent_dir_id); off += 8u;
+    (void)vw_proto_write_str(pbuf, plen, &off, name, name_len);
+
+    err = vw_proto_send(sess->conn, VW_MSG_FILE_MKDIR, pbuf, plen);
+    free(pbuf);
+    if (err != VW_OK) return err;
+
+    /* FILE_MKDIR_ACK: file_id(u64) + error_code(u32) */
+    uint8_t ackbuf[12];
+    uint32_t ackplen;
+    err = recv_expect(sess->conn, VW_MSG_FILE_MKDIR_ACK, ackbuf, sizeof(ackbuf), &ackplen);
+    if (err != VW_OK) return err;
+    if (ackplen < 12u) return VW_ERR_PROTO_TRUNCATED;
+
+    uint32_t ec = vw_read_u32le(ackbuf + 8u);
+    if (ec != 0) return (vw_err_t)ec;
+    if (out_dir_id) *out_dir_id = vw_read_u64le(ackbuf);
+    return VW_OK;
 }
 
 /* ── vw_client_version_list ──────────────────────────────────────────────── */
@@ -1379,6 +1562,144 @@ trunc:
     free(entries);
     free(rbuf);
     return VW_ERR_PROTO_TRUNCATED;
+}
+
+/* ── Vault registry (TASK-099; server side: TASK-098) ────────────────────── */
+
+vw_err_t vw_client_vault_create(vw_client_sess_t *sess, uint64_t folder_file_id,
+                                 const uint8_t *wrapped_vk, uint16_t wrapped_vk_len,
+                                 const uint8_t kdf_salt[16],
+                                 const uint8_t *kdf_params, uint16_t kdf_params_len,
+                                 uint64_t *out_vault_id)
+{
+    vw_err_t err;
+    if (!sess || !wrapped_vk || wrapped_vk_len == 0 || !kdf_salt) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    /* token[32] + folder_file_id(u64) + wrapped_vk(string) + kdf_salt[16] + kdf_params(string) */
+    uint32_t plen = VW_TOKEN_BYTES + 8u + 2u + wrapped_vk_len + 16u + 2u + kdf_params_len;
+    uint8_t *pbuf = malloc(plen);
+    if (!pbuf) return VW_ERR_OOM;
+
+    uint32_t off = 0;
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES); off += VW_TOKEN_BYTES;
+    vw_write_u64le(pbuf + off, folder_file_id); off += 8u;
+    (void)vw_proto_write_str(pbuf, plen, &off, (const char *)wrapped_vk, wrapped_vk_len);
+    memcpy(pbuf + off, kdf_salt, 16u); off += 16u;
+    (void)vw_proto_write_str(pbuf, plen, &off, (const char *)kdf_params, kdf_params_len);
+
+    err = vw_proto_send(sess->conn, VW_MSG_VAULT_CREATE, pbuf, plen);
+    free(pbuf);
+    if (err != VW_OK) return err;
+
+    /* VAULT_CREATE_ACK: error_code(u32) + vault_id(u64) */
+    uint8_t ackbuf[12];
+    uint32_t ackplen;
+    err = recv_expect(sess->conn, VW_MSG_VAULT_CREATE_ACK, ackbuf, sizeof(ackbuf), &ackplen);
+    if (err != VW_OK) return err;
+    if (ackplen < 12u) return VW_ERR_PROTO_TRUNCATED;
+
+    uint32_t ec = vw_read_u32le(ackbuf);
+    if (ec != 0) return (vw_err_t)ec;
+    if (out_vault_id) *out_vault_id = vw_read_u64le(ackbuf + 4u);
+    return VW_OK;
+}
+
+vw_err_t vw_client_vault_key_fetch(vw_client_sess_t *sess, uint64_t vault_id,
+                                    uint8_t **out_wrapped_vk, uint16_t *out_wrapped_vk_len,
+                                    uint8_t out_kdf_salt[16],
+                                    uint8_t **out_kdf_params, uint16_t *out_kdf_params_len)
+{
+    vw_err_t err;
+    if (!sess || !out_wrapped_vk || !out_wrapped_vk_len || !out_kdf_salt) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    uint8_t pbuf[VW_TOKEN_BYTES + 8u];
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES);
+    vw_write_u64le(pbuf + VW_TOKEN_BYTES, vault_id);
+
+    err = vw_proto_send(sess->conn, VW_MSG_VAULT_KEY_FETCH, pbuf, sizeof(pbuf));
+    if (err != VW_OK) return err;
+
+    uint8_t *rbuf = malloc(VW_MAX_MSG_BYTES);
+    if (!rbuf) return VW_ERR_OOM;
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_VAULT_KEY_FETCH_RESP, rbuf, VW_MAX_MSG_BYTES, &rplen);
+    if (err != VW_OK) { free(rbuf); return err; }
+
+    if (rplen < 4u) { free(rbuf); return VW_ERR_PROTO_TRUNCATED; }
+    uint32_t ec = vw_read_u32le(rbuf);
+    if (ec != 0) { free(rbuf); return (vw_err_t)ec; }
+
+    uint32_t off = 4u;
+    const char *wrapped_vk; uint16_t wrapped_vk_len;
+    err = vw_proto_read_str(rbuf, rplen, &off, &wrapped_vk, &wrapped_vk_len);
+    if (err != VW_OK) { free(rbuf); return err; }
+
+    if (off + 16u > rplen) { free(rbuf); return VW_ERR_PROTO_TRUNCATED; }
+    memcpy(out_kdf_salt, rbuf + off, 16u); off += 16u;
+
+    const char *kdf_params; uint16_t kdf_params_len;
+    err = vw_proto_read_str(rbuf, rplen, &off, &kdf_params, &kdf_params_len);
+    if (err != VW_OK) { free(rbuf); return err; }
+
+    uint8_t *wvk_copy = malloc(wrapped_vk_len ? wrapped_vk_len : 1u);
+    if (!wvk_copy) { free(rbuf); return VW_ERR_OOM; }
+    memcpy(wvk_copy, wrapped_vk, wrapped_vk_len);
+
+    uint8_t *kdfp_copy = NULL;
+    if (kdf_params_len > 0) {
+        kdfp_copy = malloc(kdf_params_len);
+        if (!kdfp_copy) { free(wvk_copy); free(rbuf); return VW_ERR_OOM; }
+        memcpy(kdfp_copy, kdf_params, kdf_params_len);
+    }
+
+    free(rbuf);
+    *out_wrapped_vk = wvk_copy;
+    *out_wrapped_vk_len = wrapped_vk_len;
+    if (out_kdf_params) *out_kdf_params = kdfp_copy; else free(kdfp_copy);
+    if (out_kdf_params_len) *out_kdf_params_len = kdf_params_len;
+    return VW_OK;
+}
+
+vw_err_t vw_client_vault_list(vw_client_sess_t *sess,
+                               vw_vault_entry_t **out, uint32_t *out_count)
+{
+    vw_err_t err;
+    if (!sess || !out || !out_count) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    err = vw_proto_send(sess->conn, VW_MSG_VAULT_LIST,
+                         sess->session_token, VW_TOKEN_BYTES);
+    if (err != VW_OK) return err;
+
+    uint8_t *rbuf = malloc(VW_MAX_MSG_BYTES);
+    if (!rbuf) return VW_ERR_OOM;
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_VAULT_LIST_RESP, rbuf, VW_MAX_MSG_BYTES, &rplen);
+    if (err != VW_OK) { free(rbuf); return err; }
+
+    if (rplen < 4u) { free(rbuf); return VW_ERR_PROTO_TRUNCATED; }
+    uint32_t count = vw_read_u32le(rbuf);
+    uint32_t off = 4u;
+
+    vw_vault_entry_t *entries = NULL;
+    if (count > 0) {
+        entries = calloc(count, sizeof(*entries));
+        if (!entries) { free(rbuf); return VW_ERR_OOM; }
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 24u > rplen) { free(entries); free(rbuf); return VW_ERR_PROTO_TRUNCATED; }
+        entries[i].vault_id       = vw_read_u64le(rbuf + off);          off += 8u;
+        entries[i].folder_file_id = vw_read_u64le(rbuf + off);          off += 8u;
+        entries[i].created_at     = (int64_t)vw_read_u64le(rbuf + off); off += 8u;
+    }
+
+    free(rbuf);
+    *out = entries;
+    *out_count = count;
+    return VW_OK;
 }
 
 vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,

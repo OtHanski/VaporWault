@@ -15,14 +15,13 @@ side of these tests actually encrypts or decrypts anything. What's under
 test is the server's storage/permission behavior around these opaque blobs,
 not cryptographic correctness (that's TASK-101's job, once TASK-099 exists).
 
-Notably NOT testable here: whether a version's vault_id/wrapped_dek is
-retrievable after a FILE_COMMIT that set them — no existing wire response
-(FILE_STAT_RESP, VERSION_LIST_RESP, VERSION_CHUNKS_RESP) surfaces a
-version's vault_id at all today. That gap is flagged in TASK-098's own
-notes as something TASK-099 will need addressed once it needs to actually
-decrypt a downloaded file. The on-disk round-trip (does the server actually
-persist and return the right bytes) is instead covered at the unit level in
-test_vw_vault.c, which has direct access to the internal record.
+A version's vault_id/wrapped_dek IS retrievable after a FILE_COMMIT that
+set them, via VERSION_CHUNKS_RESP's TASK-099 extension (see
+test_version_chunks_surfaces_vault_id_and_wrapped_dek below) — this closed
+the gap originally flagged in TASK-098's own notes. The on-disk round-trip
+(does the server actually persist and return the right bytes) is also
+covered at the unit level in test_vw_vault.c, which has direct access to
+the internal record.
 
 Each test creates its own users to avoid module-server state pollution, and
 closes every client it opens (via try/finally) — see test_sharing.py's
@@ -162,10 +161,9 @@ def test_file_commit_with_vault_id_succeeds(server, admin_client, unique_usernam
     """
     Smoke test for the FILE_COMMIT wire extension: committing a new version
     with a valid vault_id + wrapped_dek must succeed and behave exactly like
-    a normal commit from every externally observable angle (no wire
-    response surfaces vault_id today — see module docstring — so this
-    confirms "doesn't break/error", not "vault_id round-trips"; that part is
-    covered at the unit level in test_vw_vault.c).
+    a normal commit from every externally observable angle. See
+    test_version_chunks_surfaces_vault_id_and_wrapped_dek for the
+    round-trip check via VERSION_CHUNKS_RESP.
     """
     owner, otoken = _setup_user(admin_client, server, unique_username)
     try:
@@ -247,5 +245,38 @@ def test_version_restore_after_encrypted_commit_succeeds(server, admin_client, u
         new_vid = owner.version_restore(otoken, v2, "/plain.bin")
         assert new_vid != 0
         assert new_vid != v2
+    finally:
+        owner.close()
+
+
+def test_version_chunks_surfaces_vault_id_and_wrapped_dek(server, admin_client, unique_username):
+    """
+    TASK-099: VERSION_CHUNKS_RESP must carry back the exact vault_id and
+    wrapped_dek a FILE_COMMIT set, so a downloading client can decrypt.
+    An unencrypted version must report vault_id == 0 and wrapped_dek is None
+    (no trailing fields at all, distinguishing it from a real-but-empty
+    wrapped_dek — VAULT_CREATE separately rejects an empty wrapped_dek, so
+    "present but empty" should never occur on the wire either).
+    """
+    owner, otoken = _setup_user(admin_client, server, unique_username)
+    try:
+        fid, v1 = owner.upload_file(otoken, "/plain.bin", b"unencrypted version")
+        hashes, vault_id, wrapped_dek = owner.version_chunks_ex(otoken, v1)
+        assert vault_id == 0
+        assert wrapped_dek is None
+        assert len(hashes) == 1
+
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+        data2 = b"encrypted version content"
+        chash2 = hashlib.sha256(data2).digest()
+        owner.chunk_upload(otoken, data2)
+        wrapped_dek_sent = os.urandom(48)
+        _, v2 = owner.file_commit(otoken, "", [chash2], file_id=fid, logical_size=len(data2),
+                                   vault_id=vault_id, wrapped_dek=wrapped_dek_sent)
+
+        hashes2, vault_id2, wrapped_dek2 = owner.version_chunks_ex(otoken, v2)
+        assert vault_id2 == vault_id
+        assert wrapped_dek2 == wrapped_dek_sent
+        assert hashes2 == [chash2]
     finally:
         owner.close()

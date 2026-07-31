@@ -47,6 +47,33 @@ set_tests_properties(integration_auth_handshake PROPERTIES
     LABELS  "integration;auth"
 )
 
+# test_vault_e2ee: TASK-099 client vault module, end-to-end against a real
+# already-running server (unlike test_auth_handshake, this does NOT self-host
+# one — see test_vault_e2ee.c's file header). No ctest add_test entry here:
+# it needs a live server + a created user, which only the pytest wrapper
+# (test_vault_e2ee.py, which reuses conftest.py's `server`/`admin_client`
+# fixtures) knows how to provide — same reason the rest of the pytest
+# integration suite isn't wired into ctest either.
+
+add_executable(test_vault_e2ee
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vault_e2ee.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_vault.c
+)
+
+target_include_directories(test_vault_e2ee PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_link_libraries(test_vault_e2ee PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vault_e2ee PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_vault_e2ee PRIVATE ws2_32)
+endif()
+
 # ── Python integration test suite (TASK-038) ─────────────────────────────────
 # Starts real vapourwaultd + vapourwault-daemon binaries, exercises IT-1..IT-8.
 # Requires: openssl (for cert generation), Python 3.7+, POSIX.

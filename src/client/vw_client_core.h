@@ -307,6 +307,128 @@ vw_err_t vw_client_file_move(vw_client_sess_t *sess,
                               uint64_t new_parent_dir_id,
                               const char *new_name);
 
+/*
+ * Create a single directory named `name` (bare leaf, no '/') under
+ * new_parent_dir_id (0 = caller's own root). *out_dir_id receives the new
+ * directory's file_id. See docs/PROTOCOL.md §7.2 (TASK-104) — this is the
+ * only wire mechanism that produces a real VW_ENTRY_DIR record.
+ */
+vw_err_t vw_client_file_mkdir(vw_client_sess_t *sess,
+                               uint64_t new_parent_dir_id,
+                               const char *name,
+                               uint64_t *out_dir_id);
+
+/* ── Vault registry (server side: TASK-098, docs/PROTOCOL.md §7.11) ──────── */
+/*
+ * These wrap VAULT_CREATE/VAULT_KEY_FETCH/VAULT_LIST exactly as the server
+ * treats them: opaque byte blobs in, opaque byte blobs out. No crypto
+ * happens here — wrapping/unwrapping the VK and deriving the KEK from a
+ * passphrase is vw_vault.c's job (TASK-099); these functions only move the
+ * already-wrapped bytes over the wire, same division of responsibility as
+ * every other vw_client_core function.
+ */
+
+typedef struct {
+    uint64_t vault_id;
+    uint64_t folder_file_id;
+    int64_t  created_at;
+} vw_vault_entry_t;
+
+/*
+ * Register a new vault for folder_file_id (which the caller must own).
+ * wrapped_vk/kdf_salt/kdf_params are opaque to the server; wrapped_vk_len
+ * must be nonzero (rejected server-side with VW_ERR_INVALID_ARG otherwise).
+ * *out_vault_id receives the new vault's id.
+ */
+vw_err_t vw_client_vault_create(vw_client_sess_t *sess, uint64_t folder_file_id,
+                                 const uint8_t *wrapped_vk, uint16_t wrapped_vk_len,
+                                 const uint8_t kdf_salt[16],
+                                 const uint8_t *kdf_params, uint16_t kdf_params_len,
+                                 uint64_t *out_vault_id);
+
+/*
+ * Fetch a vault's wrapped VK + KDF salt/params (new-device unlock).
+ * *out_wrapped_vk and *out_kdf_params are malloc'd; caller frees both
+ * (out_kdf_params may be set to NULL with *out_kdf_params_len == 0 if the
+ * vault was created with empty kdf_params). Returns VW_ERR_PERMISSION if
+ * vault_id exists but isn't owned by the caller.
+ */
+vw_err_t vw_client_vault_key_fetch(vw_client_sess_t *sess, uint64_t vault_id,
+                                    uint8_t **out_wrapped_vk, uint16_t *out_wrapped_vk_len,
+                                    uint8_t out_kdf_salt[16],
+                                    uint8_t **out_kdf_params, uint16_t *out_kdf_params_len);
+
+/*
+ * List vaults owned by the caller. Never includes wrapped-key material —
+ * use vw_client_vault_key_fetch for that. Returns a malloc'd array; caller
+ * frees.
+ */
+vw_err_t vw_client_vault_list(vw_client_sess_t *sess,
+                               vw_vault_entry_t **out, uint32_t *out_count);
+
+/* ── Raw protocol primitives (TASK-099) ──────────────────────────────────── */
+/*
+ * Lower-level building blocks factored out of the plaintext upload/download
+ * paths above so vw_vault.c can compose them for encrypted content, without
+ * either duplicating this wire-encoding logic or vw_client_core exposing
+ * struct vw_client_sess (which stays private to vw_client_core.c). The
+ * vault module owns all cryptographic logic; these functions know nothing
+ * about encryption — they move bytes exactly as given.
+ */
+
+/*
+ * Query the server for one chunk hash and upload data (len bytes) if the
+ * server doesn't already have it. Unlike the batched CHUNK_QUERY used by
+ * vw_client_file_upload internally, this queries/uploads one chunk per
+ * call — appropriate for a caller (vw_vault.c) whose "chunk data" is
+ * produced transiently in memory (ciphertext) rather than re-read from a
+ * plaintext file on disk.
+ */
+vw_err_t vw_client_chunk_upload_if_missing(vw_client_sess_t *sess,
+                                            const uint8_t hash[VW_HASH_BYTES],
+                                            const void *data, uint32_t len);
+
+/*
+ * Send FILE_COMMIT and decode FILE_COMMIT_ACK directly — the same
+ * wire-encoding vw_client_file_upload/_to_id/_into_folder use internally,
+ * exposed so vw_vault.c can commit an encrypted version with a real
+ * vault_id/wrapped_dek. vault_id == 0 omits the optional trailing fields
+ * entirely (identical to a plaintext commit); vault_id != 0 requires a
+ * non-NULL, non-empty wrapped_dek. See docs/PROTOCOL.md §7.11.4.
+ */
+vw_err_t vw_client_file_commit_raw(vw_client_sess_t *sess, uint64_t file_id,
+                                    const char *name_or_path, uint16_t name_len,
+                                    uint64_t logical_size, uint32_t chunk_count,
+                                    const uint8_t *chunk_hashes,
+                                    uint64_t vault_id,
+                                    const uint8_t *wrapped_dek, uint16_t wrapped_dek_len,
+                                    uint64_t *out_file_id, uint64_t *out_version_id);
+
+/*
+ * VERSION_CHUNKS → ordered chunk hash list plus the TASK-099 vault_id/
+ * wrapped_dek trailing fields (docs/PROTOCOL.md §7.3). *out_hashes is a
+ * malloc'd chunk_count*VW_HASH_BYTES array; caller frees. For an
+ * unencrypted version, *out_vault_id is set to 0 and *out_wrapped_dek to
+ * NULL (if requested) — out_vault_id/out_wrapped_dek/out_wrapped_dek_len
+ * may each be NULL if the caller doesn't need them (e.g. the plaintext
+ * download path, which only wants the hash list).
+ */
+vw_err_t vw_client_version_chunks_raw(vw_client_sess_t *sess, uint64_t version_id,
+                                       uint8_t **out_hashes, uint32_t *out_chunk_count,
+                                       uint64_t *out_vault_id,
+                                       uint8_t **out_wrapped_dek, uint16_t *out_wrapped_dek_len);
+
+/*
+ * Fetch and verify one chunk by content hash (CHUNK_DOWNLOAD_REQ /
+ * CHUNK_DATA). *out_data is malloc'd *out_len bytes; caller frees. Returns
+ * VW_ERR_PROTO_INVALID if the received bytes don't hash to `hash`. For an
+ * encrypted version this returns the still-encrypted bytes — decryption is
+ * the caller's job.
+ */
+vw_err_t vw_client_chunk_download_raw(vw_client_sess_t *sess,
+                                       const uint8_t hash[VW_HASH_BYTES],
+                                       uint8_t **out_data, uint32_t *out_len);
+
 /* ── Sharing (TASK-095; server side: TASK-094, docs/PROTOCOL.md §7.5) ────── */
 
 typedef struct {

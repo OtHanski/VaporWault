@@ -2,6 +2,7 @@ set(VW_CLIENT_SOURCES
     vw_daemon.c
     vw_ipc.c
     vw_client_core.c
+    vw_vault.c
     vw_sync.c
     vw_cache.c
 )

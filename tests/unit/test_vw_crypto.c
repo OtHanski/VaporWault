@@ -9,9 +9,13 @@
  *   Argon2id: caller-provided salt with NULL out_salt (null-deref regression)
  *   HMAC-SHA256: RFC 4231 test case 1 known-answer vector
  *   Hex encode/decode: round-trip
+ *   Vault Argon2id KDF (TASK-099): floor enforcement, determinism
+ *   AES-256-GCM (TASK-099): round-trip, tamper detection (tag/ct/key/AAD)
+ *   Vault chunk nonce (TASK-099): determinism, retry-safety under GCM
  *
- * NOTE: The argon2id tests are slow (~3–8 seconds, per VW_ARGON2_MEM_KB).
- * This is expected; correctness takes priority over speed for hashing tests.
+ * NOTE: The argon2id tests are slow (~3–8 seconds, per VW_ARGON2_MEM_KB /
+ * VW_VAULT_ARGON2_MIN_MEM_KB). This is expected; correctness takes
+ * priority over speed for hashing tests.
  */
 
 #include "vw_test.h"
@@ -120,6 +124,188 @@ VW_TEST_SUITE("vw_crypto") {
         VW_ASSERT_OK(vw_crypto_argon2id_hash("pw", 2, fixed_salt, NULL, hash_a));
         VW_ASSERT_OK(vw_crypto_argon2id_hash("pw", 2, fixed_salt, NULL, hash_b));
         VW_ASSERT_MEM_EQ(hash_a, hash_b, VW_ARGON2_HASH_BYTES);
+    }
+
+    /* ── Vault Argon2id KDF (TASK-099) ────────────────────────────────── */
+    /* NOTE: mem_cost_kib is pinned at the SEC.07 floor (19456 KiB) in
+     * every test below to keep runtime bounded — see the file header note
+     * on Argon2id test speed. */
+
+    VW_TEST_CASE("Vault KDF: valid params derive a non-zero KEK") {
+        uint8_t salt[VW_VAULT_KDF_SALT_BYTES];
+        uint8_t kek[VW_VAULT_KEK_BYTES] = {0};
+        memset(salt, 0x22, sizeof(salt));
+        vw_vault_kdf_params_t p = { VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST, 1 };
+        VW_ASSERT_OK(vw_crypto_vault_derive_kek("correct horse battery staple", 29, salt, &p, kek));
+        VW_ASSERT(!all_zero(kek, VW_VAULT_KEK_BYTES));
+    }
+
+    VW_TEST_CASE("Vault KDF: same passphrase+salt+params always gives same KEK") {
+        uint8_t salt[VW_VAULT_KDF_SALT_BYTES];
+        uint8_t kek_a[VW_VAULT_KEK_BYTES], kek_b[VW_VAULT_KEK_BYTES];
+        memset(salt, 0x33, sizeof(salt));
+        vw_vault_kdf_params_t p = { VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST, 1 };
+        VW_ASSERT_OK(vw_crypto_vault_derive_kek("passphrase", 10, salt, &p, kek_a));
+        VW_ASSERT_OK(vw_crypto_vault_derive_kek("passphrase", 10, salt, &p, kek_b));
+        VW_ASSERT_MEM_EQ(kek_a, kek_b, VW_VAULT_KEK_BYTES);
+    }
+
+    VW_TEST_CASE("Vault KDF: different passphrase gives a different KEK") {
+        uint8_t salt[VW_VAULT_KDF_SALT_BYTES];
+        uint8_t kek_a[VW_VAULT_KEK_BYTES], kek_b[VW_VAULT_KEK_BYTES];
+        memset(salt, 0x44, sizeof(salt));
+        vw_vault_kdf_params_t p = { VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST, 1 };
+        VW_ASSERT_OK(vw_crypto_vault_derive_kek("passphrase-a", 12, salt, &p, kek_a));
+        VW_ASSERT_OK(vw_crypto_vault_derive_kek("passphrase-b", 12, salt, &p, kek_b));
+        VW_ASSERT(!vw_crypto_constant_time_eq(kek_a, kek_b, VW_VAULT_KEK_BYTES));
+    }
+
+    VW_TEST_CASE("Vault KDF: rejects mem_cost below the SEC.07 floor") {
+        uint8_t salt[VW_VAULT_KDF_SALT_BYTES] = {0};
+        uint8_t kek[VW_VAULT_KEK_BYTES];
+        vw_vault_kdf_params_t p = { VW_VAULT_ARGON2_MIN_MEM_KB - 1u, VW_VAULT_ARGON2_MIN_TIME_COST, 1 };
+        VW_ASSERT_ERR(vw_crypto_vault_derive_kek("pw", 2, salt, &p, kek), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("Vault KDF: rejects time_cost below the SEC.07 floor") {
+        uint8_t salt[VW_VAULT_KDF_SALT_BYTES] = {0};
+        uint8_t kek[VW_VAULT_KEK_BYTES];
+        vw_vault_kdf_params_t p = { VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST - 1u, 1 };
+        VW_ASSERT_ERR(vw_crypto_vault_derive_kek("pw", 2, salt, &p, kek), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("Vault KDF: rejects parallelism != 1 (both directions)") {
+        uint8_t salt[VW_VAULT_KDF_SALT_BYTES] = {0};
+        uint8_t kek[VW_VAULT_KEK_BYTES];
+        vw_vault_kdf_params_t p_hi = { VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST, 4 };
+        vw_vault_kdf_params_t p_lo = { VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST, 0 };
+        VW_ASSERT_ERR(vw_crypto_vault_derive_kek("pw", 2, salt, &p_hi, kek), VW_ERR_INVALID_ARG);
+        VW_ASSERT_ERR(vw_crypto_vault_derive_kek("pw", 2, salt, &p_lo, kek), VW_ERR_INVALID_ARG);
+    }
+
+    /* ── AES-256-GCM (TASK-099) ────────────────────────────────────────── */
+
+    VW_TEST_CASE("AES-256-GCM: encrypt/decrypt round-trips byte-identical plaintext") {
+        uint8_t key[VW_AES_GCM_KEY_BYTES], nonce[VW_AES_GCM_NONCE_BYTES];
+        memset(key, 0x55, sizeof(key));
+        memset(nonce, 0x66, sizeof(nonce));
+        const char *pt = "the quick brown fox jumps over the lazy dog";
+        size_t len = strlen(pt);
+        uint8_t ct[64], tag[VW_AES_GCM_TAG_BYTES], out[64] = {0};
+
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(key, nonce, NULL, 0, pt, len, ct, tag));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_decrypt(key, nonce, NULL, 0, ct, len, tag, out));
+        VW_ASSERT_MEM_EQ(pt, out, len);
+    }
+
+    VW_TEST_CASE("AES-256-GCM: ciphertext differs from plaintext") {
+        uint8_t key[VW_AES_GCM_KEY_BYTES], nonce[VW_AES_GCM_NONCE_BYTES];
+        memset(key, 0x77, sizeof(key));
+        memset(nonce, 0x88, sizeof(nonce));
+        uint8_t pt[32], ct[32], tag[VW_AES_GCM_TAG_BYTES];
+        memset(pt, 0xAA, sizeof(pt));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(key, nonce, NULL, 0, pt, sizeof(pt), ct, tag));
+        VW_ASSERT(!vw_crypto_constant_time_eq(pt, ct, sizeof(pt)));
+    }
+
+    VW_TEST_CASE("AES-256-GCM: tampered tag fails auth and zeroes output") {
+        uint8_t key[VW_AES_GCM_KEY_BYTES] = {0}, nonce[VW_AES_GCM_NONCE_BYTES] = {0};
+        uint8_t pt[16], ct[16], tag[VW_AES_GCM_TAG_BYTES], out[16];
+        memset(pt, 0x99, sizeof(pt));
+        memset(out, 0xFF, sizeof(out));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(key, nonce, NULL, 0, pt, sizeof(pt), ct, tag));
+        tag[0] ^= 0x01;
+        VW_ASSERT_ERR(vw_crypto_aes256gcm_decrypt(key, nonce, NULL, 0, ct, sizeof(ct), tag, out),
+                      VW_ERR_CRYPTO);
+        VW_ASSERT(all_zero(out, sizeof(out)));
+    }
+
+    VW_TEST_CASE("AES-256-GCM: tampered ciphertext fails auth") {
+        uint8_t key[VW_AES_GCM_KEY_BYTES] = {0}, nonce[VW_AES_GCM_NONCE_BYTES] = {0};
+        uint8_t pt[16], ct[16], tag[VW_AES_GCM_TAG_BYTES], out[16];
+        memset(pt, 0x21, sizeof(pt));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(key, nonce, NULL, 0, pt, sizeof(pt), ct, tag));
+        ct[0] ^= 0x01;
+        VW_ASSERT_ERR(vw_crypto_aes256gcm_decrypt(key, nonce, NULL, 0, ct, sizeof(ct), tag, out),
+                      VW_ERR_CRYPTO);
+    }
+
+    VW_TEST_CASE("AES-256-GCM: wrong key fails auth") {
+        uint8_t key[VW_AES_GCM_KEY_BYTES] = {0}, wrong_key[VW_AES_GCM_KEY_BYTES] = {0};
+        uint8_t nonce[VW_AES_GCM_NONCE_BYTES] = {0};
+        wrong_key[0] = 0x01;
+        uint8_t pt[16], ct[16], tag[VW_AES_GCM_TAG_BYTES], out[16];
+        memset(pt, 0x21, sizeof(pt));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(key, nonce, NULL, 0, pt, sizeof(pt), ct, tag));
+        VW_ASSERT_ERR(vw_crypto_aes256gcm_decrypt(wrong_key, nonce, NULL, 0, ct, sizeof(ct), tag, out),
+                      VW_ERR_CRYPTO);
+    }
+
+    VW_TEST_CASE("AES-256-GCM: mismatched AAD fails auth") {
+        uint8_t key[VW_AES_GCM_KEY_BYTES] = {0}, nonce[VW_AES_GCM_NONCE_BYTES] = {0};
+        uint8_t pt[16], ct[16], tag[VW_AES_GCM_TAG_BYTES], out[16];
+        memset(pt, 0x21, sizeof(pt));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(key, nonce, "aad-a", 5, pt, sizeof(pt), ct, tag));
+        VW_ASSERT_ERR(vw_crypto_aes256gcm_decrypt(key, nonce, "aad-b", 5, ct, sizeof(ct), tag, out),
+                      VW_ERR_CRYPTO);
+        VW_ASSERT_OK(vw_crypto_aes256gcm_decrypt(key, nonce, "aad-a", 5, ct, sizeof(ct), tag, out));
+        VW_ASSERT_MEM_EQ(pt, out, sizeof(pt));
+    }
+
+    /* ── Vault chunk nonce derivation (TASK-099) ──────────────────────── */
+
+    VW_TEST_CASE("Chunk nonce: deterministic for the same dek+index") {
+        uint8_t dek[VW_AES_GCM_KEY_BYTES];
+        memset(dek, 0xAB, sizeof(dek));
+        uint8_t n1[VW_AES_GCM_NONCE_BYTES], n2[VW_AES_GCM_NONCE_BYTES];
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek, 7, n1));
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek, 7, n2));
+        VW_ASSERT_MEM_EQ(n1, n2, VW_AES_GCM_NONCE_BYTES);
+    }
+
+    VW_TEST_CASE("Chunk nonce: differs across chunk indices for the same dek") {
+        uint8_t dek[VW_AES_GCM_KEY_BYTES];
+        memset(dek, 0xCD, sizeof(dek));
+        uint8_t n0[VW_AES_GCM_NONCE_BYTES], n1[VW_AES_GCM_NONCE_BYTES];
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek, 0, n0));
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek, 1, n1));
+        VW_ASSERT(!vw_crypto_constant_time_eq(n0, n1, VW_AES_GCM_NONCE_BYTES));
+    }
+
+    VW_TEST_CASE("Chunk nonce: differs across DEKs for the same index") {
+        uint8_t dek_a[VW_AES_GCM_KEY_BYTES], dek_b[VW_AES_GCM_KEY_BYTES];
+        memset(dek_a, 0x11, sizeof(dek_a));
+        memset(dek_b, 0x12, sizeof(dek_b));
+        uint8_t na[VW_AES_GCM_NONCE_BYTES], nb[VW_AES_GCM_NONCE_BYTES];
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek_a, 42, na));
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek_b, 42, nb));
+        VW_ASSERT(!vw_crypto_constant_time_eq(na, nb, VW_AES_GCM_NONCE_BYTES));
+    }
+
+    VW_TEST_CASE("Chunk nonce + GCM: same dek re-encrypting the same chunk index is retry-safe") {
+        /* Simulates an interrupted-and-retried upload: encrypting the same
+         * plaintext chunk twice with the same dek+chunk_index must derive
+         * the same nonce and produce byte-identical ciphertext+tag —
+         * never two different (nonce, ciphertext) pairs under one key,
+         * which would be the GCM nonce-reuse-with-different-plaintext
+         * failure mode this scheme exists to prevent. */
+        uint8_t dek[VW_AES_GCM_KEY_BYTES];
+        memset(dek, 0xEE, sizeof(dek));
+        uint8_t pt[4096];
+        memset(pt, 0x5A, sizeof(pt));
+
+        uint8_t nonce1[VW_AES_GCM_NONCE_BYTES], nonce2[VW_AES_GCM_NONCE_BYTES];
+        uint8_t ct1[4096], ct2[4096], tag1[VW_AES_GCM_TAG_BYTES], tag2[VW_AES_GCM_TAG_BYTES];
+
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek, 3, nonce1));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(dek, nonce1, NULL, 0, pt, sizeof(pt), ct1, tag1));
+
+        VW_ASSERT_OK(vw_crypto_vault_chunk_nonce(dek, 3, nonce2));
+        VW_ASSERT_OK(vw_crypto_aes256gcm_encrypt(dek, nonce2, NULL, 0, pt, sizeof(pt), ct2, tag2));
+
+        VW_ASSERT_MEM_EQ(nonce1, nonce2, VW_AES_GCM_NONCE_BYTES);
+        VW_ASSERT_MEM_EQ(ct1, ct2, sizeof(ct1));
+        VW_ASSERT_MEM_EQ(tag1, tag2, VW_AES_GCM_TAG_BYTES);
     }
 
     /* ── HMAC-SHA256 ───────────────────────────────────────────────────── */

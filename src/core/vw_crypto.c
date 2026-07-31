@@ -15,6 +15,9 @@
 #include <mbedtls/md.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/hkdf.h>
+#include <mbedtls/cipher.h>
 #include <psa/crypto.h>
 
 /* Argon2 reference implementation */
@@ -238,6 +241,105 @@ vw_err_t vw_crypto_argon2id_verify(const uint8_t hash[VW_ARGON2_HASH_BYTES],
     int match = vw_crypto_constant_time_eq(hash, computed, VW_ARGON2_HASH_BYTES);
     vw_crypto_secure_zero(computed, sizeof(computed));
     return match ? VW_OK : VW_ERR_AUTH_BAD_CREDS;
+}
+
+/* ── Vault Argon2id KDF ──────────────────────────────────────────────────── */
+
+vw_err_t vw_crypto_vault_derive_kek(const void *passphrase, size_t passphrase_len,
+                                     const uint8_t salt[VW_VAULT_KDF_SALT_BYTES],
+                                     const vw_vault_kdf_params_t *params,
+                                     uint8_t out_kek[VW_VAULT_KEK_BYTES]) {
+    if (!params) return VW_ERR_INVALID_ARG;
+    if (params->mem_cost_kib < VW_VAULT_ARGON2_MIN_MEM_KB) return VW_ERR_INVALID_ARG;
+    if (params->time_cost < VW_VAULT_ARGON2_MIN_TIME_COST) return VW_ERR_INVALID_ARG;
+    if (params->parallelism != VW_VAULT_ARGON2_PARALLELISM) return VW_ERR_INVALID_ARG;
+
+    int rc = argon2id_hash_raw(
+        params->time_cost,
+        params->mem_cost_kib,
+        params->parallelism,
+        passphrase, passphrase_len,
+        salt, VW_VAULT_KDF_SALT_BYTES,
+        out_kek, VW_VAULT_KEK_BYTES
+    );
+
+    return (rc == ARGON2_OK) ? VW_OK : VW_ERR_CRYPTO;
+}
+
+/* ── AES-256-GCM ─────────────────────────────────────────────────────────── */
+
+vw_err_t vw_crypto_aes256gcm_encrypt(const uint8_t key[VW_AES_GCM_KEY_BYTES],
+                                      const uint8_t nonce[VW_AES_GCM_NONCE_BYTES],
+                                      const void *aad, size_t aad_len,
+                                      const void *plaintext, size_t len,
+                                      uint8_t *out_ciphertext,
+                                      uint8_t out_tag[VW_AES_GCM_TAG_BYTES]) {
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+
+    int rc = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, VW_AES_GCM_KEY_BYTES * 8u);
+    if (rc == 0) {
+        rc = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, len,
+                                        nonce, VW_AES_GCM_NONCE_BYTES,
+                                        (const unsigned char *)aad, aad_len,
+                                        (const unsigned char *)plaintext, out_ciphertext,
+                                        VW_AES_GCM_TAG_BYTES, out_tag);
+    }
+    mbedtls_gcm_free(&ctx);
+    return (rc == 0) ? VW_OK : VW_ERR_CRYPTO;
+}
+
+vw_err_t vw_crypto_aes256gcm_decrypt(const uint8_t key[VW_AES_GCM_KEY_BYTES],
+                                      const uint8_t nonce[VW_AES_GCM_NONCE_BYTES],
+                                      const void *aad, size_t aad_len,
+                                      const void *ciphertext, size_t len,
+                                      const uint8_t tag[VW_AES_GCM_TAG_BYTES],
+                                      uint8_t *out_plaintext) {
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+
+    int rc = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, VW_AES_GCM_KEY_BYTES * 8u);
+    if (rc == 0) {
+        rc = mbedtls_gcm_auth_decrypt(&ctx, len, nonce, VW_AES_GCM_NONCE_BYTES,
+                                       (const unsigned char *)aad, aad_len,
+                                       tag, VW_AES_GCM_TAG_BYTES,
+                                       (const unsigned char *)ciphertext, out_plaintext);
+    }
+    mbedtls_gcm_free(&ctx);
+
+    if (rc != 0) {
+        /* mbedTLS may have written unauthenticated plaintext into
+         * out_plaintext before the tag check failed; never let a caller
+         * accidentally use it. */
+        if (len > 0) vw_crypto_secure_zero(out_plaintext, len);
+        return VW_ERR_CRYPTO;
+    }
+    return VW_OK;
+}
+
+vw_err_t vw_crypto_vault_chunk_nonce(const uint8_t dek[VW_AES_GCM_KEY_BYTES],
+                                      uint64_t chunk_index,
+                                      uint8_t out_nonce[VW_AES_GCM_NONCE_BYTES]) {
+    static const char label[] = "vw-chunk-nonce";
+    uint8_t info[sizeof(label) - 1 + 8];
+    memcpy(info, label, sizeof(label) - 1);
+    for (int i = 0; i < 8; i++)
+        info[sizeof(label) - 1 + i] = (uint8_t)(chunk_index >> (8 * i));
+
+    const mbedtls_md_info_t *sha256 = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!sha256) return VW_ERR_CRYPTO;
+
+    uint8_t okm[32];
+    int rc = mbedtls_hkdf(sha256, NULL, 0, dek, VW_AES_GCM_KEY_BYTES,
+                           info, sizeof(info), okm, sizeof(okm));
+    if (rc != 0) {
+        vw_crypto_secure_zero(okm, sizeof(okm));
+        return VW_ERR_CRYPTO;
+    }
+
+    memcpy(out_nonce, okm, VW_AES_GCM_NONCE_BYTES);
+    vw_crypto_secure_zero(okm, sizeof(okm));
+    return VW_OK;
 }
 
 /* ── Timing-safe comparison ──────────────────────────────────────────────── */
