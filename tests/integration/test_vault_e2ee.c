@@ -287,6 +287,39 @@ int main(int argc, char **argv) {
           "file1 v2 byte-identical after unlock-from-scratch round trip");
     free(down1b_buf);
 
+    /* ── Regression check (TASK-106 review finding): a vault handle from
+     * vw_vault_unlock (as opposed to vw_vault_setup) must still be able to
+     * create a brand-new file, not just download existing ones. Before
+     * the fix, vw_vault_unlock never learned the vault's folder_file_id,
+     * so vw_vault_upload_file's file_id==0 create-path had nowhere to
+     * point and every such upload was silently rejected by the server. ── */
+    char plain3_local[600], down3_local[600];
+    path_join(plain3_local, sizeof(plain3_local), tmpdir, "plain3.bin");
+    path_join(down3_local, sizeof(down3_local), tmpdir, "down3.bin");
+    const char *content3 = "a brand-new file created through an unlocked-from-scratch vault handle";
+    write_bytes(plain3_local, content3, strlen(content3));
+
+    uint64_t file3_id = 0, ver3_id = 0;
+    err = vault2 ? vw_vault_upload_file(vault2, sess, 0, "secret3.bin", plain3_local, NULL, NULL,
+                                         &file3_id, &ver3_id)
+                 : VW_ERR_INVALID_ARG;
+    CHECK(err == VW_OK, "create a new file through a vault handle from vw_vault_unlock");
+    CHECK(file3_id != 0 && file3_id != file1_id && file3_id != file2_id,
+          "the new file has its own distinct file_id");
+
+    if (err == VW_OK) {
+        err = vw_vault_download_file(vault2, sess, file3_id, down3_local, NULL, NULL);
+        CHECK(err == VW_OK, "download the file created through the unlocked-from-scratch handle");
+        void *down3_buf = NULL; size_t down3_len = 0;
+        err = vw_fs_read_file(down3_local, &down3_buf, &down3_len);
+        CHECK(err == VW_OK && down3_buf && down3_len == strlen(content3) &&
+              memcmp(down3_buf, content3, down3_len) == 0,
+              "new file's content byte-identical round trip");
+        free(down3_buf);
+    }
+    vw_fs_delete(plain3_local);
+    vw_fs_delete(down3_local);
+
     /* ── Wrong passphrase must fail, not silently produce garbage ── */
     vw_vault_t *vault_wrong = NULL;
     err = vw_vault_unlock(sess, vault_id, "totally the wrong passphrase", 28, &vault_wrong);

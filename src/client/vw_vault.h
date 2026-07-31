@@ -52,6 +52,20 @@ typedef struct vw_vault vw_vault_t;   /* opaque; holds the unwrapped VK */
 #define VW_VAULT_PLAINTEXT_CHUNK_BYTES (VW_CHUNK_SIZE_DEFAULT - VW_AES_GCM_TAG_BYTES)
 
 /*
+ * Minimum accepted length (bytes) for a new Encryption Passphrase, enforced
+ * by vw_vault_setup() only — never by vw_vault_unlock(), which must accept
+ * whatever passphrase a vault was actually created with, however weak,
+ * rather than lock the user out of their own existing vault (TASK-106
+ * review finding: nothing below the GUI layer rejected an empty/trivial
+ * passphrase before this). The Argon2id floor (§7.11.5) raises the cost of
+ * brute-forcing a stolen wrapped-VK blob; it does nothing to stop a
+ * trivially guessable passphrase, which this length floor is a minimal
+ * defense-in-depth measure against — not a substitute for real passphrase
+ * strength estimation, which is out of scope here.
+ */
+#define VW_VAULT_MIN_PASSPHRASE_BYTES 8u
+
+/*
  * Create a brand-new vault for folder_file_id (caller must own it),
  * derived from the given Encryption Passphrase. Generates a fresh random
  * VK, wraps it under a KEK derived via Argon2id, and registers the vault

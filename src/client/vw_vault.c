@@ -59,15 +59,27 @@ static vw_err_t decode_kdf_params(const uint8_t *buf, uint16_t len,
 /* ── VK wrap / unwrap ──────────────────────────────────────────────────────
  * wrapped_vk / wrapped_dek both use the same fixed 60-byte blob layout:
  * nonce[12] || ciphertext[N] || tag[16], where N is 32 for both VK and DEK
- * (both are VW_AES_GCM_KEY_BYTES). The wrap nonce is random and MAY be
- * reused across different key-wrap operations in principle (GCM's
- * nonce-reuse danger is reusing a (key, nonce) pair across two DIFFERENT
- * plaintexts under the SAME key) — but here every wrap operation uses a
- * freshly derived/generated KEK or VK that is never reused for another
- * wrap, so a random nonce is safe and simple: unlike per-chunk content
- * encryption (which reuses one DEK across many chunks and therefore needs
- * the deterministic scheme), each key-wrap here happens exactly once per
- * (wrapping key, wrapped key) pair.
+ * (both are VW_AES_GCM_KEY_BYTES).
+ *
+ * The wrap nonce is random, not the deterministic per-chunk scheme, and
+ * its safety argument differs by caller (TASK-106 review correction — an
+ * earlier version of this comment claimed every wrapping key is used
+ * exactly once, which is true for KEK→VK in vw_vault_setup but false for
+ * VK→DEK: the same VK wraps every file's DEK for that vault's whole
+ * lifetime):
+ *   - KEK→VK (vw_vault_setup): the KEK is freshly derived and used for
+ *     this one wrap only, so nonce reuse under that key is structurally
+ *     impossible regardless of nonce choice.
+ *   - VK→DEK (vw_vault_upload_file): the VK IS reused across every file
+ *     ever uploaded to the vault. Safety here rests on the standard
+ *     NIST SP 800-38D birthday-bound argument for independent random
+ *     96-bit GCM nonces under a fixed key — collision probability stays
+ *     negligible up to roughly 2^32 wraps, far beyond any realistic
+ *     per-vault file count. This is a different (weaker, probabilistic)
+ *     guarantee than the deterministic per-chunk scheme's "impossible by
+ *     construction," and any future change that increases per-vault wrap
+ *     volume by orders of magnitude (e.g. VK reuse across many vaults)
+ *     should re-examine this bound rather than assume it still holds.
  */
 #define VW_VAULT_WRAPPED_KEY_BYTES (VW_AES_GCM_NONCE_BYTES + VW_AES_GCM_KEY_BYTES + VW_AES_GCM_TAG_BYTES)
 
@@ -106,6 +118,7 @@ vw_err_t vw_vault_setup(vw_client_sess_t *sess, uint64_t folder_file_id,
                          vw_vault_t **out_vault, uint64_t *out_vault_id) {
     if (!sess || folder_file_id == 0 || !passphrase || !out_vault || !out_vault_id)
         return VW_ERR_INVALID_ARG;
+    if (passphrase_len < VW_VAULT_MIN_PASSPHRASE_BYTES) return VW_ERR_INVALID_ARG;
 
     vw_vault_kdf_params_t params = kdf_params ? *kdf_params
         : (vw_vault_kdf_params_t){ VW_VAULT_ARGON2_MIN_MEM_KB, VW_VAULT_ARGON2_MIN_TIME_COST,
@@ -154,9 +167,11 @@ vw_err_t vw_vault_unlock(vw_client_sess_t *sess, uint64_t vault_id,
     uint8_t  kdf_salt[VW_VAULT_KDF_SALT_BYTES];
     uint8_t *kdf_params_buf = NULL;
     uint16_t kdf_params_len = 0;
+    uint64_t folder_file_id = 0;
 
     vw_err_t err = vw_client_vault_key_fetch(sess, vault_id, &wrapped_vk, &wrapped_vk_len,
-                                              kdf_salt, &kdf_params_buf, &kdf_params_len);
+                                              kdf_salt, &kdf_params_buf, &kdf_params_len,
+                                              &folder_file_id);
     if (err != VW_OK) return err;
 
     vw_vault_kdf_params_t params;
@@ -183,7 +198,7 @@ vw_err_t vw_vault_unlock(vw_client_sess_t *sess, uint64_t vault_id,
     vw_vault_t *vault = malloc(sizeof(*vault));
     if (!vault) { vw_crypto_secure_zero(vk, sizeof(vk)); return VW_ERR_OOM; }
     vault->vault_id = vault_id;
-    vault->folder_file_id = 0;  /* not learned from VAULT_KEY_FETCH; caller may not need it */
+    vault->folder_file_id = folder_file_id;
     memcpy(vault->vk, vk, sizeof(vk));
     vw_crypto_secure_zero(vk, sizeof(vk));
 

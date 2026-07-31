@@ -2545,7 +2545,16 @@ static vw_err_t handle_vault_key_fetch(vw_store_t *store, vw_vault_store_t *vs,
         return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
     }
 
-    uint32_t resp_cap = 4u + 2u + rec.wrapped_vk_len + 16u + 2u + rec.kdf_params_len;
+    /* folder_file_id appended unconditionally (TASK-106 review finding):
+     * vw_vault_unlock() needs it to support uploading a brand-new file
+     * into a vault that was unlocked (not just created) this session —
+     * without it, vw_vault_upload_file's file_id==0 create-path had
+     * nowhere to point and every such upload was silently rejected by
+     * the server as an invalid absolute-path commit. Nothing optional
+     * follows it, so — same reasoning as FILE_STAT_RESP's vault_id —
+     * appending it unconditionally is simplest with no compatibility
+     * concern either way. */
+    uint32_t resp_cap = 4u + 2u + rec.wrapped_vk_len + 16u + 2u + rec.kdf_params_len + 8u;
     uint8_t *resp = (uint8_t *)malloc(resp_cap);
     if (!resp) {
         free(wrapped_vk); free(kdf_params);
@@ -2558,6 +2567,7 @@ static vw_err_t handle_vault_key_fetch(vw_store_t *store, vw_vault_store_t *vs,
     memcpy(resp + roff, rec.kdf_salt, 16); roff += 16u;
     (void)vw_proto_write_str(resp, resp_cap, &roff,
                               (const char *)kdf_params, (uint16_t)rec.kdf_params_len);
+    vw_write_u64le(resp + roff, rec.folder_file_id); roff += 8u;
 
     vw_err_t send_err = vw_proto_send(conn, VW_MSG_VAULT_KEY_FETCH_RESP, resp, roff);
     free(wrapped_vk); free(kdf_params); free(resp);

@@ -101,6 +101,23 @@ static void render_vault_warnings() {
 }
 
 static void render_setup_wizard(ClientApp &app) {
+    /* TASK-106 review finding: closing this modal via the window's native
+     * "X" (which ImGui::BeginPopupModal handles internally by flipping
+     * s_setup_open to false as a side effect, bypassing the Cancel/Create
+     * button handlers below that used to be the only places these buffers
+     * got zeroed) previously left a just-typed real passphrase sitting in
+     * these long-lived static buffers indefinitely. Detecting the
+     * open->closed transition here catches every closing path uniformly,
+     * at the cost of a one-frame delay after an X-close (buffers are
+     * still zeroed well before any plausible attacker could act on
+     * process memory). */
+    static bool was_open = false;
+    if (was_open && !s_setup_open) {
+        memset(s_setup_pass1, 0, sizeof(s_setup_pass1));
+        memset(s_setup_pass2, 0, sizeof(s_setup_pass2));
+    }
+    was_open = s_setup_open;
+
     if (!s_setup_open) return;
     ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Always);
     if (!ImGui::BeginPopupModal("Create Vault##dialog", &s_setup_open,
@@ -177,6 +194,13 @@ static void open_unlock_modal(uint64_t vault_id) {
 }
 
 static void render_unlock_modal(ClientApp &app) {
+    /* Same X-close zeroing fix as render_setup_wizard above. */
+    static bool was_open = false;
+    if (was_open && !s_unlock_open) {
+        memset(s_unlock_pass, 0, sizeof(s_unlock_pass));
+    }
+    was_open = s_unlock_open;
+
     if (!s_unlock_open) return;
     ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Always);
     if (!ImGui::BeginPopupModal("Unlock Vault##dialog", &s_unlock_open,
@@ -276,8 +300,8 @@ void vw_view_vault_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     ImGui::SameLine();
     if (ImGui::Button("Create New Vault...")) {
         s_setup_dirname[0] = '\0';
-        s_setup_pass1[0] = '\0';
-        s_setup_pass2[0] = '\0';
+        memset(s_setup_pass1, 0, sizeof(s_setup_pass1));
+        memset(s_setup_pass2, 0, sizeof(s_setup_pass2));
         s_setup_status[0] = '\0';
         s_setup_open = true;
         ImGui::OpenPopup("Create Vault##dialog");

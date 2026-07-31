@@ -1237,8 +1237,15 @@ right, distinct from any implementation bug.
 **VAULT_KEY_FETCH payload:** `session_token[32]`, `vault_id` (uint64).
 
 **VAULT_KEY_FETCH_RESP payload:** `error_code`, `wrapped_vk`, `kdf_salt`,
-`kdf_params` — same fields as `VAULT_CREATE`, letting a new device unwrap
-the VK locally after the user re-enters their encryption passphrase there.
+`kdf_params`, `folder_file_id` (uint64) — the first four mirror
+`VAULT_CREATE`, letting a new device unwrap the VK locally after the user
+re-enters their encryption passphrase there. `folder_file_id` was added
+after `TASK-100`'s review found that unlocking a vault (as opposed to
+creating it) left the client with no way to learn which folder a new file
+should be created under — `vw_vault_upload_file`'s create-new-file path
+needs it. No protocol version bump: nothing optional follows it in this
+response, so it is appended unconditionally, and an old client simply
+never reads that far.
 
 **VAULT_LIST / VAULT_LIST_RESP:** as named; list entries include `vault_id`,
 `folder_file_id`, `created_at` — never the wrapped-key material itself

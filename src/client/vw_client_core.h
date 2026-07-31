@@ -362,12 +362,16 @@ vw_err_t vw_client_vault_create(vw_client_sess_t *sess, uint64_t folder_file_id,
  * *out_wrapped_vk and *out_kdf_params are malloc'd; caller frees both
  * (out_kdf_params may be set to NULL with *out_kdf_params_len == 0 if the
  * vault was created with empty kdf_params). Returns VW_ERR_PERMISSION if
- * vault_id exists but isn't owned by the caller.
+ * vault_id exists but isn't owned by the caller. *out_folder_file_id (may
+ * be NULL if not needed) receives the vault's folder — vw_vault_unlock
+ * needs this so a vault unlocked (not created) this session can still
+ * have new files created in it.
  */
 vw_err_t vw_client_vault_key_fetch(vw_client_sess_t *sess, uint64_t vault_id,
                                     uint8_t **out_wrapped_vk, uint16_t *out_wrapped_vk_len,
                                     uint8_t out_kdf_salt[16],
-                                    uint8_t **out_kdf_params, uint16_t *out_kdf_params_len);
+                                    uint8_t **out_kdf_params, uint16_t *out_kdf_params_len,
+                                    uint64_t *out_folder_file_id);
 
 /*
  * List vaults owned by the caller. Never includes wrapped-key material —

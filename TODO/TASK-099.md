@@ -263,3 +263,45 @@ acceptance-test coverage (`test_vault_e2ee.c`):
   the direct regression test for the nonce-reuse gap `HKDF(DEK,
   chunk_index)` exists to close.
 All pass; no regressions found in this task's implementation.
+
+SEC.07 [2026-07-31, independent review]: An independent adversarial review
+(a fresh reviewer, not the original implementer) of `TASK-099`–`TASK-101`
+found two real issues in this task's code, both now fixed:
+
+1. **(High, functional) `vw_vault_unlock()` never populated
+   `vault->folder_file_id`**, so `vw_vault_upload_file`'s create-new-file
+   path (`file_id == 0`) had nowhere to point for any vault handle that
+   came from unlocking rather than creating — the server's
+   `handle_file_commit` would reject the resulting bare-leaf-name commit
+   as an invalid absolute path. Neither this task's nor `TASK-101`'s test
+   suite caught it because every test that called `vw_vault_unlock` only
+   used the resulting handle for downloads, never a new upload. Fixed by
+   extending `VAULT_KEY_FETCH_RESP` with the vault's `folder_file_id`
+   (docs/PROTOCOL.md §7.11.4, purely additive, same pattern as every
+   other trailing-field extension) and threading it through
+   `vw_client_vault_key_fetch`/`vw_vault_unlock`. Added a regression check
+   to `test_vault_e2ee.c` that specifically creates a new file through an
+   unlock-derived handle.
+2. **(Medium, comment correctness, not a vulnerability)** `wrap_key`'s
+   doc comment claimed every wrapping key is used exactly once, which is
+   true for KEK→VK but false for VK→DEK (the same VK wraps every file's
+   DEK for the vault's lifetime). The actual security property still
+   holds — NIST SP 800-38D's birthday bound for independent random 96-bit
+   GCM nonces under a fixed key, safe to ~2^32 wraps — but the comment
+   was rewritten to state that correctly rather than the wrong "never
+   reused" claim, since a future change trusting the wrong reasoning
+   could introduce a real bug.
+
+Also addressed as defense-in-depth (not blocking, but worth fixing while
+here): `vault_registry_put` (`vw_daemon.c`) leaked an unwrapped VK on its
+OOM path despite documenting "takes ownership unconditionally" — now
+actually unconditional. `vw_vault_setup` had no minimum passphrase length
+enforced below the GUI layer — added `VW_VAULT_MIN_PASSPHRASE_BYTES` (8),
+enforced only at creation, deliberately never at unlock (must not lock
+a user out of their own already-weakly-passphrased vault). GUI passphrase
+buffers (`vw_view_vault.cpp`) weren't zeroed when a dialog was dismissed
+via the window's native close button rather than Cancel/Create/Unlock —
+fixed via an open→closed transition check.
+
+Full GCC/WSL and MSVC rebuilds clean; full suite re-verified green after
+all fixes.

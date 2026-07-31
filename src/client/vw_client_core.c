@@ -1619,7 +1619,8 @@ vw_err_t vw_client_vault_create(vw_client_sess_t *sess, uint64_t folder_file_id,
 vw_err_t vw_client_vault_key_fetch(vw_client_sess_t *sess, uint64_t vault_id,
                                     uint8_t **out_wrapped_vk, uint16_t *out_wrapped_vk_len,
                                     uint8_t out_kdf_salt[16],
-                                    uint8_t **out_kdf_params, uint16_t *out_kdf_params_len)
+                                    uint8_t **out_kdf_params, uint16_t *out_kdf_params_len,
+                                    uint64_t *out_folder_file_id)
 {
     vw_err_t err;
     if (!sess || !out_wrapped_vk || !out_wrapped_vk_len || !out_kdf_salt) return VW_ERR_INVALID_ARG;
@@ -1665,11 +1666,15 @@ vw_err_t vw_client_vault_key_fetch(vw_client_sess_t *sess, uint64_t vault_id,
         memcpy(kdfp_copy, kdf_params, kdf_params_len);
     }
 
+    uint64_t folder_file_id = 0;
+    if (off + 8u <= rplen) folder_file_id = vw_read_u64le(rbuf + off);
+
     free(rbuf);
     *out_wrapped_vk = wvk_copy;
     *out_wrapped_vk_len = wrapped_vk_len;
     if (out_kdf_params) *out_kdf_params = kdfp_copy; else free(kdfp_copy);
     if (out_kdf_params_len) *out_kdf_params_len = kdf_params_len;
+    if (out_folder_file_id) *out_folder_file_id = folder_file_id;
     return VW_OK;
 }
 

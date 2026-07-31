@@ -385,7 +385,15 @@ static vw_err_t vault_registry_put(daemon_vault_registry_t *reg, uint64_t vault_
     if (reg->count >= reg->cap) {
         size_t new_cap = reg->cap ? reg->cap * 2 : 4;
         daemon_vault_entry_t *ne = realloc(reg->entries, new_cap * sizeof(*ne));
-        if (!ne) return VW_ERR_OOM;
+        if (!ne) {
+            /* TASK-106 review finding: this function's contract is
+             * "takes ownership unconditionally" — honor that even on
+             * this failure path, or the caller (which trusts the
+             * contract and never closes `vault` itself) leaks a live
+             * unwrapped VK. */
+            vw_vault_close(vault);
+            return VW_ERR_OOM;
+        }
         reg->entries = ne;
         reg->cap = new_cap;
     }
