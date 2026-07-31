@@ -15,7 +15,7 @@
 #include <atomic>
 #include <cstdint>
 
-enum class AppView { Login, Browser, Queue, Settings };
+enum class AppView { Login, Browser, Shared, Queue, Settings };
 
 class ClientApp {
 public:
@@ -52,6 +52,15 @@ public:
     int  ipc_folder_remove(const char *local);
     int  ipc_login(char *password, const char *otp);
     bool ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
+
+    int  ipc_share_grant(const char *virtual_path, const char *target_username,
+                          uint8_t permission, int64_t expires_at, uint64_t *out_share_id);
+    int  ipc_share_revoke(uint64_t share_id);
+    bool ipc_share_list(uint8_t mode, std::vector<VwGuiShareEntry> *out, int *out_error_code);
+    int  ipc_link_create(const char *virtual_path, uint8_t permission, int64_t expires_at,
+                          uint64_t *out_share_id, uint8_t out_token[32]);
+    int  ipc_link_revoke(uint64_t share_id);
+    bool ipc_link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code);
 
     uint16_t ipc_port = VW_IPC_DEFAULT_PORT;
 

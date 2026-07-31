@@ -126,6 +126,12 @@ typedef enum {
  *   i64    server_mtime
  *   i64    local_mtime
  *   u64    server_size
+ *   u64    file_id       server file_id (vw_cache_entry_t already tracks
+ *                        this; 0 = not yet uploaded — added for TASK-096,
+ *                        which needs it to cross-reference SHARE_LIST/
+ *                        LINK_LIST entries against browser rows). Internal
+ *                        daemon↔client IPC only, not the wire protocol to
+ *                        the server — no version negotiation needed.
  *
  * VW_IPC_FOLDER_ADD_RESP / VW_IPC_FOLDER_REMOVE_RESP / VW_IPC_SYNC_NOW_RESP /
  * VW_IPC_PAUSE_RESP / VW_IPC_RESUME_RESP / VW_IPC_SHUTDOWN_RESP:

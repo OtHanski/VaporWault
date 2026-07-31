@@ -48,6 +48,33 @@ struct VwGuiFileEntry {
     int64_t     server_mtime = 0;
     int64_t     local_mtime  = 0;
     uint64_t    server_size  = 0;
+    uint64_t    file_id      = 0; /* 0 = not yet uploaded */
+};
+
+/* Sharing (TASK-096; library: TASK-095, docs/PROTOCOL.md §7.5). Mirrors
+ * VW_IPC_SHARE_LIST_RESP / VW_IPC_LINK_LIST_RESP per-entry fields exactly
+ * (see vw_ipc.h's payload doc comments), field-for-field the same shape
+ * vapourwault-cli's `list-shares`/`list-links` decode. */
+struct VwGuiShareEntry {
+    uint64_t    share_id = 0;
+    uint64_t    file_id = 0;
+    std::string name;             /* shared item's leaf name; display-only */
+    uint8_t     share_type = 0;   /* 0 = user grant, 1 = public link */
+    std::string target_username;  /* empty for links */
+    uint8_t     permission = 0;   /* vw_perm_t */
+    int64_t     created_at = 0;
+    int64_t     expires_at = 0;   /* 0 = never */
+    uint8_t     revoked = 0;
+};
+
+struct VwGuiLinkEntry {
+    uint64_t    share_id = 0;
+    uint64_t    file_id = 0;
+    std::string name;
+    uint8_t     permission = 0;
+    int64_t     created_at = 0;
+    int64_t     expires_at = 0;
+    uint8_t     revoked = 0;
 };
 
 class VwGuiIpc {
@@ -98,6 +125,25 @@ public:
      * IPC failure (out is left unchanged).
      */
     bool file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
+
+    /*
+     * Sharing (TASK-096). All take a virtual_path — the daemon resolves it
+     * to a file_id via vw_client_file_stat before calling through (same
+     * as vapourwault-cli's share/create-link commands). Return an int
+     * error_code (0 = VW_OK) unless noted.
+     */
+    int share_grant(const char *virtual_path, const char *target_username,
+                     uint8_t permission, int64_t expires_at, uint64_t *out_share_id);
+    int share_revoke(uint64_t share_id);
+    bool share_list(uint8_t mode, std::vector<VwGuiShareEntry> *out, int *out_error_code);
+
+    /* out_token receives the raw 32-byte link token — meaningful only when
+     * the return value is 0; never re-fetchable afterward (server never
+     * re-discloses it), matching the CLI's own one-time-display handling. */
+    int link_create(const char *virtual_path, uint8_t permission, int64_t expires_at,
+                     uint64_t *out_share_id, uint8_t out_token[32]);
+    int link_revoke(uint64_t share_id);
+    bool link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code);
 
 private:
     uint16_t port_      = VW_IPC_DEFAULT_PORT;

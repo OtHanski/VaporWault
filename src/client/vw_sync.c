@@ -373,6 +373,10 @@ static int is_net_err(vw_err_t err) {
            err == VW_ERR_NET_TIMEOUT || err == VW_ERR_NET_TLS;
 }
 
+/* Defined below, near exec_action(); forward-declared here for oq_drain(). */
+static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
+                                        const char *virtual_path, const char *local_path);
+
 static void oq_drain(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
     uint32_t i = 0;
     while (i < ctx->oq_count) {
@@ -381,6 +385,8 @@ static void oq_drain(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
         switch (e->action) {
         case OQ_ACT_UPLOAD:
             err = vw_client_file_upload(sess, e->virtual_path, e->local_path, NULL, NULL);
+            if (err == VW_OK)
+                update_cache_after_upload(ctx, sess, e->virtual_path, e->local_path);
             break;
         case OQ_ACT_DOWNLOAD:
             err = vw_client_file_download(sess, e->virtual_path, e->local_path, NULL, NULL);
@@ -463,6 +469,44 @@ static void make_conflict_path(const char *local_path, int64_t ts,
         snprintf(out, outsz, "%s/%s.conflict.%s", dir, stem, ts_str);
 }
 
+/*
+ * After a successful upload, populate the cache entry's server-side fields
+ * (file_id, server_version_id, server_mtime, server_size) from a fresh
+ * FILE_STAT rather than leaving them at their pre-upload values.
+ *
+ * Bug found via TASK-096 (GUI sharing): vw_client_file_upload has no way to
+ * return the file_id/version_id FILE_COMMIT_ACK just handed back, so every
+ * call site here previously left ce.file_id at 0 after a file's first-ever
+ * upload — the comment "server_version_id will be refreshed on next server
+ * diff" assumed a later sync cycle's Pass 2 reconciliation would catch it,
+ * but that only fires when ce.server_version_id (still 0) doesn't match the
+ * server's version — which is true immediately after upload too, so in
+ * practice it did eventually self-heal on the *next* sync cycle, but left a
+ * real window where a freshly synced file's cache entry claims
+ * sync_state=SYNCED with file_id=0. Nothing could have shared that file by
+ * file_id in that window. Fixed by resolving it immediately instead of
+ * waiting.
+ */
+static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
+                                        const char *virtual_path, const char *local_path) {
+    vw_cache_entry_t ce;
+    if (vw_cache_get(ctx->cache, virtual_path, &ce) != VW_OK) return;
+
+    ce.local_mtime = get_mtime(local_path);
+    ce.local_size  = get_fsize(local_path);
+    ce.sync_state  = VW_SYNC_SYNCED;
+
+    vw_file_entry_t stat_entry;
+    if (vw_client_file_stat(sess, virtual_path, &stat_entry) == VW_OK) {
+        ce.file_id           = stat_entry.file_id;
+        ce.server_version_id = stat_entry.version_id;
+        ce.server_mtime      = stat_entry.mtime_unix;
+        ce.server_size       = stat_entry.size_bytes;
+    }
+
+    (void)vw_cache_upsert(ctx->cache, &ce);
+}
+
 /* ── Execute one action ───────────────────────────────────────────────────── */
 
 static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
@@ -477,15 +521,7 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         err = vw_client_file_upload(sess, a->virtual_path, a->local_path,
                                     sync_prog_cb, &prog);
         if (err == VW_OK) {
-            /* Update cache: mtime+size from local stat, state=SYNCED */
-            vw_cache_entry_t ce;
-            if (vw_cache_get(ctx->cache, a->virtual_path, &ce) == VW_OK) {
-                ce.local_mtime = get_mtime(a->local_path);
-                ce.local_size  = get_fsize(a->local_path);
-                ce.sync_state  = VW_SYNC_SYNCED;
-                /* server_version_id will be refreshed on next server diff */
-                (void)vw_cache_upsert(ctx->cache, &ce);
-            }
+            update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path);
         } else if (is_net_err(err)) {
             (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
             queued = 1;
@@ -576,13 +612,7 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         vw_err_t uerr = vw_client_file_upload(sess, a->virtual_path, a->local_path,
                                                sync_prog_cb, &prog);
         if (uerr == VW_OK) {
-            vw_cache_entry_t ce;
-            if (vw_cache_get(ctx->cache, a->virtual_path, &ce) == VW_OK) {
-                ce.local_mtime = get_mtime(a->local_path);
-                ce.local_size  = get_fsize(a->local_path);
-                ce.sync_state  = VW_SYNC_SYNCED;
-                (void)vw_cache_upsert(ctx->cache, &ce);
-            }
+            update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path);
         } else if (is_net_err(uerr)) {
             (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
             queued = 1;

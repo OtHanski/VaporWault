@@ -150,7 +150,7 @@ bool VwGuiIpc::file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
         uint16_t vplen = 0, lplen = 0;
         if (vw_ipc_read_str(resp.data(), rlen, &off, &vpath, &vplen) != VW_OK) break;
         if (vw_ipc_read_str(resp.data(), rlen, &off, &lpath, &lplen) != VW_OK) break;
-        if (off + 4u + 1u + 8u + 8u + 8u > rlen) break;
+        if (off + 4u + 1u + 8u + 8u + 8u + 8u > rlen) break;
 
         VwGuiFileEntry e;
         e.virtual_path.assign(vpath, vplen);
@@ -160,6 +160,145 @@ bool VwGuiIpc::file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
         e.server_mtime = read_i64_le(resp.data() + off); off += 8;
         e.local_mtime  = read_i64_le(resp.data() + off); off += 8;
         e.server_size  = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.file_id      = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        entries.push_back(std::move(e));
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
+int VwGuiIpc::share_grant(const char *virtual_path, const char *target_username,
+                           uint8_t permission, int64_t expires_at, uint64_t *out_share_id) {
+    uint8_t req[2u + 4096u + 2u + 65u + 1u + 8u]; uint32_t off = 0;
+    vw_ipc_write_str(req, sizeof(req), &off, virtual_path, (uint16_t)strlen(virtual_path));
+    vw_ipc_write_str(req, sizeof(req), &off, target_username, (uint16_t)strlen(target_username));
+    req[off++] = permission;
+    vw_write_u64le(req + off, (uint64_t)expires_at); off += 8;
+
+    uint8_t resp[12]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_SHARE_GRANT_REQ, req, off, VW_IPC_SHARE_GRANT_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 12) return (int)VW_ERR_IO;
+    uint32_t ec = read_u32_le(resp);
+    if (ec == 0 && out_share_id) *out_share_id = (uint64_t)read_i64_le(resp + 4);
+    return (int)ec;
+}
+
+int VwGuiIpc::share_revoke(uint64_t share_id) {
+    uint8_t req[8]; vw_write_u64le(req, share_id);
+    return simple_req_resp(VW_IPC_SHARE_REVOKE_REQ, VW_IPC_SHARE_REVOKE_RESP, req, sizeof(req));
+}
+
+int VwGuiIpc::link_revoke(uint64_t share_id) {
+    uint8_t req[8]; vw_write_u64le(req, share_id);
+    return simple_req_resp(VW_IPC_LINK_REVOKE_REQ, VW_IPC_LINK_REVOKE_RESP, req, sizeof(req));
+}
+
+bool VwGuiIpc::share_list(uint8_t mode, std::vector<VwGuiShareEntry> *out, int *out_error_code) {
+    uint8_t req[1] = { mode };
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_SHARE_LIST_REQ, req, sizeof(req), VW_IPC_SHARE_LIST_RESP,
+                             resp.data(), kRespCap, &rlen);
+    if (err != VW_OK) { if (out_error_code) *out_error_code = (int)err; return false; }
+    if (rlen < 8) { if (out_error_code) *out_error_code = (int)VW_ERR_IO; return false; }
+
+    uint32_t ec = read_u32_le(resp.data());
+    if (out_error_code) *out_error_code = (int)ec;
+    if (ec != 0) return false;
+
+    uint32_t count = read_u32_le(resp.data() + 4);
+    uint32_t off = 8;
+    std::vector<VwGuiShareEntry> entries;
+    entries.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 16u > rlen) break;
+        VwGuiShareEntry e;
+        e.share_id = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.file_id  = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+
+        const char *name = nullptr; uint16_t nlen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &off, &name, &nlen) != VW_OK) break;
+        e.name.assign(name, nlen);
+        if (off + 1u > rlen) break;
+        e.share_type = resp[off++];
+
+        const char *tgt = nullptr; uint16_t tlen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &off, &tgt, &tlen) != VW_OK) break;
+        e.target_username.assign(tgt, tlen);
+
+        if (off + 1u + 8u + 8u + 1u > rlen) break;
+        e.permission = resp[off++];
+        e.created_at = read_i64_le(resp.data() + off); off += 8;
+        e.expires_at = read_i64_le(resp.data() + off); off += 8;
+        e.revoked    = resp[off++];
+        entries.push_back(std::move(e));
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
+int VwGuiIpc::link_create(const char *virtual_path, uint8_t permission, int64_t expires_at,
+                           uint64_t *out_share_id, uint8_t out_token[32]) {
+    uint8_t req[2u + 4096u + 1u + 8u]; uint32_t off = 0;
+    vw_ipc_write_str(req, sizeof(req), &off, virtual_path, (uint16_t)strlen(virtual_path));
+    req[off++] = permission;
+    vw_write_u64le(req + off, (uint64_t)expires_at); off += 8;
+
+    uint8_t resp[4u + 8u + 32u]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_LINK_CREATE_REQ, req, off, VW_IPC_LINK_CREATE_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < sizeof(resp)) { memset(resp, 0, sizeof(resp)); return (int)VW_ERR_IO; }
+
+    uint32_t ec = read_u32_le(resp);
+    if (ec == 0) {
+        if (out_share_id) *out_share_id = (uint64_t)read_i64_le(resp + 4);
+        if (out_token) memcpy(out_token, resp + 12, 32);
+    }
+    memset(resp, 0, sizeof(resp)); /* never let the raw token linger */
+    return (int)ec;
+}
+
+bool VwGuiIpc::link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code) {
+    uint8_t req[8] = {0}; /* file_id_filter=0 — all my links, matching the CLI */
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_LINK_LIST_REQ, req, sizeof(req), VW_IPC_LINK_LIST_RESP,
+                             resp.data(), kRespCap, &rlen);
+    if (err != VW_OK) { if (out_error_code) *out_error_code = (int)err; return false; }
+    if (rlen < 8) { if (out_error_code) *out_error_code = (int)VW_ERR_IO; return false; }
+
+    uint32_t ec = read_u32_le(resp.data());
+    if (out_error_code) *out_error_code = (int)ec;
+    if (ec != 0) return false;
+
+    uint32_t count = read_u32_le(resp.data() + 4);
+    uint32_t off = 8;
+    std::vector<VwGuiLinkEntry> entries;
+    entries.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 16u > rlen) break;
+        VwGuiLinkEntry e;
+        e.share_id = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.file_id  = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+
+        const char *name = nullptr; uint16_t nlen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &off, &name, &nlen) != VW_OK) break;
+        e.name.assign(name, nlen);
+
+        if (off + 1u + 8u + 8u + 1u > rlen) break;
+        e.permission = resp[off++];
+        e.created_at = read_i64_le(resp.data() + off); off += 8;
+        e.expires_at = read_i64_le(resp.data() + off); off += 8;
+        e.revoked    = resp[off++];
         entries.push_back(std::move(e));
     }
 

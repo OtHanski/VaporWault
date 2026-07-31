@@ -529,8 +529,8 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         (void)vw_cache_list(dc->cache, state_filter, &entries, &ne);
         uint8_t *rbuf = malloc(65536);
         if (!rbuf) { free(entries); vw_ipc_send(conn, VW_IPC_FILE_LIST_RESP, NULL, 0); break; }
-        uint32_t roff = 0;
-        vw_write_u32le(rbuf + roff, ne); roff += 4;
+        uint32_t roff = 4; /* count patched in below once the real written count is known */
+        uint32_t written = 0;
         for (uint32_t i = 0; i < ne && roff + 2048 < 65536; i++) {
             const vw_cache_entry_t *e = &entries[i];
             /* Filter by virtual prefix if provided */
@@ -549,7 +549,16 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_write_u64le(rbuf + roff, (uint64_t)e->server_mtime); roff += 8;
             vw_write_u64le(rbuf + roff, (uint64_t)e->local_mtime);  roff += 8;
             vw_write_u64le(rbuf + roff, e->server_size);             roff += 8;
+            vw_write_u64le(rbuf + roff, e->file_id);                 roff += 8;
+            written++;
         }
+        /* Patch the real count now — cannot have been known up front since
+         * the prefix filter above may skip entries (TASK-096 fix: this
+         * previously wrote the raw pre-filter count `ne`, silently
+         * corrupting the decode whenever a prefix filter actually excluded
+         * anything, since the header would then overstate how many
+         * entries the receiver should try to read). */
+        vw_write_u32le(rbuf, written);
         free(entries);
         vw_ipc_send(conn, VW_IPC_FILE_LIST_RESP, rbuf, roff);
         free(rbuf);
