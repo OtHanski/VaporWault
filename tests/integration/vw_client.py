@@ -75,6 +75,14 @@ MSG_LINK_LIST_RESP     = 0x050C
 MSG_LINK_ACCESS        = 0x050D
 MSG_LINK_ACCESS_ACK    = 0x050E
 
+# Vault / E2EE (TASK-098)
+MSG_VAULT_CREATE          = 0x0801
+MSG_VAULT_CREATE_ACK      = 0x0802
+MSG_VAULT_KEY_FETCH       = 0x0803
+MSG_VAULT_KEY_FETCH_RESP  = 0x0804
+MSG_VAULT_LIST            = 0x0805
+MSG_VAULT_LIST_RESP       = 0x0806
+
 VW_PERM_NONE  = 0
 VW_PERM_VIEW  = 1
 VW_PERM_EDIT  = 2
@@ -95,6 +103,7 @@ ADMIN_OPLOG_TAIL_RESP  = 0x9008
 
 # Error codes
 VW_OK                  = 0
+VW_ERR_INVALID_ARG     = 3
 VW_ERR_NOT_FOUND       = 5
 VW_ERR_PERMISSION      = 7
 VW_ERR_AUTH_BAD_CREDS  = 300
@@ -145,6 +154,13 @@ def _read_frame(sock):
 def _encode_str(s):
     b = s.encode("utf-8") if isinstance(s, str) else s
     return struct.pack("<H", len(b)) + b
+
+
+def _read_str(buf, off):
+    """Decode a u16-length-prefixed byte string at off. Returns (bytes, new_off)."""
+    n = struct.unpack_from("<H", buf, off)[0]
+    off += 2
+    return buf[off:off + n], off + n
 
 
 # ── VwClient ──────────────────────────────────────────────────────────────────
@@ -310,12 +326,16 @@ class VwClient:
 
     # ── File operations ─────────────────────────────────────────────────────
 
-    def file_commit(self, session_token, path, chunk_hashes, file_id=0, logical_size=None):
+    def file_commit(self, session_token, path, chunk_hashes, file_id=0, logical_size=None,
+                     vault_id=0, wrapped_dek=None):
         """
         Finalise a file upload.
 
         chunk_hashes: ordered list of bytes[32].
         logical_size: total file size; defaults to sum of chunk sizes if None.
+        vault_id/wrapped_dek (TASK-098): optional trailing fields marking this
+        version as belonging to a vault — omit both (defaults) for a plain
+        unencrypted file, exactly like every pre-TASK-098 caller of this method.
         Returns (file_id, version_id).
         """
         if logical_size is None:
@@ -327,6 +347,8 @@ class VwClient:
             + _encode_str(path_b)
             + b"".join(chunk_hashes)
         )
+        if vault_id:
+            payload += struct.pack("<Q", vault_id) + _encode_str(wrapped_dek)
         self._send(MSG_FILE_COMMIT, payload)
         mt, resp = self._recv()
         self._expect(MSG_FILE_COMMIT_ACK, mt, resp)
@@ -618,6 +640,60 @@ class VwClient:
         if error_code != VW_OK:
             raise VwProtocolError(error_code, "version restore failed")
         return new_version_id
+
+    # ── Vault / E2EE (TASK-098) ──────────────────────────────────────────────
+
+    def vault_create(self, session_token, folder_file_id, wrapped_vk, kdf_salt, kdf_params=b""):
+        """Register a new vault. wrapped_vk/kdf_params are opaque bytes. Returns vault_id."""
+        assert len(kdf_salt) == 16, "kdf_salt must be exactly 16 bytes"
+        payload = (
+            bytes(session_token)
+            + struct.pack("<Q", folder_file_id)
+            + _encode_str(wrapped_vk)
+            + bytes(kdf_salt)
+            + _encode_str(kdf_params)
+        )
+        self._send(MSG_VAULT_CREATE, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_VAULT_CREATE_ACK, mt, resp)
+        error_code, vault_id = struct.unpack_from("<IQ", resp, 0)
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "vault create failed")
+        return vault_id
+
+    def vault_key_fetch(self, session_token, vault_id):
+        """Fetch a vault's wrapped VK blob. Returns (wrapped_vk, kdf_salt, kdf_params)."""
+        payload = bytes(session_token) + struct.pack("<Q", vault_id)
+        self._send(MSG_VAULT_KEY_FETCH, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_VAULT_KEY_FETCH_RESP, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "vault key fetch failed")
+        off = 4
+        wrapped_vk, off = _read_str(resp, off)
+        kdf_salt = resp[off:off + 16]; off += 16
+        kdf_params, off = _read_str(resp, off)
+        return wrapped_vk, kdf_salt, kdf_params
+
+    def vault_list(self, session_token):
+        """List my vaults. Returns list of {vault_id, folder_file_id, created_at}."""
+        payload = bytes(session_token)
+        self._send(MSG_VAULT_LIST, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_VAULT_LIST_RESP, mt, resp)
+        count = struct.unpack_from("<I", resp, 0)[0]
+        off = 4
+        vaults = []
+        for _ in range(count):
+            vault_id, folder_file_id, created_at = struct.unpack_from("<QQq", resp, off)
+            off += 24
+            vaults.append({
+                "vault_id": vault_id,
+                "folder_file_id": folder_file_id,
+                "created_at": created_at,
+            })
+        return vaults
 
     # ── High-level helpers ──────────────────────────────────────────────────
 

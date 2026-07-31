@@ -60,6 +60,7 @@ typedef enum {
     VW_OPLOG_PERM_WRITE    = 0x04,  /* permission record changed     */
     VW_OPLOG_SESSION_WRITE = 0x05,  /* session created/invalidated   */
     VW_OPLOG_CHUNK_WRITE   = 0x06,  /* chunk ref-count changed (GC)  */
+    VW_OPLOG_VAULT_WRITE   = 0x07,  /* vault (TASK-098) registered   */
 } vw_oplog_op_t;
 
 /* ── Opaque context ────────────────────────────────────────────────────────── */

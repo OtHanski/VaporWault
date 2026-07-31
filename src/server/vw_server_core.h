@@ -27,6 +27,7 @@
 #include "vw_store.h"
 #include "vw_storage.h"
 #include "vw_oplog.h"
+#include "vw_vault.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,6 +108,14 @@ vw_invite_store_t *vw_server_ctx_invite_store(const vw_server_ctx_t *ctx);
 void              vw_server_ctx_set_share_store(vw_server_ctx_t *ctx,
                                                  vw_share_store_t *share_store);
 vw_share_store_t *vw_server_ctx_share_store(const vw_server_ctx_t *ctx);
+
+/*
+ * Attach the vault store (TASK-098). Borrowed; caller keeps it alive until
+ * vw_server_ctx_close. May be NULL — VAULT_* messages return VW_ERR_NOT_IMPL.
+ */
+void              vw_server_ctx_set_vault_store(vw_server_ctx_t *ctx,
+                                                 vw_vault_store_t *vault_store);
+vw_vault_store_t *vw_server_ctx_vault_store(const vw_server_ctx_t *ctx);
 
 /*
  * Attach the oplog for AUDIT_QUERY support over TLS.

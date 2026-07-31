@@ -622,6 +622,7 @@ int vw_server_main_run(int argc, char *argv[]) {
     vw_server_ctx_t     *sctx           = NULL;
     vw_invite_store_t   *invite_store   = NULL;
     vw_share_store_t    *share_store    = NULL;
+    vw_vault_store_t    *vault_store    = NULL;
     vw_recovery_store_t *recovery_store = NULL;
     vw_net_ctx_t        *net_ctx        = NULL;
     vw_admin_server_t *admin_srv    = NULL;
@@ -678,6 +679,14 @@ int vw_server_main_run(int argc, char *argv[]) {
     } else {
         vw_server_ctx_set_share_store(sctx, share_store);
         vw_log(LOG_INFO, "share store opened");
+    }
+
+    /* TASK-098: vault store — VAULT_* messages return VW_ERR_NOT_IMPL if this fails. */
+    if (vw_vault_store_open(cfg.data_dir, oplog, &vault_store) != VW_OK) {
+        vw_log(LOG_WARN, "vault store open failed — vaults disabled");
+    } else {
+        vw_server_ctx_set_vault_store(sctx, vault_store);
+        vw_log(LOG_INFO, "vault store opened");
     }
 
     if (vw_recovery_store_open(cfg.data_dir, &recovery_store) != VW_OK) {
@@ -876,6 +885,7 @@ shutdown:
     if (recovery_store) vw_recovery_store_close(recovery_store);
     if (invite_store)   vw_invite_store_close(invite_store);
     if (share_store)    vw_share_store_close(share_store);
+    if (vault_store)    vw_vault_store_close(vault_store);
     if (file_store)   vw_file_store_close(file_store);
     if (store)        vw_store_close(store);
     if (oplog)      vw_oplog_close(oplog);

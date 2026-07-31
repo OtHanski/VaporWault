@@ -1198,18 +1198,45 @@ the VK locally after the user re-enters their encryption passphrase there.
 (no legitimate client need to enumerate other vaults' key blobs in a list
 view).
 
-File commit (`FILE_COMMIT`, §7.3 — not modified here in payload shape but
-extended in meaning) additionally carries, for files under a vault: the
-owning `vault_id` and the file's own wrapped DEK, stored alongside that
-file's version record. `vw_version_record_t` has 32 reserved bytes
-(`_reserved[32]`) available to carry a `vault_id` + an offset/length into
-the existing variable-length blob area (`versions.blob`, already used for
-the chunk hash list) where the wrapped DEK itself is stored — mirroring the
-existing pattern of using that blob area for per-version variable-length
-data rather than growing the fixed-size record. Exact byte layout is left to
-`TASK-098` (SRV.01) to finalize alongside a CQR.08 review of the on-disk
-compatibility claim, matching how `TASK-090`'s `deleted_at` field was
-finalized and reviewed.
+**FILE_COMMIT extension (finalized 2026-07-31, `TASK-098`):** `FILE_COMMIT`
+(§7.2) gains two optional trailing fields, appended after the existing
+`chunk_hashes` array:
+
+| Field       | Type              | Notes |
+|-------------|-------------------|-------|
+| vault_id    | uint64 (optional) | Absent (payload simply ends after `chunk_hashes`) = unencrypted, identical to every pre-`TASK-098` client. 0 is not a valid non-absent value here — a client either omits this field or sends a real nonzero `vault_id`. |
+| wrapped_dek | string (only present if `vault_id` is present and nonzero) | Opaque bytes, server never inspects content — only presence and a size ceiling (`VW_VAULT_MAX_WRAPPED_VK_BYTES`-equivalent, checked server-side). |
+
+Purely additive and optional in both directions — no protocol version bump:
+an old server ignores trailing bytes it never reads past `chunk_hashes`
+(unaffected by a hypothetical future client sending them); an old client
+never sends them at all. The server validates `vault_id` (if present)
+references a real vault owned by the file's actual owner (`file_rec.
+owner_id`, not necessarily the acting session's `user_id` — same
+quota/ownership resolution rule as everything else in §7.5) before
+accepting the commit.
+
+`vw_version_record_t`'s former 32 reserved bytes (`_reserved[32]`) are now:
+`vault_id` (uint64, 0 = not encrypted), `wrapped_dek_offset` (uint64, byte
+offset into `versions.blob` immediately following that version's chunk
+hashes), `wrapped_dek_len` (uint32, 0 when `vault_id == 0`), and 12
+remaining reserved bytes. A version record written before this field
+existed reads back with `vault_id == 0` for free — every prior write path
+already zeroed this exact byte range (`memset(w._reserved, 0, ...)` in
+`vw_store_version_create`), so no migration is needed; confirmed by
+`test_vw_vault.c`'s dedicated layout test. `_Static_assert(sizeof(
+vw_version_record_t) == 80, ...)` (unchanged) enforces the on-disk
+compatibility claim at compile time, reviewed by CQR.08 matching how
+`TASK-090`'s `deleted_at` field was finalized and reviewed.
+
+**Known gap, deliberately not addressed here (flagged for `TASK-099`):** no
+existing wire response (`FILE_STAT_RESP`, `VERSION_LIST_RESP`,
+`VERSION_CHUNKS_RESP`) surfaces a version's `vault_id`/wrapped DEK back to
+a *downloading* client — the extension above only covers the upload
+direction. `TASK-099` (client vault module) will need this to actually
+decrypt a downloaded file, and implementing it without a real client to
+validate the design against risked guessing wrong; better to let the
+consuming client's actual needs drive that extension's shape.
 
 ### 7.11.5 Security properties for review
 
@@ -1326,6 +1353,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 12      | 2026-07-31 | SRV.01  | Vault/E2EE (§7.11) implemented server-side, resolving `TASK-098`: `VAULT_CREATE`/`_ACK`, `VAULT_KEY_FETCH`/`_RESP`, `VAULT_LIST`/`_RESP` (0x0801–0x0806, first-ever handlers for opcodes reserved since version 8) plus the `FILE_COMMIT` `vault_id`/`wrapped_dek` extension and `vw_version_record_t`'s finalized `_reserved[32]` layout (see §7.11.4 for both). The server never sees unwrapped key material or plaintext at any point — SEC.07 confirmed no code path (including oplog replay) logs, caches, or persists anything beyond the opaque blobs the client sends. Purely additive/optional: no existing message's byte layout changed for any client that omits the two new optional `FILE_COMMIT` fields, no protocol version bump required. Client-side vault module (`TASK-099`) and the download-direction wire gap noted in §7.11.4 remain open. |
 | 11      | 2026-07-31 | PRT.04  | `FILE_MKDIR`/`FILE_MKDIR_ACK` (0x0211/0x0212) defined and implemented server-side, resolving `TASK-104` — the first wire mechanism to create a `VW_ENTRY_DIR` record at all (previously only reachable via direct `vw_store_file_create` calls, bypassing the wire; see §7.2 for the full payload spec and its permission/rate-limit rules). Purely additive: no existing message's byte layout changed, no protocol version bump required. |
 | 10      | 2026-07-30 | SRV.01  | Sharing (§7.5/§7.10) implemented server-side, resolving `TASK-094`. No existing message's wire byte layout changed — every SHARE_*/LINK_* message here is newly used (previous `SUB_CREATE`/`SUB_DELETE` never had a handler), and existing messages (`FILE_LIST`, `FILE_STAT`, `FILE_COMMIT`, `FILE_DELETE`, `VERSION_LIST`/`_RESTORE`/`_CHUNKS`, `CHUNK_UPLOAD`/`_DOWNLOAD_REQ`) keep their exact prior byte layout — only the server's permission-check and quota-attribution logic behind them changed. Two purely additive definitions: `FILE_MOVE`/`FILE_MOVE_ACK` (0x020F/0x0210) gets its first-ever payload (see §7.2) — the opcode existed but no handler did; error code 605 (`VW_ERR_RATE_LIMITED`, §10.1) added for the new scoped-session write-count limit. No protocol version bump required since no existing client-observable byte layout changed. |
 | 9       | 2026-07-29 | SRV.01  | §7.6 documents fine-grained admin capability requirements (TASK-092, implemented — not design-stage): `USER_LIST`/`USER_SUSPEND`/`INVITE_CREATE` require `VW_CAP_USER_MGMT`, `QUOTA_ADJUST` requires `VW_CAP_QUOTA_MGMT`, `AUDIT_QUERY` requires `VW_CAP_AUDIT_READ`, `CLUSTER_STATUS` (§7.7) requires `VW_CAP_CLUSTER_MGMT`; an authenticated admin lacking the required capability now gets `VW_ERR_PERMISSION` rather than succeeding. No wire payload shapes changed — this documents new server-side authorization behavior on existing messages. CQR.08 finding: the doc previously described only the blanket `is_admin` gate |

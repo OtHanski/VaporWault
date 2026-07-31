@@ -2,6 +2,7 @@
 #include "vw_cluster.h"
 #include "vw_invite.h"
 #include "vw_share.h"
+#include "vw_vault.h"
 #include "vw_store.h"
 #include "vw_storage.h"
 #include "vw_oplog.h"
@@ -747,6 +748,7 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
                                     vw_file_store_t  *fs,
                                     vw_storage_t     *cs,
                                     vw_share_store_t *ss,
+                                    vw_vault_store_t *vs,
                                     vw_conn_t        *conn,
                                     const uint8_t    *payload,
                                     uint32_t          plen)
@@ -806,6 +808,30 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
     if (var_len - off < hash_bytes)
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
     const uint8_t *chunk_hashes = var + off;
+    off += hash_bytes;
+
+    /* TASK-098 (E2EE, docs/PROTOCOL.md §7.11.4): optional trailing fields
+     * for a vault-encrypted file's version — vault_id(u64) + wrapped_dek
+     * (string). Absent entirely (the payload simply ends after
+     * chunk_hashes) means an unencrypted file, exactly how every
+     * pre-TASK-098 client's FILE_COMMIT already looks — no version bump
+     * needed in either direction: an old server ignores these trailing
+     * bytes (it never reads past hash_bytes), and an old client simply
+     * never sends them. Ownership/vault-existence validation happens
+     * further below, once file_rec is resolved. */
+    uint64_t vault_id = 0;
+    const char *wrapped_dek = NULL;
+    uint16_t wrapped_dek_len = 0;
+    if (var_len - off >= 8u) {
+        vault_id = vw_read_u64le(var + off); off += 8u;
+        if (vault_id != 0) {
+            err = vw_proto_read_str(var, var_len, &off, &wrapped_dek, &wrapped_dek_len);
+            if (err != VW_OK)
+                return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+            if (wrapped_dek_len == 0)
+                return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+        }
+    }
 
     /* Verify all chunks exist in chunk store. */
     if (chunk_count > 0) {
@@ -932,6 +958,26 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
         }
     }
 
+    /* TASK-098 (E2EE): a vault_id, if given, must reference a real vault
+     * owned by this file's actual owner (file_rec.owner_id, resolved
+     * above — not necessarily the acting session's user_id, mirroring the
+     * quota/ownership resolution rule already applied to chunks below).
+     * The server never inspects wrapped_dek's content — only its presence
+     * and size ceiling (already checked above) — it is opaque bytes
+     * stored alongside the version, exactly like wrapped_vk/kdf_params in
+     * vw_vault.c. */
+    if (vault_id != 0) {
+        if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+        vw_vault_record_t vault_rec;
+        uint8_t *unused_vk = NULL, *unused_params = NULL;
+        err = vw_vault_get_by_id(vs, vault_id, &vault_rec, &unused_vk, &unused_params);
+        free(unused_vk); free(unused_params);
+        if (err != VW_OK)
+            return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+        if (vault_rec.owner_id != file_rec.owner_id)
+            return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+    }
+
     /* Create the version record. */
     vw_version_record_t ver_rec;
     memset(&ver_rec, 0, sizeof(ver_rec));
@@ -939,6 +985,7 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
     ver_rec.created_at  = (uint64_t)time(NULL);
     ver_rec.size_bytes  = logical_size;
     ver_rec.chunk_count = chunk_count;
+    ver_rec.vault_id    = vault_id;
 
     uint64_t new_version_id = 0;
     uint64_t new_file_id    = file_id;
@@ -954,7 +1001,9 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
         ver_rec.file_id = new_file_id;
     }
 
-    err = vw_store_version_create(fs, &ver_rec, chunk_hashes, &new_version_id);
+    err = vw_store_version_create(fs, &ver_rec, chunk_hashes,
+                                   (const uint8_t *)wrapped_dek, wrapped_dek_len,
+                                   &new_version_id);
     if (err != VW_OK) {
         for (uint32_t c = 0; c < chunk_count; c++)
             (void)vw_storage_chunk_decref(cs, chunk_hashes + (size_t)c * VW_HASH_BYTES);
@@ -1236,16 +1285,40 @@ static vw_err_t handle_version_restore(vw_store_t       *store,
         }
     }
 
-    /* Create a new version record copying src_ver's chunk list. */
+    /* Create a new version record copying src_ver's chunk list. TASK-098:
+     * also carry forward vault_id/wrapped_dek unchanged if the restored
+     * version was encrypted — this is re-pointing HEAD at the same
+     * already-encrypted ciphertext, not a new encryption operation, so
+     * there is no new DEK to generate (the "new version -> new DEK" rule,
+     * §7.11.2, applies to genuinely new content, which a restore doesn't
+     * produce). The wrapped_dek bytes themselves are duplicated into a
+     * fresh blob region rather than referencing the old one, exactly like
+     * src_hashes above — consistent with this function's existing
+     * duplicate-don't-reference pattern for chunk hashes on restore. */
+    uint8_t *src_wrapped_dek = NULL;
+    if (src_ver.vault_id != 0) {
+        err = vw_store_version_get_wrapped_dek(fs, &src_ver, &src_wrapped_dek);
+        if (err != VW_OK) {
+            for (uint32_t c = 0; c < src_ver.chunk_count; c++)
+                (void)vw_storage_chunk_decref(cs, src_hashes + (size_t)c * VW_HASH_BYTES);
+            free(src_hashes);
+            return (send_error(conn, err), VW_OK);
+        }
+    }
+
     vw_version_record_t new_ver;
     memset(&new_ver, 0, sizeof(new_ver));
     new_ver.file_id     = src_ver.file_id;
     new_ver.created_at  = (uint64_t)time(NULL);
     new_ver.size_bytes  = src_ver.size_bytes;
     new_ver.chunk_count = src_ver.chunk_count;
+    new_ver.vault_id    = src_ver.vault_id;
 
     uint64_t new_version_id = 0;
-    err = vw_store_version_create(fs, &new_ver, src_hashes, &new_version_id);
+    err = vw_store_version_create(fs, &new_ver, src_hashes,
+                                   src_wrapped_dek, src_ver.wrapped_dek_len,
+                                   &new_version_id);
+    free(src_wrapped_dek);
     if (err != VW_OK) {
         /* Undo ref_count bumps before releasing src_hashes. */
         for (uint32_t c = 0; c < new_ver.chunk_count; c++)
@@ -2324,6 +2397,184 @@ static vw_err_t handle_link_list(vw_store_t *store, vw_file_store_t *fs,
     return err;
 }
 
+/* ── Vault / E2EE (TASK-098; docs/PROTOCOL.md §7.11) ──────────────────────
+ * The server treats wrapped_vk/kdf_params as fully opaque bytes — no
+ * parsing, no validation beyond size ceilings (vw_vault.h). No content
+ * decryption or key material ever exists server-side; these handlers only
+ * store/return already-wrapped blobs.
+ */
+
+/* VAULT_CREATE: session_token[32] + folder_file_id(u64) + wrapped_vk(string)
+ * + kdf_salt[16] + kdf_params(string). ACK: error_code(u32) + vault_id(u64). */
+static vw_err_t handle_vault_create(vw_store_t *store, vw_file_store_t *fs,
+                                     vw_vault_store_t *vs, vw_conn_t *conn,
+                                     const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    uint64_t folder_file_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+
+    const uint8_t *var = payload + VW_TOKEN_BYTES + 8u;
+    uint32_t var_len   = plen - VW_TOKEN_BYTES - 8u;
+    uint32_t off = 0;
+
+    const char *wrapped_vk; uint16_t wrapped_vk_len;
+    err = vw_proto_read_str(var, var_len, &off, &wrapped_vk, &wrapped_vk_len);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    /* wrapped_vk_len == 0 / oversized are well-formed-but-invalid *values*,
+     * not a malformed encoding — matches handle_share_grant's convention
+     * of VW_ERR_INVALID_ARG for a semantically-invalid field value (e.g.
+     * an out-of-range permission byte) vs. VW_ERR_PROTO_TRUNCATED/_INVALID
+     * for the wire encoding itself being broken. */
+    if (wrapped_vk_len == 0 || wrapped_vk_len > VW_VAULT_MAX_WRAPPED_VK_BYTES)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    if (off + 16u > var_len)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    const uint8_t *kdf_salt = var + off; off += 16u;
+
+    const char *kdf_params; uint16_t kdf_params_len;
+    err = vw_proto_read_str(var, var_len, &off, &kdf_params, &kdf_params_len);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    if (kdf_params_len > VW_VAULT_MAX_KDF_PARAMS_BYTES)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    /* Only the folder/file's owner may opt it into encryption. */
+    vw_file_record_t folder_rec;
+    if (vw_store_file_get_by_id(fs, folder_file_id, &folder_rec) != VW_OK)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    if (folder_rec.owner_id != user_id)
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+
+    uint64_t vault_id = 0;
+    err = vw_vault_create(vs, user_id, folder_file_id,
+                           (const uint8_t *)wrapped_vk, wrapped_vk_len, kdf_salt,
+                           kdf_params_len ? (const uint8_t *)kdf_params : NULL, kdf_params_len,
+                           &vault_id);
+    if (err != VW_OK)
+        return (send_error(conn, err), VW_OK);
+
+    uint8_t ack[12];
+    vw_write_u32le(ack, 0u);
+    vw_write_u64le(ack + 4u, vault_id);
+    return vw_proto_send(conn, VW_MSG_VAULT_CREATE_ACK, ack, sizeof(ack));
+}
+
+/* VAULT_KEY_FETCH: session_token[32] + vault_id(u64).
+ * RESP: error_code(u32) + wrapped_vk(string) + kdf_salt[16] + kdf_params(string). */
+static vw_err_t handle_vault_key_fetch(vw_store_t *store, vw_vault_store_t *vs,
+                                        vw_conn_t *conn,
+                                        const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    uint64_t vault_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+
+    vw_vault_record_t rec;
+    uint8_t *wrapped_vk = NULL, *kdf_params = NULL;
+    err = vw_vault_get_by_id(vs, vault_id, &rec, &wrapped_vk, &kdf_params);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+    /* Same "id exists but isn't yours -> PERMISSION" convention as
+     * SHARE_REVOKE/LINK_REVOKE (§7.5) — vault_id is an opaque counter like
+     * share_id, not something whose mere existence needs hiding. */
+    if (rec.owner_id != user_id) {
+        free(wrapped_vk); free(kdf_params);
+        return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+    }
+
+    uint32_t resp_cap = 4u + 2u + rec.wrapped_vk_len + 16u + 2u + rec.kdf_params_len;
+    uint8_t *resp = (uint8_t *)malloc(resp_cap);
+    if (!resp) {
+        free(wrapped_vk); free(kdf_params);
+        return (send_error(conn, VW_ERR_OOM), VW_OK);
+    }
+    uint32_t roff = 0;
+    vw_write_u32le(resp, 0u); roff += 4u;
+    (void)vw_proto_write_str(resp, resp_cap, &roff,
+                              (const char *)wrapped_vk, (uint16_t)rec.wrapped_vk_len);
+    memcpy(resp + roff, rec.kdf_salt, 16); roff += 16u;
+    (void)vw_proto_write_str(resp, resp_cap, &roff,
+                              (const char *)kdf_params, (uint16_t)rec.kdf_params_len);
+
+    vw_err_t send_err = vw_proto_send(conn, VW_MSG_VAULT_KEY_FETCH_RESP, resp, roff);
+    free(wrapped_vk); free(kdf_params); free(resp);
+    return send_err;
+}
+
+/* VAULT_LIST: session_token[32] (no other fields — always "my vaults").
+ * RESP: count(u32) + count * {vault_id(u64), folder_file_id(u64), created_at(i64)}
+ * — never the wrapped-key material (no legitimate client need to enumerate
+ * other vaults' key blobs in a list view, matching LINK_LIST_RESP's
+ * never-include-the-token convention). */
+typedef struct {
+    uint64_t user_id;
+    uint8_t *buf;
+    uint32_t cap, len, count;
+} vault_list_ctx_t;
+
+static int vault_list_cb(const vw_vault_record_t *rec, void *ud)
+{
+    vault_list_ctx_t *c = (vault_list_ctx_t *)ud;
+    if (rec->owner_id != c->user_id) return 0;
+
+    uint32_t entry_cap = 8u + 8u + 8u;
+    if (c->len + entry_cap > c->cap) {
+        uint32_t new_cap = c->cap ? c->cap * 2u : 4096u;
+        while (c->len + entry_cap > new_cap) new_cap *= 2u;
+        uint8_t *p = (uint8_t *)realloc(c->buf, new_cap);
+        if (!p) return 1;
+        c->buf = p; c->cap = new_cap;
+    }
+    uint32_t off = c->len;
+    vw_write_u64le(c->buf + off, rec->vault_id);       off += 8u;
+    vw_write_u64le(c->buf + off, rec->folder_file_id); off += 8u;
+    vw_write_u64le(c->buf + off, (uint64_t)rec->created_at); off += 8u;
+    c->len = off;
+    c->count++;
+    return 0;
+}
+
+static vw_err_t handle_vault_list(vw_store_t *store, vw_vault_store_t *vs,
+                                   vw_conn_t *conn,
+                                   const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, NULL);
+    if (err != VW_OK) return err;
+    if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    vault_list_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.user_id = user_id;
+    err = vw_vault_scan(vs, vault_list_cb, &c);
+    if (err != VW_OK) { free(c.buf); return (send_error(conn, err), VW_OK); }
+
+    uint8_t *resp = (uint8_t *)malloc(4u + c.len);
+    if (!resp) { free(c.buf); return (send_error(conn, VW_ERR_OOM), VW_OK); }
+    vw_write_u32le(resp, c.count);
+    if (c.len) memcpy(resp + 4u, c.buf, c.len);
+    free(c.buf);
+
+    err = vw_proto_send(conn, VW_MSG_VAULT_LIST_RESP, resp, 4u + c.len);
+    free(resp);
+    return err;
+}
+
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
 vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
@@ -2341,6 +2592,7 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
     vw_oplog_t        *oplog   = vw_server_ctx_oplog(ctx);
     vw_cluster_t      *cluster = vw_server_ctx_cluster(ctx);
     vw_share_store_t  *ss      = vw_server_ctx_share_store(ctx);
+    vw_vault_store_t  *vs      = vw_server_ctx_vault_store(ctx);
 
     /* Admin-only messages that do not require file/chunk stores. */
     switch (type) {
@@ -2378,7 +2630,7 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
     case VW_MSG_CHUNK_DOWNLOAD_REQ:
         return handle_chunk_download(store, fs, cs, ss, conn, payload, plen);
     case VW_MSG_FILE_COMMIT:
-        return handle_file_commit(store, fs, cs, ss, conn, payload, plen);
+        return handle_file_commit(store, fs, cs, ss, vs, conn, payload, plen);
     case VW_MSG_FILE_DELETE:
         return handle_file_delete(store, fs, ss, conn, payload, plen);
     case VW_MSG_FILE_MOVE:
@@ -2403,6 +2655,12 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_share_or_link_revoke(store, ss, conn, payload, plen, VW_MSG_LINK_REVOKE_ACK);
     case VW_MSG_LINK_LIST:
         return handle_link_list(store, fs, ss, conn, payload, plen);
+    case VW_MSG_VAULT_CREATE:
+        return handle_vault_create(store, fs, vs, conn, payload, plen);
+    case VW_MSG_VAULT_KEY_FETCH:
+        return handle_vault_key_fetch(store, vs, conn, payload, plen);
+    case VW_MSG_VAULT_LIST:
+        return handle_vault_list(store, vs, conn, payload, plen);
     default:
         /* TASK-105: an unrecognized/misplaced message type on an
          * authenticated connection (e.g. a pre-auth-phase type like

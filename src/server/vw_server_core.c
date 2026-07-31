@@ -40,6 +40,7 @@ struct vw_server_ctx {
     vw_cluster_t        *cluster;         /* NULL = cluster status returns empty list */
     vw_conn_registry_t  *conn_registry;   /* NULL = connection list not tracked here */
     vw_share_store_t    *share_store;     /* NULL = sharing disabled            */
+    vw_vault_store_t    *vault_store;     /* NULL = vaults disabled             */
     uint32_t             auth_timeout_ms;
 };
 
@@ -847,6 +848,16 @@ void vw_server_ctx_set_share_store(vw_server_ctx_t *ctx, vw_share_store_t *share
 vw_share_store_t *vw_server_ctx_share_store(const vw_server_ctx_t *ctx)
 {
     return ctx ? ctx->share_store : NULL;
+}
+
+void vw_server_ctx_set_vault_store(vw_server_ctx_t *ctx, vw_vault_store_t *vault_store)
+{
+    if (ctx) ctx->vault_store = vault_store;
+}
+
+vw_vault_store_t *vw_server_ctx_vault_store(const vw_server_ctx_t *ctx)
+{
+    return ctx ? ctx->vault_store : NULL;
 }
 
 void vw_server_ctx_close(vw_server_ctx_t *ctx)

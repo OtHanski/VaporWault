@@ -155,6 +155,18 @@ _Static_assert(sizeof(vw_file_record_t) == 128,
  * On-disk version record. Exactly 80 bytes; _Static_assert enforced.
  * version_id == 0 marks a free slot.
  * chunk_count * VW_HASH_BYTES of SHA-256 hashes live in versions.blob at blob_offset.
+ *
+ * TASK-098 (E2EE, docs/PROTOCOL.md §7.11): the former `_reserved[32]` is
+ * repurposed below to carry a vault-encrypted version's vault_id and a
+ * reference to its wrapped DEK, stored in the same versions.blob area used
+ * for chunk hashes (mirroring that existing pattern rather than growing the
+ * fixed-size record). A version record written before this field existed —
+ * or any version of a file never opted into a vault — reads back with
+ * vault_id == 0 for free, since old records' trailing bytes were always
+ * written as zero (see handle_file_commit/vw_store_version_create) and
+ * memset(w._reserved, 0, ...) already zeroed this exact byte range on every
+ * write; no migration needed. wrapped_dek_offset/_len are meaningless
+ * (and always 0) whenever vault_id == 0.
  */
 typedef struct {
     uint64_t version_id;     /* monotonic, 1-based; 0 = free slot               */
@@ -164,7 +176,12 @@ typedef struct {
     uint32_t chunk_count;    /* number of 4 MiB chunks                          */
     uint32_t _pad;
     uint64_t blob_offset;    /* byte offset in versions.blob where hashes start */
-    uint8_t  _reserved[32];
+    uint64_t vault_id;           /* 0 = not encrypted (was _reserved[0:8])      */
+    uint64_t wrapped_dek_offset; /* versions.blob offset of the wrapped DEK bytes,
+                                   * placed immediately after this version's chunk
+                                   * hashes (was _reserved[8:16])                */
+    uint32_t wrapped_dek_len;    /* byte length; 0 if vault_id == 0 (was _reserved[16:20]) */
+    uint8_t  _reserved[12];      /* still reserved (was _reserved[20:32])       */
 } vw_version_record_t;
 
 _Static_assert(sizeof(vw_version_record_t) == 80,
@@ -406,14 +423,23 @@ vw_err_t vw_store_file_list(vw_file_store_t *fs,
 
 /*
  * Create a version record and append its chunk hashes to versions.blob.
- * rec->version_id and rec->blob_offset are ignored on input.
- * chunk_hashes: rec->chunk_count * VW_HASH_BYTES of ordered SHA-256 hashes.
- * Caller must have incremented ref-counts (via vw_storage_chunk_put) for every
- * hash before calling this — ref-count must be >= 1 before commit.
+ * rec->version_id, rec->blob_offset, rec->wrapped_dek_offset are ignored on
+ * input (server-computed). chunk_hashes: rec->chunk_count * VW_HASH_BYTES of
+ * ordered SHA-256 hashes. Caller must have incremented ref-counts (via
+ * vw_storage_chunk_put) for every hash before calling this — ref-count must
+ * be >= 1 before commit.
+ *
+ * wrapped_dek/wrapped_dek_len (TASK-098): opaque bytes appended to
+ * versions.blob immediately after this version's chunk hashes; this
+ * function sets rec->wrapped_dek_offset itself. Pass NULL/0 for an
+ * unencrypted version (rec->vault_id must then also be 0 — this function
+ * does not cross-check that; the caller, handle_file_commit, already
+ * validated vault_id against a real vault before calling here).
  */
 vw_err_t vw_store_version_create(vw_file_store_t *fs,
                                   const vw_version_record_t *rec,
                                   const uint8_t *chunk_hashes,
+                                  const uint8_t *wrapped_dek, uint32_t wrapped_dek_len,
                                   uint64_t *out_version_id);
 
 /* Fetch a version record by version_id. Returns VW_ERR_NOT_FOUND if absent. */
@@ -429,6 +455,16 @@ vw_err_t vw_store_version_get(vw_file_store_t *fs,
 vw_err_t vw_store_version_get_chunks(vw_file_store_t *fs,
                                       const vw_version_record_t *ver,
                                       uint8_t **out_hashes);
+
+/*
+ * TASK-098 (E2EE): read a version's wrapped DEK. *out_wrapped_dek receives
+ * a malloc'd buffer of ver->wrapped_dek_len bytes, or NULL if
+ * ver->vault_id == 0 (unencrypted — not an error). Caller frees a non-NULL
+ * result.
+ */
+vw_err_t vw_store_version_get_wrapped_dek(vw_file_store_t *fs,
+                                           const vw_version_record_t *ver,
+                                           uint8_t **out_wrapped_dek);
 
 /*
  * List all versions for a file, sorted by version_id ascending.

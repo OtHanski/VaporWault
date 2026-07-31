@@ -196,6 +196,16 @@ typedef enum {
     VW_MSG_CLUSTER_STATUS     = 0x0706,
     VW_MSG_CLUSTER_STATUS_RESP = 0x0707,
     VW_MSG_NODE_HELLO_FAIL    = 0x07FF,  /* primary → replica: auth rejected */
+
+    /* Vault / E2EE (TASK-098; docs/PROTOCOL.md §7.11). Server stores/returns
+     * wrapped_vk and kdf_params as fully opaque bytes — no decryption, no
+     * key material, ever server-side. */
+    VW_MSG_VAULT_CREATE         = 0x0801,  /* register a new vault + wrapped VK   */
+    VW_MSG_VAULT_CREATE_ACK     = 0x0802,
+    VW_MSG_VAULT_KEY_FETCH      = 0x0803,  /* fetch wrapped VK (new-device unlock) */
+    VW_MSG_VAULT_KEY_FETCH_RESP = 0x0804,
+    VW_MSG_VAULT_LIST           = 0x0805,  /* list my vaults                       */
+    VW_MSG_VAULT_LIST_RESP      = 0x0806,
 } vw_msg_type_t;
 
 /* ── Permission levels ───────────────────────────────────────────────────── */

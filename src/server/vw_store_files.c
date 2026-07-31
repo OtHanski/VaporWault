@@ -771,6 +771,7 @@ vw_err_t vw_store_file_list(vw_file_store_t *fs,
 vw_err_t vw_store_version_create(vw_file_store_t *fs,
                                   const vw_version_record_t *rec,
                                   const uint8_t *chunk_hashes,
+                                  const uint8_t *wrapped_dek, uint32_t wrapped_dek_len,
                                   uint64_t *out_version_id)
 {
     vw_err_t rc;
@@ -783,27 +784,47 @@ vw_err_t vw_store_version_create(vw_file_store_t *fs,
     /* Protocol limits chunk_count to uint16 range; guard the storage layer too
      * to prevent blob_bytes overflow when passed chunk_count is unvalidated. */
     if (rec->chunk_count > UINT16_MAX) return VW_ERR_INVALID_ARG;
+    /* TASK-098: vault_id and the wrapped_dek buffer must agree — either
+     * both absent (unencrypted) or both present. */
+    if ((rec->vault_id != 0) != (wrapped_dek != NULL && wrapped_dek_len > 0))
+        return VW_ERR_INVALID_ARG;
 
     rwlock_wrlock(&fs->versions_lock);
 
     uint64_t version_id = fs->next_version_id;
     uint64_t blob_off   = fs->blob_size;
-    uint64_t blob_bytes = (uint64_t)rec->chunk_count * VW_HASH_BYTES;
+    uint64_t hash_bytes  = (uint64_t)rec->chunk_count * VW_HASH_BYTES;
+    uint64_t dek_off     = blob_off + hash_bytes;
+    uint64_t blob_bytes  = hash_bytes + wrapped_dek_len;
 
     /* Oplog append for the version write. */
     rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_WRITE,
                          &rec->file_id, (uint32_t)sizeof(rec->file_id), &eid);
     if (rc != VW_OK) { rwlock_wrunlock(&fs->versions_lock); return rc; }
 
-    /* 1. Append chunk hashes to versions.blob. */
-    if (blob_bytes > 0) {
-        rc = vw_fs_append(fs->blob_path, chunk_hashes, (size_t)blob_bytes);
+    /* 1. Append chunk hashes, then the wrapped DEK (if any), to
+     * versions.blob — same append-only blob area, two logically distinct
+     * regions referenced by two separate offset/length pairs in the fixed
+     * record below. */
+    if (hash_bytes > 0) {
+        rc = vw_fs_append(fs->blob_path, chunk_hashes, (size_t)hash_bytes);
         if (rc != VW_OK) {
             abort_rc = vw_oplog_abort(fs->oplog, eid);
             (void)abort_rc;
             rwlock_wrunlock(&fs->versions_lock);
             return rc;
         }
+    }
+    if (wrapped_dek_len > 0) {
+        rc = vw_fs_append(fs->blob_path, wrapped_dek, wrapped_dek_len);
+        if (rc != VW_OK) {
+            abort_rc = vw_oplog_abort(fs->oplog, eid);
+            (void)abort_rc;
+            rwlock_wrunlock(&fs->versions_lock);
+            return rc;
+        }
+    }
+    if (blob_bytes > 0) {
         rc = vw_fs_sync_file(fs->blob_path);
         if (rc != VW_OK) {
             abort_rc = vw_oplog_abort(fs->oplog, eid);
@@ -817,6 +838,8 @@ vw_err_t vw_store_version_create(vw_file_store_t *fs,
     vw_version_record_t w = *rec;
     w.version_id  = version_id;
     w.blob_offset = blob_off;
+    w.wrapped_dek_offset = (wrapped_dek_len > 0) ? dek_off : 0;
+    w.wrapped_dek_len    = wrapped_dek_len;
     memset(w._reserved, 0, sizeof(w._reserved));
     w._pad = 0;
 
@@ -908,6 +931,32 @@ vw_err_t vw_store_version_get_chunks(vw_file_store_t *fs,
     }
 
     *out_hashes = buf;
+    return VW_OK;
+}
+
+vw_err_t vw_store_version_get_wrapped_dek(vw_file_store_t *fs,
+                                           const vw_version_record_t *ver,
+                                           uint8_t **out_wrapped_dek)
+{
+    if (!fs || !ver || !out_wrapped_dek) return VW_ERR_INVALID_ARG;
+    if (ver->vault_id == 0 || ver->wrapped_dek_len == 0) {
+        *out_wrapped_dek = NULL;
+        return VW_OK;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc(ver->wrapped_dek_len);
+    if (!buf) return VW_ERR_OOM;
+
+    rwlock_rdlock(&fs->versions_lock);
+    int r = fs_pread(fs->blob_path, buf, ver->wrapped_dek_len, ver->wrapped_dek_offset);
+    rwlock_rdunlock(&fs->versions_lock);
+
+    if (r != 0) {
+        free(buf);
+        return VW_ERR_IO;
+    }
+
+    *out_wrapped_dek = buf;
     return VW_OK;
 }
 
