@@ -394,10 +394,30 @@ static vw_err_t handle_file_stat(vw_store_t       *store,
     vw_perm_t perm = effective_permission(ss, fs, &rec, user_id, scope_share_id);
     if (!require_permission(conn, perm, VW_PERM_VIEW)) return VW_OK;
 
+    /* TASK-100 (GUI encrypted-indicator support): look up the file's
+     * current version's vault_id so the client can show a lock icon
+     * without a separate VERSION_CHUNKS round-trip per listed file.
+     * A directory (no current_version_id) or a version lookup failure
+     * (shouldn't happen for a real file, but fail open to "unencrypted"
+     * rather than erroring the whole FILE_STAT) both report vault_id 0. */
+    uint64_t vault_id = 0;
+    if (rec.entry_type != VW_ENTRY_DIR && rec.current_version_id != 0) {
+        vw_version_record_t ver;
+        if (vw_store_version_get(fs, rec.current_version_id, &ver) == VW_OK)
+            vault_id = ver.vault_id;
+    }
+
     /* Encode FILE_STAT_RESP:
      * u8 entry_type + u64 file_id + u64 size_bytes + i64 mtime_unix +
-     * u64 version_id + u64 owner_id + u8 perm + string path(name) */
-    uint8_t resp[2 + 64 + 1 + 8 + 8 + 8 + 8 + 8 + 1];
+     * u64 version_id + u64 owner_id + u8 perm + string path(name)
+     * + u64 vault_id (TASK-100; always present, 0 = unencrypted — unlike
+     * FILE_COMMIT/VERSION_CHUNKS_RESP's absent-when-zero convention, this
+     * response has no other optional fields after it, so there's no
+     * ambiguity to resolve by omitting it; appending it unconditionally
+     * keeps this encoder simpler with no behavioral difference an old
+     * client would notice either way, since old clients stop reading
+     * after the name string regardless). */
+    uint8_t resp[2 + 64 + 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8];
     uint32_t roff = 0;
     resp[roff++] = rec.entry_type;
     vw_write_u64le(resp + roff, rec.file_id);             roff += 8;
@@ -411,6 +431,8 @@ static vw_err_t handle_file_stat(vw_store_t       *store,
     err = vw_proto_write_str(resp, sizeof(resp), &roff, rec.name, nlen);
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_OOM), VW_OK);
+
+    vw_write_u64le(resp + roff, vault_id); roff += 8;
 
     err = vw_proto_send(conn, VW_MSG_FILE_STAT_RESP, resp, roff);
     LOG_DEBUG("FILE_STAT uid=%llu fid=%llu rc=%d",

@@ -305,3 +305,136 @@ bool VwGuiIpc::link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code) 
     *out = std::move(entries);
     return true;
 }
+
+int VwGuiIpc::file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id) {
+    uint8_t req[8u + 2u + 256u]; uint32_t off = 0;
+    vw_write_u64le(req, new_parent_dir_id); off += 8u;
+    vw_ipc_write_str(req, sizeof(req), &off, name, (uint16_t)strlen(name));
+
+    uint8_t resp[12]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_FILE_MKDIR_REQ, req, off, VW_IPC_FILE_MKDIR_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 12) return (int)VW_ERR_IO;
+    uint32_t ec = read_u32_le(resp);
+    if (ec == 0 && out_dir_id) *out_dir_id = (uint64_t)read_i64_le(resp + 4);
+    return (int)ec;
+}
+
+int VwGuiIpc::vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id) {
+    uint8_t req[8u + 2u + 512u]; uint32_t off = 0;
+    vw_write_u64le(req, folder_file_id); off += 8u;
+    vw_ipc_write_str(req, sizeof(req), &off, passphrase, (uint16_t)strnlen(passphrase, 511));
+
+    uint8_t resp[12]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VAULT_CREATE_REQ, req, off, VW_IPC_VAULT_CREATE_RESP,
+                             resp, sizeof(resp), &rlen);
+
+    /* Zero both the wire-form request buffer and the caller's own field —
+     * same convention as login(). */
+    memset(req, 0, sizeof(req));
+    memset(passphrase, 0, strlen(passphrase));
+
+    if (err != VW_OK) return (int)err;
+    if (rlen < 12) return (int)VW_ERR_IO;
+    uint32_t ec = read_u32_le(resp);
+    if (ec == 0 && out_vault_id) *out_vault_id = (uint64_t)read_i64_le(resp + 4);
+    return (int)ec;
+}
+
+int VwGuiIpc::vault_unlock(uint64_t vault_id, char *passphrase) {
+    uint8_t req[8u + 2u + 512u]; uint32_t off = 0;
+    vw_write_u64le(req, vault_id); off += 8u;
+    vw_ipc_write_str(req, sizeof(req), &off, passphrase, (uint16_t)strnlen(passphrase, 511));
+
+    uint8_t resp[4]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VAULT_UNLOCK_REQ, req, off, VW_IPC_VAULT_UNLOCK_RESP,
+                             resp, sizeof(resp), &rlen);
+
+    memset(req, 0, sizeof(req));
+    memset(passphrase, 0, strlen(passphrase));
+
+    if (err != VW_OK) return (int)err;
+    if (rlen < 4) return (int)VW_ERR_IO;
+    return (int)read_u32_le(resp);
+}
+
+bool VwGuiIpc::vault_list(std::vector<VwGuiVaultEntry> *out, int *out_error_code) {
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VAULT_LIST_REQ, nullptr, 0, VW_IPC_VAULT_LIST_RESP,
+                             resp.data(), kRespCap, &rlen);
+    if (err != VW_OK) { if (out_error_code) *out_error_code = (int)err; return false; }
+    if (rlen < 8) { if (out_error_code) *out_error_code = (int)VW_ERR_IO; return false; }
+
+    uint32_t ec = read_u32_le(resp.data());
+    if (out_error_code) *out_error_code = (int)ec;
+    if (ec != 0) return false;
+
+    uint32_t count = read_u32_le(resp.data() + 4);
+    uint32_t off = 8;
+    std::vector<VwGuiVaultEntry> entries;
+    entries.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 24u > rlen) break;
+        VwGuiVaultEntry e;
+        e.vault_id       = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.folder_file_id = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.created_at     = read_i64_le(resp.data() + off);           off += 8;
+        entries.push_back(e);
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
+int VwGuiIpc::vault_upload(uint64_t vault_id, uint64_t file_id,
+                            const char *leaf_name, const char *local_path,
+                            uint64_t *out_file_id, uint64_t *out_version_id) {
+    uint8_t req[16u + 2u + 256u + 2u + 1024u]; uint32_t off = 0;
+    vw_write_u64le(req, vault_id);      off += 8u;
+    vw_write_u64le(req + off, file_id); off += 8u;
+    const char *leaf = leaf_name ? leaf_name : "";
+    vw_ipc_write_str(req, sizeof(req), &off, leaf, (uint16_t)strlen(leaf));
+    vw_ipc_write_str(req, sizeof(req), &off, local_path, (uint16_t)strlen(local_path));
+
+    uint8_t resp[20]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VAULT_UPLOAD_REQ, req, off, VW_IPC_VAULT_UPLOAD_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 20) return (int)VW_ERR_IO;
+    uint32_t ec = read_u32_le(resp);
+    if (ec == 0) {
+        if (out_file_id)    *out_file_id    = (uint64_t)read_i64_le(resp + 4);
+        if (out_version_id) *out_version_id = (uint64_t)read_i64_le(resp + 12);
+    }
+    return (int)ec;
+}
+
+int VwGuiIpc::vault_download(uint64_t vault_id, uint64_t file_id, const char *local_path) {
+    uint8_t req[16u + 2u + 1024u]; uint32_t off = 0;
+    vw_write_u64le(req, vault_id);      off += 8u;
+    vw_write_u64le(req + off, file_id); off += 8u;
+    vw_ipc_write_str(req, sizeof(req), &off, local_path, (uint16_t)strlen(local_path));
+
+    uint8_t resp[4]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VAULT_DOWNLOAD_REQ, req, off, VW_IPC_VAULT_DOWNLOAD_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 4) return (int)VW_ERR_IO;
+    return (int)read_u32_le(resp);
+}
+
+int VwGuiIpc::file_vault_id(uint64_t file_id, uint64_t *out_vault_id) {
+    uint8_t req[8]; vw_write_u64le(req, file_id);
+    uint8_t resp[12]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_FILE_VAULT_ID_REQ, req, sizeof(req), VW_IPC_FILE_VAULT_ID_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 12) return (int)VW_ERR_IO;
+    uint32_t ec = read_u32_le(resp);
+    if (ec == 0 && out_vault_id) *out_vault_id = (uint64_t)read_i64_le(resp + 4);
+    return (int)ec;
+}

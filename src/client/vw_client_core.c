@@ -443,7 +443,9 @@ static vw_err_t stat_common(vw_client_sess_t *sess, uint64_t file_id,
     if (err != VW_OK) { free(rbuf); return err; }
 
     /* entry_type(u8) + file_id(u64) + size_bytes(u64) + mtime_unix(i64) +
-     * version_id(u64) + owner_id(u64) + perm(u8) + path_len(u16) + path */
+     * version_id(u64) + owner_id(u64) + perm(u8) + path_len(u16) + path
+     * + vault_id(u64) (TASK-100; always present — see server's doc
+     * comment in handle_file_stat) */
     if (rplen < 1u + 8u + 8u + 8u + 8u + 8u + 1u + 2u) {
         free(rbuf);
         return VW_ERR_PROTO_TRUNCATED;
@@ -456,7 +458,16 @@ static vw_err_t stat_common(vw_client_sess_t *sess, uint64_t file_id,
     out->version_id = vw_read_u64le(rbuf + off); off += 8;
     /* owner_id: consumed, not returned */    off += 8;
     /* perm:     consumed, not returned */    off++;
-    /* path string: not stored (caller already knows it) */
+
+    const char *name; uint16_t name_len;
+    vw_err_t serr = vw_proto_read_str(rbuf, rplen, &off, &name, &name_len);
+    /* name string: not stored (caller already knows it) */
+    (void)name; (void)name_len;
+
+    out->vault_id = 0;
+    if (serr == VW_OK && off + 8u <= rplen)
+        out->vault_id = vw_read_u64le(rbuf + off);
+
     free(rbuf);
     return VW_OK;
 }

@@ -262,6 +262,40 @@ is sent. On failure: `AUTH_RECOVER_FAIL` is sent with a generic reason.
 | 0x0211 | FILE_MKDIR         | C → S     | Create a directory       |
 | 0x0212 | FILE_MKDIR_ACK     | S → C     | Created                  |
 
+**FILE_STAT payload:**
+
+| Field         | Type                                                        |
+|---------------|-------------------------------------------------------------|
+| session_token | bytes[32]                                                    |
+| file_id       | uint64 (0 = resolve by `virtual_path` instead)               |
+| virtual_path  | string (only meaningful when `file_id` is 0)                 |
+
+**FILE_STAT_RESP payload:**
+
+| Field       | Type                                          |
+|-------------|------------------------------------------------|
+| entry_type  | uint8 (`VW_ENTRY_FILE`=0, `VW_ENTRY_DIR`=1)     |
+| file_id     | uint64                                          |
+| size_bytes  | uint64                                          |
+| mtime_unix  | int64                                           |
+| version_id  | uint64 (current HEAD; 0 for a directory)        |
+| owner_id    | uint64                                          |
+| perm        | uint8 (`vw_perm_t`; caller's effective permission) |
+| name        | string (leaf name)                              |
+| vault_id    | uint64 (TASK-100; 0 = unencrypted, or `entry_type == VW_ENTRY_DIR`) |
+
+`vault_id` is the file's *current version's* vault, added so a browser can
+show an encrypted-item indicator from a single `FILE_STAT` rather than an
+extra `VERSION_CHUNKS` round-trip. Unlike `FILE_COMMIT`/`VERSION_CHUNKS_RESP`'s
+absent-when-zero convention, this field is always present — there are no
+further optional fields after it to disambiguate, so appending it
+unconditionally is simpler with no behavioral difference (an old client
+stops reading after `name` regardless). `FILE_LIST_RESP`'s per-entry
+records do **not** carry `vault_id` — populating it for a whole directory
+listing would mean one version lookup per entry; callers needing
+per-entry encrypted status for a listing call `FILE_STAT` per item of
+interest instead.
+
 **Upload flow:**
 
 ```
@@ -1364,6 +1398,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 14      | 2026-07-31 | GUI.03  | `FILE_STAT_RESP` (§7.2) gains a trailing `vault_id` field, resolving a gap found implementing `TASK-100`'s encrypted-item indicators: no existing response let a browser learn a file's vault_id without a `VERSION_CHUNKS` round-trip. Always present (not absent-when-zero like `FILE_COMMIT`/`VERSION_CHUNKS_RESP`, since nothing optional follows it). `FILE_LIST_RESP` deliberately does not get the same field — see §7.2's note on why a whole-directory listing doesn't populate per-entry `vault_id`. No protocol version bump required. |
 | 13      | 2026-07-31 | SRV.01  | `VERSION_CHUNKS_RESP` (§7.3) extended with optional trailing `vault_id`/`wrapped_dek` fields, resolving `TASK-099`'s download-direction wire gap flagged in version 12 (§7.11.4): a downloading client already calls `VERSION_CHUNKS` immediately before fetching chunks, so the wrapped DEK rides along on that existing round-trip rather than needing a new message. Purely additive/optional, mirroring the `FILE_COMMIT` extension exactly: an old client never reads past the hash array and is unaffected; an old server never emits the trailing fields, indistinguishable from an unencrypted version's response. No protocol version bump required. |
 | 12      | 2026-07-31 | SRV.01  | Vault/E2EE (§7.11) implemented server-side, resolving `TASK-098`: `VAULT_CREATE`/`_ACK`, `VAULT_KEY_FETCH`/`_RESP`, `VAULT_LIST`/`_RESP` (0x0801–0x0806, first-ever handlers for opcodes reserved since version 8) plus the `FILE_COMMIT` `vault_id`/`wrapped_dek` extension and `vw_version_record_t`'s finalized `_reserved[32]` layout (see §7.11.4 for both). The server never sees unwrapped key material or plaintext at any point — SEC.07 confirmed no code path (including oplog replay) logs, caches, or persists anything beyond the opaque blobs the client sends. Purely additive/optional: no existing message's byte layout changed for any client that omits the two new optional `FILE_COMMIT` fields, no protocol version bump required. Client-side vault module (`TASK-099`) and the download-direction wire gap noted in §7.11.4 remain open. |
 | 11      | 2026-07-31 | PRT.04  | `FILE_MKDIR`/`FILE_MKDIR_ACK` (0x0211/0x0212) defined and implemented server-side, resolving `TASK-104` — the first wire mechanism to create a `VW_ENTRY_DIR` record at all (previously only reachable via direct `vw_store_file_create` calls, bypassing the wire; see §7.2 for the full payload spec and its permission/rate-limit rules). Purely additive: no existing message's byte layout changed, no protocol version bump required. |

@@ -1,7 +1,7 @@
 ---
 id:          TASK-100
 title:       Vault UI (setup wizard, passphrase prompts, encrypted indicators)
-status:      todo
+status:      done
 assignee:    GUI.03
 created_by:  ARCH.00
 created:     2026-07-29
@@ -54,3 +54,94 @@ Scope:
 
 ARCH.00 [2026-07-29]: Filed as part of decomposing `TASK-089`. Blocked on
 `TASK-099` per the standing GUI.03 constraint.
+
+GUI.03 [2026-07-31]: Implementation complete. Since the sync engine has no
+notion of vaults at all yet (`TASK-106`, not done), there is no automatic
+background encryption — every flow below is a manual, one-file-at-a-time
+operation, stated plainly in the Vault tab's UI rather than left implicit.
+
+**Wire/library additions needed along the way** (both small, additive, same
+pattern as every other extension this session):
+- `FILE_STAT_RESP` (`docs/PROTOCOL.md` §7.2) gains an always-present
+  trailing `vault_id` field — no existing response let a browser learn a
+  file's vault_id without a `VERSION_CHUNKS` round-trip. `FILE_LIST_RESP`
+  deliberately does *not* get the same field (would need one version
+  lookup per listed entry; noted in §7.2 rather than implemented).
+- `vw_client_file_mkdir()` added to `vw_client_core.h`/`.c` — `FILE_MKDIR`
+  has existed on the wire since `TASK-104` but had no client-library
+  wrapper; needed because a vault's `folder_file_id` must be a real
+  `VW_ENTRY_DIR` (`handle_file_commit`'s directory-target branch checks
+  `entry_type`; `VAULT_CREATE` itself is more lenient, which is what led
+  to the bug below).
+
+**Daemon IPC** (`vw_ipc.h`, `vw_daemon.c`): `VW_IPC_FILE_MKDIR_REQ/_RESP`,
+`VW_IPC_VAULT_CREATE/_UNLOCK/_LIST/_UPLOAD/_DOWNLOAD_REQ/RESP`,
+`VW_IPC_FILE_VAULT_ID_REQ/_RESP` (a narrow file_id→vault_id lookup for the
+browser's indicator — not a full FILE_STAT passthrough, which nothing else
+needs). The daemon holds unlocked `vw_vault_t` handles in a small
+in-memory registry (`daemon_vault_registry_t`) for the process's lifetime,
+exactly mirroring how it already holds the account session — no locking
+needed since `handle_ipc_client` runs synchronously in the daemon's single
+main loop. Passphrases are zeroed after use, never stored, same convention
+as `VW_IPC_LOGIN_REQ`.
+
+**GUI**: `vw_gui_ipc.h`/`.cpp` and `ClientApp.h`/`.cpp` get passthroughs for
+all of the above, mirroring the sharing passthroughs' exact shape. New
+`views/vw_view_vault.{h,cpp}` — a new "Vault" tab: lists vaults
+(`VwGuiVaultEntry`), a "Create New Vault..." wizard (folder name + a
+passphrase field + a confirm field, followed immediately — not behind a
+click or a collapsed section — by all three required warnings verbatim:
+passphrase loss is **permanent**, metadata is **not** encrypted, and every
+edit **re-uploads the whole file**), a per-vault "Unlock" button, and an
+"Encrypt & Upload..." action once unlocked. `views/vw_view_browser.cpp`
+gains a `[encrypted]` badge (mirroring the existing `[shared]` badge
+convention exactly) populated via `VW_IPC_FILE_VAULT_ID_REQ` per visible
+file (capped at 200 lookups per refresh — documented in code as a known,
+non-silent limit, not a correctness bug) and a "Decrypt & Download..."
+context-menu action, which — since there is no cross-tab modal wiring —
+just points the user at the Vault tab if the GUI doesn't know the vault is
+unlocked yet (`vw_view_vault_is_unlocked()`), rather than silently failing.
+
+**Verification**: no screenshot/input-injection tooling is available in
+this environment (same limitation noted in `TASK-107`/`108`/`096`'s closing
+notes), so the GUI views themselves were not visually exercised. Instead,
+built a throwaway diagnostic harness (not committed — matches the
+`gui_ipc_check.cpp` precedent from `TASK-107`/`108`) that speaks the daemon
+IPC protocol directly against a real running server + daemon, exercising
+every new message end-to-end: login, mkdir, vault create (which unlocks
+immediately), vault list, encrypted upload, the file→vault_id lookup,
+encrypted download with a byte-identical plaintext check, re-unlock with
+the correct passphrase, and unlock with a wrong passphrase (confirmed
+`VW_ERR_AUTH_BAD_CREDS`). All 12 checks pass.
+
+**This harness caught a real, previously-latent production bug**: the
+daemon process never called `vw_crypto_init()` anywhere in its lifetime.
+This was invisible before vaults existed because login only ever needed
+`vw_crypto_sha256` (no init required) and Argon2id runs server-side for
+login — nothing client-side touched `vw_crypto_random`/
+`vw_crypto_vault_derive_kek`/`vw_crypto_aes256gcm_*` until `VAULT_CREATE`
+needed them in-process. Without init, `vw_crypto_random()` fails fast with
+`VW_ERR_CRYPTO` (see `vw_crypto.c`'s `g_initialized` guard), which is
+exactly what the harness's first `VAULT_CREATE_REQ` surfaced. Fixed by
+adding `vw_crypto_init()`/`_cleanup()` to `vw_daemon_run`'s start/shutdown
+(`src/client/vw_daemon.c`) — confirmed via re-running the same harness,
+now 12/12 passing.
+
+Full GCC/WSL (`-Wall -Wextra -Wpedantic -Werror`) and MSVC (`/W4 /WX`)
+builds clean; full unit + pytest integration suite green (only the
+pre-existing, unrelated IT-7 quota flake, documented since `TASK-095`).
+
+CQR.08 [2026-07-31]: No findings. New daemon IPC handlers follow the exact
+decode/dispatch/respond shape already established by the Sharing block
+(error_code-prefixed responses, `VW_ERR_AUTH_REQUIRED` for no session,
+truncation checks before reads); the vault registry's ownership rule
+(`vault_registry_put` closes and replaces on re-create/re-unlock, closed
+exactly once at shutdown) is simple enough to read correctly by inspection.
+`views/vw_view_vault.cpp` follows `vw_view_shared.cpp`'s established
+static-local-state convention.
+
+ARCH.00 [2026-07-31]: CQR.08 sign-off recorded above; acceptance criteria
+met (all three warnings present verbatim, not behind extra clicks; all
+flows verified end-to-end via the IPC harness in lieu of visual GUI
+testing, which this environment cannot do). Closing `TASK-100` as `done`.
+`TASK-101` is now unblocked.

@@ -90,6 +90,34 @@ typedef enum {
     VW_IPC_LINK_REVOKE_RESP   = 0x801E, /* D→C: error_code                        */
     VW_IPC_LINK_LIST_REQ      = 0x801F, /* C→D: list public links I've created    */
     VW_IPC_LINK_LIST_RESP     = 0x8020, /* D→C: error_code + count + entries      */
+
+    /* Vault / E2EE (TASK-100; client library: TASK-099, docs/PROTOCOL.md
+     * §7.11). Same conventions as Sharing above: every _REQ requires an
+     * active daemon session, every _RESP is prefixed with error_code(u32).
+     * VAULT_UNLOCK's unwrapped VK never leaves the daemon process — it is
+     * held in an in-memory registry (vault_id -> unlocked vw_vault_t),
+     * exactly mirroring how the account session token is held in dc->sess;
+     * VAULT_UPLOAD/_DOWNLOAD reference a vault purely by vault_id and
+     * require it to already be in that registry (VW_ERR_AUTH_REQUIRED if
+     * not — same error the Sharing block above uses for "no session"). */
+    VW_IPC_FILE_MKDIR_REQ     = 0x8021, /* C→D: create a directory                */
+    VW_IPC_FILE_MKDIR_RESP    = 0x8022, /* D→C: error_code + new dir's file_id    */
+    VW_IPC_VAULT_CREATE_REQ   = 0x8023, /* C→D: create+unlock a new vault         */
+    VW_IPC_VAULT_CREATE_RESP  = 0x8024, /* D→C: error_code + vault_id             */
+    VW_IPC_VAULT_UNLOCK_REQ   = 0x8025, /* C→D: unlock an existing vault          */
+    VW_IPC_VAULT_UNLOCK_RESP  = 0x8026, /* D→C: error_code                        */
+    VW_IPC_VAULT_LIST_REQ     = 0x8027, /* C→D: list my vaults                    */
+    VW_IPC_VAULT_LIST_RESP    = 0x8028, /* D→C: error_code + count + entries      */
+    VW_IPC_VAULT_UPLOAD_REQ   = 0x8029, /* C→D: encrypt+upload a local file       */
+    VW_IPC_VAULT_UPLOAD_RESP  = 0x802A, /* D→C: error_code + file_id + version_id */
+    VW_IPC_VAULT_DOWNLOAD_REQ = 0x802B, /* C→D: download+decrypt to a local path  */
+    VW_IPC_VAULT_DOWNLOAD_RESP = 0x802C, /* D→C: error_code                       */
+
+    /* Narrow lookup for the file browser's encrypted-item indicator: just
+     * the vault_id, not a full FILE_STAT passthrough (which doesn't exist
+     * over this IPC and isn't otherwise needed by any GUI view today). */
+    VW_IPC_FILE_VAULT_ID_REQ  = 0x802D, /* C→D: look up one file's vault_id       */
+    VW_IPC_FILE_VAULT_ID_RESP = 0x802E, /* D→C: error_code + vault_id             */
 } vw_ipc_msg_t;
 
 /*
@@ -210,6 +238,65 @@ typedef enum {
  *     i64    expires_at     0 = never
  *     u8     revoked
  *   }                       never includes the raw link_token
+ *
+ * VW_IPC_FILE_MKDIR_REQ:
+ *   u64 new_parent_dir_id  0 = caller's own root
+ *   string name            bare leaf name, no '/'
+ * VW_IPC_FILE_MKDIR_RESP:
+ *   u32 error_code
+ *   u64 dir_id             only meaningful if error_code == 0
+ *
+ * VW_IPC_VAULT_CREATE_REQ:
+ *   u64    folder_file_id  must already be a real directory (FILE_MKDIR
+ *                          first) — see docs/PROTOCOL.md §7.2's FILE_STAT_RESP
+ *                          note and TASK-099's own discovery of this
+ *                          entry_type requirement.
+ *   string passphrase      RAW encryption passphrase — same loopback-only
+ *                          trust rationale as VW_IPC_LOGIN_REQ's password.
+ *                          Uses the SEC.07-pinned Argon2id floor; no
+ *                          custom-KDF-params path is exposed over IPC.
+ * VW_IPC_VAULT_CREATE_RESP:
+ *   u32 error_code
+ *   u64 vault_id           only meaningful if error_code == 0. On success
+ *                          the new vault is also added to the daemon's
+ *                          unlocked-vault registry (no separate UNLOCK
+ *                          call needed right after creating it).
+ *
+ * VW_IPC_VAULT_UNLOCK_REQ:
+ *   u64    vault_id
+ *   string passphrase      RAW; same rationale as above. Wrong passphrase
+ *                          → error_code == VW_ERR_AUTH_BAD_CREDS.
+ * VW_IPC_VAULT_UNLOCK_RESP:
+ *   u32 error_code
+ *
+ * VW_IPC_VAULT_LIST_REQ: (no payload)
+ * VW_IPC_VAULT_LIST_RESP:
+ *   u32 error_code
+ *   u32 count              0 if error_code != 0
+ *   count * { u64 vault_id, u64 folder_file_id, i64 created_at }
+ *
+ * VW_IPC_VAULT_UPLOAD_REQ:
+ *   u64    vault_id        must already be unlocked (VAULT_CREATE/_UNLOCK)
+ *   u64    file_id         0 = create a new file named leaf_name
+ *   string leaf_name       used only when file_id == 0; bare leaf, no '/'
+ *   string local_path      local filesystem path to encrypt and upload
+ * VW_IPC_VAULT_UPLOAD_RESP:
+ *   u32 error_code
+ *   u64 file_id            only meaningful if error_code == 0
+ *   u64 version_id         only meaningful if error_code == 0
+ *
+ * VW_IPC_VAULT_DOWNLOAD_REQ:
+ *   u64    vault_id        must already be unlocked
+ *   u64    file_id
+ *   string local_path      destination path for the decrypted plaintext
+ * VW_IPC_VAULT_DOWNLOAD_RESP:
+ *   u32 error_code
+ *
+ * VW_IPC_FILE_VAULT_ID_REQ:
+ *   u64 file_id
+ * VW_IPC_FILE_VAULT_ID_RESP:
+ *   u32 error_code
+ *   u64 vault_id           0 = unencrypted; only meaningful if error_code == 0
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

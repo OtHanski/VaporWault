@@ -77,6 +77,14 @@ struct VwGuiLinkEntry {
     uint8_t     revoked = 0;
 };
 
+/* Vault / E2EE (TASK-100; library: TASK-099, docs/PROTOCOL.md §7.11).
+ * Mirrors VW_IPC_VAULT_LIST_RESP's per-entry fields exactly. */
+struct VwGuiVaultEntry {
+    uint64_t vault_id = 0;
+    uint64_t folder_file_id = 0;
+    int64_t  created_at = 0;
+};
+
 class VwGuiIpc {
 public:
     VwGuiIpc() = default;
@@ -144,6 +152,55 @@ public:
                      uint64_t *out_share_id, uint8_t out_token[32]);
     int link_revoke(uint64_t share_id);
     bool link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code);
+
+    /*
+     * Vault / E2EE (TASK-100). Create a real server-side directory — a
+     * vault's folder_file_id must already be one (see docs/PROTOCOL.md
+     * §7.2's FILE_STAT_RESP note). new_parent_dir_id == 0 means the
+     * caller's own root.
+     */
+    int file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id);
+
+    /*
+     * Create a new vault under folder_file_id, deriving its KEK from
+     * passphrase. passphrase is zeroed by this call before returning,
+     * regardless of outcome — same convention as login(). On success the
+     * new vault is unlocked in the daemon's registry immediately (no
+     * separate vault_unlock() call needed right after).
+     */
+    int vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id);
+
+    /*
+     * Unlock an existing vault (new-device case). passphrase is zeroed
+     * before returning. Returns VW_ERR_AUTH_BAD_CREDS (encoded as int) for
+     * a wrong passphrase.
+     */
+    int vault_unlock(uint64_t vault_id, char *passphrase);
+
+    /* List vaults owned by the caller. Never includes key material. */
+    bool vault_list(std::vector<VwGuiVaultEntry> *out, int *out_error_code);
+
+    /*
+     * Encrypt local_path and upload it into vault_id (which must already
+     * be unlocked — vault_create or vault_unlock first). file_id == 0
+     * creates a new file named leaf_name inside the vault's folder;
+     * file_id != 0 uploads a new version of that existing file (leaf_name
+     * ignored). Returns VW_ERR_AUTH_REQUIRED (encoded as int) if vault_id
+     * is not currently unlocked in the daemon.
+     */
+    int vault_upload(uint64_t vault_id, uint64_t file_id,
+                      const char *leaf_name, const char *local_path,
+                      uint64_t *out_file_id, uint64_t *out_version_id);
+
+    /* Download and decrypt file_id's current version to local_path. */
+    int vault_download(uint64_t vault_id, uint64_t file_id, const char *local_path);
+
+    /*
+     * Look up one file's current-version vault_id (0 = unencrypted) for
+     * the browser's encrypted-item indicator. Returns the error_code as
+     * int; *out_vault_id is only meaningful when the return is 0.
+     */
+    int file_vault_id(uint64_t file_id, uint64_t *out_vault_id);
 
 private:
     uint16_t port_      = VW_IPC_DEFAULT_PORT;

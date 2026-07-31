@@ -1,10 +1,12 @@
 #include "vw_view_browser.h"
 #include "../ClientApp.h"
+#include "vw_view_vault.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -144,6 +146,15 @@ static std::string s_current_path = "/";
 static bool        s_needs_refresh = true;
 static char        s_error_msg[128] = "";
 static std::set<uint64_t> s_shared_file_ids; /* file_ids with an active grant or link */
+static std::map<uint64_t, uint64_t> s_vault_ids; /* file_id -> vault_id (0 = unencrypted) */
+
+/* Decrypt & Download dialog (TASK-100) */
+static bool     s_decrypt_open = false;
+static uint64_t s_decrypt_vault_id = 0;
+static uint64_t s_decrypt_file_id = 0;
+static std::string s_decrypt_name;
+static char     s_decrypt_local_path[600] = "";
+static char     s_decrypt_status[220] = "";
 
 /* ── Share dialog state (TASK-096) ────────────────────────────────────────
  * Opened per-row via a right-click context menu; operates on whichever
@@ -189,6 +200,27 @@ static void refresh_shared_badges(ClientApp &app) {
         for (auto &l : links) if (!l.revoked) s_shared_file_ids.insert(l.file_id);
 }
 
+/* TASK-100: FILE_LIST_RESP doesn't carry per-entry vault_id (see
+ * docs/PROTOCOL.md §7.2's note on why), so the encrypted-item indicator
+ * needs one VW_IPC_FILE_VAULT_ID round trip per uploaded file. Capped at
+ * kMaxVaultLookups to bound refresh cost for very large listings — files
+ * beyond the cap simply show no lock indicator until a future refresh
+ * budget/streaming approach exists (a known, documented limitation, not
+ * silently wrong: those files just look unencrypted rather than blocking
+ * or slowing the whole browser). */
+static void refresh_vault_badges(ClientApp &app) {
+    static const size_t kMaxVaultLookups = 200;
+    s_vault_ids.clear();
+    size_t n = 0;
+    for (auto &e : s_entries) {
+        if (e.entry_type != 0 || e.file_id == 0) continue; /* dirs / not-yet-uploaded */
+        if (n++ >= kMaxVaultLookups) break;
+        uint64_t vault_id = 0;
+        if (app.ipc_file_vault_id(e.file_id, &vault_id) == 0 && vault_id != 0)
+            s_vault_ids[e.file_id] = vault_id;
+    }
+}
+
 static void refresh(ClientApp &app) {
     if (app.ipc_file_list("", &s_entries)) {
         s_error_msg[0] = '\0';
@@ -196,6 +228,7 @@ static void refresh(ClientApp &app) {
         snprintf(s_error_msg, sizeof(s_error_msg), "Failed to fetch file list from daemon.");
     }
     refresh_shared_badges(app);
+    refresh_vault_badges(app);
     s_needs_refresh = false;
 }
 
@@ -222,6 +255,51 @@ static void open_share_dialog(const DisplayRow &row, ClientApp &app) {
     refresh_dialog_lists(app);
     s_share_open = true;
     ImGui::OpenPopup("Share##dialog");
+}
+
+static void render_decrypt_dialog(ClientApp &app) {
+    if (!s_decrypt_open) return;
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Always);
+    if (!ImGui::BeginPopupModal("Decrypt & Download##dialog", &s_decrypt_open,
+                                 ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("%s", s_decrypt_name.c_str());
+
+    if (!vw_view_vault_is_unlocked(s_decrypt_vault_id)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+            "Vault #%llu is locked in this session. Unlock it from the "
+            "Vault tab first, then try again.",
+            (unsigned long long)s_decrypt_vault_id);
+        ImGui::Separator();
+        if (ImGui::Button("Close##decrypt")) { s_decrypt_open = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::Separator();
+    ImGui::InputText("Save to local path", s_decrypt_local_path, sizeof(s_decrypt_local_path));
+
+    if (ImGui::Button("Decrypt & Download##confirm")) {
+        if (!s_decrypt_local_path[0]) {
+            snprintf(s_decrypt_status, sizeof(s_decrypt_status), "Enter a destination path.");
+        } else {
+            int rc = app.ipc_vault_download(s_decrypt_vault_id, s_decrypt_file_id,
+                                             s_decrypt_local_path);
+            if (rc == 0) {
+                snprintf(s_decrypt_status, sizeof(s_decrypt_status), "Downloaded and decrypted.");
+            } else {
+                snprintf(s_decrypt_status, sizeof(s_decrypt_status),
+                         "Download failed (code %d).", rc);
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Close##decrypt2")) { s_decrypt_open = false; ImGui::CloseCurrentPopup(); }
+    if (s_decrypt_status[0]) ImGui::TextUnformatted(s_decrypt_status);
+
+    ImGui::EndPopup();
 }
 
 static void render_share_dialog(ClientApp &app) {
@@ -433,7 +511,11 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
             ImGui::TableSetColumnIndex(0);
             const char *icon = row.is_dir ? "[dir] " : "";
             bool shared = row.file_id != 0 && s_shared_file_ids.count(row.file_id) > 0;
-            std::string label = std::string(icon) + row.name + (shared ? "  [shared]" : "");
+            auto vault_it = row.file_id != 0 ? s_vault_ids.find(row.file_id) : s_vault_ids.end();
+            bool encrypted = vault_it != s_vault_ids.end();
+            std::string label = std::string(icon) + row.name +
+                                 (encrypted ? "  [encrypted]" : "") +
+                                 (shared ? "  [shared]" : "");
             ImGui::PushID(row.virtual_path.c_str());
             bool clicked = ImGui::Selectable(label.c_str(), false,
                                               ImGuiSelectableFlags_SpanAllColumns |
@@ -443,6 +525,15 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
             }
             if (ImGui::BeginPopupContextItem("##ctx")) {
                 if (ImGui::MenuItem("Share...")) open_share_dialog(row, app);
+                if (encrypted && ImGui::MenuItem("Decrypt & Download...")) {
+                    s_decrypt_vault_id = vault_it->second;
+                    s_decrypt_file_id  = row.file_id;
+                    s_decrypt_name     = row.name;
+                    s_decrypt_local_path[0] = '\0';
+                    s_decrypt_status[0]     = '\0';
+                    s_decrypt_open = true;
+                    ImGui::OpenPopup("Decrypt & Download##dialog");
+                }
                 ImGui::EndPopup();
             }
             ImGui::PopID();
@@ -475,6 +566,7 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
     }
 
     render_share_dialog(app);
+    render_decrypt_dialog(app);
 
     /* Conflict modal */
     if (ImGui::BeginPopupModal("Conflict##browser", nullptr,

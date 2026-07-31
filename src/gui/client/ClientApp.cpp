@@ -2,6 +2,7 @@
 #include "views/vw_view_login.h"
 #include "views/vw_view_browser.h"
 #include "views/vw_view_shared.h"
+#include "views/vw_view_vault.h"
 #include "views/vw_view_queue.h"
 #include "views/vw_view_settings.h"
 #include "imgui.h"
@@ -67,6 +68,8 @@ void ClientApp::render_frame() {
             active_view_ = AppView::Browser;
         if (ImGui::MenuItem("Shared",   nullptr, active_view_ == AppView::Shared))
             active_view_ = AppView::Shared;
+        if (ImGui::MenuItem("Vault",    nullptr, active_view_ == AppView::Vault))
+            active_view_ = AppView::Vault;
         if (ImGui::MenuItem("Queue",    nullptr, active_view_ == AppView::Queue))
             active_view_ = AppView::Queue;
         if (ImGui::MenuItem("Settings", nullptr, active_view_ == AppView::Settings))
@@ -84,6 +87,7 @@ void ClientApp::render_frame() {
     switch (active_view_) {
     case AppView::Browser:  vw_view_browser_render(snap, *this);  break;
     case AppView::Shared:   vw_view_shared_render(snap, *this);   break;
+    case AppView::Vault:    vw_view_vault_render(snap, *this);    break;
     case AppView::Queue:    vw_view_queue_render(snap, *this);    break;
     case AppView::Settings: vw_view_settings_render(snap, *this); break;
     default:
@@ -165,4 +169,35 @@ int ClientApp::ipc_link_revoke(uint64_t share_id) {
 bool ClientApp::ipc_link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.link_list(out, out_error_code);
+}
+
+int ClientApp::ipc_file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.file_mkdir(new_parent_dir_id, name, out_dir_id);
+}
+int ClientApp::ipc_vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.vault_create(folder_file_id, passphrase, out_vault_id);
+}
+int ClientApp::ipc_vault_unlock(uint64_t vault_id, char *passphrase) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.vault_unlock(vault_id, passphrase);
+}
+bool ClientApp::ipc_vault_list(std::vector<VwGuiVaultEntry> *out, int *out_error_code) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.vault_list(out, out_error_code);
+}
+int ClientApp::ipc_vault_upload(uint64_t vault_id, uint64_t file_id,
+                                 const char *leaf_name, const char *local_path,
+                                 uint64_t *out_file_id, uint64_t *out_version_id) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.vault_upload(vault_id, file_id, leaf_name, local_path, out_file_id, out_version_id);
+}
+int ClientApp::ipc_vault_download(uint64_t vault_id, uint64_t file_id, const char *local_path) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.vault_download(vault_id, file_id, local_path);
+}
+int ClientApp::ipc_file_vault_id(uint64_t file_id, uint64_t *out_vault_id) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.file_vault_id(file_id, out_vault_id);
 }

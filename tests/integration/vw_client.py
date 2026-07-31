@@ -417,6 +417,8 @@ class VwClient:
         perm = resp[41]
         path_len = struct.unpack_from("<H", resp, 42)[0]
         vpath = resp[44:44 + path_len].decode("utf-8")
+        off = 44 + path_len
+        vault_id = struct.unpack_from("<Q", resp, off)[0] if off + 8 <= len(resp) else 0
         return {
             "entry_type":   entry_type,
             "file_id":      fid,
@@ -426,6 +428,7 @@ class VwClient:
             "owner_id":     owner_id,
             "perm":         perm,
             "virtual_path": vpath,
+            "vault_id":     vault_id,
         }
 
     def file_delete(self, session_token, file_id=0, path=None):

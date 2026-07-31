@@ -183,6 +183,37 @@ def test_file_commit_with_vault_id_succeeds(server, admin_client, unique_usernam
         stat = owner.file_stat(otoken, file_id=fid)
         assert stat["file_id"] == fid
         assert stat["size_bytes"] == len(data)
+        assert stat["vault_id"] == vault_id
+    finally:
+        owner.close()
+
+
+def test_file_stat_vault_id_reflects_current_version(server, admin_client, unique_username):
+    """
+    TASK-100: FILE_STAT_RESP's vault_id must track the file's CURRENT
+    version, not just "was this file ever encrypted" — an unencrypted file
+    reports vault_id 0, and a directory (which has no version at all)
+    always reports vault_id 0 too.
+    """
+    owner, otoken = _setup_user(admin_client, server, unique_username)
+    try:
+        fid, _ = owner.upload_file(otoken, "/plain.bin", b"unencrypted content")
+        stat = owner.file_stat(otoken, file_id=fid)
+        assert stat["vault_id"] == 0
+
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+        data = b"now encrypted"
+        chash = hashlib.sha256(data).digest()
+        owner.chunk_upload(otoken, data)
+        owner.file_commit(otoken, "", [chash], file_id=fid, logical_size=len(data),
+                           vault_id=vault_id, wrapped_dek=os.urandom(48))
+
+        stat2 = owner.file_stat(otoken, file_id=fid)
+        assert stat2["vault_id"] == vault_id
+
+        dir_id = owner.file_mkdir(otoken, "somedir")
+        dir_stat = owner.file_stat(otoken, file_id=dir_id)
+        assert dir_stat["vault_id"] == 0
     finally:
         owner.close()
 

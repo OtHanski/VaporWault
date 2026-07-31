@@ -5,6 +5,7 @@ add_executable(vapourwault-gui
     views/vw_view_login.cpp
     views/vw_view_browser.cpp
     views/vw_view_shared.cpp
+    views/vw_view_vault.cpp
     views/vw_view_queue.cpp
     views/vw_view_settings.cpp
     ${CMAKE_SOURCE_DIR}/src/client/vw_ipc.c

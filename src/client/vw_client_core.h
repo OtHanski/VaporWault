@@ -125,6 +125,17 @@ typedef struct {
     int64_t  mtime_unix;
     uint64_t version_id;    /* current HEAD version; 0 if directory           */
     char     name[256];     /* leaf name, NUL-terminated                      */
+    uint64_t vault_id;      /* TASK-100: current version's vault, 0 if
+                              * unencrypted. Populated by vw_client_file_stat/
+                              * _stat_by_id (FILE_STAT_RESP carries it); always
+                              * 0 from vw_client_file_list (FILE_LIST_RESP does
+                              * not carry per-entry vault_id — a folder listing
+                              * would need one version lookup per entry to
+                              * populate this honestly, so it doesn't claim to;
+                              * callers needing per-entry encrypted-indicators
+                              * for a whole listing should FILE_STAT each entry
+                              * of interest, same as any other on-demand
+                              * metadata this project doesn't batch). */
 } vw_file_entry_t;
 
 /*

@@ -4,6 +4,7 @@
 #include "vw_watch.h"
 #include "vw_ipc.h"
 #include "vw_client_core.h"
+#include "vw_vault.h"
 #include "../core/vw_fs.h"
 #include "../core/vw_proto.h"
 
@@ -343,6 +344,65 @@ static void ipc_send_u32(vw_ipc_conn_t *conn, vw_ipc_msg_t type, uint32_t code) 
     vw_ipc_send(conn, type, buf, 4);
 }
 
+/* ── Vault registry (TASK-100) ────────────────────────────────────────────
+ * The daemon's IPC loop is single-threaded (handle_ipc_client is called
+ * synchronously from vw_daemon_run's main loop — see that function), so
+ * this needs no locking, same as every other piece of `dc` state. Holds
+ * unlocked vw_vault_t handles (unwrapped VK in memory) for the daemon
+ * process's lifetime, exactly mirroring how dc->sess holds the account
+ * session for the same lifetime — the passphrase itself is never stored,
+ * only used transiently to derive the KEK during VAULT_CREATE/_UNLOCK.
+ */
+typedef struct {
+    uint64_t    vault_id;
+    vw_vault_t *vault;
+} daemon_vault_entry_t;
+
+typedef struct {
+    daemon_vault_entry_t *entries;
+    size_t                count;
+    size_t                cap;
+} daemon_vault_registry_t;
+
+static vw_vault_t *vault_registry_find(daemon_vault_registry_t *reg, uint64_t vault_id) {
+    for (size_t i = 0; i < reg->count; i++)
+        if (reg->entries[i].vault_id == vault_id) return reg->entries[i].vault;
+    return NULL;
+}
+
+/* Takes ownership of `vault` (caller must not vw_vault_close it itself).
+ * If vault_id is already registered, the old handle is closed and
+ * replaced — VAULT_CREATE/_UNLOCK are idempotent from the caller's view. */
+static vw_err_t vault_registry_put(daemon_vault_registry_t *reg, uint64_t vault_id,
+                                    vw_vault_t *vault) {
+    for (size_t i = 0; i < reg->count; i++) {
+        if (reg->entries[i].vault_id == vault_id) {
+            vw_vault_close(reg->entries[i].vault);
+            reg->entries[i].vault = vault;
+            return VW_OK;
+        }
+    }
+    if (reg->count >= reg->cap) {
+        size_t new_cap = reg->cap ? reg->cap * 2 : 4;
+        daemon_vault_entry_t *ne = realloc(reg->entries, new_cap * sizeof(*ne));
+        if (!ne) return VW_ERR_OOM;
+        reg->entries = ne;
+        reg->cap = new_cap;
+    }
+    reg->entries[reg->count].vault_id = vault_id;
+    reg->entries[reg->count].vault    = vault;
+    reg->count++;
+    return VW_OK;
+}
+
+static void vault_registry_close_all(daemon_vault_registry_t *reg) {
+    for (size_t i = 0; i < reg->count; i++)
+        vw_vault_close(reg->entries[i].vault);
+    free(reg->entries);
+    reg->entries = NULL;
+    reg->count = reg->cap = 0;
+}
+
 /* ── IPC dispatch ────────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -359,6 +419,7 @@ typedef struct {
     vw_client_sess_t     **sess_out;  /* points at vw_daemon_run's own `sess` var —
                                         * LOGIN_REQ writes the new session here so
                                         * it survives past this dispatch call      */
+    daemon_vault_registry_t *vaults;  /* TASK-100: unlocked vw_vault_t handles */
 } ipc_dispatch_ctx_t;
 
 /* otp_cb userdata for VW_IPC_LOGIN_REQ: hands a pre-supplied OTP code (if any)
@@ -781,6 +842,187 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_FILE_MKDIR_REQ: {
+        if (plen < 8u || !dc->sess) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_FILE_MKDIR_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint64_t new_parent_dir_id = vw_read_u64le(buf);
+        uint32_t off = 8u;
+        const char *name = NULL; uint16_t name_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &name, &name_len);
+        char name_buf[256];
+        uint64_t dir_id = 0;
+        vw_err_t rc = err;
+        if (rc == VW_OK) {
+            if (name_len >= sizeof(name_buf)) rc = VW_ERR_INVALID_ARG;
+            else {
+                memcpy(name_buf, name, name_len); name_buf[name_len] = '\0';
+                rc = vw_client_file_mkdir(dc->sess, new_parent_dir_id, name_buf, &dir_id);
+            }
+        }
+        uint8_t rbuf[12];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u64le(rbuf + 4u, dir_id);
+        vw_ipc_send(conn, VW_IPC_FILE_MKDIR_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
+    case VW_IPC_VAULT_CREATE_REQ: {
+        if (plen < 8u || !dc->sess) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_VAULT_CREATE_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint64_t folder_file_id = vw_read_u64le(buf);
+        uint32_t off = 8u;
+        const char *pass = NULL; uint16_t pass_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &pass, &pass_len);
+
+        vw_vault_t *vault = NULL;
+        uint64_t vault_id = 0;
+        vw_err_t rc = err;
+        if (rc == VW_OK)
+            rc = vw_vault_setup(dc->sess, folder_file_id, pass, pass_len, NULL, &vault, &vault_id);
+        if (rc == VW_OK) rc = vault_registry_put(dc->vaults, vault_id, vault);
+
+        uint8_t rbuf[12];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u64le(rbuf + 4u, vault_id);
+        vw_ipc_send(conn, VW_IPC_VAULT_CREATE_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
+    case VW_IPC_VAULT_UNLOCK_REQ: {
+        if (plen < 8u || !dc->sess) {
+            ipc_send_u32(conn, VW_IPC_VAULT_UNLOCK_RESP,
+                         (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf);
+        uint32_t off = 8u;
+        const char *pass = NULL; uint16_t pass_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &pass, &pass_len);
+
+        vw_vault_t *vault = NULL;
+        vw_err_t rc = err;
+        if (rc == VW_OK)
+            rc = vw_vault_unlock(dc->sess, vault_id, pass, pass_len, &vault);
+        if (rc == VW_OK) rc = vault_registry_put(dc->vaults, vault_id, vault);
+
+        ipc_send_u32(conn, VW_IPC_VAULT_UNLOCK_RESP, (uint32_t)rc);
+        break;
+    }
+
+    case VW_IPC_VAULT_LIST_REQ: {
+        if (!dc->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            vw_ipc_send(conn, VW_IPC_VAULT_LIST_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        vw_vault_entry_t *entries = NULL; uint32_t count = 0;
+        vw_err_t rc = vw_client_vault_list(dc->sess, &entries, &count);
+        uint8_t *rbuf = malloc(8u + (size_t)count * 24u);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_VAULT_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4;
+        vw_write_u32le(rbuf + roff, (rc == VW_OK) ? count : 0u); roff += 4;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count; i++) {
+                vw_write_u64le(rbuf + roff, entries[i].vault_id);                  roff += 8;
+                vw_write_u64le(rbuf + roff, entries[i].folder_file_id);            roff += 8;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].created_at);      roff += 8;
+            }
+        }
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_VAULT_LIST_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
+    case VW_IPC_VAULT_UPLOAD_REQ: {
+        if (plen < 16u || !dc->sess) {
+            uint8_t rbuf[20] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_VAULT_UPLOAD_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf);
+        uint64_t file_id  = vw_read_u64le(buf + 8u);
+        uint32_t off = 16u;
+        const char *leaf = NULL; uint16_t leaf_len = 0;
+        const char *lpath = NULL; uint16_t lpath_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &leaf, &leaf_len);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &lpath, &lpath_len);
+
+        char leaf_buf[256], lpath_buf[1024];
+        uint64_t out_file_id = 0, out_version_id = 0;
+        vw_err_t rc = err;
+        vw_vault_t *vault = (rc == VW_OK) ? vault_registry_find(dc->vaults, vault_id) : NULL;
+        if (rc == VW_OK && !vault) rc = VW_ERR_AUTH_REQUIRED;
+        if (rc == VW_OK && (leaf_len >= sizeof(leaf_buf) || lpath_len >= sizeof(lpath_buf)))
+            rc = VW_ERR_INVALID_ARG;
+        if (rc == VW_OK) {
+            memcpy(leaf_buf, leaf, leaf_len); leaf_buf[leaf_len] = '\0';
+            memcpy(lpath_buf, lpath, lpath_len); lpath_buf[lpath_len] = '\0';
+            rc = vw_vault_upload_file(vault, dc->sess, file_id,
+                                       file_id == 0 ? leaf_buf : NULL, lpath_buf,
+                                       NULL, NULL, &out_file_id, &out_version_id);
+        }
+        uint8_t rbuf[20];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u64le(rbuf + 4u, out_file_id);
+        vw_write_u64le(rbuf + 12u, out_version_id);
+        vw_ipc_send(conn, VW_IPC_VAULT_UPLOAD_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
+    case VW_IPC_VAULT_DOWNLOAD_REQ: {
+        if (plen < 16u || !dc->sess) {
+            ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP,
+                         (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf);
+        uint64_t file_id  = vw_read_u64le(buf + 8u);
+        uint32_t off = 16u;
+        const char *lpath = NULL; uint16_t lpath_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &lpath, &lpath_len);
+
+        char lpath_buf[1024];
+        vw_err_t rc = err;
+        vw_vault_t *vault = (rc == VW_OK) ? vault_registry_find(dc->vaults, vault_id) : NULL;
+        if (rc == VW_OK && !vault) rc = VW_ERR_AUTH_REQUIRED;
+        if (rc == VW_OK && lpath_len >= sizeof(lpath_buf)) rc = VW_ERR_INVALID_ARG;
+        if (rc == VW_OK) {
+            memcpy(lpath_buf, lpath, lpath_len); lpath_buf[lpath_len] = '\0';
+            rc = vw_vault_download_file(vault, dc->sess, file_id, lpath_buf, NULL, NULL);
+        }
+        ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP, (uint32_t)rc);
+        break;
+    }
+
+    case VW_IPC_FILE_VAULT_ID_REQ: {
+        if (plen < 8u || !dc->sess) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_FILE_VAULT_ID_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint64_t file_id = vw_read_u64le(buf);
+        vw_file_entry_t entry;
+        vw_err_t rc = vw_client_file_stat_by_id(dc->sess, file_id, &entry);
+        uint8_t rbuf[12];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u64le(rbuf + 4u, rc == VW_OK ? entry.vault_id : 0u);
+        vw_ipc_send(conn, VW_IPC_FILE_VAULT_ID_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }
@@ -840,6 +1082,19 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     install_signal_handlers();
 
     vw_log(LOG_INFO, "VaporWault daemon starting");
+
+    /* TASK-100 finding: nothing in the daemon's process lifetime called
+     * vw_crypto_init() before vaults existed — login only ever needed
+     * vw_crypto_sha256 (no init required) and Argon2id runs server-side,
+     * so this was a latent gap invisible until VAULT_CREATE/_UNLOCK
+     * needed vw_crypto_random/_vault_derive_kek/_aes256gcm_* in this
+     * process. Without it, vw_crypto_random() fails fast with
+     * VW_ERR_CRYPTO (see vw_crypto.c's g_initialized guard), which is
+     * exactly what surfaced this via the TASK-100 IPC diagnostic check. */
+    if (vw_crypto_init() != VW_OK) {
+        vw_log(LOG_ERROR, "vw_crypto_init failed");
+        return VW_ERR_CRYPTO;
+    }
 
     vw_err_t err = vw_fs_ensure_dir(cfg->state_dir);
     if (err != VW_OK) {
@@ -910,6 +1165,7 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     int shutdown  = 0;
     int64_t last_sync_at = 0;
     uint32_t error_count  = 0;
+    daemon_vault_registry_t vault_registry = {0};
 
     ipc_dispatch_ctx_t dc;
     dc.cache         = cache;
@@ -923,6 +1179,7 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     dc.shutdown_flag = &shutdown;
     dc.cfg           = cfg;
     dc.sess_out      = &sess;
+    dc.vaults        = &vault_registry;
 
     vw_log(LOG_INFO, "daemon ready (ipc_port=%u sync_interval=%ums)",
            (unsigned)cfg->ipc_port, (unsigned)cfg->sync_interval_ms);
@@ -1024,12 +1281,14 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     /* ── Shutdown ───────────────────────────────────────────────────────── */
     vw_log(LOG_INFO, "shutting down");
 
+    vault_registry_close_all(&vault_registry);
     vw_sync_close(sync_ctx);
     if (sess) vw_client_logout(sess);
     vw_watcher_close(watcher);
     vw_ipc_server_close(ipc_srv);
     vw_cache_close(cache);
     pid_file_remove();
+    vw_crypto_cleanup();
 
     if (g_log_fp && g_log_to_file) fclose(g_log_fp);
     return VW_OK;
