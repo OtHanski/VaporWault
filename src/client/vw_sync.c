@@ -888,7 +888,20 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
                 ce.server_size       = se->size_bytes;
                 (void)vw_cache_upsert(ctx->cache, &ce);
             } else if (cerr == VW_OK) {
-                if (ce.server_version_id != se->version_id) {
+                /* TASK-109 workaround: FILE_LIST_RESP never carries
+                 * version_id per entry (always 0 — see ARCHITECTURE.md's
+                 * "Sync engine awareness of shared folders" note), so
+                 * comparing only server_version_id can never detect a
+                 * remote change on any cycle after the first — every
+                 * value involved is permanently 0. FILE_LIST_RESP does
+                 * correctly carry mtime_unix/size_bytes, so those are
+                 * compared too; a real fix (extending FILE_LIST_RESP
+                 * itself) is tracked separately (TODO/TASK-109.md), since
+                 * safely extending a repeated wire structure is a bigger
+                 * change than fits here. */
+                if (ce.server_version_id != se->version_id ||
+                    ce.server_mtime      != se->mtime_unix ||
+                    ce.server_size       != se->size_bytes) {
                     /* Server has a newer version */
                     if (ce.sync_state == VW_SYNC_LOCAL_MOD ||
                         ce.sync_state == VW_SYNC_NEW_LOCAL) {
@@ -902,7 +915,7 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
                     ce.file_id           = se->file_id;
                     (void)vw_cache_upsert(ctx->cache, &ce);
                 }
-                /* version_id matches → no change from server side */
+                /* else: no change from server side */
             }
         }
 

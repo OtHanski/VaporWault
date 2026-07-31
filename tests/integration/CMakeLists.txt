@@ -97,6 +97,35 @@ if(WIN32)
     target_link_libraries(test_vault_regression PRIVATE ws2_32)
 endif()
 
+# test_shared_sync: TASK-106 sync engine shared-folder support, end-to-end
+# against a real already-running server. Drives vw_sync.c's shared-folder
+# branch directly (there is no daemon process involved, unlike the IPC
+# plumbing added for TASK-106 Task #20 — this exercises the sync engine
+# itself, the thing that actually moves bytes). Same rationale as
+# test_vault_e2ee for not using ctest add_test directly: needs a live
+# server + two created users, which only the pytest wrapper
+# (test_shared_sync.py) knows how to provide.
+
+add_executable(test_shared_sync
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_shared_sync.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_cache.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_sync.c
+)
+
+target_include_directories(test_shared_sync PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_link_libraries(test_shared_sync PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_shared_sync PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_shared_sync PRIVATE ws2_32)
+endif()
+
 # ── Python integration test suite (TASK-038) ─────────────────────────────────
 # Starts real vapourwaultd + vapourwault-daemon binaries, exercises IT-1..IT-8.
 # Requires: openssl (for cert generation), Python 3.7+, POSIX.
