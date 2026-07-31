@@ -50,6 +50,8 @@ public:
     bool ipc_shutdown();
     int  ipc_folder_add(const char *local, const char *virt);
     int  ipc_folder_remove(const char *local);
+    int  ipc_login(char *password, const char *otp);
+    bool ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
 
     uint16_t ipc_port = VW_IPC_DEFAULT_PORT;
 

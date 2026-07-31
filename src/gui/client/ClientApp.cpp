@@ -128,3 +128,11 @@ int ClientApp::ipc_folder_remove(const char *local) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.send_folder_remove(local);
 }
+int ClientApp::ipc_login(char *password, const char *otp) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.login(password, otp);
+}
+bool ClientApp::ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.file_list(prefix, out);
+}

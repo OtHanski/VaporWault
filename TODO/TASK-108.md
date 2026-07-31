@@ -1,0 +1,93 @@
+---
+id:          TASK-108
+title:       GUI client file browser — wire to real synced-file listing
+status:      done
+assignee:    GUI.03
+created_by:  ARCH.00
+created:     2026-07-31
+priority:    normal
+depends_on:  [TASK-107]
+blocks:      [TASK-096]
+review_by:   [CQR.08]
+tags:        [gui]
+---
+
+Discovered alongside `TASK-107`: `vw_view_browser_render`
+(`src/gui/client/views/vw_view_browser.cpp`) has never called
+`VW_IPC_FILE_LIST_REQ` at all — the file table always renders one hardcoded
+placeholder row ("select a folder to list files"), and the folder tree pane
+is a hardcoded "/ (root)" label with no navigation. `VwGuiIpc` has no
+`file_list()` method. Meanwhile `vapourwault-cli ls` already exercises this
+exact IPC message successfully — the daemon-side plumbing is not the gap,
+only the GUI side.
+
+Note the scope of what this shows: `VW_IPC_FILE_LIST_REQ` is backed by the
+daemon's local sync cache (`vw_cache_list`), i.e. files inside folders the
+user has `add-folder`'d — the same thing `vapourwault-cli ls` shows. It is
+**not** a live arbitrary-path remote browse of the server's whole tree.
+This is an existing architectural property of the daemon/CLI/GUI stack
+(not something this task changes) — see `TASK-096`'s notes for why
+"shared with me" therefore needs its own view rather than appearing inside
+this browser.
+
+## Acceptance criteria
+
+- `VwGuiIpc` gains a `file_list(prefix, out)` method mirroring
+  `vw_client_cli.c`'s `cmd_ls` decode logic (`VW_IPC_FILE_LIST_REQ`/`_RESP`),
+  returning a `std::vector` of entries (virtual path, size, mtime,
+  entry_type, sync_state).
+- `vw_view_browser_render` populates the file table with real rows: name,
+  human-readable size (or "--" for directories), formatted modified time,
+  and the sync-state colour/label helpers already defined in that file
+  (currently `[[maybe_unused]]` — remove that attribute once actually
+  used).
+- Folder navigation: double-clicking a directory row descends into it
+  (refetches with the extended path prefix); an "up" affordance returns to
+  the parent. A breadcrumb or path display shows the current location.
+- A "Refresh" action re-fetches the current listing on demand, and the
+  listing auto-refreshes when the view is first opened after login.
+- Manually verified against a real running daemon + server with at least
+  one populated sync folder (not just a compile check).
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-07-31]: Filed alongside `TASK-107`, same context.
+
+GUI.03 [2026-07-31]: Implemented `VwGuiIpc::file_list()` (benefits from
+`TASK-107`'s one-shot connection fix — this was actually the call that
+first exposed that bug, since it's the second call in a login-then-list
+sequence). `vw_view_browser_render` now fetches on first open and on an
+explicit "Refresh" button, renders real rows with human-readable size,
+formatted mtime, and the sync-state colour/label helpers (now actually
+used — removed their `[[maybe_unused]]` attribute).
+
+Folder navigation required more care than expected: `VW_IPC_FILE_LIST_REQ`
+is a **flat, string-prefix-filtered** listing of the entire local sync
+cache, not a "list this directory's immediate children" call — confirmed
+by reading `vw_daemon.c`'s handler (`strncmp` against the requested prefix
+over every cache entry, no path-depth awareness at all). So "current
+directory" browsing is synthesized client-side: fetch the whole list once,
+then group by virtual-path components relative to the current path,
+inferring intermediate directories from deeper file paths. A twist
+confirmed via the same diagnostic harness: the local cache **does**
+sometimes contain real `VW_ENTRY_DIR` records directly (the local walk
+creates them; only the *remote* upload side skips them, per `TASK-104`'s
+notes) — so the grouping logic checks `entry_type` for direct children
+before falling back to inferring a directory from a deeper path, to avoid
+showing a real directory record as a zero-byte "file" row.
+
+Double-click-to-descend and an "Up" button are implemented via simple
+string manipulation on the current-path breadcrumb (no need to re-fetch on
+navigation — the full list is already cached client-side from the last
+refresh).
+
+**Validation:** same standalone diagnostic as `TASK-107` confirmed
+`file_list()` returns correct, decodable entries (3 for a test folder with
+one root file and one nested file — the nested file's parent directory
+appearing as a real cache entry, confirming the `entry_type` handling
+above was necessary, not speculative). GCC/WSL build of both
+`vapourwault-gui` and `vapourwault-server-gui` clean. Same disclosed
+limitation as `TASK-107`: no pixel-level interactive verification possible
+in this environment — a human should click through folder navigation once.
