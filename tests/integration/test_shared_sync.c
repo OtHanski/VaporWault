@@ -116,6 +116,16 @@ static int file_content_equals(const char *path, const char *expected) {
     return match;
 }
 
+static int count_cb(const char *name, void *ud) { (void)name; *(int *)ud += 1; return 0; }
+
+/* Counts entries in `dir` — used to catch a spurious extra file (e.g. a
+ * bogus *.conflict.* artifact) that a correct sync cycle must not create. */
+static int count_dir_entries(const char *dir) {
+    int count = 0;
+    vw_fs_list_dir(dir, count_cb, &count);
+    return count;
+}
+
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
@@ -259,6 +269,22 @@ int main(int argc, char **argv) {
     write_bytes(down_second, "second file content, edited by grantee");
     err = vw_sync_run(sync_ctx);
     CHECK(err == VW_OK, "grantee: sync_run after local modify succeeds");
+
+    /* Regression check (TASK-106 review finding #2): grantee_new.txt's
+     * cache entry just got a real server_version_id from the upload two
+     * cycles ago (update_cache_after_upload's FILE_STAT_BY_ID call), while
+     * this cycle's FILE_LIST reports it with version_id always 0 — an
+     * unconditional version_id comparison would spuriously flag it as
+     * "changed" here even though nothing about it changed, producing an
+     * unwanted extra download or, worse, a bogus *.conflict.* file (if this
+     * cycle's Pass 1 had also marked it LOCAL_MOD/NEW_LOCAL). Confirm
+     * neither happened: exactly 3 entries in local_root (orig.txt,
+     * second.txt, grantee_new.txt — no spurious conflict artifact), and
+     * grantee_new.txt's content is exactly what was written, untouched. */
+    CHECK(count_dir_entries(local_root) == 3,
+          "grantee: no spurious extra file in local_root after an unrelated sync cycle");
+    CHECK(file_content_equals(new_local, "created by grantee"),
+          "grantee: grantee_new.txt untouched by an unrelated sync cycle");
 
     char owner_check_local[600];
     path_join(owner_check_local, sizeof(owner_check_local), tmpdir, "owner_check.txt");

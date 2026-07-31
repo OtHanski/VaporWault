@@ -592,18 +592,34 @@ def test_file_list_by_dir_file_id_lists_a_shared_folder(server, admin_client, un
     finally:
         grantee.close()
 
+    child_file_id = owner.file_stat(otoken, path="/shared_folder/child.txt")["file_id"]
+
     try:
-        # A user with no grant at all gets NOT_FOUND (existence hidden).
+        # A user with no grant at all gets NOT_FOUND (existence hidden) —
+        # both for a directory (folder_id) and, critically, for a plain
+        # FILE (child_file_id). The file case regression-tests a real
+        # SEC.07 finding from TASK-106's review: the server used to check
+        # entry_type BEFORE checking permission, so a caller with zero
+        # access could distinguish "exists and is a file" (INVALID_ARG)
+        # from "doesn't exist, or is a directory I can't see" (NOT_FOUND)
+        # for an arbitrary/guessed file_id — file_id is a single global
+        # sequential counter, not scoped per user, making this a real
+        # enumeration oracle. Both must come back identically as NOT_FOUND.
         stranger, stoken = _setup_user(admin_client, server, f"{unique_username}_stranger")
         try:
             with pytest.raises(VwProtocolError) as exc_info:
                 stranger.file_list(stoken, dir_file_id=folder_id)
             assert exc_info.value.code == VW_ERR_NOT_FOUND
+
+            with pytest.raises(VwProtocolError) as exc_info_file:
+                stranger.file_list(stoken, dir_file_id=child_file_id)
+            assert exc_info_file.value.code == VW_ERR_NOT_FOUND
         finally:
             stranger.close()
 
-        # dir_file_id naming a plain FILE (not a directory) is rejected.
-        child_file_id = owner.file_stat(otoken, path="/shared_folder/child.txt")["file_id"]
+        # dir_file_id naming a plain FILE the caller DOES have full access
+        # to (the owner, here) is rejected as INVALID_ARG — the type check
+        # still applies once permission is established.
         with pytest.raises(VwProtocolError) as exc_info2:
             owner.file_list(otoken, dir_file_id=child_file_id)
         assert exc_info2.value.code == VW_ERR_INVALID_ARG

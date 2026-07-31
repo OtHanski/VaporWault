@@ -248,14 +248,23 @@ static vw_err_t handle_file_list(vw_store_t       *store,
          * on, by file_id — the sync engine's shared-folder support needs
          * this since path-based FILE_LIST can never resolve into someone
          * else's tree. Same permission-resolution helper FILE_COMMIT's
-         * directory-target branch already uses. */
+         * directory-target branch uses, and — as that branch does — the
+         * permission check runs BEFORE the entry_type check (SEC.07
+         * finding during TASK-106 review: checking entry_type first let
+         * any authenticated caller learn whether an arbitrary/guessed
+         * file_id exists and is a file, via VW_ERR_INVALID_ARG vs.
+         * VW_ERR_NOT_FOUND, with zero permission on it — file_id is a
+         * single global sequential counter, not scoped per user, so this
+         * was a real enumeration oracle). Ordering matters: a caller with
+         * no access at all must get the same VW_ERR_NOT_FOUND regardless
+         * of whether dir_file_id names a file, a directory, or nothing. */
         vw_file_record_t dir_rec;
         if (vw_store_file_get_by_id(fs, dir_file_id, &dir_rec) != VW_OK)
             return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
-        if (dir_rec.entry_type != VW_ENTRY_DIR)
-            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
         vw_perm_t perm = effective_permission(ss, fs, &dir_rec, user_id, scope_share_id);
         if (!require_permission(conn, perm, VW_PERM_VIEW)) return VW_OK;
+        if (dir_rec.entry_type != VW_ENTRY_DIR)
+            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
         entry_perm    = (uint8_t)perm;
         root_dir_id   = dir_rec.file_id;
         list_owner_id = dir_rec.owner_id;
