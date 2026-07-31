@@ -340,6 +340,22 @@ per vault as they choose. Only file *content* is encrypted — filenames,
 folder structure, and sizes remain visible to the server, and this
 boundary must be disclosed plainly in the GUI, not just documented here.
 
+**Implementation complete (2026-07-31, `TASK-098`–`TASK-101`)**: server
+storage, client crypto/vault module, GUI (setup wizard, unlock prompts,
+encrypted indicators, and all three required disclosures — passphrase-loss,
+metadata-scope, delta-sync cost), and the regression suite are all done and
+verified (`docs/PROTOCOL.md` §7.11.5, `TODO/TASK-098.md`–`TASK-101.md`).
+Two decisions emerged during implementation that the design stage didn't
+anticipate: (1) per-chunk content is sized at `VW_CHUNK_SIZE_DEFAULT -
+16 bytes` rather than the full chunk size, so a full ciphertext+GCM-tag
+chunk lands exactly at the server's existing `CHUNK_UPLOAD` size ceiling
+instead of overflowing it; (2) a vault's folder must be a real directory
+(`FILE_MKDIR`-created), not merely an owned `file_id` — `VAULT_CREATE`
+itself doesn't enforce this, but `FILE_COMMIT`'s "create a new file under
+this folder" branch does, which only became apparent once a client
+actually tried to create more than one file in a vault (`TASK-100`'s IPC
+diagnostic check caught this exact bug on its first run).
+
 ---
 
 ## Implementation Phases

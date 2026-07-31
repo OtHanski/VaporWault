@@ -232,3 +232,13 @@ should read this task's "explicitly flagged as open" note above before
 starting: it will need to drive the download-direction wire extension
 (surfacing a version's `vault_id`/wrapped DEK to a client) that this task
 deliberately left unspecified pending a real consumer.
+
+QA.06 [2026-07-31]: `TASK-101`'s regression suite
+(`tests/integration/test_vault_regression.c`/`.py`) directly exercises this
+task's storage layer: server opacity (a distinctive plaintext marker
+uploaded exclusively as encrypted content is confirmed absent from a raw
+black-box scan of the server's entire `data_dir` — chunks, versions.blob,
+vaults.blob, all of it) and dedup-defeat across the storage layer's own
+chunk-addressing (identical plaintext uploaded plain + into two different
+vaults produces three pairwise-distinct stored chunk hashes). Both pass.
+No regressions found in this task's own implementation.

@@ -238,3 +238,28 @@ used throughout `vw_client_core.c`'s auth path.
 ARCH.00 [2026-07-31]: SEC.07 and CQR.08 sign-offs recorded above; all
 acceptance criteria satisfied. Closing `TASK-099` as `done`. `TASK-100`
 (GUI vault UI) and `TASK-101` (E2EE regression tests) are now unblocked.
+
+QA.06 [2026-07-31]: `TASK-101`'s regression suite exercises every
+`vw_vault.c`/`vw_client_core.c` API this task added, beyond this task's own
+acceptance-test coverage (`test_vault_e2ee.c`):
+- **Key-loss scoping** (not previously tested): three vaults — two
+  different passphrases, plus a third reusing one of those passphrases'
+  exact text but with its own independently-generated VK. Confirmed a
+  wrong-passphrase unlock (simulating a forgotten passphrase) on one vault
+  has no effect on any other vault's accessibility, including the one
+  sharing the same passphrase text — proving passphrase reuse across
+  vaults never creates cross-vault access.
+- **Cross-vault dedup-defeat** (this task's own test only checked
+  same-vault): identical plaintext uploaded plain + into two different
+  vaults produces three pairwise-distinct chunk hashes, not just two.
+- **Multi-chunk round-trip** (a real gap: every test until now used
+  single-chunk content only): a file spanning two real
+  `VW_VAULT_PLAINTEXT_CHUNK_BYTES` chunks uploads, downloads, and decrypts
+  byte-identical across the chunk boundary.
+- **Retry/nonce-safety at realistic (~4 MiB) scale** (this task's own test
+  only checked a synthetic 64-byte chunk): encrypting a full-size chunk
+  twice with the same DEK+chunk_index reproduces the identical nonce,
+  ciphertext+tag, and content hash, and re-uploading it is idempotent —
+  the direct regression test for the nonce-reuse gap `HKDF(DEK,
+  chunk_index)` exists to close.
+All pass; no regressions found in this task's implementation.

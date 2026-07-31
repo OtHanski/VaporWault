@@ -74,6 +74,29 @@ if(WIN32)
     target_link_libraries(test_vault_e2ee PRIVATE ws2_32)
 endif()
 
+# test_vault_regression: TASK-101 E2EE regression suite (dedup-defeat,
+# key-loss scoping, multi-chunk round-trip, realistic-scale retry safety).
+# Same rationale as test_vault_e2ee for not using ctest add_test directly.
+
+add_executable(test_vault_regression
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vault_regression.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_vault.c
+)
+
+target_include_directories(test_vault_regression PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_link_libraries(test_vault_regression PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vault_regression PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_vault_regression PRIVATE ws2_32)
+endif()
+
 # ── Python integration test suite (TASK-038) ─────────────────────────────────
 # Starts real vapourwaultd + vapourwault-daemon binaries, exercises IT-1..IT-8.
 # Requires: openssl (for cert generation), Python 3.7+, POSIX.
