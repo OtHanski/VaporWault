@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from vw_client import VwClient, VwProtocolError
+from vw_client import VwClient, VwProtocolError, VW_ENTRY_DIR
 
 PASSWORD = "TestP@ssw0rd!"
 CHUNK_4MIB = 4 * 1024 * 1024
@@ -97,6 +97,61 @@ def test_file_list(server, admin_client, unique_username):
 
     assert "alpha.bin" in names, f"alpha.bin not in listing: {names}"
     assert "beta.bin"  in names, f"beta.bin not in listing: {names}"
+
+    c.close()
+
+
+def test_mkdir_creates_nested_directory_structure(server, admin_client, unique_username):
+    """
+    TASK-104: before FILE_MKDIR existed, there was no wire message capable
+    of creating a VW_ENTRY_DIR record at all — folders were only reachable
+    via direct vw_store_file_create calls, bypassing the wire entirely.
+    Creates a two-level nested structure purely over the wire and confirms
+    FILE_LIST/FILE_STAT see all of it, including a file uploaded inside the
+    deepest directory (via the file_id-addressed FILE_COMMIT branch) and
+    resolved back out through purely path-based FILE_LIST — which only
+    works now that every ancestor in the path is a real record.
+    """
+    c, token = _setup_user(admin_client, server, unique_username)
+
+    docs_id = c.file_mkdir(token, "docs")
+    sub_id = c.file_mkdir(token, "sub", new_parent_dir_id=docs_id)
+
+    root_entries = c.file_list(token, path="/")
+    docs_entry = next((e for e in root_entries if e["name"] == "docs"), None)
+    assert docs_entry is not None, f"docs/ missing from root listing: {root_entries}"
+    assert docs_entry["entry_type"] == VW_ENTRY_DIR
+    assert docs_entry["file_id"] == docs_id
+
+    docs_listing = c.file_list(token, path="/docs")
+    sub_entry = next((e for e in docs_listing if e["name"] == "sub"), None)
+    assert sub_entry is not None, f"sub/ missing from /docs listing: {docs_listing}"
+    assert sub_entry["entry_type"] == VW_ENTRY_DIR
+    assert sub_entry["file_id"] == sub_id
+
+    data = b"nested content"
+    chash = hashlib.sha256(data).digest()
+    c.chunk_upload(token, data)
+    file_id, _ = c.file_commit(token, "leaf.txt", [chash], file_id=sub_id, logical_size=len(data))
+
+    stat = c.file_stat(token, file_id=file_id)
+    assert stat["file_id"] == file_id
+
+    nested_listing = c.file_list(token, path="/docs/sub")
+    leaf_entry = next((e for e in nested_listing if e["name"] == "leaf.txt"), None)
+    assert leaf_entry is not None, f"leaf.txt missing from /docs/sub listing: {nested_listing}"
+    assert leaf_entry["file_id"] == file_id
+
+    c.close()
+
+
+def test_mkdir_duplicate_name_rejected(server, admin_client, unique_username):
+    """A second FILE_MKDIR with the same name under the same parent must fail."""
+    c, token = _setup_user(admin_client, server, unique_username)
+
+    c.file_mkdir(token, "dup")
+    with pytest.raises(VwProtocolError):
+        c.file_mkdir(token, "dup")
 
     c.close()
 

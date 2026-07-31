@@ -787,8 +787,15 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
     memcpy(path_buf, path, path_len);
     path_buf[path_len] = '\0';
 
-    /* Allow empty/root path only when file_id != 0 (update by id). */
-    if (path_len > 0) {
+    /* Full absolute-path validation only applies to path-based addressing
+     * (file_id == 0). For file_id != 0 targeting a directory, `path` is a
+     * bare leaf name instead (TASK-104's discovery: this branch was
+     * unreachable in practice before FILE_MKDIR existed to create a real
+     * directory to target — validated separately below, in that branch,
+     * with the bare-leaf-name rules it actually needs, not this
+     * absolute-path check). For file_id != 0 targeting a file (update by
+     * id), `path` is never read at all — see that branch below. */
+    if (file_id == 0 && path_len > 0) {
         err = vw_path_validate(path_buf, (uint32_t)path_len);
         if (err != VW_OK)
             return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
@@ -1909,6 +1916,88 @@ static vw_err_t handle_file_move(vw_store_t       *store,
     return send_err;
 }
 
+/* ── FILE_MKDIR (TASK-104) ─────────────────────────────────────────────────
+ * session_token[32] + new_parent_dir_id(u64, 0 = caller's own root) +
+ * name(string, bare leaf — no '/'). Creates exactly one directory record;
+ * does not auto-create missing ancestors ("mkdir", not "mkdir -p" — see
+ * docs/PROTOCOL.md §7.2). ACK: file_id(u64) + error_code(u32). */
+static vw_err_t handle_file_mkdir(vw_store_t       *store,
+                                   vw_file_store_t  *fs,
+                                   vw_share_store_t *ss,
+                                   vw_conn_t        *conn,
+                                   const uint8_t    *payload,
+                                   uint32_t          plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+
+    /* Same per-scoped-session write-count rate limit as every other write
+     * op (§7.5) — unbounded directory creation is the same small-object
+     * abuse shape the limit already bounds for FILE_COMMIT et al. */
+    if (scope_share_id != 0 && ss &&
+        vw_share_scoped_write_ratelimit_check(ss, payload) != VW_OK)
+        return (send_error(conn, VW_ERR_RATE_LIMITED), VW_OK);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint64_t new_parent_dir_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+
+    const uint8_t *var = payload + VW_TOKEN_BYTES + 8u;
+    uint32_t var_len   = plen - VW_TOKEN_BYTES - 8u;
+    uint32_t off = 0;
+    const char *name; uint16_t name_len;
+    err = vw_proto_read_str(var, var_len, &off, &name, &name_len);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    if (name_len == 0 || name_len >= 64u)
+        return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+    for (uint16_t i = 0; i < name_len; i++)
+        if (name[i] == '/' || name[i] == '\0')
+            return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+
+    uint64_t dest_owner_id;
+    if (new_parent_dir_id == 0) {
+        if (user_id == 0)
+            return (send_error(conn, VW_ERR_PERMISSION), VW_OK); /* anonymous has no root */
+        dest_owner_id = user_id;
+    } else {
+        vw_file_record_t parent_rec;
+        err = vw_store_file_get_by_id(fs, new_parent_dir_id, &parent_rec);
+        if (err != VW_OK)
+            return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+        if (parent_rec.entry_type != VW_ENTRY_DIR)
+            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+        dest_owner_id = parent_rec.owner_id;
+    }
+
+    vw_perm_t parent_perm = permission_on_dir_or_root(ss, fs, new_parent_dir_id,
+                                                       dest_owner_id, user_id, scope_share_id);
+    if (!require_permission(conn, parent_perm, VW_PERM_EDIT)) return VW_OK;
+
+    vw_file_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.owner_id      = dest_owner_id;
+    rec.parent_dir_id = new_parent_dir_id;
+    rec.entry_type    = VW_ENTRY_DIR;
+    memcpy(rec.name, name, name_len);
+    rec.name[name_len] = '\0';
+
+    uint64_t new_file_id = 0;
+    err = vw_store_file_create(fs, &rec, &new_file_id);
+
+    uint8_t ack[12];
+    vw_write_u64le(ack, new_file_id);
+    vw_write_u32le(ack + 8u, (uint32_t)(err == VW_OK ? 0u : (uint32_t)err));
+    vw_err_t send_err = vw_proto_send(conn, VW_MSG_FILE_MKDIR_ACK, ack, sizeof(ack));
+
+    LOG_DEBUG("FILE_MKDIR uid=%llu parent=%llu name=%s rc=%d",
+              (unsigned long long)user_id, (unsigned long long)new_parent_dir_id,
+              rec.name, (int)err);
+    return send_err;
+}
+
 /* ── Sharing (TASK-094; docs/PROTOCOL.md §7.5) ────────────────────────────── */
 
 /*
@@ -2294,6 +2383,8 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_file_delete(store, fs, ss, conn, payload, plen);
     case VW_MSG_FILE_MOVE:
         return handle_file_move(store, fs, ss, conn, payload, plen);
+    case VW_MSG_FILE_MKDIR:
+        return handle_file_mkdir(store, fs, ss, conn, payload, plen);
     case VW_MSG_VERSION_LIST:
         return handle_version_list(store, fs, ss, conn, payload, plen);
     case VW_MSG_VERSION_RESTORE:

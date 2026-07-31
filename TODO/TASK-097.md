@@ -155,3 +155,14 @@ findings. Closing as done. `TASK-088`'s sharing milestone
 remains open, and `TASK-104`/`TASK-106` remain as disclosed, filed
 follow-up gaps (no wire `mkdir`; sync-engine tree integration for shared
 folders).
+
+QA.06 [2026-07-31]: `TASK-104` closed shortly after this task, unblocking
+real wire-created folders. Added four tests this file couldn't have had
+before: two folder-sharing scenarios
+(`test_folder_share_view_grant_blocks_creating_children`/
+`test_folder_share_edit_grant_allows_creating_children`) and — closing the
+FILE_MOVE gap this task's own checklist flagged as untestable — the
+cross-owner-destination and directory-cycle scenarios
+(`test_file_move_rejects_destination_owned_by_someone_else`/
+`test_file_move_directory_into_own_descendant_rejected`). This task's
+FILE_MOVE coverage is now complete.

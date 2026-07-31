@@ -50,6 +50,8 @@ MSG_FILE_DELETE        = 0x020D
 MSG_FILE_DELETE_ACK    = 0x020E
 MSG_FILE_MOVE          = 0x020F
 MSG_FILE_MOVE_ACK      = 0x0210
+MSG_FILE_MKDIR         = 0x0211
+MSG_FILE_MKDIR_ACK     = 0x0212
 MSG_VERSION_LIST       = 0x0301
 MSG_VERSION_LIST_RESP  = 0x0302
 MSG_VERSION_RESTORE    = 0x0303
@@ -77,6 +79,9 @@ VW_PERM_NONE  = 0
 VW_PERM_VIEW  = 1
 VW_PERM_EDIT  = 2
 VW_PERM_OWNER = 3
+
+VW_ENTRY_FILE = 0
+VW_ENTRY_DIR  = 1
 
 # Admin message types (AF_UNIX admin socket, same 8-byte frame format)
 ADMIN_USER_CREATE_REQ  = 0x9001
@@ -429,6 +434,21 @@ class VwClient:
         error_code = struct.unpack_from("<I", resp, 0)[0]
         if error_code != VW_OK:
             raise VwProtocolError(error_code, "file move failed")
+
+    def file_mkdir(self, session_token, name, new_parent_dir_id=0):
+        """Create one directory under new_parent_dir_id (0 = own root). Returns file_id."""
+        payload = (
+            bytes(session_token)
+            + struct.pack("<Q", new_parent_dir_id)
+            + _encode_str(name)
+        )
+        self._send(MSG_FILE_MKDIR, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_FILE_MKDIR_ACK, mt, resp)
+        file_id, error_code = struct.unpack_from("<QI", resp, 0)
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "mkdir failed")
+        return file_id
 
     # ── Sharing (TASK-094) ──────────────────────────────────────────────────
 

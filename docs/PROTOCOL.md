@@ -259,6 +259,8 @@ is sent. On failure: `AUTH_RECOVER_FAIL` is sent with a generic reason.
 | 0x020E | FILE_DELETE_ACK    | S → C     | Deleted                  |
 | 0x020F | FILE_MOVE          | C → S     | Move / rename            |
 | 0x0210 | FILE_MOVE_ACK      | S → C     | Moved                    |
+| 0x0211 | FILE_MKDIR         | C → S     | Create a directory       |
+| 0x0212 | FILE_MKDIR_ACK     | S → C     | Created                  |
 
 **Upload flow:**
 
@@ -332,6 +334,40 @@ Supports move-only, rename-only, or both in one call. See §7.5's
 checks applied before the move is performed.
 
 **FILE_MOVE_ACK payload:** `error_code` (uint32).
+
+**FILE_MKDIR payload (TASK-104 — 0x0211/0x0212, first-ever definition; no
+prior reserved meaning to preserve):**
+
+| Field             | Type                                          |
+|-------------------|------------------------------------------------|
+| session_token     | bytes[32]                                      |
+| new_parent_dir_id | uint64 (0 = caller's own root)                 |
+| name              | string (bare leaf name — no `/`, 1–63 bytes)   |
+
+Creates exactly one new directory record under `new_parent_dir_id`. This is
+`mkdir`, not `mkdir -p` — deliberately does not auto-create missing
+intermediate ancestors, matching this protocol's existing preference for
+explicit single-record operations over implicit multi-record side effects
+(e.g. `FILE_MOVE` never silently creates its destination either). A client
+that needs a nested path created must issue one `FILE_MKDIR` per path
+component, checking each `FILE_MKDIR_ACK` before issuing the next.
+
+Permission rule: same as `FILE_COMMIT`'s "creating a new file under a
+shared folder" case (§7.5) — `VW_PERM_EDIT` is required on
+`new_parent_dir_id` (or, for `new_parent_dir_id == 0`, the caller must be
+an authenticated user creating in their own root; an anonymous scoped
+session can never target `0`, since it has no root of its own, matching
+§7.5's existing scoped-session root-navigation restriction). The new
+directory's `owner_id` is the parent's `owner_id` (or the caller's own
+`user_id` for a root-level create) — same quota/ownership-resolution rule
+as every other content-creation message. Also subject to the same
+per-scoped-session write-count rate limit as `FILE_COMMIT`/`CHUNK_UPLOAD`/
+`FILE_DELETE`/`FILE_MOVE` (§7.5) — unbounded directory creation is the same
+small-object abuse shape that limit already bounds.
+
+**FILE_MKDIR_ACK payload:** `file_id` (uint64, the new directory's id; 0 on
+failure), `error_code` (uint32). `VW_ERR_ALREADY_EXISTS` if a sibling with
+the same name already exists under that parent.
 
 **Download flow:**
 
@@ -1290,6 +1326,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 11      | 2026-07-31 | PRT.04  | `FILE_MKDIR`/`FILE_MKDIR_ACK` (0x0211/0x0212) defined and implemented server-side, resolving `TASK-104` — the first wire mechanism to create a `VW_ENTRY_DIR` record at all (previously only reachable via direct `vw_store_file_create` calls, bypassing the wire; see §7.2 for the full payload spec and its permission/rate-limit rules). Purely additive: no existing message's byte layout changed, no protocol version bump required. |
 | 10      | 2026-07-30 | SRV.01  | Sharing (§7.5/§7.10) implemented server-side, resolving `TASK-094`. No existing message's wire byte layout changed — every SHARE_*/LINK_* message here is newly used (previous `SUB_CREATE`/`SUB_DELETE` never had a handler), and existing messages (`FILE_LIST`, `FILE_STAT`, `FILE_COMMIT`, `FILE_DELETE`, `VERSION_LIST`/`_RESTORE`/`_CHUNKS`, `CHUNK_UPLOAD`/`_DOWNLOAD_REQ`) keep their exact prior byte layout — only the server's permission-check and quota-attribution logic behind them changed. Two purely additive definitions: `FILE_MOVE`/`FILE_MOVE_ACK` (0x020F/0x0210) gets its first-ever payload (see §7.2) — the opcode existed but no handler did; error code 605 (`VW_ERR_RATE_LIMITED`, §10.1) added for the new scoped-session write-count limit. No protocol version bump required since no existing client-observable byte layout changed. |
 | 9       | 2026-07-29 | SRV.01  | §7.6 documents fine-grained admin capability requirements (TASK-092, implemented — not design-stage): `USER_LIST`/`USER_SUSPEND`/`INVITE_CREATE` require `VW_CAP_USER_MGMT`, `QUOTA_ADJUST` requires `VW_CAP_QUOTA_MGMT`, `AUDIT_QUERY` requires `VW_CAP_AUDIT_READ`, `CLUSTER_STATUS` (§7.7) requires `VW_CAP_CLUSTER_MGMT`; an authenticated admin lacking the required capability now gets `VW_ERR_PERMISSION` rather than succeeding. No wire payload shapes changed — this documents new server-side authorization behavior on existing messages. CQR.08 finding: the doc previously described only the blanket `is_admin` gate |
 | 8       | 2026-07-29 | ARCH.00 | Vault/E2EE design published (§7.11): `VAULT_CREATE`/`_ACK` (0x0801/0x0802), `VAULT_KEY_FETCH`/`_RESP` (0x0803/0x0804), `VAULT_LIST`/`_RESP` (0x0805/0x0806); envelope-encryption key model, per-file DEK/nonce scheme, dedup interaction, and metadata-scope boundary specified. Same-day revision after SEC.07 design review: nonce derivation changed from random-prefix+counter to deterministic `HKDF(DEK, chunk_index)` (closes a retry-triggered GCM-nonce-reuse gap); explicit DEK-per-file (not per-vault) guardrail added; Argon2id parameter floor pinned; per-version-DEK/delta-sync tradeoff explicitly accepted (ARCH.00 sign-off). Design-stage only — resolves the design half of `TASK-089`; implementation tracked as `TASK-098`–`TASK-101` |

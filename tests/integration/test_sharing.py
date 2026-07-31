@@ -9,13 +9,17 @@ Originally written as TASK-094's own validation (a subset); TASK-097
 extended it to the full scenario matrix against TASK-094/TASK-095's SEC.07
 findings once a real client existed to drive it.
 
-Deliberately root-level-file-only: there is no wire message that creates a
-directory (VW_ENTRY_DIR) anywhere in this protocol today — FILE_COMMIT's
-path-based branch requires every ancestor directory to already exist, and
-never creates one itself (see TASK-103's sibling finding, filed as
-TASK-104). Folder-sharing's ancestor-walk-up permission resolution is
-covered at the unit level instead (test_vw_share.c builds folder records
-directly via vw_store_file_create, bypassing the wire).
+Most tests here are still root-level-file-only, matching how they were
+originally written back when there was no wire message that could create a
+directory (VW_ENTRY_DIR) at all (see TASK-103's sibling finding, filed as
+TASK-104). FILE_MKDIR (TASK-104) has since closed that gap — see the
+"Folder sharing" section below, which is the one part of this file that
+exercises real wire-created folders. Everything else predates FILE_MKDIR
+and hasn't been retrofitted, since the file-level scenarios they cover
+don't need a folder to make their point. Folder-sharing's ancestor-walk-up
+permission resolution itself is still also covered at the unit level
+(test_vw_share.c builds folder records directly via vw_store_file_create),
+which remains valid, independent coverage.
 
 Each test creates its own users to avoid module-server state pollution, and
 closes every client it opens (via try/finally) even on assertion failure —
@@ -413,14 +417,7 @@ def test_link_list_never_includes_raw_token(server, admin_client, unique_usernam
 # ── FILE_MOVE ────────────────────────────────────────────────────────────────
 
 def test_file_move_rename_at_root(server, admin_client, unique_username):
-    """
-    Rename-only (parent unchanged, new_parent_dir_id=0 -> 0): relocating
-    into a genuinely different folder isn't reachable in this wire-only
-    test file — see module note. That codepath (destination_parent.owner_id
-    == file.owner_id, EDIT on both parents) is exercised by code review and
-    the cycle-check logic shares its shape with handle_file_list's own
-    ancestor walk, which test_vw_share.c does exercise directly.
-    """
+    """Rename-only (parent unchanged, new_parent_dir_id=0 -> 0)."""
     owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
     try:
         fid, _ = owner.upload_file(otoken, "/src.txt", b"move me")
@@ -452,6 +449,110 @@ def test_file_move_requires_edit_not_just_view(server, admin_client, unique_user
 
         with pytest.raises(VwProtocolError):
             grantee.file_move(gtoken, fid, new_parent_dir_id=0, new_name="renamed.txt")
+    finally:
+        owner.close(); grantee.close()
+
+
+def test_file_move_rejects_destination_owned_by_someone_else(server, admin_client, unique_username):
+    """
+    SEC.07 "FILE_MOVE ownership and cycle rules" (§7.5): a grantee with
+    EDIT on the owner's shared folder must not be able to move one of the
+    owner's files out into the grantee's own tree — that would let the
+    file's owner_id (still the real owner, for quota purposes) drift into a
+    parent_dir_id chain the owner can no longer see. Only reachable as a
+    real integration test since FILE_MKDIR (TASK-104) made real
+    cross-owner folders possible.
+    """
+    owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
+    grantee, gtoken = _setup_user(admin_client, server, f"{unique_username}_grantee")
+    try:
+        owner_folder_id = owner.file_mkdir(otoken, "owner_folder")
+        owner.share_grant(otoken, owner_folder_id, f"{unique_username}_grantee", VW_PERM_EDIT)
+        data = b"x"
+        owner.chunk_upload(otoken, data)
+        fid, _ = owner.file_commit(
+            otoken, "doc.txt", [hashlib.sha256(data).digest()],
+            file_id=owner_folder_id, logical_size=len(data),
+        )
+
+        grantee_folder_id = grantee.file_mkdir(gtoken, "grantee_folder")
+
+        with pytest.raises(VwProtocolError):
+            grantee.file_move(gtoken, fid, new_parent_dir_id=grantee_folder_id)
+    finally:
+        owner.close(); grantee.close()
+
+
+def test_file_move_directory_into_own_descendant_rejected(server, admin_client, unique_username):
+    """
+    General correctness requirement (§7.5, independent of sharing): moving
+    a directory into itself or one of its own descendants must be rejected
+    — an undetected cycle would hang or misevaluate every permission check
+    for the affected subtree (the walk-up permission check assumes an
+    acyclic parent_dir_id tree).
+    """
+    owner, otoken = _setup_user(admin_client, server, unique_username)
+    try:
+        parent_id = owner.file_mkdir(otoken, "parent")
+        child_id = owner.file_mkdir(otoken, "child", new_parent_dir_id=parent_id)
+
+        with pytest.raises(VwProtocolError):
+            owner.file_move(otoken, parent_id, new_parent_dir_id=child_id)
+    finally:
+        owner.close()
+
+
+# ── Folder sharing (TASK-104 unblocked this — see module docstring) ────────
+
+def test_folder_share_view_grant_blocks_creating_children(server, admin_client, unique_username):
+    """
+    Folder-sharing scenario, previously only exercisable at the unit level
+    (test_vw_share.c) since there was no wire message to create a real
+    directory — now possible via FILE_MKDIR (TASK-104). A VIEW-only grant
+    on a folder must not let the grantee create a file inside it (mirrors
+    test_grant_view_allows_read_but_not_write's file-level equivalent).
+    """
+    owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
+    grantee, gtoken = _setup_user(admin_client, server, f"{unique_username}_grantee")
+    try:
+        folder_id = owner.file_mkdir(otoken, "shared_folder")
+        owner.share_grant(otoken, folder_id, f"{unique_username}_grantee", VW_PERM_VIEW)
+
+        # Grantee can see the folder and its (empty) contents...
+        stat = grantee.file_stat(gtoken, file_id=folder_id)
+        assert stat["file_id"] == folder_id
+
+        # ...but cannot create a file inside it (VIEW, not EDIT) via either
+        # FILE_COMMIT's folder-target branch or FILE_MKDIR.
+        data = b"sneaky"
+        chash = hashlib.sha256(data).digest()
+        grantee.chunk_upload(gtoken, data)
+        with pytest.raises(VwProtocolError):
+            grantee.file_commit(gtoken, "sneaky.txt", [chash], file_id=folder_id, logical_size=len(data))
+        with pytest.raises(VwProtocolError):
+            grantee.file_mkdir(gtoken, "sneaky_dir", new_parent_dir_id=folder_id)
+    finally:
+        owner.close(); grantee.close()
+
+
+def test_folder_share_edit_grant_allows_creating_children(server, admin_client, unique_username):
+    """The EDIT-permission counterpart of the test above."""
+    owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
+    grantee, gtoken = _setup_user(admin_client, server, f"{unique_username}_grantee")
+    try:
+        folder_id = owner.file_mkdir(otoken, "shared_folder")
+        owner.share_grant(otoken, folder_id, f"{unique_username}_grantee", VW_PERM_EDIT)
+
+        sub_id = grantee.file_mkdir(gtoken, "sub", new_parent_dir_id=folder_id)
+
+        data = b"allowed"
+        chash = hashlib.sha256(data).digest()
+        grantee.chunk_upload(gtoken, data)
+        file_id, _ = grantee.file_commit(gtoken, "ok.txt", [chash], file_id=sub_id, logical_size=len(data))
+
+        # The owner (not the grantee) must be charged, per §7.5 quota resolution.
+        stat = owner.file_stat(otoken, file_id=file_id)
+        assert stat["file_id"] == file_id
     finally:
         owner.close(); grantee.close()
 

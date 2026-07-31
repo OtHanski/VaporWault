@@ -132,6 +132,8 @@ typedef enum {
     VW_MSG_FILE_DELETE_ACK    = 0x020E,
     VW_MSG_FILE_MOVE          = 0x020F,
     VW_MSG_FILE_MOVE_ACK      = 0x0210,
+    VW_MSG_FILE_MKDIR         = 0x0211,  /* create a single directory (TASK-104) */
+    VW_MSG_FILE_MKDIR_ACK     = 0x0212,
 
     /* Version history */
     VW_MSG_VERSION_LIST        = 0x0301,
