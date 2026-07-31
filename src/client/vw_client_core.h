@@ -172,6 +172,18 @@ vw_err_t vw_client_file_list(vw_client_sess_t *sess,
                                uint32_t *out_count);
 
 /*
+ * List a folder by file_id (TASK-106) — works for a folder the caller
+ * doesn't own but has at least VIEW access to (a share grant), unlike
+ * vw_client_file_list. See docs/PROTOCOL.md §7.2's FILE_LIST dir_file_id
+ * note for why path-based listing can't reach a shared folder at all.
+ */
+vw_err_t vw_client_file_list_by_id(vw_client_sess_t *sess,
+                                    uint64_t dir_file_id,
+                                    uint8_t recursive,
+                                    vw_file_entry_t **out,
+                                    uint32_t *out_count);
+
+/*
  * Stat a single virtual path. Returns metadata in *out.
  * Returns VW_ERR_NOT_FOUND if the path does not exist for this user.
  */
@@ -224,6 +236,12 @@ vw_err_t vw_client_file_download(vw_client_sess_t *sess,
  */
 vw_err_t vw_client_file_delete(vw_client_sess_t *sess,
                                  const char *virtual_path);
+
+/*
+ * Delete a file/folder directly by file_id (TASK-106) — works for content
+ * the caller doesn't own (a grant target), unlike vw_client_file_delete.
+ */
+vw_err_t vw_client_file_delete_by_id(vw_client_sess_t *sess, uint64_t file_id);
 
 /*
  * List all versions of virtual_path, oldest first.

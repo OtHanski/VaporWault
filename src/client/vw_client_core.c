@@ -331,44 +331,19 @@ static vw_err_t recv_expect(vw_conn_t *conn, vw_msg_type_t expected_type,
 
 /* ── vw_client_file_list ─────────────────────────────────────────────────── */
 
-vw_err_t vw_client_file_list(vw_client_sess_t *sess,
-                               const char *virtual_path,
-                               uint8_t recursive,
-                               vw_file_entry_t **out,
-                               uint32_t *out_count)
+/*
+ * Shared by vw_client_file_list (path-based) and vw_client_file_list_by_id
+ * (TASK-106, file_id-based — for a folder the caller doesn't own but has
+ * a grant on). Decodes FILE_LIST_RESP: count(u32) then repeated entries.
+ */
+static vw_err_t recv_file_list_resp(vw_conn_t *conn, vw_file_entry_t **out, uint32_t *out_count)
 {
-    vw_err_t err;
-    if (!sess || !virtual_path || !out || !out_count) return VW_ERR_INVALID_ARG;
-    if ((err = sess_check_valid(sess)) != VW_OK) return err;
-    if ((err = path_validate_client(virtual_path)) != VW_OK) return err;
-
-    uint16_t path_len = (uint16_t)strlen(virtual_path);
-
-    /* Build payload: token[32] + recursive(u8) + include_deleted(u8) +
-     *                path_len(u16 LE) + path */
-    uint32_t plen = VW_TOKEN_BYTES + 1u + 1u + 2u + (uint32_t)path_len;
-    uint8_t *pbuf = malloc(plen);
-    if (!pbuf) return VW_ERR_OOM;
-    uint8_t *p = pbuf;
-    memcpy(p, sess->session_token, VW_TOKEN_BYTES); p += VW_TOKEN_BYTES;
-    *p++ = recursive;
-    *p++ = 0; /* include_deleted=0 */
-    vw_write_u16le(p, path_len); p += 2;
-    memcpy(p, virtual_path, path_len);
-
-    err = vw_proto_send(sess->conn, VW_MSG_FILE_LIST, pbuf, plen);
-    free(pbuf);
-    if (err != VW_OK) return err;
-
-    /* Receive FILE_LIST_RESP. Max 65535 entries × ~300 bytes ≈ 20 MiB;
-     * allocate a VW_MAX_MSG_BYTES receive buffer. */
     uint8_t *rbuf = malloc(VW_MAX_MSG_BYTES);
     if (!rbuf) return VW_ERR_OOM;
     uint32_t rplen;
-    err = recv_expect(sess->conn, VW_MSG_FILE_LIST_RESP, rbuf, VW_MAX_MSG_BYTES, &rplen);
+    vw_err_t err = recv_expect(conn, VW_MSG_FILE_LIST_RESP, rbuf, VW_MAX_MSG_BYTES, &rplen);
     if (err != VW_OK) { free(rbuf); return err; }
 
-    /* Decode: count(u32) then repeated entries */
     if (rplen < 4) { free(rbuf); return VW_ERR_PROTO_TRUNCATED; }
     uint32_t count = vw_read_u32le(rbuf);
     uint32_t off = 4;
@@ -406,6 +381,64 @@ trunc:
     free(entries);
     free(rbuf);
     return VW_ERR_PROTO_TRUNCATED;
+}
+
+vw_err_t vw_client_file_list(vw_client_sess_t *sess,
+                               const char *virtual_path,
+                               uint8_t recursive,
+                               vw_file_entry_t **out,
+                               uint32_t *out_count)
+{
+    vw_err_t err;
+    if (!sess || !virtual_path || !out || !out_count) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+    if ((err = path_validate_client(virtual_path)) != VW_OK) return err;
+
+    uint16_t path_len = (uint16_t)strlen(virtual_path);
+
+    /* Build payload: token[32] + recursive(u8) + include_deleted(u8) +
+     *                path_len(u16 LE) + path */
+    uint32_t plen = VW_TOKEN_BYTES + 1u + 1u + 2u + (uint32_t)path_len;
+    uint8_t *pbuf = malloc(plen);
+    if (!pbuf) return VW_ERR_OOM;
+    uint8_t *p = pbuf;
+    memcpy(p, sess->session_token, VW_TOKEN_BYTES); p += VW_TOKEN_BYTES;
+    *p++ = recursive;
+    *p++ = 0; /* include_deleted=0 */
+    vw_write_u16le(p, path_len); p += 2;
+    memcpy(p, virtual_path, path_len);
+
+    err = vw_proto_send(sess->conn, VW_MSG_FILE_LIST, pbuf, plen);
+    free(pbuf);
+    if (err != VW_OK) return err;
+
+    return recv_file_list_resp(sess->conn, out, out_count);
+}
+
+vw_err_t vw_client_file_list_by_id(vw_client_sess_t *sess,
+                                    uint64_t dir_file_id,
+                                    uint8_t recursive,
+                                    vw_file_entry_t **out,
+                                    uint32_t *out_count)
+{
+    vw_err_t err;
+    if (!sess || dir_file_id == 0 || !out || !out_count) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    /* token[32] + recursive(u8) + include_deleted(u8) + path_len(u16)=0
+     * + dir_file_id(u64) */
+    uint8_t pbuf[VW_TOKEN_BYTES + 1u + 1u + 2u + 8u];
+    uint8_t *p = pbuf;
+    memcpy(p, sess->session_token, VW_TOKEN_BYTES); p += VW_TOKEN_BYTES;
+    *p++ = recursive;
+    *p++ = 0; /* include_deleted=0 */
+    vw_write_u16le(p, 0); p += 2; /* path_len=0: path unused, dir_file_id used instead */
+    vw_write_u64le(p, dir_file_id);
+
+    err = vw_proto_send(sess->conn, VW_MSG_FILE_LIST, pbuf, sizeof(pbuf));
+    if (err != VW_OK) return err;
+
+    return recv_file_list_resp(sess->conn, out, out_count);
 }
 
 /* ── vw_client_file_stat ─────────────────────────────────────────────────── */
@@ -1136,6 +1169,39 @@ vw_err_t vw_client_file_delete(vw_client_sess_t *sess,
 
     err = vw_proto_send(sess->conn, VW_MSG_FILE_DELETE, pbuf, plen);
     free(pbuf);
+    if (err != VW_OK) return err;
+
+    uint8_t rbuf[4];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_FILE_DELETE_ACK, rbuf, sizeof(rbuf), &rplen);
+    if (err == VW_OK && rplen >= 4u) {
+        uint32_t ec = vw_read_u32le(rbuf);
+        if (ec != 0) err = (vw_err_t)ec;
+    }
+    return err;
+}
+
+/*
+ * Delete a file/folder directly by file_id (TASK-106) — FILE_DELETE's
+ * wire format already supported file_id addressing (file_id != 0 skips
+ * path parsing entirely, matching FILE_STAT/FILE_COMMIT's convention);
+ * this is simply the client-library wrapper that was never added,
+ * needed so the sync engine can delete a shared item it doesn't own a
+ * path into.
+ */
+vw_err_t vw_client_file_delete_by_id(vw_client_sess_t *sess, uint64_t file_id)
+{
+    vw_err_t err;
+    if (!sess || file_id == 0) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    /* token[32] + file_id(u64) + path_len(u16)=0 (path unused when file_id != 0) */
+    uint8_t pbuf[VW_TOKEN_BYTES + 8u + 2u];
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES);
+    vw_write_u64le(pbuf + VW_TOKEN_BYTES, file_id);
+    vw_write_u16le(pbuf + VW_TOKEN_BYTES + 8u, 0);
+
+    err = vw_proto_send(sess->conn, VW_MSG_FILE_DELETE, pbuf, sizeof(pbuf));
     if (err != VW_OK) return err;
 
     uint8_t rbuf[4];

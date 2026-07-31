@@ -182,6 +182,16 @@ static vw_err_t handle_file_list(vw_store_t       *store,
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
 
+    /* TASK-106: optional trailing dir_file_id(u64) — lets an authenticated
+     * grant-holder list a SHARED folder's children by file_id, which no
+     * existing FILE_LIST path could reach (path lookups are namespaced by
+     * the caller's own owner_id; only a scoped/anonymous session could
+     * navigate a shared subtree before this, via its own fixed scope
+     * target, never a caller-supplied id). Absent or 0 = today's
+     * behavior unchanged; old clients never send this field. */
+    uint64_t dir_file_id = 0;
+    if (off + 8u <= var_len) dir_file_id = vw_read_u64le(var + off);
+
     int path_is_root = (path_len == 0) || (path_len == 1 && path[0] == '/');
 
     /* Resolve path → parent directory file_id.
@@ -202,14 +212,17 @@ static vw_err_t handle_file_list(vw_store_t       *store,
     if (scope_share_id != 0) {
         /* TASK-094 (CQR.08 finding): a scoped session has no access to the
          * global root. parent_dir_id == 0 (empty/root path) resolves to the
-         * scope's own target instead — never the server's actual root. A
+         * scope's own target instead — never the server's actual root.
+         * dir_file_id is rejected for a scoped session: it already has its
+         * own fixed navigation root and no legitimate reason to name a
+         * different file_id (TASK-106 added dir_file_id for authenticated
+         * grant-holders specifically because they have no scope target to
+         * fall back on — a scoped session doesn't have that gap). A
          * non-root path from a scoped session isn't supported by this
-         * wire message today (FILE_LIST has no file_id field to name a
-         * deeper subfolder outside the caller's own path namespace;
-         * recursive=1 from the scope root already returns the whole
-         * subtree in one call without needing one) — rejected explicitly
-         * rather than silently misbehaving. */
-        if (!path_is_root)
+         * wire message either (recursive=1 from the scope root already
+         * returns the whole subtree in one call without needing one) —
+         * both rejected explicitly rather than silently misbehaving. */
+        if (!path_is_root || dir_file_id != 0)
             return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
 
         vw_share_record_t share;
@@ -230,6 +243,22 @@ static vw_err_t handle_file_list(vw_store_t       *store,
             root_dir_id   = scope_rec.file_id;
             list_owner_id = scope_rec.owner_id;
         }
+    } else if (dir_file_id != 0) {
+        /* TASK-106: list a folder the caller doesn't own but has a grant
+         * on, by file_id — the sync engine's shared-folder support needs
+         * this since path-based FILE_LIST can never resolve into someone
+         * else's tree. Same permission-resolution helper FILE_COMMIT's
+         * directory-target branch already uses. */
+        vw_file_record_t dir_rec;
+        if (vw_store_file_get_by_id(fs, dir_file_id, &dir_rec) != VW_OK)
+            return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+        if (dir_rec.entry_type != VW_ENTRY_DIR)
+            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+        vw_perm_t perm = effective_permission(ss, fs, &dir_rec, user_id, scope_share_id);
+        if (!require_permission(conn, perm, VW_PERM_VIEW)) return VW_OK;
+        entry_perm    = (uint8_t)perm;
+        root_dir_id   = dir_rec.file_id;
+        list_owner_id = dir_rec.owner_id;
     } else if (!path_is_root) {
         char path_buf[VW_MAX_PATH_BYTES + 1];
         if (path_len > VW_MAX_PATH_BYTES)

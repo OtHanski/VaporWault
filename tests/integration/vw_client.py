@@ -357,9 +357,14 @@ class VwClient:
             raise VwProtocolError(error_code, "file commit failed")
         return new_file_id, version_id
 
-    def file_list(self, session_token, path="/", recursive=False, include_deleted=False):
+    def file_list(self, session_token, path="/", recursive=False, include_deleted=False,
+                   dir_file_id=0):
         """
         List directory contents.
+
+        dir_file_id (TASK-106): list a folder by file_id instead of path —
+        works for a folder the caller doesn't own but has a grant on. When
+        nonzero, `path` is ignored server-side.
 
         Returns list of dicts: name, file_id, size_bytes, mtime_unix, entry_type, perm.
         """
@@ -369,6 +374,8 @@ class VwClient:
             + struct.pack("<BB", 1 if recursive else 0, 1 if include_deleted else 0)
             + _encode_str(path_b)
         )
+        if dir_file_id:
+            payload += struct.pack("<Q", dir_file_id)
         self._send(MSG_FILE_LIST, payload)
         mt, resp = self._recv()
         self._expect(MSG_FILE_LIST_RESP, mt, resp)

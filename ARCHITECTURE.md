@@ -356,6 +356,56 @@ this folder" branch does, which only became apparent once a client
 actually tried to create more than one file in a vault (`TASK-100`'s IPC
 diagnostic check caught this exact bug on its first run).
 
+**Sync engine awareness of shared folders (2026-07-31, `TASK-106` design)**:
+`TASK-095` gave grant-holders file-id-based stat/upload/download/move for a
+single shared item, but not folder sync, because paths are owner-namespaced
+server-side (`vw_store_file_get_by_path`'s hard filter) — a grantee's own
+`FILE_LIST` call can never resolve into someone else's tree by path. The
+missing piece: no wire mechanism let an *authenticated* (non-scoped)
+session list a shared folder's children by `file_id` at all (only the
+anonymous scoped-link case, `LINK_ACCESS`, could navigate a shared subtree,
+via its own scope target rather than a caller-supplied id).
+
+Design, implemented across five pieces:
+1. **Wire**: `FILE_LIST` gains an optional trailing `dir_file_id` (uint64)
+   field. When present and nonzero (and the session isn't already scoped —
+   scoped sessions have their own root-resolution path and reject this
+   field), the server resolves the listing root via `effective_permission()`
+   exactly like `FILE_COMMIT`'s existing directory-target branch does,
+   instead of the path-based owner lookup. Purely additive; no version
+   bump — mirrors every other trailing-field extension this project uses.
+2. **Client cache**: `vw_sync_folder_t` gains `remote_dir_id` (uint64,
+   0 = today's owned-path-based folder). A nonzero value means "this sync
+   folder is rooted at a shared item, addressed by file_id, not by virtual
+   path" — `virtual_root` becomes purely a local bookkeeping/display value
+   in that mode, never sent to the server.
+3. **Sync engine**: `srv_collect`'s BFS is mirrored (not shared via a
+   parameterized abstraction — the two walks differ enough in what they
+   carry, and duplication here is cheaper than the abstraction) into a
+   `remote_dir_id`-rooted variant using the new `FILE_LIST` extension.
+   `compute_actions`/`exec_action` needed `action_t` to carry `file_id` and
+   `remote_dir_id` so the executor can pick file-id-addressed primitives
+   (`vw_client_file_upload_into_folder`/`_to_id`/`_download_by_id`, plus a
+   new `vw_client_file_delete_by_id` — `FILE_DELETE`'s wire format already
+   supported file_id addressing, only the client wrapper never exposed it)
+   instead of path-based ones for a shared folder, while owned folders keep
+   their existing path-based behavior byte-for-byte unchanged.
+4. **Live revocation**: a definitive permission error (share revoked)
+   walking a shared folder's root auto-pauses that one sync folder
+   (reusing the existing `paused` flag/mechanism) rather than being retried
+   forever as a generic network error — the folder simply stops advancing
+   and stays visible/inspectable, rather than spinning.
+5. **Discovered, deliberately not fixed here**: implementing this surfaced
+   that `FILE_LIST_RESP` never carries `version_id` per entry, so ongoing
+   (non-first-time) remote-change detection driven by `FILE_LIST` alone was
+   silently broken for *every* sync folder, not just shared ones — see
+   `TODO/TASK-109.md`. Worked around for both owned and shared folders with
+   a client-local, wire-safe fix (`compute_actions` also compares
+   `mtime_unix`/`size_bytes`, which `FILE_LIST_RESP` already carries
+   correctly) rather than the real fix, which means safely extending a
+   *repeated* wire structure — a large enough change to deserve its own
+   design pass, not a rushed addition here.
+
 ---
 
 ## Implementation Phases

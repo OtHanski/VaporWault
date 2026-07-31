@@ -58,3 +58,17 @@ CLI.02 [2026-07-30]: Filed while closing out `TASK-095` — this is the one
 scope item from that task's original description not covered by the
 delivered work. Not fixed in place since it's a genuinely separate design
 question, not a small follow-on.
+
+CLI.02 [2026-07-31]: Design recorded in full in `ARCHITECTURE.md`'s "Sync
+engine awareness of shared folders" entry — summary: `FILE_LIST` gains an
+optional `dir_file_id` field (resolved via `effective_permission()`,
+mirroring `FILE_COMMIT`'s existing directory-target branch), `vw_sync_folder_t`
+gains `remote_dir_id`, the sync engine's server-walk and action-executor
+get file-id-addressed variants alongside the existing path-based ones
+(owned-folder behavior is unchanged byte-for-byte), and a definitive
+permission error auto-pauses the affected sync folder instead of retrying
+forever. Also filed `TODO/TASK-109.md` for a pre-existing, unrelated-but-
+adjacent bug this surfaced (`FILE_LIST_RESP` never carries `version_id`,
+silently breaking ongoing remote-change detection for *every* sync folder)
+— worked around client-locally for this task rather than fixed at the wire
+level, which needs its own design pass. Proceeding to implementation.

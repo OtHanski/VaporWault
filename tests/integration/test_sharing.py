@@ -37,6 +37,7 @@ import pytest
 from vw_client import (
     VwClient, VwProtocolError, VwAuthError,
     VW_PERM_VIEW, VW_PERM_EDIT, VW_ERR_NOT_FOUND, VW_ERR_RATE_LIMITED,
+    VW_ERR_INVALID_ARG,
 )
 
 PASSWORD = "TestP@ssw0rd!"
@@ -555,6 +556,59 @@ def test_folder_share_edit_grant_allows_creating_children(server, admin_client, 
         assert stat["file_id"] == file_id
     finally:
         owner.close(); grantee.close()
+
+
+def test_file_list_by_dir_file_id_lists_a_shared_folder(server, admin_client, unique_username):
+    """
+    TASK-106: FILE_LIST's dir_file_id extension is the sync engine's
+    actual entry point for shared-folder support — a grant-holder can now
+    list a shared folder's children without owning a path into it, which
+    was structurally impossible before (path lookups are namespaced by
+    the caller's own owner_id).
+    """
+    # Only two clients ever held open simultaneously — this module's server
+    # is configured with max_workers=2 (see conftest.py), so a third
+    # concurrently-open connection would hang waiting for a free worker
+    # rather than fail fast. grantee is closed before stranger opens.
+    owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
+    grantee, gtoken = _setup_user(admin_client, server, f"{unique_username}_grantee")
+    try:
+        folder_id = owner.file_mkdir(otoken, "shared_folder")
+        owner.share_grant(otoken, folder_id, f"{unique_username}_grantee", VW_PERM_VIEW)
+
+        data = b"content"
+        chash = hashlib.sha256(data).digest()
+        owner.chunk_upload(otoken, data)
+        owner.file_commit(otoken, "child.txt", [chash], file_id=folder_id, logical_size=len(data))
+
+        entries = grantee.file_list(gtoken, dir_file_id=folder_id)
+        assert len(entries) == 1
+        assert entries[0]["name"] == "child.txt"
+
+        # A subdirectory works too (recursive walk of a shared subtree).
+        owner.file_mkdir(otoken, "sub", new_parent_dir_id=folder_id)
+        entries2 = grantee.file_list(gtoken, dir_file_id=folder_id, recursive=True)
+        assert {e["name"] for e in entries2} == {"child.txt", "sub"}
+    finally:
+        grantee.close()
+
+    try:
+        # A user with no grant at all gets NOT_FOUND (existence hidden).
+        stranger, stoken = _setup_user(admin_client, server, f"{unique_username}_stranger")
+        try:
+            with pytest.raises(VwProtocolError) as exc_info:
+                stranger.file_list(stoken, dir_file_id=folder_id)
+            assert exc_info.value.code == VW_ERR_NOT_FOUND
+        finally:
+            stranger.close()
+
+        # dir_file_id naming a plain FILE (not a directory) is rejected.
+        child_file_id = owner.file_stat(otoken, path="/shared_folder/child.txt")["file_id"]
+        with pytest.raises(VwProtocolError) as exc_info2:
+            owner.file_list(otoken, dir_file_id=child_file_id)
+        assert exc_info2.value.code == VW_ERR_INVALID_ARG
+    finally:
+        owner.close()
 
 
 # ── LINK_ACCESS IP rate limiting ─────────────────────────────────────────────
