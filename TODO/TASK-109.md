@@ -1,7 +1,7 @@
 ---
 id:          TASK-109
 title:       FILE_LIST_RESP never carries version_id — remote-change detection silently relies on it anyway
-status:      todo
+status:      done
 assignee:    CLI.02
 created_by:  CLI.02
 created:     2026-07-31
@@ -89,3 +89,33 @@ Whoever does this task's real wire-level fix should keep this in mind:
 only once) `FILE_LIST_RESP` returns a real value for it consistently, at
 which point the mtime/size comparison becomes true defense-in-depth
 instead of a competing, differently-sourced signal.
+
+CLI.02 [2026-08-01]: Real wire-level fix landed (commit `c16af9e`).
+`FILE_LIST_RESP` now appends a trailing `count * u64 version_id` parallel
+array after all existing fixed-size entries — `current_version_id`, the
+same field `FILE_STAT_RESP` already reports. This turned out to need
+neither the entry-length wrapper nor the protocol version bump this file
+originally assumed necessary: a *trailing* parallel array (rather than
+interleaving the new field inside each entry's own byte range) lets an
+old client's decode loop read exactly `count` entries via its own
+hardcoded byte counts and simply stop, never touching the new bytes — the
+same "purely additive" pattern every other extension in this protocol
+uses, just applied as a parallel array instead of a single trailing
+scalar. See `docs/PROTOCOL.md` version history entry 16 for the full
+writeup. `compute_actions` (Pass 2, `vw_sync.c`) now compares `version_id`
+again alongside `mtime_unix`/`size_bytes`, exactly as this file's
+acceptance criteria asked — safe now that both sides read the same source
+field, unlike the transitional workaround that briefly compared it across
+two different provenances (an independent review caught that bug during
+`TASK-106`'s closeout; see that file's notes).
+
+No dedicated new regression test was added for this fix specifically:
+`tests/integration/test_shared_sync.c` (written for `TASK-106`) already
+drives `compute_actions` end-to-end with an owner modifying an
+already-synced file and a second sync cycle detecting it — and that
+function has no `shared`/owned branching anywhere in Pass 2, so the same
+code path this fix touches is exercised regardless of which kind of
+folder triggers it. That test passed cleanly with the restored
+`version_id` comparison (GCC/WSL `-Werror` + `ctest` + full 63-test
+integration pytest suite + MSVC `/W4 /WX`, all clean modulo the
+pre-existing `TASK-110` flake). Marking `done`.
