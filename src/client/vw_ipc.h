@@ -118,6 +118,15 @@ typedef enum {
      * over this IPC and isn't otherwise needed by any GUI view today). */
     VW_IPC_FILE_VAULT_ID_REQ  = 0x802D, /* C→D: look up one file's vault_id       */
     VW_IPC_FILE_VAULT_ID_RESP = 0x802E, /* D→C: error_code + vault_id             */
+
+    /* TASK-106: add a sync folder rooted at a SHARED item (by file_id)
+     * rather than an owned virtual path — a separate message pair rather
+     * than an optional trailing field on FOLDER_ADD_REQ, since the two
+     * cases need genuinely different validation (an owned virtual_root
+     * the caller is free to invent vs. a remote_dir_id that must already
+     * exist and be a directory the caller has at least VIEW access to). */
+    VW_IPC_FOLDER_ADD_SHARED_REQ  = 0x802F, /* C→D: add shared-folder sync target */
+    VW_IPC_FOLDER_ADD_SHARED_RESP = 0x8030, /* D→C: error_code                    */
 } vw_ipc_msg_t;
 
 /*
@@ -145,7 +154,17 @@ typedef enum {
  *   string local_root
  *   string virtual_root
  *   u8     paused
+ *   u64    remote_dir_id  TASK-106: 0 = owned, path-addressed folder;
+ *                         nonzero = a shared folder rooted at this server
+ *                         file_id. Appended after every existing field —
+ *                         no prior consumer of this message decoded past
+ *                         `paused`, so this is a plain addition, not a
+ *                         version-negotiated one (unlike the wire protocol
+ *                         to the server, this IPC channel has no separate
+ *                         client/daemon versions to keep in sync — they
+ *                         ship from the same build).
  *
+
  * VW_IPC_FILE_LIST_RESP per-entry:
  *   string virtual_path
  *   string local_path
@@ -297,6 +316,23 @@ typedef enum {
  * VW_IPC_FILE_VAULT_ID_RESP:
  *   u32 error_code
  *   u64 vault_id           0 = unencrypted; only meaningful if error_code == 0
+ *
+ * VW_IPC_FOLDER_ADD_SHARED_REQ:
+ *   string local_root      local filesystem directory to sync into
+ *   string virtual_root    local display/bookkeeping name only (TASK-106
+ *                          design: never sent to the server for a shared
+ *                          folder) — shown in `ls`/status output the same
+ *                          way an owned folder's virtual_root is.
+ *   u64    remote_dir_id   the shared item's server file_id. Must already
+ *                          be a directory (VW_ENTRY_DIR) the caller has at
+ *                          least VIEW access to (checked via FILE_STAT_BY_ID
+ *                          before the folder is added — VW_ERR_NOT_FOUND if
+ *                          no access, VW_ERR_INVALID_ARG if it's a file, not
+ *                          a directory).
+ * VW_IPC_FOLDER_ADD_SHARED_RESP:
+ *   u32 error_code       vw_err_t; 0 = VW_OK. Requires an active daemon
+ *                        session (VW_ERR_AUTH_REQUIRED if none), same as
+ *                        every other server-touching IPC request.
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

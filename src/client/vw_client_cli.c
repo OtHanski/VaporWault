@@ -253,6 +253,81 @@ static int cmd_remove_folder(vw_ipc_conn_t *conn, const char *local) {
     return 0;
 }
 
+/* ── Subcommand: add-shared-folder (TASK-106) ────────────────────────────── */
+
+/* FOLDER_ADD_SHARED_REQ payload: string local_root, string virtual_root, u64 remote_dir_id. */
+static int cmd_add_shared_folder(vw_ipc_conn_t *conn, const char *local,
+                                   const char *virt, uint64_t remote_dir_id) {
+    uint8_t payload[1048];
+    uint32_t off = 0;
+    vw_ipc_write_str(payload, sizeof(payload), &off,
+                      local, (uint16_t)strnlen(local, 511));
+    vw_ipc_write_str(payload, sizeof(payload), &off,
+                      virt,  (uint16_t)strnlen(virt,  511));
+    vw_write_u64le(payload + off, remote_dir_id); off += 8u;
+
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_FOLDER_ADD_SHARED_REQ, payload, off,
+                             VW_IPC_FOLDER_ADD_SHARED_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "add-shared-folder: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "add-shared-folder")) return 1;
+    printf("shared folder added: %s -> %s (remote_dir_id=%llu)\n",
+           local, virt, (unsigned long long)remote_dir_id);
+    return 0;
+}
+
+/* ── Subcommand: list-folders (TASK-106) ─────────────────────────────────── */
+
+/* FOLDER_LIST_REQ: no payload. FOLDER_LIST_RESP: u32 count + per-entry
+ * (str local_root, str virtual_root, u8 paused, u64 remote_dir_id). */
+static int cmd_list_folders(vw_ipc_conn_t *conn) {
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "list-folders: out of memory\n"); return 1; }
+
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_FOLDER_LIST_REQ, NULL, 0,
+                             VW_IPC_FOLDER_LIST_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) {
+        fprintf(stderr, "list-folders: IPC error %d\n", (int)err);
+        free(resp);
+        return 1;
+    }
+    if (rlen < 4u) { free(resp); return 0; }
+
+    uint32_t count = vw_read_u32le(resp);
+    uint32_t off = 4u;
+
+    printf("%-8s  %-12s  %-30s  %s\n", "PAUSED", "KIND", "LOCAL_ROOT", "VIRTUAL_ROOT");
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *lroot = NULL, *vroot = NULL;
+        uint16_t ll = 0, vl = 0;
+        if (vw_ipc_read_str(resp, rlen, &off, &lroot, &ll) != VW_OK) break;
+        if (vw_ipc_read_str(resp, rlen, &off, &vroot, &vl) != VW_OK) break;
+        if (off + 1u + 8u > rlen) break;
+        uint8_t  paused        = resp[off++];
+        uint64_t remote_dir_id = vw_read_u64le(resp + off); off += 8u;
+
+        char lbuf[512]; size_t lc = ll < sizeof(lbuf)-1u ? ll : sizeof(lbuf)-1u;
+        memcpy(lbuf, lroot, lc); lbuf[lc] = '\0';
+        char vbuf[512]; size_t vc = vl < sizeof(vbuf)-1u ? vl : sizeof(vbuf)-1u;
+        memcpy(vbuf, vroot, vc); vbuf[vc] = '\0';
+
+        char kind_buf[32];
+        if (remote_dir_id != 0)
+            snprintf(kind_buf, sizeof(kind_buf), "shared(%llu)", (unsigned long long)remote_dir_id);
+        else
+            snprintf(kind_buf, sizeof(kind_buf), "owned");
+
+        printf("%-8s  %-12s  %-30s  %s\n",
+               paused ? "yes" : "no", kind_buf, lbuf, vbuf);
+    }
+
+    free(resp);
+    return 0;
+}
+
 /* ── Subcommand: ls / conflicts ──────────────────────────────────────────── */
 
 /*
@@ -566,7 +641,11 @@ static void print_usage(const char *prog) {
         "  pause [<local_root>]          Pause sync (all or one folder)\n"
         "  resume [<local_root>]         Resume sync\n"
         "  add-folder <local> <virtual>  Add a sync folder\n"
+        "  add-shared-folder <local> <virtual> <remote_dir_id>\n"
+        "                                Add a sync folder rooted at a shared\n"
+        "                                item's file_id (see list-shares)\n"
         "  remove-folder <local>         Remove a sync folder\n"
+        "  list-folders                  List sync folders (owned + shared)\n"
         "  ls [<virtual_path>]           List synced files\n"
         "  conflicts                     List conflicted files only\n"
         "  login <password|-|--stdin-password> [otp-code]\n"
@@ -685,6 +764,28 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         return rc;
     }
 
+    if (strcmp(cmd, "add-shared-folder") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi + 2 >= argc) {
+            fprintf(stderr, "Usage: %s add-shared-folder <local_path> <virtual_path> <remote_dir_id>\n",
+                    argv[0]);
+            return 1;
+        }
+        const char *local = argv[argi++];
+        const char *virt  = argv[argi++];
+        const char *idstr = argv[argi++];
+        unsigned long long remote_dir_id = strtoull(idstr, NULL, 10);
+        if (remote_dir_id == 0) {
+            fprintf(stderr, "error: remote_dir_id must be a nonzero file_id\n");
+            return 1;
+        }
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_add_shared_folder(c, local, virt, (uint64_t)remote_dir_id);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
     if (strcmp(cmd, "remove-folder") == 0) {
         HELP_IF_REQUESTED();
         if (argi >= argc) {
@@ -695,6 +796,15 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
         int rc = cmd_remove_folder(c, local);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "list-folders") == 0) {
+        HELP_IF_REQUESTED();
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_list_folders(c);
         vw_ipc_conn_close(c);
         return rc;
     }

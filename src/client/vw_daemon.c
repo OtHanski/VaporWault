@@ -551,6 +551,46 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_FOLDER_ADD_SHARED_REQ: {
+        if (!dc->sess) {
+            ipc_send_u32(conn, VW_IPC_FOLDER_ADD_SHARED_RESP, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            break;
+        }
+        uint32_t off = 0;
+        const char *lroot = NULL, *vroot = NULL;
+        uint16_t ll = 0, vl = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &lroot, &ll);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &vroot, &vl);
+        if (err == VW_OK && off + 8u > plen) err = VW_ERR_PROTO_TRUNCATED;
+        if (err != VW_OK) {
+            ipc_send_u32(conn, VW_IPC_FOLDER_ADD_SHARED_RESP, (uint32_t)err);
+            break;
+        }
+        uint64_t remote_dir_id = vw_read_u64le(buf + off);
+
+        /* TASK-106: remote_dir_id must already be a directory the caller
+         * has at least VIEW access to — checked up front so a bad id fails
+         * immediately with a clear error instead of silently never syncing. */
+        vw_file_entry_t dir_entry;
+        vw_err_t rc = vw_client_file_stat_by_id(dc->sess, remote_dir_id, &dir_entry);
+        if (rc == VW_OK && dir_entry.entry_type != VW_ENTRY_DIR)
+            rc = VW_ERR_INVALID_ARG;
+        if (rc == VW_OK) {
+            vw_sync_folder_t f;
+            memset(&f, 0, sizeof(f));
+            size_t al = ll < sizeof(f.local_root)-1 ? ll : sizeof(f.local_root)-1;
+            memcpy(f.local_root, lroot, al); f.local_root[al] = '\0';
+            al = vl < sizeof(f.virtual_root)-1 ? vl : sizeof(f.virtual_root)-1;
+            memcpy(f.virtual_root, vroot, al); f.virtual_root[al] = '\0';
+            f.remote_dir_id = remote_dir_id;
+            rc = vw_cache_folder_add(dc->cache, &f);
+            if (rc == VW_OK)
+                vw_watcher_add(dc->watcher, f.local_root);
+        }
+        ipc_send_u32(conn, VW_IPC_FOLDER_ADD_SHARED_RESP, (uint32_t)rc);
+        break;
+    }
+
     case VW_IPC_FOLDER_REMOVE_REQ: {
         uint32_t off = 0;
         const char *lroot = NULL; uint16_t ll = 0;
@@ -568,10 +608,11 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     case VW_IPC_FOLDER_LIST_REQ: {
         vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
         (void)vw_cache_folder_list(dc->cache, &folders, &nf);
-        /* Encode: u32 count + per-entry (str local_root, str virtual_root, u8 paused) */
+        /* Encode: u32 count + per-entry (str local_root, str virtual_root,
+         * u8 paused, u64 remote_dir_id [TASK-106]) */
         uint8_t rbuf[65536]; uint32_t roff = 0;
         vw_write_u32le(rbuf + roff, nf); roff += 4;
-        for (uint32_t i = 0; i < nf && roff < sizeof(rbuf) - 1040; i++) {
+        for (uint32_t i = 0; i < nf && roff < sizeof(rbuf) - 1050; i++) {
             uint16_t llen = (uint16_t)strnlen(folders[i].local_root,
                                                sizeof(folders[i].local_root));
             uint16_t vlen = (uint16_t)strnlen(folders[i].virtual_root,
@@ -581,6 +622,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_ipc_write_str(rbuf, sizeof(rbuf), &roff,
                               folders[i].virtual_root, vlen);
             rbuf[roff++] = folders[i].paused;
+            vw_write_u64le(rbuf + roff, folders[i].remote_dir_id); roff += 8u;
         }
         free(folders);
         vw_ipc_send(conn, VW_IPC_FOLDER_LIST_RESP, rbuf, roff);
