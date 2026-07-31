@@ -1,7 +1,7 @@
 ---
 id:          TASK-106
 title:       Sync engine awareness of shared folders (local tree integration)
-status:      todo
+status:      done
 assignee:    CLI.02
 created_by:  CLI.02
 created:     2026-07-30
@@ -123,3 +123,86 @@ change either) — coverage is via the integration/pytest suite and will be
 extended in Task #21 (regression tests) with shared-folder-specific sync
 scenarios once Task #20 (CLI/daemon plumbing to actually add a shared
 folder as a sync target) lands.
+
+CLI.02 [2026-07-31]: Daemon IPC + CLI plumbing done (commit `8900cac`):
+`VW_IPC_FOLDER_ADD_SHARED_REQ/RESP` as a separate message pair from
+`FOLDER_ADD_REQ` (genuinely different validation — a shared `remote_dir_id`
+must already exist, be a directory, and the caller must have at least VIEW
+access, checked server-side via `FILE_STAT_BY_ID` before the folder is
+registered). `FOLDER_LIST_RESP` gained a trailing `remote_dir_id` per
+entry. New CLI commands `add-shared-folder` and `list-folders` (the latter
+didn't exist at all before this — `FOLDER_LIST_REQ/RESP` had no CLI
+consumer). Verified clean on all three toolchains.
+
+CLI.02 [2026-07-31]: Regression tests + closeout (commit `c0ab0e3`), then
+an independent SEC.07/CQR.08 review pass before marking `done` (this task
+is `security-sensitive`, requiring both per CLAUDE.md's routing rules) —
+commit `719d742` fixed what it found.
+
+While writing the regression test, discovered Task #19's implementation
+had never actually applied the `TASK-109` mtime/size workaround it claimed
+in this file's own design notes — `compute_actions`' Pass 2 was still
+comparing only `version_id`, which `FILE_LIST_RESP` never populates
+(always 0), silently breaking remote-change detection for every sync
+folder since the first sync cycle. Fixed in `vw_sync.c` before writing the
+new test (which specifically exercises the modify case this depends on).
+
+New end-to-end test `tests/integration/test_shared_sync.c`/`.py` drives
+`vw_sync.c`'s shared-folder branch directly against a real server with two
+users (owner + EDIT grantee). All checks passed on first run: initial
+sync, incremental sync (new remote file + modified remote file), a
+grantee-created file landing under the owner's ownership
+(`upload_into_folder`), a grantee-modified already-synced file updating in
+place (`upload_to_id`, not a duplicate), and revocation auto-pausing the
+folder without hanging or erroring.
+
+**Independent SEC.07/CQR.08 review** (a fresh, non-forked agent — this
+implementer cannot review its own work objectively) of the full diff
+(`a6a4929`, `19a08a8`, `8900cac`, `c0ab0e3`) found:
+
+- **BLOCKING (SEC.07)**: `handle_file_list`'s new `dir_file_id` branch
+  checked `entry_type` *before* checking permission. Since `file_id` is a
+  single global sequential counter (not scoped per user), any
+  authenticated caller with zero access to an arbitrary/guessed
+  `dir_file_id` could distinguish "exists and is a file"
+  (`VW_ERR_INVALID_ARG`) from "doesn't exist, or is a directory I can't
+  see" (`VW_ERR_NOT_FOUND`) — a real existence/type enumeration oracle,
+  and the only place in this file that reversed the permission-then-type
+  ordering every other branch (`FILE_STAT`, `FILE_DELETE`,
+  `FILE_COMMIT`'s directory-target branch) already used correctly. Fixed:
+  permission check now runs first. New test case added to
+  `test_sharing.py` covering the exact combination that let this through
+  (zero-permission caller + a **file**'s `dir_file_id`, not just a
+  directory's).
+- **BLOCKING (correctness)**: the `TASK-109` workaround itself had a bug —
+  comparing `ce.server_version_id != se->version_id` where the left side
+  is sometimes a *real* value (set by `update_cache_after_upload`'s
+  `FILE_STAT` call after any upload) while the right side is *always* 0
+  (from `FILE_LIST_RESP`). Comparing across those two provenances produced
+  a deterministic false "changed" on every sync cycle immediately
+  following any upload — an unwanted extra download, or worse, a bogus
+  `*.conflict.*` artifact if local state happened to be `LOCAL_MOD`/
+  `NEW_LOCAL` in that same cycle. The very regression test written to
+  validate the workaround silently triggered this without asserting
+  anything about it. Fixed: `version_id` is no longer compared at all in
+  Pass 2 — only `mtime_unix`/`size_bytes`, which `FILE_LIST_RESP` does
+  carry correctly. New assertions added to `test_shared_sync.c`
+  specifically catching this scenario (unchanged file/entry-count after an
+  unrelated sync cycle).
+- Advisory: `update_cache_after_upload` only set `ce.file_id` inside the
+  `FILE_STAT` success branch, leaving it at 0 on a transient stat failure
+  right after a successful create-upload even though the caller already
+  had the real id. Fixed alongside the above (cheap, low-risk).
+- Advisory, deferred (not blocking): revocation-detection treats a
+  same-cycle subdirectory-delete race as indistinguishable from a real
+  revocation (narrow TOCTOU, not exploitable beyond what the share owner
+  could already do directly), and the shared-folder BFS has no cap on
+  total tree size (a sharer can force unbounded grantee-side resource use
+  once the grantee adds the share as a sync target). Filed as
+  `TODO/TASK-111.md`.
+
+Both blocking findings fixed, verified via the new regression assertions
+plus a full three-toolchain pass (GCC/WSL `-Werror` + `ctest` + 63-test
+integration pytest suite + MSVC `/W4 /WX`, all clean modulo the
+pre-existing `TASK-110` flake). SEC.07 + CQR.08 review requirement (this
+task is `security-sensitive`) satisfied by the above. Marking `done`.

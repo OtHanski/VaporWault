@@ -69,3 +69,23 @@ deliberately not fixed in place — a safe wire-level fix to a *repeated*
 structure's per-entry layout is a bigger, riskier change than anything
 else touched this session, and deserves the same "own design pass"
 treatment `TASK-106` itself got, not a rushed tangent.
+
+CLI.02 [2026-07-31]: The client-local workaround described above was
+initially only *planned* (recorded in `ARCHITECTURE.md`), not actually
+implemented, when `TASK-106` first landed — a gap caught while writing
+`TASK-106`'s regression test. Now implemented in `compute_actions` (Pass
+2). One correction to this file's original framing: the mtime/size
+comparison does **not** run alongside a `version_id` comparison as
+defense-in-depth (this file's acceptance criteria assumed it would/should)
+— an independent review during `TASK-106`'s closeout found that comparing
+`ce.server_version_id` (sometimes real, populated by `FILE_STAT` after an
+upload) against `se->version_id` (always 0, from `FILE_LIST_RESP`) is not
+harmless defense-in-depth but actively wrong: it produces a deterministic
+false "changed" on every cycle immediately following any upload, since
+one side is real and the other is permanently zero. `version_id` is
+therefore not compared at all right now, only `mtime_unix`/`size_bytes`.
+Whoever does this task's real wire-level fix should keep this in mind:
+`compute_actions` can safely start comparing `version_id` again once (and
+only once) `FILE_LIST_RESP` returns a real value for it consistently, at
+which point the mtime/size comparison becomes true defense-in-depth
+instead of a competing, differently-sourced signal.
