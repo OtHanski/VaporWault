@@ -154,15 +154,15 @@ typedef enum {
  *   string local_root
  *   string virtual_root
  *   u8     paused
+ *   u8     pause_reason   TASK-111: VW_PAUSE_REASON_* (vw_cache.h); valid
+ *                         iff paused. Inserted right after `paused` (not
+ *                         appended) — both client and daemon ship from the
+ *                         same build, so there is no version-skew risk from
+ *                         changing a field's position rather than only ever
+ *                         appending.
  *   u64    remote_dir_id  TASK-106: 0 = owned, path-addressed folder;
  *                         nonzero = a shared folder rooted at this server
- *                         file_id. Appended after every existing field —
- *                         no prior consumer of this message decoded past
- *                         `paused`, so this is a plain addition, not a
- *                         version-negotiated one (unlike the wire protocol
- *                         to the server, this IPC channel has no separate
- *                         client/daemon versions to keep in sync — they
- *                         ship from the same build).
+ *                         file_id.
  *
 
  * VW_IPC_FILE_LIST_RESP per-entry:

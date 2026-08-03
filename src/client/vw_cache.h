@@ -62,13 +62,27 @@ typedef struct {
 _Static_assert(sizeof(vw_cache_entry_t) == 1088,
                "vw_cache_entry_t must be 1088 bytes");
 
+/* Reasons a sync folder can be found paused (vw_sync_folder_t.pause_reason).
+ * Only meaningful when paused == 1; VW_PAUSE_REASON_NONE covers both "never
+ * paused" and "paused manually" (via vw_cache_folder_set_paused, which
+ * always clears any prior automatic reason — a human pausing/resuming a
+ * folder isn't one of these specific automated causes). */
+#define VW_PAUSE_REASON_NONE           ((uint8_t)0)
+#define VW_PAUSE_REASON_REVOKED        ((uint8_t)1) /* TASK-106/111: shared-folder
+                                                       * access revoked or the
+                                                       * shared root itself deleted */
+#define VW_PAUSE_REASON_TREE_TOO_LARGE ((uint8_t)2) /* TASK-111: shared-folder BFS
+                                                       * exceeded the client's
+                                                       * per-cycle resource ceiling */
+
 /* ── Sync-folder record ──────────────────────────────────────────────────── */
 
 typedef struct {
     char     local_root[512];   /* absolute local path, NUL-terminated  */
     char     virtual_root[512]; /* virtual path root, NUL-terminated    */
     uint8_t  paused;            /* 1 = sync paused for this folder      */
-    uint8_t  _pad[7];
+    uint8_t  pause_reason;      /* VW_PAUSE_REASON_*; valid iff paused   */
+    uint8_t  _pad[6];
     uint64_t remote_dir_id;     /* TASK-106: 0 = normal owned, path-addressed
                                   * sync folder. Nonzero = a SHARED folder,
                                   * rooted at this server file_id rather than
@@ -129,9 +143,21 @@ vw_err_t vw_cache_folder_remove(vw_cache_t *cache, const char *local_root);
 vw_err_t vw_cache_folder_list(vw_cache_t *cache,
                                vw_sync_folder_t **out, uint32_t *out_count);
 
-/* Set the paused flag for a folder by local_root. Returns VW_ERR_NOT_FOUND if absent. */
+/*
+ * Set the paused flag for a folder by local_root. Always resets
+ * pause_reason to VW_PAUSE_REASON_NONE (this is the manual/generic path —
+ * use vw_cache_folder_set_pause_reason for an automatic pause with a
+ * specific cause). Returns VW_ERR_NOT_FOUND if absent.
+ */
 vw_err_t vw_cache_folder_set_paused(vw_cache_t *cache,
                                     const char *local_root, uint8_t paused);
+
+/*
+ * Auto-pause a folder with a specific reason (VW_PAUSE_REASON_*). Always
+ * sets paused = 1. Returns VW_ERR_NOT_FOUND if absent.
+ */
+vw_err_t vw_cache_folder_set_pause_reason(vw_cache_t *cache,
+                                          const char *local_root, uint8_t reason);
 
 #ifdef __cplusplus
 }

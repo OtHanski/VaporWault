@@ -126,6 +126,38 @@ if(WIN32)
     target_link_libraries(test_shared_sync PRIVATE ws2_32)
 endif()
 
+# test_shared_sync_hardening: TASK-111 regression tests for the two advisory
+# findings from TASK-106's independent review (revocation-detection too
+# coarse; unbounded shared-tree BFS). Built with VW_SYNC_TEST_HOOKS so its
+# own compiled copy of vw_sync.c exposes vw_sync_test_before_list_dir — a
+# hook that exists in NO other target here (including test_shared_sync
+# above), letting this test deterministically inject the subdirectory-
+# delete TOCTOU race instead of racing real threads against real network
+# timing. Same rationale as test_shared_sync for not using ctest add_test
+# directly.
+
+add_executable(test_shared_sync_hardening
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_shared_sync_hardening.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_cache.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_sync.c
+)
+
+target_include_directories(test_shared_sync_hardening PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_compile_definitions(test_shared_sync_hardening PRIVATE VW_SYNC_TEST_HOOKS)
+
+target_link_libraries(test_shared_sync_hardening PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_shared_sync_hardening PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_shared_sync_hardening PRIVATE ws2_32)
+endif()
+
 # ── Python integration test suite (TASK-038) ─────────────────────────────────
 # Starts real vapourwaultd + vapourwault-daemon binaries, exercises IT-1..IT-8.
 # Requires: openssl (for cert generation), Python 3.7+, POSIX.

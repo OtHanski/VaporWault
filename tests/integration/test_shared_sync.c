@@ -304,14 +304,20 @@ int main(int argc, char **argv) {
     vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
     err = vw_cache_folder_list(cache, &folders, &nf);
     CHECK(err == VW_OK, "grantee: can list sync folders after revocation");
-    int found_paused = 0;
+    int found_paused = 0, found_reason = -1;
     for (uint32_t i = 0; i < nf; i++) {
         if (strcmp(folders[i].local_root, local_root) == 0) {
             found_paused = folders[i].paused ? 1 : 0;
+            found_reason = (int)folders[i].pause_reason;
             break;
         }
     }
     CHECK(found_paused, "grantee: shared folder auto-paused after revocation");
+    /* TASK-111: a root-level revocation must record VW_PAUSE_REASON_REVOKED
+     * specifically, not be conflated with (e.g.) the BFS-size-ceiling
+     * reason — see test_shared_sync_hardening.c for that scenario. */
+    CHECK(found_reason == VW_PAUSE_REASON_REVOKED,
+          "grantee: pause_reason is VW_PAUSE_REASON_REVOKED after revocation");
     free(folders);
 
     vw_sync_close(sync_ctx);

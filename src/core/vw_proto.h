@@ -89,6 +89,10 @@ typedef enum {
 
     /* IPC */
     VW_ERR_IPC_NOT_RUNNING     = 700,  /* daemon not listening on IPC port           */
+
+    /* Client-local sync engine (TASK-111; never sent over the wire) */
+    VW_ERR_SYNC_TREE_TOO_LARGE = 800,  /* shared-folder BFS exceeded the client's
+                                          resource ceiling for one sync cycle       */
 } vw_err_t;
 
 /* ── Message types ───────────────────────────────────────────────────────── */

@@ -609,7 +609,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
         (void)vw_cache_folder_list(dc->cache, &folders, &nf);
         /* Encode: u32 count + per-entry (str local_root, str virtual_root,
-         * u8 paused, u64 remote_dir_id [TASK-106]) */
+         * u8 paused, u8 pause_reason [TASK-111], u64 remote_dir_id [TASK-106]) */
         uint8_t rbuf[65536]; uint32_t roff = 0;
         vw_write_u32le(rbuf + roff, nf); roff += 4;
         for (uint32_t i = 0; i < nf && roff < sizeof(rbuf) - 1050; i++) {
@@ -622,6 +622,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_ipc_write_str(rbuf, sizeof(rbuf), &roff,
                               folders[i].virtual_root, vlen);
             rbuf[roff++] = folders[i].paused;
+            rbuf[roff++] = folders[i].pause_reason;
             vw_write_u64le(rbuf + roff, folders[i].remote_dir_id); roff += 8u;
         }
         free(folders);
@@ -1324,6 +1325,13 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
                 }
             }
         }
+        /* TASK-112: fold in per-action failures (e.g. quota rejections)
+         * that vw_sync_run itself treats as non-fatal for the cycle — these
+         * were previously invisible to status entirely. */
+        uint32_t action_errs = vw_sync_action_error_count(sync_ctx);
+        if (action_errs > 0)
+            vw_log(LOG_WARN, "sync cycle had %u action error(s)", (unsigned)action_errs);
+        error_count += action_errs;
 
         sync_now = 0;
     }

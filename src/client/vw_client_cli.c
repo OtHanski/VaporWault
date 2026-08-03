@@ -280,7 +280,8 @@ static int cmd_add_shared_folder(vw_ipc_conn_t *conn, const char *local,
 /* ── Subcommand: list-folders (TASK-106) ─────────────────────────────────── */
 
 /* FOLDER_LIST_REQ: no payload. FOLDER_LIST_RESP: u32 count + per-entry
- * (str local_root, str virtual_root, u8 paused, u64 remote_dir_id). */
+ * (str local_root, str virtual_root, u8 paused, u8 pause_reason [TASK-111],
+ * u64 remote_dir_id). */
 static int cmd_list_folders(vw_ipc_conn_t *conn) {
     uint8_t *resp = malloc(65536);
     if (!resp) { fprintf(stderr, "list-folders: out of memory\n"); return 1; }
@@ -298,15 +299,17 @@ static int cmd_list_folders(vw_ipc_conn_t *conn) {
     uint32_t count = vw_read_u32le(resp);
     uint32_t off = 4u;
 
-    printf("%-8s  %-12s  %-30s  %s\n", "PAUSED", "KIND", "LOCAL_ROOT", "VIRTUAL_ROOT");
+    printf("%-8s  %-10s  %-12s  %-30s  %s\n",
+           "PAUSED", "REASON", "KIND", "LOCAL_ROOT", "VIRTUAL_ROOT");
 
     for (uint32_t i = 0; i < count; i++) {
         const char *lroot = NULL, *vroot = NULL;
         uint16_t ll = 0, vl = 0;
         if (vw_ipc_read_str(resp, rlen, &off, &lroot, &ll) != VW_OK) break;
         if (vw_ipc_read_str(resp, rlen, &off, &vroot, &vl) != VW_OK) break;
-        if (off + 1u + 8u > rlen) break;
+        if (off + 2u + 8u > rlen) break;
         uint8_t  paused        = resp[off++];
+        uint8_t  pause_reason  = resp[off++];
         uint64_t remote_dir_id = vw_read_u64le(resp + off); off += 8u;
 
         char lbuf[512]; size_t lc = ll < sizeof(lbuf)-1u ? ll : sizeof(lbuf)-1u;
@@ -320,8 +323,17 @@ static int cmd_list_folders(vw_ipc_conn_t *conn) {
         else
             snprintf(kind_buf, sizeof(kind_buf), "owned");
 
-        printf("%-8s  %-12s  %-30s  %s\n",
-               paused ? "yes" : "no", kind_buf, lbuf, vbuf);
+        const char *reason_str = "-";
+        if (paused) {
+            switch (pause_reason) {
+            case VW_PAUSE_REASON_REVOKED:        reason_str = "revoked";   break;
+            case VW_PAUSE_REASON_TREE_TOO_LARGE: reason_str = "too_large"; break;
+            default:                             reason_str = "manual";   break;
+            }
+        }
+
+        printf("%-8s  %-10s  %-12s  %-30s  %s\n",
+               paused ? "yes" : "no", reason_str, kind_buf, lbuf, vbuf);
     }
 
     free(resp);

@@ -374,20 +374,66 @@ static uint64_t dirmap_lookup(const dirmap_t *dm, const char *vpath) {
 }
 
 /*
+ * TASK-111: ceiling on the total number of directory+file entries observed
+ * across a whole shared-folder BFS walk (summed over however many
+ * FILE_LIST_BY_ID calls it takes) — mirrors the per-call 65535-entry cap
+ * already applied server-side (vw_file_handlers.c), this time against the
+ * *cumulative* walk size, since a share's owner controls that tree's shape,
+ * not the grantee whose client has to walk it every cycle.
+ */
+#define VW_SHARED_TREE_MAX_ITEMS_DEFAULT 65535u
+
+static uint32_t shared_tree_max_items(void) {
+#ifdef VW_SYNC_TEST_HOOKS
+    /* Overridable via VW_SHARED_TREE_MAX_ITEMS, but only in test binaries
+     * that opt into VW_SYNC_TEST_HOOKS (CQR.08 finding: gating this the
+     * same way as the BFS test hook below avoids a stray/forgotten env var
+     * silently defeating this protection for a real user — production
+     * binaries never read this env var at all, not even if it happens to
+     * be set). strtoul, not atol: getenv() input is untrusted and atol's
+     * behavior on an out-of-range value is undefined, not just clamped. */
+    const char *env = getenv("VW_SHARED_TREE_MAX_ITEMS");
+    if (env && env[0]) {
+        char *endp = NULL;
+        unsigned long v = strtoul(env, &endp, 10);
+        if (endp != env && *endp == '\0' && v > 0 && v <= UINT32_MAX)
+            return (uint32_t)v;
+    }
+#endif
+    return VW_SHARED_TREE_MAX_ITEMS_DEFAULT;
+}
+
+#ifdef VW_SYNC_TEST_HOOKS
+/*
+ * Test-only instrumentation (TASK-111 regression test for the shared-folder
+ * BFS TOCTOU race). Compiled in only for test binaries that define
+ * VW_SYNC_TEST_HOOKS; absent from every production target. When set,
+ * invoked synchronously immediately before srv_collect_by_id lists a
+ * directory, letting a test deterministically delete/revoke access to that
+ * exact directory in the window the real race would occur in, instead of
+ * racing real threads against real network timing.
+ */
+void (*vw_sync_test_before_list_dir)(const char *vpath, uint64_t dir_id) = NULL;
+#endif
+
+/*
  * Id-addressed counterpart of srv_collect for a shared folder: BFS via
  * FILE_LIST's dir_file_id extension instead of path-based FILE_LIST, since a
  * grantee's own FILE_LIST can never resolve into someone else's tree by path
  * (docs/PROTOCOL.md §7.2). virtual_root/dir_root here name the shared
  * folder's client-local naming root and its server-side file_id.
  *
- * Unlike srv_collect, VW_ERR_NOT_FOUND / VW_ERR_PERMISSION from ANY level are
- * NOT swallowed — for a directory the client already knows the file_id of
- * (either the folder's root, learned when the sync folder was added, or a
- * subdirectory just discovered a moment ago in this same walk), a definitive
- * "you can't see this" response only happens when the share has been
- * revoked (or the item deleted) since — the caller treats this as a
- * revocation signal, not a routine empty/missing directory (which FILE_LIST
- * always reports as a normal zero-entry result, never NOT_FOUND).
+ * TASK-111: only a NOT_FOUND/PERMISSION on the ROOT id is treated as a
+ * revocation signal by the caller. A subdirectory discovered earlier in
+ * this same walk can legitimately vanish between discovery and its own
+ * listing call (the owner deletes it mid-cycle) — that is a routine race,
+ * not a revocation (permission can only be equal-or-higher moving down an
+ * inherited subtree per vw_share_resolve_permission, so a *valid* share
+ * never has a subtree selectively cut off; a NOT_FOUND/PERMISSION below the
+ * root is therefore always this race, never a real access change worth
+ * pausing the whole folder over). Such a level is skipped — same as
+ * srv_collect already does for an owned folder's missing directory — rather
+ * than aborting the whole walk.
  */
 static vw_err_t srv_collect_by_id(vw_client_sess_t *sess,
                                    const char *virtual_root, uint64_t dir_root,
@@ -395,6 +441,8 @@ static vw_err_t srv_collect_by_id(vw_client_sess_t *sess,
     typedef struct { char vpath[512]; uint64_t dir_id; } q_item_t;
     q_item_t *queue = NULL;
     uint32_t q_head = 0, q_tail = 0, q_cap = 16;
+    uint32_t total_items = 0;
+    const uint32_t max_items = shared_tree_max_items();
 
     queue = malloc(q_cap * sizeof(q_item_t));
     if (!queue) return VW_ERR_OOM;
@@ -407,10 +455,30 @@ static vw_err_t srv_collect_by_id(vw_client_sess_t *sess,
 
     while (q_head < q_tail) {
         q_item_t cur = queue[q_head++];
+#ifdef VW_SYNC_TEST_HOOKS
+        if (vw_sync_test_before_list_dir)
+            vw_sync_test_before_list_dir(cur.vpath, cur.dir_id);
+#endif
         vw_file_entry_t *entries = NULL;
         uint32_t n = 0;
         vw_err_t lerr = vw_client_file_list_by_id(sess, cur.dir_id, 0, &entries, &n);
+        if (lerr == VW_ERR_NOT_FOUND || lerr == VW_ERR_PERMISSION) {
+            if (cur.dir_id == dir_root) {
+                /* Root-level failure: the share itself is gone or revoked. */
+                err = lerr; break;
+            }
+            /* A subdirectory raced out from under us this cycle — benign,
+             * skip it and keep walking the rest of the tree. */
+            continue;
+        }
         if (lerr != VW_OK) { err = lerr; break; }
+
+        if (total_items + n > max_items) {
+            free(entries);
+            err = VW_ERR_SYNC_TREE_TOO_LARGE;
+            break;
+        }
+        total_items += n;
 
         for (uint32_t i = 0; i < n; i++) {
             char vpath[512];
@@ -451,6 +519,7 @@ struct vw_sync_ctx {
     uint32_t          oq_cap;
     uint64_t          bytes_done;
     uint64_t          bytes_total;
+    uint32_t          action_errors; /* per-cycle count of non-network action failures */
 };
 
 /* ── Offline queue helpers ────────────────────────────────────────────────── */
@@ -492,6 +561,19 @@ static vw_err_t oq_push(vw_sync_ctx_t *ctx, int action,
 static int is_net_err(vw_err_t err) {
     return err == VW_ERR_NET_CONNECT || err == VW_ERR_NET_CLOSED ||
            err == VW_ERR_NET_TIMEOUT || err == VW_ERR_NET_TLS;
+}
+
+/*
+ * Record a non-network action failure (e.g. a quota-rejected upload) so it
+ * reaches the daemon's status error count (TASK-112). Network errors are
+ * deliberately excluded — those are already handled via the offline queue
+ * (or, for shared-folder actions, transparent per-cycle retry) and are not
+ * counted here.
+ */
+static void note_action_error(vw_sync_ctx_t *ctx) {
+    vw__mu_lock(&ctx->mu);
+    ctx->action_errors++;
+    vw__mu_unlock(&ctx->mu);
 }
 
 /* Defined below, near exec_action(); forward-declared here for oq_drain(). */
@@ -671,6 +753,8 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                 if (err == VW_OK)
                     update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path,
                                                a->file_id);
+                else if (!is_net_err(err))
+                    note_action_error(ctx);
             } else if (a->parent_dir_id != 0) {
                 const char *sl = strrchr(a->virtual_path, '/');
                 const char *leaf = sl ? sl + 1 : a->virtual_path;
@@ -680,11 +764,20 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                                         &new_id, &new_ver);
                 if (err == VW_OK)
                     update_cache_after_upload(ctx, sess, a->virtual_path, a->local_path, new_id);
+                else if (!is_net_err(err))
+                    note_action_error(ctx);
             } else {
                 /* Parent directory unresolvable this cycle (e.g. a brand-new
                  * local subdirectory with no server-side counterpart yet) —
-                 * not a network error, just not actionable yet. */
+                 * not a network error, but not necessarily self-healing
+                 * either: nothing in this sync engine auto-creates a
+                 * missing remote directory for a shared folder (see
+                 * TASK-113), so this can in practice recur every cycle
+                 * indefinitely. Count it so it's at least visible via
+                 * status rather than a second permanently-silent gap of
+                 * the same kind TASK-112 exists to close. */
                 err = VW_ERR_NOT_FOUND;
+                note_action_error(ctx);
             }
         } else {
             err = vw_client_file_upload(sess, a->virtual_path, a->local_path,
@@ -694,6 +787,8 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
             } else if (is_net_err(err)) {
                 (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
                 queued = 1;
+            } else {
+                note_action_error(ctx);
             }
         }
         break;
@@ -723,6 +818,8 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         } else if (is_net_err(err) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_DOWNLOAD, a->virtual_path, a->local_path);
             queued = 1;
+        } else if (!is_net_err(err)) {
+            note_action_error(ctx);
         }
         break;
     }
@@ -737,6 +834,8 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         } else if (is_net_err(err) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_DELETE, a->virtual_path, a->local_path);
             queued = 1;
+        } else if (!is_net_err(err)) {
+            note_action_error(ctx);
         }
         break;
 
@@ -748,8 +847,12 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         if (err == VW_OK || err == VW_ERR_NOT_FOUND) {
             (void)vw_cache_delete(ctx->cache, a->virtual_path);
             err = VW_OK;
+        } else {
+            /* Local IO errors are non-fatal for the sync cycle (it
+             * continues with remaining actions) but are still counted —
+             * a persistently undeletable local file is worth surfacing. */
+            note_action_error(ctx);
         }
-        /* IO errors are non-fatal for local deletes; continue sync */
         break;
 
     case ACT_CONFLICT: {
@@ -800,6 +903,8 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
         } else if (is_net_err(uerr) && !a->shared) {
             (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
             queued = 1;
+        } else if (!is_net_err(uerr)) {
+            note_action_error(ctx);
         }
         err = uerr;
         break;
@@ -1047,9 +1152,22 @@ static vw_err_t sync_one_folder(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                      &srv, &dm);
             if (err == VW_ERR_NOT_FOUND || err == VW_ERR_PERMISSION) {
                 /* TASK-106 live revocation: the share no longer grants this
-                 * client any access. Auto-pause rather than retry forever —
-                 * the folder stays visible/inspectable but stops advancing. */
-                (void)vw_cache_folder_set_paused(ctx->cache, folder->local_root, 1);
+                 * client any access at the root (TASK-111: srv_collect_by_id
+                 * now only surfaces this for a root-id failure — a same-
+                 * cycle subdirectory race no longer reaches here). Auto-
+                 * pause rather than retry forever — the folder stays
+                 * visible/inspectable but stops advancing. */
+                (void)vw_cache_folder_set_pause_reason(ctx->cache, folder->local_root,
+                                                       VW_PAUSE_REASON_REVOKED);
+                free(lf.arr); free(srv.arr); free(dm.arr);
+                return VW_OK;
+            }
+            if (err == VW_ERR_SYNC_TREE_TOO_LARGE) {
+                /* TASK-111: the shared tree exceeds this client's per-cycle
+                 * resource ceiling. Auto-pause with a distinct reason — this
+                 * is not a revocation and must not be reported as one. */
+                (void)vw_cache_folder_set_pause_reason(ctx->cache, folder->local_root,
+                                                       VW_PAUSE_REASON_TREE_TOO_LARGE);
                 free(lf.arr); free(srv.arr); free(dm.arr);
                 return VW_OK;
             }
@@ -1159,8 +1277,9 @@ vw_err_t vw_sync_run(vw_sync_ctx_t *ctx) {
 
     vw__mu_lock(&ctx->mu);
     vw_client_sess_t *sess = ctx->sess;
-    ctx->bytes_done  = 0;
-    ctx->bytes_total = 0;
+    ctx->bytes_done    = 0;
+    ctx->bytes_total   = 0;
+    ctx->action_errors = 0;
     vw__mu_unlock(&ctx->mu);
 
     /* Drain offline queue first when online */
@@ -1237,4 +1356,13 @@ void vw_sync_get_progress(const vw_sync_ctx_t *ctx,
     if (out_done)  *out_done  = nc->bytes_done;
     if (out_total) *out_total = nc->bytes_total;
     vw__mu_unlock(&nc->mu);
+}
+
+uint32_t vw_sync_action_error_count(const vw_sync_ctx_t *ctx) {
+    if (!ctx) return 0;
+    vw_sync_ctx_t *nc = (vw_sync_ctx_t *)(uintptr_t)ctx;
+    vw__mu_lock(&nc->mu);
+    uint32_t n = nc->action_errors;
+    vw__mu_unlock(&nc->mu);
+    return n;
 }

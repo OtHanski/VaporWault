@@ -581,7 +581,33 @@ vw_err_t vw_cache_folder_set_paused(vw_cache_t *cache,
         if (cache->folders[i].local_root[0] != '\0' &&
             strncmp(cache->folders[i].local_root, local_root, 511) == 0)
         {
-            cache->folders[i].paused = paused;
+            cache->folders[i].paused       = paused;
+            cache->folders[i].pause_reason = VW_PAUSE_REASON_NONE;
+            err = folder_write_slot(cache, i);
+            break;
+        }
+    }
+
+    rwlock_wrunlock(&cache->lock);
+    return err;
+}
+
+vw_err_t vw_cache_folder_set_pause_reason(vw_cache_t *cache,
+                                          const char *local_root, uint8_t reason)
+{
+    vw_err_t err = VW_ERR_NOT_FOUND;
+    uint64_t i;
+
+    if (!cache || !local_root) return VW_ERR_INVALID_ARG;
+
+    rwlock_wrlock(&cache->lock);
+
+    for (i = 1; i < cache->nfolders; i++) {
+        if (cache->folders[i].local_root[0] != '\0' &&
+            strncmp(cache->folders[i].local_root, local_root, 511) == 0)
+        {
+            cache->folders[i].paused       = 1;
+            cache->folders[i].pause_reason = reason;
             err = folder_write_slot(cache, i);
             break;
         }

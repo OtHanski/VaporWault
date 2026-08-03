@@ -19,8 +19,9 @@
  *   VW_SYNC_REMOTE_DEL local deletions are verified to be under a registered
  *   sync folder's local_root before any call to vw_fs_delete (§SEC.07).
  *
- * Thread safety: vw_sync_set_session and vw_sync_get_progress are safe to
- * call concurrently with vw_sync_run. Other functions are not concurrent-safe.
+ * Thread safety: vw_sync_set_session, vw_sync_get_progress, and
+ * vw_sync_action_error_count are safe to call concurrently with
+ * vw_sync_run. Other functions are not concurrent-safe.
  */
 
 #include "vw_client_core.h"
@@ -75,6 +76,27 @@ uint32_t vw_sync_pending_count(const vw_sync_ctx_t *ctx);
  */
 void vw_sync_get_progress(const vw_sync_ctx_t *ctx,
                            uint64_t *out_done, uint64_t *out_total);
+
+/*
+ * Return the number of non-network action failures (e.g. a quota-rejected
+ * upload) recorded during the current (or most recent) sync cycle. Reset to
+ * zero at the start of each vw_sync_run. Network errors are not counted here
+ * — they are already handled via the offline queue / per-cycle retry.
+ * Thread-safe; may be called while vw_sync_run is running.
+ */
+uint32_t vw_sync_action_error_count(const vw_sync_ctx_t *ctx);
+
+#ifdef VW_SYNC_TEST_HOOKS
+/*
+ * Test-only instrumentation (TASK-111). Only declared/defined when the
+ * compiling target defines VW_SYNC_TEST_HOOKS — never part of a production
+ * build. Set to a callback to have it invoked synchronously immediately
+ * before the shared-folder BFS lists a given directory, letting a
+ * regression test deterministically inject a delete/permission change
+ * exactly in the window a real TOCTOU race would occur in.
+ */
+extern void (*vw_sync_test_before_list_dir)(const char *vpath, uint64_t dir_id);
+#endif
 
 #ifdef __cplusplus
 }
