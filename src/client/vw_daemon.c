@@ -467,7 +467,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     case VW_IPC_STATUS_REQ: {
         uint64_t bd = 0, bt = 0;
         vw_sync_get_progress(dc->sync_ctx, &bd, &bt);
-        uint8_t resp[24]; uint32_t off = 0;
+        uint8_t resp[28]; uint32_t off = 0;
         resp[off++] = dc->sess ? 1 : 0;        /* connected */
         resp[off++] = (bd < bt) ? 1 : 0;       /* syncing */
         resp[off++] = (uint8_t)dc->paused_all;
@@ -477,6 +477,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         vw_write_u32le(resp + off, pending); off += 4; /* pending_uploads */
         vw_write_u32le(resp + off, 0);       off += 4; /* pending_downloads */
         vw_write_u32le(resp + off, dc->error_count); off += 4;
+        /* TASK-113: distinct from error_count above — a permission-denied
+         * shared-folder auto-mkdir is its own specific signal, not lumped
+         * in with every other kind of action failure. */
+        vw_write_u32le(resp + off, vw_sync_permission_denied_count(dc->sync_ctx)); off += 4;
         vw_ipc_send(conn, VW_IPC_STATUS_RESP, resp, off);
         break;
     }
@@ -1332,6 +1336,15 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
         if (action_errs > 0)
             vw_log(LOG_WARN, "sync cycle had %u action error(s)", (unsigned)action_errs);
         error_count += action_errs;
+
+        /* TASK-113: logged distinctly, and NOT folded into error_count —
+         * status reports it as its own field so a permission problem
+         * doesn't look like every other kind of action failure. */
+        uint32_t perm_denied = vw_sync_permission_denied_count(sync_ctx);
+        if (perm_denied > 0)
+            vw_log(LOG_WARN,
+                   "sync cycle had %u permission-denied shared-folder mkdir attempt(s)",
+                   (unsigned)perm_denied);
 
         sync_now = 0;
     }

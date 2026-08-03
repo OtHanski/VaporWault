@@ -520,6 +520,7 @@ struct vw_sync_ctx {
     uint64_t          bytes_done;
     uint64_t          bytes_total;
     uint32_t          action_errors; /* per-cycle count of non-network action failures */
+    uint32_t          permission_denied_count; /* per-cycle count, see note_permission_denied */
 };
 
 /* ── Offline queue helpers ────────────────────────────────────────────────── */
@@ -570,6 +571,19 @@ static int is_net_err(vw_err_t err) {
  * (or, for shared-folder actions, transparent per-cycle retry) and are not
  * counted here.
  */
+/*
+ * Record a permission-denied FILE_MKDIR while auto-creating a shared
+ * folder's missing directory for a new local file (TASK-113). Counted
+ * separately from note_action_error so a VIEW-only grantee who creates a
+ * local subfolder gets a distinct signal, not lumped in with every other
+ * kind of action failure.
+ */
+static void note_permission_denied(vw_sync_ctx_t *ctx) {
+    vw__mu_lock(&ctx->mu);
+    ctx->permission_denied_count++;
+    vw__mu_unlock(&ctx->mu);
+}
+
 static void note_action_error(vw_sync_ctx_t *ctx) {
     vw__mu_lock(&ctx->mu);
     ctx->action_errors++;
@@ -767,17 +781,17 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                 else if (!is_net_err(err))
                     note_action_error(ctx);
             } else {
-                /* Parent directory unresolvable this cycle (e.g. a brand-new
-                 * local subdirectory with no server-side counterpart yet) —
-                 * not a network error, but not necessarily self-healing
-                 * either: nothing in this sync engine auto-creates a
-                 * missing remote directory for a shared folder (see
-                 * TASK-113), so this can in practice recur every cycle
-                 * indefinitely. Count it so it's at least visible via
-                 * status rather than a second permanently-silent gap of
-                 * the same kind TASK-112 exists to close. */
+                /* Parent directory still unresolved this cycle. TASK-113's
+                 * resolve_or_create_dir() (called from compute_actions when
+                 * this action was built) already attempted to create it and
+                 * has already classified and counted the outcome — a
+                 * permission denial (note_permission_denied), a genuine
+                 * failure (note_action_error), or a benign create race
+                 * (deliberately uncounted, self-heals next cycle). Counting
+                 * again here would double-count the exact same event
+                 * (CQR.08 finding on TASK-113's review) — this branch's only
+                 * job is to make exec_action a no-op for this action. */
                 err = VW_ERR_NOT_FOUND;
-                note_action_error(ctx);
             }
         } else {
             err = vw_client_file_upload(sess, a->virtual_path, a->local_path,
@@ -915,13 +929,123 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
     return err;
 }
 
+/*
+ * Sentinel dirmap value meaning "already attempted and classified as
+ * unresolvable earlier THIS cycle" — distinct from 0 ("never looked up").
+ * Lets resolve_or_create_dir() memoize a failed/denied/racy outcome so N
+ * sibling files newly created under the same still-unresolved directory in
+ * one cycle trigger exactly one FILE_MKDIR attempt and one counted outcome,
+ * not N of each (CQR.08 finding on TASK-113's review). A real file_id is
+ * always > 0 and, being a global sequential counter, will never collide
+ * with this reserved value in practice.
+ */
+#define VW_DIRMAP_UNRESOLVABLE ((uint64_t)-1)
+
+/*
+ * TASK-113: resolve `vpath`'s server-side directory id within a shared
+ * folder, auto-creating it (and any missing ancestors, up to the nearest
+ * already-known directory) via FILE_MKDIR when the grantee has sufficient
+ * permission. Before this, a new local subdirectory inside a shared folder
+ * had no server-side counterpart and nothing ever created one — uploads
+ * into it silently retried the same no-op forever (TASK-112 made that
+ * *visible* via action_errors, but didn't fix it).
+ *
+ * *out_id is set to the resolved (or freshly created) directory's file_id,
+ * or left 0 if it could not be resolved this cycle — a benign, silently
+ * retried case (e.g. a create raced against another client, or an
+ * ancestor is itself still unresolved) except for a permission denial,
+ * which is counted via note_permission_denied so it is distinguishable
+ * from an ordinary transient action failure. Every non-network outcome is
+ * counted (or deliberately left uncounted, for a benign race) exactly
+ * once per distinct directory per cycle — the caller (compute_actions) and
+ * exec_action's fallback for an unresolved parent_dir_id must NOT count
+ * this again; this function is the sole source of truth for it.
+ *
+ * Returns a network error verbatim (unmodified) so the caller aborts the
+ * cycle exactly the way any other network failure during sync does; a
+ * non-network failure to create the directory is otherwise absorbed here
+ * (VW_OK returned, *out_id left 0) rather than aborting the whole cycle
+ * over one file's parent directory.
+ */
+static vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
+                                       dirmap_t *dm, const char *root_vpath,
+                                       const char *vpath, uint64_t *out_id) {
+    uint64_t known = dirmap_lookup(dm, vpath);
+    if (known == VW_DIRMAP_UNRESOLVABLE) {
+        /* Already attempted (and its outcome already counted) earlier this
+         * cycle — don't re-attempt or double-count. */
+        *out_id = 0;
+        return VW_OK;
+    }
+    *out_id = known;
+    if (*out_id != 0 || strcmp(vpath, root_vpath) == 0) {
+        /* Either already known, or this *is* the folder root — which is
+         * always pushed into dm unconditionally at the start of
+         * srv_collect_by_id, so reaching here with lookup still failing
+         * would mean the root itself couldn't be resolved this cycle
+         * (e.g. offline) — nothing to create, not this function's job. */
+        return VW_OK;
+    }
+
+    char parent_vpath[512];
+    snprintf(parent_vpath, sizeof(parent_vpath), "%s", vpath);
+    char *sl = strrchr(parent_vpath, '/');
+    if (sl && sl != parent_vpath) *sl = '\0';
+    else snprintf(parent_vpath, sizeof(parent_vpath), "%s", root_vpath);
+
+    uint64_t parent_id = 0;
+    vw_err_t err = resolve_or_create_dir(ctx, sess, dm, root_vpath, parent_vpath, &parent_id);
+    if (err != VW_OK) return err;      /* real (network) error: propagate */
+    if (parent_id == 0) {
+        /* Ancestor unresolved (already counted/memoized at whichever depth
+         * actually failed) — this level is transitively unresolvable too;
+         * memoize it so sibling files don't re-recurse into the same
+         * already-failed ancestor chain. */
+        (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
+        return VW_OK;
+    }
+
+    const char *leaf = strrchr(vpath, '/');
+    leaf = leaf ? leaf + 1 : vpath;
+
+    uint64_t new_id = 0;
+    err = vw_client_file_mkdir(sess, parent_id, leaf, &new_id);
+    if (err == VW_OK) {
+        err = dirmap_push(dm, vpath, new_id);
+        if (err != VW_OK) return err;  /* OOM */
+        *out_id = new_id;
+        return VW_OK;
+    }
+    if (is_net_err(err)) return err;
+    if (err == VW_ERR_PERMISSION) {
+        /* Grantee lacks EDIT on this subtree — will keep failing
+         * identically every cycle until permission changes, but that's now
+         * a distinct, specific signal rather than a generic action error. */
+        note_permission_denied(ctx);
+        (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
+        return VW_OK;
+    }
+    if (err == VW_ERR_ALREADY_EXISTS) {
+        /* Benign race — some other client created it moments ago; next
+         * cycle's BFS will discover it via the normal path. Deliberately
+         * NOT memoized as unresolvable: a retry within this same cycle
+         * (unlikely given dirmap_push above already covers the common
+         * multi-sibling case, but possible via a different call path)
+         * should get a fair chance to find it via a plain lookup instead. */
+        return VW_OK;
+    }
+    note_action_error(ctx);
+    (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
+    return VW_OK;
+}
+
 /* ── Compute action plan (two-pass) ─────────────────────────────────────── */
 
-static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
+static vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                  const vw_sync_folder_t *folder,
                                  const lfiles_t *lfiles,
                                  const srv_list_t *srv,
-                                 const dirmap_t *dm,
+                                 dirmap_t *dm,
                                  action_list_t *out) {
     size_t vroot_len = strlen(folder->virtual_root);
     int shared = folder->remote_dir_id != 0;
@@ -1076,15 +1200,18 @@ static vw_err_t compute_actions(vw_sync_ctx_t *ctx,
             uint64_t parent_dir_id = 0;
             if (shared && ce->file_id == 0) {
                 /* New file inside a shared folder: resolve its immediate
-                 * parent's file_id from the dirmap built during this
-                 * cycle's BFS. dirname(ce->virtual_path) — strip the leaf. */
+                 * parent's file_id, auto-creating it (and any missing
+                 * ancestors, TASK-113) if it has no server-side counterpart
+                 * yet. dirname(ce->virtual_path) — strip the leaf. */
                 char parent_vpath[512];
                 snprintf(parent_vpath, sizeof(parent_vpath), "%s", ce->virtual_path);
                 char *psl = strrchr(parent_vpath, '/');
                 if (psl) *psl = '\0';
                 if (parent_vpath[0] == '\0')
                     snprintf(parent_vpath, sizeof(parent_vpath), "/");
-                parent_dir_id = dirmap_lookup(dm, parent_vpath);
+                err = resolve_or_create_dir(ctx, sess, dm, folder->virtual_root,
+                                             parent_vpath, &parent_dir_id);
+                if (err != VW_OK) break; /* network error: abort the whole walk below */
             }
             err = action_push(out, ACT_UPLOAD,
                               ce->virtual_path, ce->local_path,
@@ -1187,7 +1314,7 @@ static vw_err_t sync_one_folder(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
 
     /* Steps 3 and 4: compute + execute */
     action_list_t actions = {0};
-    err = compute_actions(ctx, folder, &lf, &srv, &dm, &actions);
+    err = compute_actions(ctx, sess, folder, &lf, &srv, &dm, &actions);
     free(lf.arr);
     free(srv.arr);
     free(dm.arr);
@@ -1277,9 +1404,10 @@ vw_err_t vw_sync_run(vw_sync_ctx_t *ctx) {
 
     vw__mu_lock(&ctx->mu);
     vw_client_sess_t *sess = ctx->sess;
-    ctx->bytes_done    = 0;
-    ctx->bytes_total   = 0;
-    ctx->action_errors = 0;
+    ctx->bytes_done              = 0;
+    ctx->bytes_total             = 0;
+    ctx->action_errors           = 0;
+    ctx->permission_denied_count = 0;
     vw__mu_unlock(&ctx->mu);
 
     /* Drain offline queue first when online */
@@ -1363,6 +1491,15 @@ uint32_t vw_sync_action_error_count(const vw_sync_ctx_t *ctx) {
     vw_sync_ctx_t *nc = (vw_sync_ctx_t *)(uintptr_t)ctx;
     vw__mu_lock(&nc->mu);
     uint32_t n = nc->action_errors;
+    vw__mu_unlock(&nc->mu);
+    return n;
+}
+
+uint32_t vw_sync_permission_denied_count(const vw_sync_ctx_t *ctx) {
+    if (!ctx) return 0;
+    vw_sync_ctx_t *nc = (vw_sync_ctx_t *)(uintptr_t)ctx;
+    vw__mu_lock(&nc->mu);
+    uint32_t n = nc->permission_denied_count;
     vw__mu_unlock(&nc->mu);
     return n;
 }

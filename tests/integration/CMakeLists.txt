@@ -158,6 +158,36 @@ if(WIN32)
     target_link_libraries(test_shared_sync_hardening PRIVATE ws2_32)
 endif()
 
+# test_shared_sync_mkdir: TASK-113 regression tests — a shared folder's
+# locally-new subdirectory (with no server-side counterpart) auto-creates
+# it via FILE_MKDIR when the grantee has EDIT permission, recursively for
+# however many missing ancestor levels, instead of retrying the same no-op
+# forever; a VIEW-only grantee's blocked attempt is counted distinctly
+# (vw_sync_permission_denied_count) rather than folded into the generic
+# action-error count, without auto-pausing the folder or allowing an
+# unauthorized write. Same rationale as test_shared_sync for not using
+# ctest add_test directly.
+
+add_executable(test_shared_sync_mkdir
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_shared_sync_mkdir.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_cache.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_sync.c
+)
+
+target_include_directories(test_shared_sync_mkdir PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_link_libraries(test_shared_sync_mkdir PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_shared_sync_mkdir PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_shared_sync_mkdir PRIVATE ws2_32)
+endif()
+
 # ── Python integration test suite (TASK-038) ─────────────────────────────────
 # Starts real vapourwaultd + vapourwault-daemon binaries, exercises IT-1..IT-8.
 # Requires: openssl (for cert generation), Python 3.7+, POSIX.

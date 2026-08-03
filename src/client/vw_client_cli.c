@@ -114,9 +114,12 @@ static int check_u32_resp(const uint8_t *buf, uint32_t plen, const char *cmd) {
 /* ── Subcommand: status ───────────────────────────────────────────────────── */
 
 /*
- * STATUS_RESP layout (24 bytes):
+ * STATUS_RESP layout (24 bytes, or 28 with the TASK-113 permission_denied_count
+ * field — older/newer builds always match since client and daemon ship
+ * together, but this reads it defensively via rlen anyway):
  *   u8  connected, u8 syncing, u8 paused, u8 _pad,
- *   i64 last_sync_at, u32 pending_uploads, u32 pending_downloads, u32 error_count
+ *   i64 last_sync_at, u32 pending_uploads, u32 pending_downloads,
+ *   u32 error_count, u32 permission_denied_count
  */
 static int cmd_status(vw_ipc_conn_t *conn) {
     uint8_t resp[32];
@@ -139,6 +142,7 @@ static int cmd_status(vw_ipc_conn_t *conn) {
     uint32_t uploads    = vw_read_u32le(resp + 12);
     uint32_t downloads  = vw_read_u32le(resp + 16);
     uint32_t errors     = vw_read_u32le(resp + 20);
+    uint32_t perm_denied = (rlen >= 28) ? vw_read_u32le(resp + 24) : 0;
 
     char ts_buf[32];
     format_ts(last_sync, ts_buf, sizeof(ts_buf), 1);
@@ -150,6 +154,7 @@ static int cmd_status(vw_ipc_conn_t *conn) {
     printf("  Last sync: %s\n", ts_buf);
     printf("  Pending:   %u uploads, %u downloads, %u errors\n",
            uploads, downloads, errors);
+    printf("  Permission-denied (shared-folder auto-mkdir): %u\n", perm_denied);
     return 0;
 }
 

@@ -19,9 +19,10 @@
  *   VW_SYNC_REMOTE_DEL local deletions are verified to be under a registered
  *   sync folder's local_root before any call to vw_fs_delete (§SEC.07).
  *
- * Thread safety: vw_sync_set_session, vw_sync_get_progress, and
- * vw_sync_action_error_count are safe to call concurrently with
- * vw_sync_run. Other functions are not concurrent-safe.
+ * Thread safety: vw_sync_set_session, vw_sync_get_progress,
+ * vw_sync_action_error_count, and vw_sync_permission_denied_count are safe
+ * to call concurrently with vw_sync_run. Other functions are not
+ * concurrent-safe.
  */
 
 #include "vw_client_core.h"
@@ -85,6 +86,17 @@ void vw_sync_get_progress(const vw_sync_ctx_t *ctx,
  * Thread-safe; may be called while vw_sync_run is running.
  */
 uint32_t vw_sync_action_error_count(const vw_sync_ctx_t *ctx);
+
+/*
+ * Return the number of permission-denied auto-mkdir attempts (TASK-113: a
+ * shared folder's new local subdirectory has no server-side counterpart,
+ * and the grantee lacks EDIT permission to create one) recorded during the
+ * current (or most recent) sync cycle. Reset to zero at the start of each
+ * vw_sync_run. Counted separately from vw_sync_action_error_count so a
+ * permission problem is distinguishable from any other action failure.
+ * Thread-safe; may be called while vw_sync_run is running.
+ */
+uint32_t vw_sync_permission_denied_count(const vw_sync_ctx_t *ctx);
 
 #ifdef VW_SYNC_TEST_HOOKS
 /*

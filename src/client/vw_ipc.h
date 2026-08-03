@@ -140,7 +140,16 @@ typedef enum {
  *   i64 last_sync_at     Unix timestamp of last completed sync; 0 = never
  *   u32 pending_uploads
  *   u32 pending_downloads
- *   u32 error_count      non-fatal errors since last sync
+ *   u32 error_count           non-fatal errors since last sync
+ *   u32 permission_denied_count  TASK-113: permission-denied shared-folder
+ *                                auto-mkdir attempts since last sync — kept
+ *                                distinct from error_count above rather than
+ *                                folded in, so a permission problem doesn't
+ *                                read as a generic action error. Appended
+ *                                after every existing field; client and
+ *                                daemon ship from the same build (see the
+ *                                FOLDER_LIST_RESP pause_reason field for the
+ *                                same precedent).
  *
  * VW_IPC_FOLDER_ADD_REQ:
  *   string local_root
