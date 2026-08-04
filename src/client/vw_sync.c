@@ -1,4 +1,5 @@
 #include "vw_sync.h"
+#include "vw_sync_internal.h"
 #include "vw_client_core.h"
 #include "vw_cache.h"
 #include "../core/vw_fs.h"
@@ -8,6 +9,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+
+/*
+ * VW_SYNC_TESTABLE: resolves to `static` in every production build. Only
+ * when VW_SYNC_TEST_HOOKS is defined (test binaries opting in, see
+ * vw_sync_internal.h) does it resolve to external linkage, so
+ * tests/unit/test_vw_sync.c can call these functions directly. No
+ * production target's symbol table is affected either way.
+ */
+#ifdef VW_SYNC_TEST_HOOKS
+#define VW_SYNC_TESTABLE
+#else
+#define VW_SYNC_TESTABLE static
+#endif
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -64,7 +78,7 @@ static uint64_t get_fsize(const char *path) {
 }
 #endif
 
-static int under_root(const char *path, const char *root) {
+VW_SYNC_TESTABLE int under_root(const char *path, const char *root) {
     size_t n = strlen(root);
     while (n > 0 && (root[n-1] == '/' || root[n-1] == '\\')) n--;
     if (strncmp(path, root, n) != 0) return 0;
@@ -89,36 +103,11 @@ typedef struct {
 _Static_assert(sizeof(oq_entry_t) == 1040, "oq_entry_t size mismatch");
 
 /* ── Action plan ──────────────────────────────────────────────────────────── */
+/* Types (action_t, action_list_t) and the ACT_* constants now live in
+ * vw_sync_internal.h — TASK-114 needed the unit test to be able to declare
+ * fixtures of them and inspect the actions compute_actions() builds. */
 
-#define ACT_UPLOAD      1
-#define ACT_DOWNLOAD    2
-#define ACT_DEL_REMOTE  3
-#define ACT_DEL_LOCAL   4
-#define ACT_CONFLICT    5
-
-typedef struct {
-    char     virtual_path[512];
-    char     local_path[512];
-    char     local_root[512];  /* registered root (security anchor for DEL_LOCAL) */
-    int      action;
-    uint64_t size;
-    int      shared;         /* TASK-106: 1 = target folder is shared (file-id
-                                 addressed); 0 = owned (path-addressed), the
-                                 pre-TASK-106 behavior, byte-for-byte unchanged */
-    uint64_t file_id;        /* TASK-106: target file's own file_id; 0 if it
-                                 doesn't exist on the server yet (new upload) */
-    uint64_t parent_dir_id;  /* TASK-106: immediate parent folder's file_id —
-                                 only meaningful for a shared-folder ACT_UPLOAD
-                                 with file_id == 0 (vw_client_file_upload_into_folder) */
-} action_t;
-
-typedef struct {
-    action_t *arr;
-    uint32_t  count;
-    uint32_t  cap;
-} action_list_t;
-
-static vw_err_t action_push(action_list_t *al, int act,
+VW_SYNC_TESTABLE vw_err_t action_push(action_list_t *al, int act,
                              const char *vpath, const char *lpath,
                              const char *lroot, uint64_t size,
                              int shared, uint64_t file_id, uint64_t parent_dir_id) {
@@ -142,22 +131,10 @@ static vw_err_t action_push(action_list_t *al, int act,
 }
 
 /* ── Local file entries ───────────────────────────────────────────────────── */
+/* Types (lfile_t, lfiles_t) now live in vw_sync_internal.h — see the note
+ * above action_push. */
 
-typedef struct {
-    char     local_path[512];
-    char     virtual_path[512];
-    int64_t  mtime;
-    uint64_t size;
-} lfile_t;
-
-typedef struct {
-    lfile_t *arr;
-    uint32_t count;
-    uint32_t cap;
-    vw_err_t err;
-} lfiles_t;
-
-static vw_err_t lfiles_push(lfiles_t *lf, const char *lpath, const char *vpath,
+VW_SYNC_TESTABLE vw_err_t lfiles_push(lfiles_t *lf, const char *lpath, const char *vpath,
                               int64_t mtime, uint64_t size) {
     if (lf->count >= lf->cap) {
         uint32_t nc = lf->cap ? lf->cap * 2u : 64u;
@@ -233,23 +210,10 @@ static vw_err_t walk_recursive(lfiles_t *lf,
 }
 
 /* ── Server entry list ────────────────────────────────────────────────────── */
+/* Types (srv_entry_t, srv_list_t) now live in vw_sync_internal.h — see the
+ * note above action_push. */
 
-typedef struct {
-    char     virtual_path[512];
-    uint64_t file_id;
-    uint64_t size_bytes;
-    int64_t  mtime_unix;
-    uint64_t version_id;
-    uint8_t  entry_type;
-} srv_entry_t;
-
-typedef struct {
-    srv_entry_t *arr;
-    uint32_t     count;
-    uint32_t     cap;
-} srv_list_t;
-
-static vw_err_t srv_push(srv_list_t *sl, const char *vpath, const vw_file_entry_t *e) {
+VW_SYNC_TESTABLE vw_err_t srv_push(srv_list_t *sl, const char *vpath, const vw_file_entry_t *e) {
     if (sl->count >= sl->cap) {
         uint32_t nc = sl->cap ? sl->cap * 2u : 64u;
         srv_entry_t *tmp = realloc(sl->arr, nc * sizeof(srv_entry_t));
@@ -341,18 +305,10 @@ done:
  * short of "the id we discovered while listing this directory's parent" can
  * name it.
  */
-typedef struct {
-    char     virtual_path[512];
-    uint64_t dir_id;
-} dir_entry_t;
+/* Types (dir_entry_t, dirmap_t) now live in vw_sync_internal.h — see the
+ * note above action_push. */
 
-typedef struct {
-    dir_entry_t *arr;
-    uint32_t     count;
-    uint32_t     cap;
-} dirmap_t;
-
-static vw_err_t dirmap_push(dirmap_t *dm, const char *vpath, uint64_t dir_id) {
+VW_SYNC_TESTABLE vw_err_t dirmap_push(dirmap_t *dm, const char *vpath, uint64_t dir_id) {
     if (dm->count >= dm->cap) {
         uint32_t nc = dm->cap ? dm->cap * 2u : 16u;
         dir_entry_t *tmp = realloc(dm->arr, nc * sizeof(dir_entry_t));
@@ -366,7 +322,7 @@ static vw_err_t dirmap_push(dirmap_t *dm, const char *vpath, uint64_t dir_id) {
 }
 
 /* Returns 0 if vpath is not a known directory (caller treats as unresolvable). */
-static uint64_t dirmap_lookup(const dirmap_t *dm, const char *vpath) {
+VW_SYNC_TESTABLE uint64_t dirmap_lookup(const dirmap_t *dm, const char *vpath) {
     if (!dm) return 0;
     for (uint32_t i = 0; i < dm->count; i++)
         if (strcmp(dm->arr[i].virtual_path, vpath) == 0) return dm->arr[i].dir_id;
@@ -559,7 +515,7 @@ static vw_err_t oq_push(vw_sync_ctx_t *ctx, int action,
     return oq_save(ctx);
 }
 
-static int is_net_err(vw_err_t err) {
+VW_SYNC_TESTABLE int is_net_err(vw_err_t err) {
     return err == VW_ERR_NET_CONNECT || err == VW_ERR_NET_CLOSED ||
            err == VW_ERR_NET_TIMEOUT || err == VW_ERR_NET_TLS;
 }
@@ -747,7 +703,7 @@ static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
 
 /* ── Execute one action ───────────────────────────────────────────────────── */
 
-static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
+VW_SYNC_TESTABLE vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                               const action_t *a) {
     prog_ud_t prog = { ctx, 0 };
     vw_err_t err = VW_OK;
@@ -929,17 +885,8 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
     return err;
 }
 
-/*
- * Sentinel dirmap value meaning "already attempted and classified as
- * unresolvable earlier THIS cycle" — distinct from 0 ("never looked up").
- * Lets resolve_or_create_dir() memoize a failed/denied/racy outcome so N
- * sibling files newly created under the same still-unresolved directory in
- * one cycle trigger exactly one FILE_MKDIR attempt and one counted outcome,
- * not N of each (CQR.08 finding on TASK-113's review). A real file_id is
- * always > 0 and, being a global sequential counter, will never collide
- * with this reserved value in practice.
- */
-#define VW_DIRMAP_UNRESOLVABLE ((uint64_t)-1)
+/* VW_DIRMAP_UNRESOLVABLE now lives in vw_sync_internal.h — see that header
+ * for the sentinel's full rationale (unchanged from before this move). */
 
 /*
  * TASK-113: resolve `vpath`'s server-side directory id within a shared
@@ -967,7 +914,7 @@ static vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
  * (VW_OK returned, *out_id left 0) rather than aborting the whole cycle
  * over one file's parent directory.
  */
-static vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
+VW_SYNC_TESTABLE vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                        dirmap_t *dm, const char *root_vpath,
                                        const char *vpath, uint64_t *out_id) {
     uint64_t known = dirmap_lookup(dm, vpath);
@@ -1041,7 +988,7 @@ static vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
 
 /* ── Compute action plan (two-pass) ─────────────────────────────────────── */
 
-static vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
+VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                  const vw_sync_folder_t *folder,
                                  const lfiles_t *lfiles,
                                  const srv_list_t *srv,

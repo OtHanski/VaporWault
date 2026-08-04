@@ -1,5 +1,12 @@
 # vw_server_lib — static library containing all server modules except startup.
 # Linked by vapourwaultd and by unit tests that need server-layer APIs.
+#
+# CQR.08 (TASK-115 review): tests/unit/CMakeLists.txt's test_vw_file_handlers
+# target duplicates this exact source list (it needs VW_FILE_HANDLERS_TEST_HOOKS
+# applied to vw_file_handlers.c specifically, which this shared library can't
+# give it without breaking every other consumer — see that target's comment).
+# If you add/remove a source here, update that list too, or it will silently
+# stop reflecting what actually ships.
 add_library(vw_server_lib STATIC
     vw_server_core.c
     vw_file_handlers.c

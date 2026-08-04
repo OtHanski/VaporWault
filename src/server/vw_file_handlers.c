@@ -1,4 +1,5 @@
 #include "vw_file_handlers.h"
+#include "vw_file_handlers_internal.h"
 #include "vw_cluster.h"
 #include "vw_invite.h"
 #include "vw_share.h"
@@ -30,6 +31,21 @@ static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
     fprintf(stderr, "[WRN] vw_file_handlers: " fmt "\n", ##__VA_ARGS__)
 #if defined(__clang__)
 #pragma clang diagnostic pop
+#endif
+
+/*
+ * VW_FH_TESTABLE: resolves to `static` in every production build. Only
+ * when VW_FILE_HANDLERS_TEST_HOOKS is defined (the unit test target
+ * opting in, see vw_file_handlers_internal.h) does it resolve to external
+ * linkage, so tests/unit/test_vw_file_handlers.c can call
+ * effective_permission()/permission_on_dir_or_root() directly. No
+ * production target's symbol table is affected either way (same pattern
+ * as VW_SYNC_TESTABLE in src/client/vw_sync.c, TASK-114).
+ */
+#ifdef VW_FILE_HANDLERS_TEST_HOOKS
+#define VW_FH_TESTABLE
+#else
+#define VW_FH_TESTABLE static
 #endif
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -78,6 +94,15 @@ vw_err_t vw_path_validate(const char *path, uint32_t len)
     return VW_OK;
 }
 
+vw_err_t vw_leaf_name_validate(const char *name, uint16_t len, int allow_empty)
+{
+    if (len == 0) return allow_empty ? VW_OK : VW_ERR_PATH_INVALID;
+    if (len >= 64u) return VW_ERR_PATH_INVALID;
+    for (uint16_t i = 0; i < len; i++)
+        if (name[i] == '/' || name[i] == '\0') return VW_ERR_PATH_INVALID;
+    return VW_OK;
+}
+
 /*
  * Extract session_token from the first VW_TOKEN_BYTES of payload and validate.
  * On failure sends VW_MSG_ERROR(VW_ERR_AUTH_REQUIRED) and returns non-OK.
@@ -122,7 +147,7 @@ static vw_err_t validate_session(vw_store_t    *store,
  * access (scope_share_id != 0) — see docs/PROTOCOL.md §7.5's ordered rule.
  * ss may be NULL (sharing disabled) — then only the owner check applies.
  */
-static vw_perm_t effective_permission(vw_share_store_t *ss, vw_file_store_t *fs,
+VW_FH_TESTABLE vw_perm_t effective_permission(vw_share_store_t *ss, vw_file_store_t *fs,
                                        const vw_file_record_t *file_rec,
                                        uint64_t user_id, uint64_t scope_share_id)
 {
@@ -1980,7 +2005,7 @@ static vw_err_t handle_invite_create(vw_store_t *store,
  * grant/link names a real file_id), so the only way to have EDIT-
  * equivalent access to a root is to literally own it.
  */
-static vw_perm_t permission_on_dir_or_root(vw_share_store_t *ss, vw_file_store_t *fs,
+VW_FH_TESTABLE vw_perm_t permission_on_dir_or_root(vw_share_store_t *ss, vw_file_store_t *fs,
                                             uint64_t dir_id, uint64_t root_owner_id,
                                             uint64_t user_id, uint64_t scope_share_id)
 {
@@ -2020,11 +2045,8 @@ static vw_err_t handle_file_move(vw_store_t       *store,
     err = vw_proto_read_str(var, var_len, &off, &new_name, &new_name_len);
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
-    if (new_name_len >= 64u)
+    if (vw_leaf_name_validate(new_name, new_name_len, 1) != VW_OK)
         return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
-    for (uint16_t i = 0; i < new_name_len; i++)
-        if (new_name[i] == '/' || new_name[i] == '\0')
-            return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
 
     vw_file_record_t rec;
     err = vw_store_file_get_by_id(fs, file_id, &rec);
@@ -2130,11 +2152,8 @@ static vw_err_t handle_file_mkdir(vw_store_t       *store,
     err = vw_proto_read_str(var, var_len, &off, &name, &name_len);
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
-    if (name_len == 0 || name_len >= 64u)
+    if (vw_leaf_name_validate(name, name_len, 0) != VW_OK)
         return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
-    for (uint16_t i = 0; i < name_len; i++)
-        if (name[i] == '/' || name[i] == '\0')
-            return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
 
     uint64_t dest_owner_id;
     if (new_parent_dir_id == 0) {

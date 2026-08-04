@@ -199,3 +199,106 @@ if(WIN32)
     target_link_libraries(test_vw_ipc PRIVATE ws2_32)
 endif()
 add_test(NAME unit_vw_ipc COMMAND test_vw_ipc)
+
+# ── vw_sync (TASK-114) ────────────────────────────────────────────────────
+#
+# vw_sync.c lives in src/client and is not part of vw_core; compiled
+# directly into the test binary (same pattern as test_vw_ipc/test_vw_smtp).
+# vw_cache.c + vw_client_core.c are compiled in too since vw_sync.c needs
+# real (non-mocked) vw_cache_t/vw_sync_folder_t and the vw_file_entry_t
+# type — no network code from vw_client_core.c is ever exercised here since
+# every scenario in test_vw_sync.c runs with sess = NULL.
+#
+# VW_SYNC_TEST_HOOKS gives external linkage to functions that are `static`
+# in every other target compiling vw_sync.c (vapourwault-daemon,
+# test_shared_sync, test_shared_sync_mkdir) — see vw_sync_internal.h. This
+# is the SAME macro test_shared_sync_hardening already defines for a
+# different purpose (TASK-111's BFS race-injection hook); both purposes
+# coexist under one flag without conflict since neither test binary links
+# against the other's compiled vw_sync.o.
+add_executable(test_vw_sync
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_sync.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_sync.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_cache.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+)
+target_compile_definitions(test_vw_sync PRIVATE VW_SYNC_TEST_HOOKS)
+target_include_directories(test_vw_sync PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_vw_sync PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_sync PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_vw_sync PRIVATE ws2_32)
+endif()
+add_test(NAME unit_vw_sync COMMAND test_vw_sync)
+
+# ── vw_file_handlers (TASK-115) ───────────────────────────────────────────
+#
+# vw_file_handlers.c is normally only compiled as part of vw_server_lib
+# (src/server/CMakeLists.txt) alongside 18 other server sources it depends
+# on transitively (vw_cluster.c, vw_invite.c, vw_vault.c, etc. — anything
+# vw_server_lib bundles). Linking test_vw_auth/test_vw_store/test_vw_share/
+# test_vw_vault against the pre-built vw_server_lib works for them because
+# they only need PUBLIC functions from it. This target can't do that: it
+# needs VW_FILE_HANDLERS_TEST_HOOKS applied specifically to
+# vw_file_handlers.c's compilation (to expose effective_permission()/
+# permission_on_dir_or_root() — see vw_file_handlers_internal.h), and
+# vw_server_lib is built exactly once, without that define. Linking both
+# vw_server_lib AND a separately-compiled vw_file_handlers.c together
+# would duplicate-define vw_path_validate/vw_server_dispatch_file_op (both
+# already plain public functions regardless of the test-hooks define).
+#
+# So this target compiles vw_server_lib's ENTIRE source list directly
+# instead of linking the library — mirrors src/server/CMakeLists.txt's
+# add_library(vw_server_lib ...) source list exactly. target_compile_
+# definitions applies VW_FILE_HANDLERS_TEST_HOOKS to the whole target,
+# which is harmless: no other file here references that macro.
+#
+# CQR.08 (TASK-115 review): this list is a manual mirror, not a shared
+# CMake variable, so it WILL silently go stale if src/server/CMakeLists.txt's
+# vw_server_lib source list changes without a matching update here (a
+# missing/extra file here won't fail the build, it'll just mean this test
+# target no longer reflects the real library). That file has a matching
+# comment pointing back here.
+add_executable(test_vw_file_handlers
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_file_handlers.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_server_core.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_file_handlers.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_admin.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_acme.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ddns.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_cluster.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_conn_registry.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_vault.c
+)
+target_compile_definitions(test_vw_file_handlers PRIVATE VW_FILE_HANDLERS_TEST_HOOKS)
+target_include_directories(test_vw_file_handlers PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_vw_file_handlers PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_file_handlers PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_vw_file_handlers PRIVATE ws2_32)
+endif()
+add_test(NAME unit_vw_file_handlers COMMAND test_vw_file_handlers)

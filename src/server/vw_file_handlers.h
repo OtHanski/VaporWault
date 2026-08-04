@@ -29,6 +29,17 @@ extern "C" {
 vw_err_t vw_path_validate(const char *path, uint32_t len);
 
 /*
+ * Validate a bare leaf name (a directory/file name component, never a full
+ * path — no '/' separators expected in valid input).
+ * Rules: no '/', no null bytes, len < 64. If allow_empty is 0, len == 0 is
+ * also rejected; if allow_empty is 1, len == 0 is accepted (FILE_MOVE's
+ * "empty new_name means keep the current name" semantics — the one place
+ * this differs from FILE_MKDIR, where a directory must have a name).
+ * Returns VW_OK or VW_ERR_PATH_INVALID.
+ */
+vw_err_t vw_leaf_name_validate(const char *name, uint16_t len, int allow_empty);
+
+/*
  * Dispatch one post-auth message.
  *
  * ctx    — server context (must have file stores set via
