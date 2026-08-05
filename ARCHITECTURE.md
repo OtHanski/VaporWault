@@ -1,7 +1,7 @@
 # VaporWault — System Architecture
 
 **Owner**: ARCH.00  
-**Last updated**: 2026-07-14 (Phase 10 complete — gap-fill tasks done. TASK-066: pytest.ini (declares cluster/slow/e2e marks), tests/integration/gen_test_cert.sh, CMake vw_integration_test target. TASK-067: client daemon Linux packaging — packaging/linux/vapourwault-daemon.service (systemd user service), client.conf.example, client_install.sh (no-root installer), CMakeLists.txt updated with lib/systemd/user install. TASK-068: client daemon Windows packaging — Install-VaporWaultClient.ps1 (Task Scheduler logon trigger, ACL restriction, idempotent), client.conf.example. TASK-069: end-to-end sync test suite — tests/e2e/test_sync.py with DaemonProcess class; 4 tests covering connect, upload sync, delete sync, conflict handling; gated by VW_TEST_E2E=1.)
+**Last updated**: 2026-08-05 (`TASK-118` — full phase-status/doc-drift audit against `TODO/TASK-001`–`TASK-125`; see the 2026-08-05 audit-note follow-up under Implementation Phases for what was found and fixed. Prior entry, 2026-07-14, covered Phase 10 packaging/e2e-test completion — see `TASK-066`–`TASK-069` for that level of detail; superseded here rather than kept verbatim, since `TODO/` is the trustworthy record of what shipped, not this header.)
 
 ---
 
@@ -22,12 +22,14 @@ All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| mbedTLS | latest stable | TLS 1.3, SHA-256, AES, ECDSA (for ACME CSR), RNG |
-| SDL2 | latest stable | Windowing + OpenGL context for Dear ImGui |
-| Dear ImGui | vendored | GUI rendering (C++) |
-| Argon2 reference | vendored (~600 lines, public domain) | Password hashing (Argon2id) |
+| mbedTLS | v3.6.7, pinned via CMake `FetchContent` (`third_party/CMakeLists.txt`) — not a submodule, see `TASK-119` | TLS 1.3, SHA-256, AES, ECDSA (for ACME CSR), RNG |
+| SDL2 | ≥2.26.0, manually vendored on Windows / system package on Linux+macOS (`VENDOR_SETUP.md`) | Windowing + OpenGL context for Dear ImGui |
+| Dear ImGui | vendored (git submodule, `docking` branch) | GUI rendering (C++) |
+| Argon2 reference | 20190702, pinned via CMake `FetchContent` (not a submodule, see `TASK-125`) — ~600 lines, public domain | Password hashing (Argon2id) |
 
 **No SQLite. No other external libraries.**
+
+*(2026-08-05, `TASK-118`: corrected — this table previously said mbedTLS/Argon2 were "vendored"/submodules, matching the Repository Structure listing below, but `TASK-119`/`TASK-125` found and removed dead `third_party/mbedtls` and `third_party/argon2` submodules that had drifted from what `FetchContent` actually pulls in; only Dear ImGui is a true submodule today.)*
 
 ---
 
@@ -65,9 +67,10 @@ VaporWault/
       server/       # vw_server_gui (C++, Dear ImGui)
       client/       # vw_client_gui (C++, Dear ImGui)
   third_party/
-    mbedtls/        # vendored
-    imgui/          # vendored
-    argon2/         # vendored (~600 lines, public domain)
+    imgui/          # vendored (git submodule, docking branch)
+    SDL2/           # vendored manually on Windows only (VENDOR_SETUP.md); Linux/macOS use the system package
+    # mbedTLS and Argon2 are NOT vendored here — CMake FetchContent pulls both
+    # at configure time (third_party/CMakeLists.txt); see TASK-119 / TASK-125.
   tests/
     unit/           # Per-module unit tests (pure C harness)
     integration/    # Client-server and cluster integration tests
@@ -128,11 +131,22 @@ VaporWault/
 | `vw_ipc` | `src/client/vw_ipc.{h,c}` | CLI.02 | C | IPC protocol (localhost TCP, same framing as wire proto) |
 | `vw_client_core` | `src/client/vw_client_core.{h,c}` | CLI.02 | C | Server connection, auth, session, quota tracking |
 | `vw_sync` | `src/client/vw_sync.{h,c}` | CLI.02 | C | Sync engine: diff, offline queue, delta-chunk transfer, conflict |
-| `vw_cache` | `src/client/vw_cache.{h,c}` | CLI.02 | C | Local metadata cache: file state, selective-sync rules |
+| `vw_cache` | `src/client/vw_cache.{h,c}` | CLI.02 | C | Local metadata cache: per-file sync state (`cache.db`) and tracked sync-folder roots (`sync_folders.db`, including shared-folder `remote_dir_id` addressing, `TASK-106`) |
 | `vw_watch_linux` | `src/client/vw_watch_linux.{h,c}` | CLI.02 | C | inotify-based filesystem watcher |
 | `vw_watch_windows` | `src/client/vw_watch_windows.{h,c}` | CLI.02 | C | ReadDirectoryChangesW filesystem watcher |
 | `vw_client_cli` | `src/client/vw_client_cli.{h,c}` | CLI.02 | C | Client CLI connecting to daemon via IPC |
 | `vw_client_gui` | `src/gui/client/` | GUI.03 | C++ | Dear ImGui client interface (SDL2 + OpenGL) |
+
+> **2026-08-05 flag (`TASK-118`):** this document previously claimed
+> `vw_cache` owns "selective-sync rules" (letting a user include/exclude
+> specific subfolders or file patterns within a synced folder). No such
+> logic exists anywhere in `src/client/vw_cache.{h,c}` today, and no closed
+> or open task in `TODO/` ever scoped it — it does not appear to be a
+> feature that was built and later removed; it reads as aspirational text
+> that was never implemented. Corrected the row above to describe what
+> `vw_cache` actually does. Not filing a follow-up task to build selective
+> sync — that's a product-scope decision (ARCH.00/the project owner's
+> call), not something to assume from a stale doc line.
 
 ### Tools
 
@@ -418,13 +432,33 @@ See `TODO/` for the active task list. Phases in order:
 | 1 | Authentication | `vw_auth`, `vw_auth_provider`, `vw_store` (users/sessions), `vw_smtp` | PRT.04, SRV.01 | **complete** (TASK-007–020 done) |
 | 2 | File Transfer | `vw_store` (files/versions), `vw_storage` (chunks/dedup), `vw_file_handlers`, `vw_client_core` file transfer | SRV.01, CLI.02 | **complete** (TASK-021–025 done) |
 | 3 | Sync Engine | `vw_cache`, `vw_watch_*`, `vw_sync`, `vw_daemon`, `vw_ipc`, `vw_client_cli`; server quota enforcement | CLI.02, SRV.01 | **complete** (TASK-026–033 done) |
-| 4 | Sharing | `vw_share` (new module), permission checks in `vw_file_handlers`, shared-folder sync | SRV.01, CLI.02 | **design complete, implementation not started** — corrected 2026-07-29: this row previously claimed "complete", citing TASK-034/035 as evidence; those tasks are actually CI setup and Dear ImGui vendoring, unrelated to sharing. No sharing/permission code exists in `src/server` today (confirmed by direct source inspection). Full design (data model, wire protocol, permission-check and quota rules) published 2026-07-29 in `docs/PROTOCOL.md` §7.5/§7.10; `TASK-088` closed `done` after SEC.07 + CQR.08 sign-off and an independent re-verification pass. Implementation split into `TASK-094` (SRV.01), `TASK-095` (CLI.02), `TASK-096` (GUI.03), `TASK-097` (QA.06), none started yet. |
+| 4 | Sharing | `vw_share` (new module), permission checks in `vw_file_handlers`, shared-folder sync | SRV.01, CLI.02 | **complete** — design published 2026-07-29 (`docs/PROTOCOL.md` §7.5/§7.10, `TASK-088`); server (`TASK-094`), client library (`TASK-095`), GUI (`TASK-096`), and integration tests (`TASK-097`) all closed `done`. Shared-folder local sync (`vw_sync` awareness of `remote_dir_id`-rooted folders) followed as `TASK-106`, hardened by `TASK-109`/`TASK-111`–`TASK-113`. Verified against `TODO/TASK-094.md`–`TASK-097.md`, `TASK-106.md` 2026-08-05 (`TASK-118`) — this row previously read "design complete, implementation not started" well after implementation had actually finished. |
 | 5 | DDNS, ACME, Admin | `vw_ddns`, `vw_acme`, thread pool, admin CLI, integration tests | SRV.01, PRT.04 | **complete** (TASK-036–041 done) |
 | 6 | GC, Invites, Recovery | `vw_gc`, invite tokens, recovery email | SRV.01, PRT.04 | **complete** (TASK-042–046 done) |
 | 7 | GUIs + Cluster | `vw_client_gui`, `vw_server_gui`, `vw_cluster` replication | GUI.03, SRV.01 | **complete** (TASK-047–053 done) |
-| 8 | Hardening | Security audit, fuzz testing, integration suite, CI | SEC.07, CQR.08, QA.06 | **in progress** (TASK-054–059 and ongoing — this phase has no fixed end; real-world bugs keep surfacing as previously-untested features get exercised for the first time, e.g. TASK-085/087) |
+| 8 | Hardening | Security audit, fuzz testing, integration suite, CI, and every bug/gap found by exercising previously-untested features for the first time | SEC.07, CQR.08, QA.06, all agents | **in progress, open-ended by design** — this phase has no fixed end, since real-world bugs keep surfacing as previously-untested features get exercised for the first time. Spans `TASK-054`–`TASK-093` and continues through the current task range (`TASK-102`–`TASK-117`, `TASK-119`, `TASK-121`–`TASK-125`), covering GUI wiring (`TASK-107`/`TASK-108`), oplog format hardening (`TASK-121`–`TASK-124`), dependency build hygiene (`TASK-119`/`TASK-125`), and this doc refresh itself (`TASK-118`). `TASK-120` (tutorial doc) is the one item still open as of 2026-08-05. |
+| 9 | Vault / End-to-end encryption | `vw_vault` (client + server), envelope encryption, vault UI | PRT.04 (design), SRV.01/CLI.02/GUI.03 (impl), QA.06 | **complete** — design published 2026-07-29 (`docs/PROTOCOL.md` §7.11, `TASK-089`); server storage (`TASK-098`), client vault module (`TASK-099`), GUI (`TASK-100`), and regression tests (`TASK-101`) all closed `done`. |
+| 10 | Packaging, deployment docs, end-to-end tests | Linux/Windows service packaging (server + client daemon), `docs/DEPLOYMENT.md`, benchmark suite, e2e sync tests | BLD.05, QA.06 | **complete** (TASK-062–069 done) |
 
 > **2026-07-29 audit note**: this table (and the Module Map / on-disk-layout sections above) was found to contain at least one fabricated completion claim (Phase 4, corrected above) that cited unrelated task IDs and referenced a module (`vw_users`) that was never created. The rest of this document has not been re-audited line-by-line against the current codebase — treat "complete" markers here as unverified until spot-checked against `TODO/` and the actual source tree, the same way Phase 4's was. `TODO/` task files (which get appended-to, never rewritten wholesale) are more trustworthy than this document's prose for "did X actually happen."
+>
+> **2026-08-05 follow-up (`TASK-118`)**: re-audited every phase-status claim
+> in the table above against `TODO/TASK-*.md` status fields (all 125 task
+> files checked, not sampled) rather than against memory of past
+> conversations. Found Phase 4 (Sharing) was, ironically, *still* wrong —
+> the 2026-07-29 fix correctly identified the original fabrication but by
+> this date the real implementation had since finished, and the row hadn't
+> been updated to say so — plus two whole phases (Vault/E2EE, Packaging)
+> that existed in this document's own "Last updated" header prose but were
+> never given rows in this table at all. Also found and corrected: the
+> Approved External Dependencies table and Repository Structure listing
+> both still described `mbedTLS`/`Argon2` as vendored submodules after
+> `TASK-119`/`TASK-125` removed them; the `vw_cache` "selective-sync rules"
+> claim (§ Module Map) had no corresponding code or task, ever. See
+> `TASK-118` for the full diff. This document drifting *again* within ten
+> days of its last audit is itself worth noting: prefer trusting `TODO/`
+> over this file's prose for anything you're about to act on, and don't
+> assume a past "corrected" note means a claim is still accurate today.
 
 ---
 
