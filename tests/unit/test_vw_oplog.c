@@ -115,10 +115,7 @@ typedef struct {
     uint64_t      ids[128];
     vw_oplog_op_t ops[128];
     int           count;
-    uint64_t      tss[128];  /* ts_unix_secs per entry (TASK-121/TASK-123); trailing
-                               * field so existing {{0},{0},0} initializers below are
-                               * unaffected — it's implicitly zeroed per C's aggregate
-                               * initialization rules. */
+    uint64_t      tss[128];  /* ts_unix_secs per entry (TASK-121/TASK-123) */
 } replay_ctx_t;
 
 static int replay_collect(uint64_t entry_id, vw_oplog_op_t op_type, uint64_t ts_unix_secs,
@@ -163,7 +160,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
 
         /* Reopen: recovery */
         VW_ASSERT_OK(vw_oplog_open(d, &log));
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 1);
         VW_ASSERT_EQ((int)r.ids[0], (int)id_a);
@@ -187,7 +184,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
 
         /* Reopen: recovery should truncate id_a */
         VW_ASSERT_OK(vw_oplog_open(d, &log));
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 0);
         vw_oplog_close(log);
@@ -218,7 +215,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
 
         /* Reopen: id_c must be truncated; id_a and id_b survive */
         VW_ASSERT_OK(vw_oplog_open(d, &log));
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 2);
         VW_ASSERT_EQ((int)r.ids[0], (int)id_a);
@@ -259,7 +256,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
 
         /* Recovery */
         VW_ASSERT_OK(vw_oplog_open(d, &log));
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
 
         /* Must deliver exactly B (not A, not zero entries) */
@@ -309,7 +306,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
 
         /* Recovery */
         VW_ASSERT_OK(vw_oplog_open(d, &log));
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
 
         /* All 24 confirmed entries from segment 1 must be present;
@@ -342,7 +339,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
         VW_ASSERT_OK(vw_oplog_abort(log, id_b));
 
         /* id_b was aborted; replay should only see id_a */
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 1);
         VW_ASSERT_EQ((int)r.ids[0], (int)id_a);
@@ -388,7 +385,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
         }
 
         /* Replay starting from the 3rd entry */
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, ids[2], replay_collect, &r));
         VW_ASSERT_EQ(r.count, 2);
         VW_ASSERT_EQ((int)r.ids[0], (int)ids[2]);
@@ -435,7 +432,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
         VW_ASSERT_OK(vw_oplog_confirm(log, id_a));
         time_t after = time(NULL);
 
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 1);
         VW_ASSERT((uint64_t)before <= r.tss[0] && r.tss[0] <= (uint64_t)after);
@@ -456,7 +453,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
         log = NULL;
 
         VW_ASSERT_OK(vw_oplog_open(d, &log));
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 1);
         VW_ASSERT(r.tss[0] >= (uint64_t)before);
@@ -515,7 +512,7 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
                                      PAYLOAD, sizeof(PAYLOAD), &id_version));
         VW_ASSERT_OK(vw_oplog_confirm(log, id_version));
 
-        replay_ctx_t r = {{0},{0},0};
+        replay_ctx_t r = {0};
         VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
         VW_ASSERT_EQ(r.count, 3);
         VW_ASSERT_EQ((int)r.ops[0], (int)VW_OPLOG_FILE_CREATE);
