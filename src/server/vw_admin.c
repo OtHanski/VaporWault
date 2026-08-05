@@ -401,12 +401,12 @@ typedef struct {
     uint32_t max_count;   /* requested count <= TAIL_MAX */
 } tail_ctx_t;
 
-static int tail_cb(uint64_t entry_id, vw_oplog_op_t op_type,
+static int tail_cb(uint64_t entry_id, vw_oplog_op_t op_type, uint64_t ts_unix_secs,
                    const void *payload, uint32_t payload_len, void *ud)
 {
     tail_ctx_t *tc = (tail_ctx_t *)ud;
     uint32_t    idx = tc->write_pos % TAIL_MAX;
-    (void)payload; (void)payload_len;
+    (void)payload; (void)payload_len; (void)ts_unix_secs;
     tc->entry_id[idx] = entry_id;
     tc->op_type[idx]  = (uint8_t)op_type;
     tc->write_pos      = (tc->write_pos + 1) % TAIL_MAX;

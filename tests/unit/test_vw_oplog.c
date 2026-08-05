@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -114,9 +115,13 @@ typedef struct {
     uint64_t      ids[128];
     vw_oplog_op_t ops[128];
     int           count;
+    uint64_t      tss[128];  /* ts_unix_secs per entry (TASK-121/TASK-123); trailing
+                               * field so existing {{0},{0},0} initializers below are
+                               * unaffected — it's implicitly zeroed per C's aggregate
+                               * initialization rules. */
 } replay_ctx_t;
 
-static int replay_collect(uint64_t entry_id, vw_oplog_op_t op_type,
+static int replay_collect(uint64_t entry_id, vw_oplog_op_t op_type, uint64_t ts_unix_secs,
                            const void *payload, uint32_t payload_len,
                            void *userdata)
 {
@@ -125,6 +130,7 @@ static int replay_collect(uint64_t entry_id, vw_oplog_op_t op_type,
     if (r->count < 128) {
         r->ids[r->count] = entry_id;
         r->ops[r->count] = op_type;
+        r->tss[r->count] = ts_unix_secs;
         r->count++;
     }
     return 0;
@@ -412,6 +418,109 @@ VW_TEST_SUITE("vw_oplog crash-injection") {
         VW_ASSERT_OK(vw_oplog_confirm(log, id_b));
 
         VW_ASSERT_EQ((int)vw_oplog_last_entry_id(log), (int)id_b);
+        vw_oplog_close(log);
+    }
+
+    /* ── Protocol v17: ts_unix_secs + FILE_* op codes (TASK-121/TASK-122/TASK-123) ── */
+
+    VW_TEST_CASE("ts_unix_secs is stamped at append time and delivered via replay_from") {
+        char d[512]; make_testdir(d, sizeof(d), base, "ts_append");
+        vw_oplog_t *log = NULL;
+        VW_ASSERT_OK(vw_oplog_open(d, &log));
+
+        time_t before = time(NULL);
+        uint64_t id_a;
+        VW_ASSERT_OK(vw_oplog_append(log, VW_OPLOG_USER_WRITE,
+                                     PAYLOAD, sizeof(PAYLOAD), &id_a));
+        VW_ASSERT_OK(vw_oplog_confirm(log, id_a));
+        time_t after = time(NULL);
+
+        replay_ctx_t r = {{0},{0},0};
+        VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
+        VW_ASSERT_EQ(r.count, 1);
+        VW_ASSERT((uint64_t)before <= r.tss[0] && r.tss[0] <= (uint64_t)after);
+        vw_oplog_close(log);
+    }
+
+    VW_TEST_CASE("ts_unix_secs survives close/reopen (part of the CRC-verified header)") {
+        char d[512]; make_testdir(d, sizeof(d), base, "ts_reopen");
+        vw_oplog_t *log = NULL;
+        VW_ASSERT_OK(vw_oplog_open(d, &log));
+
+        time_t before = time(NULL);
+        uint64_t id_a;
+        VW_ASSERT_OK(vw_oplog_append(log, VW_OPLOG_USER_WRITE,
+                                     PAYLOAD, sizeof(PAYLOAD), &id_a));
+        VW_ASSERT_OK(vw_oplog_confirm(log, id_a));
+        vw_oplog_close(log);
+        log = NULL;
+
+        VW_ASSERT_OK(vw_oplog_open(d, &log));
+        replay_ctx_t r = {{0},{0},0};
+        VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
+        VW_ASSERT_EQ(r.count, 1);
+        VW_ASSERT(r.tss[0] >= (uint64_t)before);
+        vw_oplog_close(log);
+    }
+
+    VW_TEST_CASE("read_range entries carry the original ts_unix_secs at the new header offset") {
+        char d[512]; make_testdir(d, sizeof(d), base, "read_range_ts");
+        vw_oplog_t *log = NULL;
+        VW_ASSERT_OK(vw_oplog_open(d, &log));
+
+        time_t before = time(NULL);
+        uint64_t id_a;
+        VW_ASSERT_OK(vw_oplog_append(log, VW_OPLOG_FILE_CREATE,
+                                     PAYLOAD, sizeof(PAYLOAD), &id_a));
+        VW_ASSERT_OK(vw_oplog_confirm(log, id_a));
+        time_t after = time(NULL);
+
+        uint8_t  *buf = NULL;
+        uint32_t  count = 0;
+        uint64_t  last_id = 0;
+        VW_ASSERT_OK(vw_oplog_read_range(log, 0, 10, &buf, &count, &last_id));
+        VW_ASSERT_EQ((int)count, 1);
+        VW_ASSERT(buf != NULL);
+
+        /* Entry layout: crc32(4)+payload_len(4)+entry_id(8)+ts_unix_secs(8)+
+         * confirmed(1)+op_type(1)+payload(4) = 30 bytes total for this 4-byte payload. */
+        uint32_t stored_plen = vw_read_u32le(buf + 4);
+        VW_ASSERT_EQ((int)stored_plen, (int)(1 + sizeof(PAYLOAD)));
+        uint64_t entry_id = vw_read_u64le(buf + 8);
+        VW_ASSERT_EQ((int)entry_id, (int)id_a);
+        uint64_t ts = vw_read_u64le(buf + 16);
+        VW_ASSERT((uint64_t)before <= ts && ts <= (uint64_t)after);
+        uint8_t confirmed = buf[24];
+        VW_ASSERT_EQ((int)confirmed, 1);
+        uint8_t op_type = buf[25];
+        VW_ASSERT_EQ((int)op_type, (int)VW_OPLOG_FILE_CREATE);
+
+        free(buf);
+        vw_oplog_close(log);
+    }
+
+    VW_TEST_CASE("FILE_CREATE/FILE_UPDATE/FILE_VERSION round-trip as distinct op_types") {
+        char d[512]; make_testdir(d, sizeof(d), base, "file_ops_v17");
+        vw_oplog_t *log = NULL;
+        VW_ASSERT_OK(vw_oplog_open(d, &log));
+
+        uint64_t id_create, id_update, id_version;
+        VW_ASSERT_OK(vw_oplog_append(log, VW_OPLOG_FILE_CREATE,
+                                     PAYLOAD, sizeof(PAYLOAD), &id_create));
+        VW_ASSERT_OK(vw_oplog_confirm(log, id_create));
+        VW_ASSERT_OK(vw_oplog_append(log, VW_OPLOG_FILE_UPDATE,
+                                     PAYLOAD, sizeof(PAYLOAD), &id_update));
+        VW_ASSERT_OK(vw_oplog_confirm(log, id_update));
+        VW_ASSERT_OK(vw_oplog_append(log, VW_OPLOG_FILE_VERSION,
+                                     PAYLOAD, sizeof(PAYLOAD), &id_version));
+        VW_ASSERT_OK(vw_oplog_confirm(log, id_version));
+
+        replay_ctx_t r = {{0},{0},0};
+        VW_ASSERT_OK(vw_oplog_replay_from(log, 0, replay_collect, &r));
+        VW_ASSERT_EQ(r.count, 3);
+        VW_ASSERT_EQ((int)r.ops[0], (int)VW_OPLOG_FILE_CREATE);
+        VW_ASSERT_EQ((int)r.ops[1], (int)VW_OPLOG_FILE_UPDATE);
+        VW_ASSERT_EQ((int)r.ops[2], (int)VW_OPLOG_FILE_VERSION);
         vw_oplog_close(log);
     }
 

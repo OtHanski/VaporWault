@@ -1,8 +1,10 @@
 # VaporWault Wire Protocol Specification
 
 **Owner:** PRT.04  
-**Current version:** 10  
-**Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8); §7.5/§7.10 implemented server-side (TASK-094); client (TASK-095) and GUI (TASK-096) support still pending. §7.11 is design-stage (TASK-089), not yet implemented — see TASK-098/099
+**Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
+**Document revision (§11 Version History, below):** 18 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+*(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
+**Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
 ---
 
@@ -957,6 +959,10 @@ On failure (unknown code / expired / already used / username taken): `AUTH_FAIL`
 | 0x0611 | DRIVE_CONFIG       | C → S     | Get/set server config    |
 | 0x0612 | DRIVE_CONFIG_RESP  | S → C     |                          |
 
+**AUDIT_QUERY payload:** `session_token[32]` + `max_entries(uint32)` (0 or > 256 clamps to 100; returns at most the last 256 confirmed entries).
+
+**AUDIT_RESP payload:** `count(uint32)` + raw oplog entry bytes concatenated, `count` entries total. Entry byte layout (`crc32`/`payload_len`/`entry_id`/`ts_unix_secs`/`confirmed`/`op_type`/`op_payload`) is specified once in §7.7's "Oplog entry format" — the wire bytes here are exactly the on-disk entry bytes, `confirmed` forced to 1.
+
 ### 7.7 Cluster (server ↔ server, ALPN `vw-cluster/1`)
 
 | Code   | Name                | Direction       | Description                  |
@@ -971,6 +977,45 @@ On failure (unknown code / expired / already used / username taken): `AUTH_FAIL`
 | 0x07FF | NODE_HELLO_FAIL     | Primary → Replica | Auth rejected; primary closes connection |
 
 **Replication model:** pull-based. The replica connects to the primary, sends NODE_HELLO, and the primary authenticates it. The replica then repeatedly sends OPLOG_PULL with its current watermark; the primary responds with OPLOG_DATA entries. The replica applies them locally and sends OPLOG_ACK. The primary uses the minimum ACK watermark across all active replicas to determine the safe oplog truncation offset.
+
+**Oplog entry format (v17 — breaking change, `TASK-121`/`TASK-122`):**
+
+On-disk entries under `<data_dir>/oplog/*.log` (`vw_oplog.h`) and the `entries` bytes of `OPLOG_DATA` above and `AUDIT_RESP` (§7.6) are the same byte layout — all little-endian, packed, no padding:
+
+| Offset | Size | Field       | Notes |
+|--------|------|-------------|-------|
+| 0      | 4    | crc32       | Covers `payload_len + entry_id + ts_unix_secs + op_type + op_payload`; `confirmed` is excluded (see below) |
+| 4      | 4    | payload_len | = 1 (`op_type`) + caller payload length |
+| 8      | 8    | entry_id    | Monotonic sequence number; remains the sole authority for replication ordering, dedup, and watermarks |
+| 16     | 8    | ts_unix_secs | Wall-clock append time, **seconds** since Unix epoch (not milliseconds — see the implementation note below the table). Stamped **once**, by `vw_oplog_append()` on the node where the entry originates (always the primary in a cluster). `vw_oplog_append_raw()` (replica applying a primary-sent entry) does **not** re-stamp it — it copies the received entry bytes through as-is (only the `confirmed` byte is overwritten), so `ts_unix_secs` is part of the CRC-covered payload the replica already verifies before applying. This keeps a given `entry_id`'s timestamp identical on every node and avoids re-deriving a value that would silently invalidate the received CRC if changed post-verification. **Advisory only** — never consulted for ordering, dedup, GC cutoff, or any replication decision, so clock skew or adjustment across cluster nodes cannot affect correctness. Exists solely so `AUDIT_RESP` consumers (the admin audit log, `TASK-116`) can filter/sort by date/time. |
+| 24     | 1    | confirmed   | NOT crc-covered — updated in place by `vw_oplog_confirm()`. Unchanged from the pre-v17 format. |
+| 25     | 1    | op_type     | One of `vw_oplog_op_t` |
+| 26     | N    | op_payload  | op-specific bytes, `N = payload_len - 1` |
+
+Total entry size = `25 + payload_len` bytes (was `17 + payload_len` before this version — `ts_unix_secs` adds 8 header bytes).
+
+*Implementation note (SRV.01, `TASK-123`):* the field was designed above as `ts_unix_ms` (milliseconds) but shipped as `ts_unix_secs` (seconds), same 8-byte width. The codebase has no precedent anywhere for a millisecond-precision clock — every existing timestamp (`mtime_unix`, session expiry, invite TTL) uses `time_t`/seconds via `time(NULL)` — and this field's only consumer (a date/time-range filter in the audit log UI) doesn't need sub-second resolution, so a new cross-platform ms-clock helper would have been unjustified complexity. Purely a naming/precision correction: offset, width, and every other property described above are unchanged.
+
+**`op_type` changes (`TASK-122`):** `VW_OPLOG_FILE_WRITE` (0x02) is retired. Its bare 8-byte `uint64` payload was ambiguous — meaning `owner_id` on the create path but `file_id` on the rename/update and version-write paths in `vw_store_files.c`, with nothing in the entry to tell a reader which. Replaced by three explicit codes, same 8-byte `uint64` payload shape:
+
+| Code | Name                     | Payload    | Call site (`vw_store_files.c`)      |
+|------|--------------------------|------------|--------------------------------------|
+| 0x08 | `VW_OPLOG_FILE_CREATE`   | `owner_id` | create path                          |
+| 0x09 | `VW_OPLOG_FILE_UPDATE`   | `file_id`  | rename/update path                   |
+| 0x0A | `VW_OPLOG_FILE_VERSION` | `file_id`  | version-write path                   |
+
+`0x02` is retired, not reassigned — do not reuse it for a future op type. An entry bearing it (only reachable from before the upgrade cutover below) is still unresolvable and must be handled exactly as today: no subject attribution.
+
+**Upgrade / compatibility note:** the oplog is not durable history — GC (`vw_oplog_truncate_before`, invoked once every active replica's ack watermark has passed a given entry) already reclaims segments once no longer needed. There is no version/magic field in the pre-v17 header letting a reader distinguish an old 17-byte-header entry from a new 25-byte-header one of the same nominal `payload_len`, so the two cannot coexist in one segment. This is therefore a **hard cutover, not an in-place migration**. Per node, in order:
+
+1. Confirm the node is caught up (`lag_entries == 0` via `CLUSTER_STATUS_RESP`) or is the primary.
+2. Stop the node.
+3. Clear `<data_dir>/oplog/` (crash-recovery/replication state only; no other data is affected).
+4. Start the node on the new binary.
+
+A cluster must never run mixed pre-v17/post-v17 nodes against shared oplog segments; single-node deployments only need steps 2–4 applied locally. No rolling-upgrade path is provided, consistent with this project's other pre-1.0 breaking on-disk format changes. Step 2 ("stop the node") is safe with respect to in-flight appends: `vw_server_main.c`'s shutdown path drains all worker threads (`pool_shutdown_and_join`) before closing the oplog, and every `vw_oplog_append()` call site confirms or aborts its entry synchronously within the same handler call — so a fully-drained clean stop never leaves a `confirmed=0` entry behind for the wipe to lose.
+
+**Implementation note — three independent call sites parse this header, not one:** besides `vw_oplog.c` itself (the only place that should own the layout), both `src/gui/server/views/vw_view_audit.cpp` (`OPLOG_ENTRY_HDR = 17u`, parsing `AUDIT_RESP`) and `src/server/vw_cluster.c` (the replica's `OPLOG_DATA`-batch-splitting loop, `entry_total = 17u + entry_plen` around its `vw_oplog_append_raw()` call) each hardcode their own private copy of the pre-v17 17-byte header size to find entry boundaries in a concatenated buffer. All three must move to the new 25-byte size together, or replication/audit parsing silently misaligns (the replica loop in particular would under-read each entry by 8 bytes and desync the next one — a correctness bug in the exact path this format change is tagged `security-sensitive` for). To prevent this class of divergent-copy bug recurring, `vw_oplog.h` should expose the header-size constant publicly (e.g. `VW_OPLOG_ENTRY_HDR_BYTES`) for both external call sites to use instead of redefining it privately. Tracked in `TASK-123`.
 
 ### 7.8 File Transfer Security Model
 
@@ -1453,6 +1498,8 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 18      | 2026-08-05 | ARCH.00 | Doc-only clarification (`TASK-118`): split the header's single "Current version: 10" field — which matched neither `VW_PROTO_VERSION_CURRENT` (6) nor this table's own latest row (17) — into two separately labeled fields: the actual wire-negotiated version (`VW_PROTO_VERSION_CURRENT`, still 6, unchanged) and this table's revision counter (17 at the time, now 18). No wire behavior changed. Also corrected the header's **Status** line, which still said sharing's client/GUI support (`TASK-095`/`TASK-096`) and vault (§7.11, `TASK-089`) were pending — both finished and closed (`TASK-097`, `TASK-101`) well before this correction. Reviewed and confirmed by PRT.04 (document owner) per `CLAUDE.md`. |
+| 17      | 2026-08-04 | PRT.04  | **Breaking change** to the oplog entry format (§7.7), resolving `TASK-121` and `TASK-122` (both filed by GUI.03/CQR.08 out of `TASK-116`'s audit-log work): entry header gains an 8-byte `ts_unix_secs` append timestamp (advisory only — `entry_id` remains authoritative for ordering/replication), and the ambiguous `VW_OPLOG_FILE_WRITE` (0x02, meant `owner_id` on create but `file_id` on rename/update/version-write with no way to tell which) is retired in favor of explicit `VW_OPLOG_FILE_CREATE`/`VW_OPLOG_FILE_UPDATE`/`VW_OPLOG_FILE_VERSION` (0x08–0x0A). Total entry size grows from `17 + payload_len` to `25 + payload_len` bytes. This is a hard cutover, not an in-place migration — see §7.7's upgrade note; `AUDIT_RESP` (§7.6) and `OPLOG_DATA` (§7.7) both carry the new layout since they serialise raw entry bytes. Design-stage SEC.07 review (same day) found and closed a blocking gap in the initial draft: the text implied `vw_oplog_append_raw()` (replica applying a primary-sent entry) re-stamps the timestamp itself, and the draft's implementation notes missed that `src/server/vw_cluster.c`'s replica-side `OPLOG_DATA` batch-splitting loop independently hardcodes the pre-v17 17-byte header size (a third copy alongside `vw_oplog.c` and `vw_view_audit.cpp`) — left as-is, that loop would under-read every entry by 8 bytes and desync replication. Implemented as `TASK-123` (SRV.01) and `TASK-124` (GUI.03): the field shipped as `ts_unix_secs` rather than the originally-drafted `ts_unix_ms` (see §7.7's implementation note — no precedent in this codebase for ms-precision timestamps, and this field's filter-UI consumer doesn't need it), and implementation review found two *more* independent hardcoded-header-size copies beyond the three already caught (`handle_audit_query` in `vw_file_handlers.c`, and the primary-side `OPLOG_PULL` handler in `vw_cluster.c`) — all five now reference the single public `VW_OPLOG_ENTRY_HDR_BYTES` constant (`vw_oplog.h`). Full local build (MSVC, `/W4 /WX`) and unit test suite pass with no regressions. |
 | 16      | 2026-08-01 | CLI.02  | `FILE_LIST_RESP` (§7.2) gains a trailing `count * uint64 version_id` parallel array, resolving `TASK-109`: the response shipped with `TASK-021` never carried `version_id` at all, silently breaking `vw_sync.c`'s ongoing remote-change detection (both sides of its comparison were permanently 0). A trailing parallel array — rather than the entry-length wrapper originally assumed necessary — lets an old client's fixed-size-per-entry decode loop simply stop after `count` entries without ever touching the new bytes, so no protocol version bump is required, matching every other extension in this document. `compute_actions` now compares the real `version_id` (same source field as `FILE_STAT_RESP`'s) alongside `mtime_unix`/`size_bytes` as defense-in-depth. |
 | 15      | 2026-07-31 | CLI.02  | `FILE_LIST` (§7.2) gains an optional trailing `dir_file_id` field, resolving `TASK-106`'s core blocker: no wire mechanism let an authenticated grant-holder list a shared folder's children by file_id (only the anonymous scoped-link case could navigate a shared subtree, via its own fixed scope target). Resolved via `effective_permission()`, the same helper `FILE_COMMIT`'s directory-target branch already uses. Purely additive: old clients never send it, so `virtual_path`-based listing is unaffected; rejected for an already-scoped session, which has no legitimate use for it. No protocol version bump required. |
 | 14      | 2026-07-31 | GUI.03  | `FILE_STAT_RESP` (§7.2) gains a trailing `vault_id` field, resolving a gap found implementing `TASK-100`'s encrypted-item indicators: no existing response let a browser learn a file's vault_id without a `VERSION_CHUNKS` round-trip. Always present (not absent-when-zero like `FILE_COMMIT`/`VERSION_CHUNKS_RESP`, since nothing optional follows it). `FILE_LIST_RESP` deliberately does not get the same field — see §7.2's note on why a whole-directory listing doesn't populate per-entry `vault_id`. No protocol version bump required. |

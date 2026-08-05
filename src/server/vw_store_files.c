@@ -468,7 +468,7 @@ vw_err_t vw_store_file_create(vw_file_store_t *fs,
         }
     }
 
-    rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_WRITE,
+    rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_CREATE,
                          &rec->owner_id, (uint32_t)sizeof(rec->owner_id), &eid);
     if (rc != VW_OK) { rwlock_wrunlock(&fs->files_lock); return rc; }
 
@@ -631,7 +631,7 @@ vw_err_t vw_store_file_update(vw_file_store_t *fs,
     uint64_t slot = fs->fid_to_slot[file_id];
     uint64_t off  = slot * (uint64_t)sizeof(vw_file_record_t);
 
-    rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_WRITE,
+    rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_UPDATE,
                          &file_id, (uint32_t)sizeof(file_id), &eid);
     if (rc != VW_OK) { rwlock_wrunlock(&fs->files_lock); return rc; }
 
@@ -798,7 +798,7 @@ vw_err_t vw_store_version_create(vw_file_store_t *fs,
     uint64_t blob_bytes  = hash_bytes + wrapped_dek_len;
 
     /* Oplog append for the version write. */
-    rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_WRITE,
+    rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_VERSION,
                          &rec->file_id, (uint32_t)sizeof(rec->file_id), &eid);
     if (rc != VW_OK) { rwlock_wrunlock(&fs->versions_lock); return rc; }
 

@@ -350,14 +350,14 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
         }
 
         /* Compute total byte length of entries_buf by scanning each entry.
-         * Each entry: [crc(4)][payload_len(4)][...] → total = 17 + payload_len.
+         * Each entry: [crc(4)][payload_len(4)][...] → total = VW_OPLOG_ENTRY_HDR_BYTES + payload_len.
          * Guard against uint32_t overflow in entries_bytes accumulation. */
         uint32_t entries_bytes = 0;
         if (entries_buf && entries_count > 0) {
             const uint8_t *p = entries_buf;
             for (uint32_t i = 0; i < entries_count; i++) {
                 uint32_t plen_field = vw_read_u32le(p + 4);  /* stored_plen */
-                uint32_t e_total    = 17u + plen_field;
+                uint32_t e_total    = VW_OPLOG_ENTRY_HDR_BYTES + plen_field;
                 if (plen_field > VW_MAX_MSG_BYTES ||
                     entries_bytes > VW_MAX_MSG_BYTES - e_total)
                     break;  /* truncate — should not happen with internal data */
@@ -775,10 +775,10 @@ static void replica_repl_session(vw_cluster_t *ctx)
         uint64_t last_applied = my_watermark;
 
         for (uint32_t i = 0; i < entry_count; i++) {
-            if (remaining < 17u + 1u) { apply_ok = 0; break; }
+            if (remaining < VW_OPLOG_ENTRY_HDR_BYTES + 1u) { apply_ok = 0; break; }
 
             uint32_t entry_plen  = vw_read_u32le(p + 4);  /* stored_plen */
-            uint32_t entry_total = 17u + entry_plen;
+            uint32_t entry_total = VW_OPLOG_ENTRY_HDR_BYTES + entry_plen;
             if (entry_total > remaining) { apply_ok = 0; break; }
 
             uint64_t this_eid = vw_read_u64le(p + 8);

@@ -1753,9 +1753,10 @@ static vw_err_t handle_user_suspend(vw_store_t *store, vw_conn_t *conn,
  *
  * Request:  session_token(32) + max_entries(u32)
  * Response (AUDIT_RESP): count(u32) + raw_oplog_bytes[...]
- *   Each entry in raw_oplog_bytes is the on-disk format from vw_oplog:
- *     crc32(4) + payload_len(4) + entry_id(8) + confirmed(1) + op_type(1) + op_payload[...]
- *   Total entry size = 17 + payload_len bytes.
+ *   Each entry in raw_oplog_bytes is the on-disk format from vw_oplog (protocol
+ *   v17, docs/PROTOCOL.md §7.7):
+ *     crc32(4) + payload_len(4) + entry_id(8) + ts_unix_secs(8) + confirmed(1) + op_type(1) + op_payload[...]
+ *   Total entry size = VW_OPLOG_ENTRY_HDR_BYTES(25) + payload_len bytes.
  *
  * Returns the last min(max_entries, 256) confirmed entries from the oplog.
  * If oplog is NULL or empty, returns count=0.
@@ -1816,10 +1817,11 @@ static vw_err_t handle_audit_query(vw_store_t *store, vw_oplog_t *oplog,
         const uint8_t *p = entries_buf;
         for (uint32_t i = 0; i < entries_count; i++) {
             uint32_t eplen = vw_read_u32le(p + 4);
-            if (eplen > VW_MAX_MSG_BYTES || entries_bytes > VW_MAX_MSG_BYTES - (17u + eplen))
+            if (eplen > VW_MAX_MSG_BYTES ||
+                entries_bytes > VW_MAX_MSG_BYTES - (VW_OPLOG_ENTRY_HDR_BYTES + eplen))
                 break;  /* truncate — should not happen with server-generated data */
-            entries_bytes += 17u + eplen;
-            p             += 17u + eplen;
+            entries_bytes += VW_OPLOG_ENTRY_HDR_BYTES + eplen;
+            p             += VW_OPLOG_ENTRY_HDR_BYTES + eplen;
         }
     }
 

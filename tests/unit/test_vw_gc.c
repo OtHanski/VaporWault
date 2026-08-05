@@ -145,11 +145,11 @@ static void gc_stack_close(gc_stack_t *s)
 
 /* ── Oplog replay counter ─────────────────────────────────────────────────── */
 
-static int count_replay_cb(uint64_t entry_id, vw_oplog_op_t op_type,
+static int count_replay_cb(uint64_t entry_id, vw_oplog_op_t op_type, uint64_t ts_unix_secs,
                             const void *payload, uint32_t payload_len,
                             void *userdata)
 {
-    (void)entry_id; (void)op_type; (void)payload; (void)payload_len;
+    (void)entry_id; (void)op_type; (void)ts_unix_secs; (void)payload; (void)payload_len;
     (*(int *)userdata)++;
     return 0;
 }

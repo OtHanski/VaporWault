@@ -67,10 +67,10 @@ static int make_tmpdir(char *buf, size_t bufsz) {
 
 /* ── No-op replay callback ───────────────────────────────────────────────── */
 
-static int noop_cb(uint64_t entry_id, vw_oplog_op_t op_type,
+static int noop_cb(uint64_t entry_id, vw_oplog_op_t op_type, uint64_t ts_unix_secs,
                    const void *payload, uint32_t payload_len, void *ud)
 {
-    (void)entry_id; (void)op_type; (void)payload; (void)payload_len; (void)ud;
+    (void)entry_id; (void)op_type; (void)ts_unix_secs; (void)payload; (void)payload_len; (void)ud;
     return 0;
 }
 

@@ -3,19 +3,20 @@
  *
  * See vw_oplog.h for the full design description.
  *
- * On-disk entry layout (little-endian, packed):
+ * On-disk entry layout (little-endian, packed) — protocol v17:
  *   Offset  Size  Field
- *   0       4     crc32         (covers bytes 4..end of entry)
+ *   0       4     crc32         (covers bytes 4..end of entry, excluding confirmed)
  *   4       4     payload_len   (= 1 + caller's payload_len: includes op_type byte)
  *   8       8     entry_id
- *   16      1     confirmed     (NOT CRC-covered; 0 = pending, 1 = committed)
- *   17      1     op_type
- *   18      N     op_payload    (N = payload_len - 1)
+ *   16      8     ts_unix_secs  (wall-clock append time; advisory only)
+ *   24      1     confirmed     (NOT CRC-covered; 0 = pending, 1 = committed)
+ *   25      1     op_type
+ *   26      N     op_payload    (N = payload_len - 1)
  *
- *   Total entry size on disk = 4 + 4 + 8 + 1 + payload_len = 17 + payload_len bytes.
+ *   Total entry size on disk = 4 + 4 + 8 + 8 + 1 + payload_len = ENTRY_HDR_SIZE(25) + payload_len bytes.
  *
- *   crc32 covers bytes 4..15 (payload_len + entry_id) plus all payload bytes.
- *   The confirmed byte at offset 16 is excluded from the CRC so it can be
+ *   crc32 covers bytes 4..23 (payload_len + entry_id + ts_unix_secs) plus all payload bytes.
+ *   The confirmed byte at offset 24 is excluded from the CRC so it can be
  *   updated in-place by vw_oplog_confirm() without recomputing the CRC.
  *
  * CRC-32 uses the ISO 3309 / Ethernet polynomial 0xEDB88320 (reflected).
@@ -28,6 +29,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <time.h>
 
 #ifdef _WIN32
 #   define WIN32_LEAN_AND_MEAN
@@ -43,16 +45,18 @@
 /* ── Fixed sizes ─────────────────────────────────────────────────────────── */
 
 /*
- * Full fixed header = crc32(4) + payload_len(4) + entry_id(8) + confirmed(1) = 17 bytes.
- * Then payload_len bytes follow (op_type + op_payload).
+ * Full fixed header = crc32(4) + payload_len(4) + entry_id(8) + ts_unix_secs(8)
+ * + confirmed(1) = 25 bytes (VW_OPLOG_ENTRY_HDR_BYTES, vw_oplog.h). Then
+ * payload_len bytes follow (op_type + op_payload).
  *
- * CRC covers bytes 4..15 (payload_len + entry_id = 12 bytes) plus the entire
- * payload (op_type byte + op_payload bytes = payload_len bytes total).
- * The confirmed byte at offset 16 is intentionally excluded.
+ * CRC covers bytes 4..23 (payload_len + entry_id + ts_unix_secs = 20 bytes)
+ * plus the entire payload (op_type byte + op_payload bytes = payload_len
+ * bytes total). The confirmed byte at offset 24 is intentionally excluded.
  */
-#define ENTRY_HDR_SIZE        17u  /* crc32(4) + payload_len(4) + entry_id(8) + confirmed(1) */
-#define ENTRY_CONFIRMED_OFF   16u  /* byte offset of the confirmed field within each entry    */
-#define CRC_HEADER_BYTES      12u  /* CRC-covered header bytes: payload_len(4) + entry_id(8) */
+#define ENTRY_HDR_SIZE        VW_OPLOG_ENTRY_HDR_BYTES  /* 25: see vw_oplog.h */
+#define ENTRY_TS_OFF          16u  /* byte offset of the ts_unix_secs field within each entry */
+#define ENTRY_CONFIRMED_OFF   24u  /* byte offset of the confirmed field within each entry    */
+#define CRC_HEADER_BYTES      20u  /* CRC-covered header bytes: payload_len(4) + entry_id(8) + ts_unix_secs(8) */
 
 /* Maximum number of entries awaiting vw_oplog_confirm() at any one time. */
 #define VW_OPLOG_MAX_PENDING  64u
@@ -398,7 +402,7 @@ static vw_err_t seg_scan(const char *path,
     uint8_t  hdr[ENTRY_HDR_SIZE];
 
     for (;;) {
-        /* Read fixed header (17 bytes: crc32+payload_len+entry_id+confirmed) */
+        /* Read fixed header (25 bytes: crc32+payload_len+entry_id+ts_unix_secs+confirmed) */
         int n = fd_read(fd, hdr, ENTRY_HDR_SIZE);
         if (n == 0) break;                   /* clean EOF          */
         if (n < (int)ENTRY_HDR_SIZE) break;  /* partial header — corrupt tail */
@@ -406,7 +410,7 @@ static vw_err_t seg_scan(const char *path,
         uint32_t stored_crc  = vw_read_u32le(hdr + 0);
         uint32_t payload_len = vw_read_u32le(hdr + 4);
         uint64_t entry_id    = vw_read_u64le(hdr + 8);
-        uint8_t  confirmed   = hdr[ENTRY_CONFIRMED_OFF]; /* offset 16 */
+        uint8_t  confirmed   = hdr[ENTRY_CONFIRMED_OFF]; /* offset 24 */
 
         if (payload_len == 0) break;   /* malformed */
         if (payload_len > VW_OPLOG_SEGMENT_MAX) break; /* malformed — exceeds segment cap */
@@ -430,8 +434,8 @@ static vw_err_t seg_scan(const char *path,
             break;
         }
 
-        /* Verify CRC: covers hdr[4..15] (payload_len+entry_id) + payload.
-         * The confirmed byte (hdr[16]) is intentionally excluded from CRC. */
+        /* Verify CRC: covers hdr[4..23] (payload_len+entry_id+ts_unix_secs) + payload.
+         * The confirmed byte (hdr[24]) is intentionally excluded from CRC. */
         uint32_t crc = 0;
         crc = crc32_update(crc, hdr + 4, CRC_HEADER_BYTES);
         crc = crc32_update(crc, payload, payload_len);
@@ -708,13 +712,20 @@ vw_err_t vw_oplog_append(vw_oplog_t *ctx,
 
     uint64_t eid = ctx->next_entry_id;
 
-    /* Build CRC-covered header bytes: [payload_len(4)][entry_id(8)] = 12 bytes.
-     * The confirmed byte (offset 16) is NOT included in the CRC. */
-    uint8_t crc_hdr[CRC_HEADER_BYTES];
-    vw_write_u32le(crc_hdr + 0, stored_plen);
-    vw_write_u64le(crc_hdr + 4, eid);
+    /* ts_unix_secs is stamped once, here, on the node where the entry
+     * originates. vw_oplog_append_raw() (replica applying a primary-sent
+     * entry) never re-derives this — it preserves the received value
+     * verbatim (see vw_oplog.h's format comment). */
+    uint64_t ts_secs = (uint64_t)time(NULL);
 
-    /* CRC covers: crc_hdr(12) + op_type(1) + payload(payload_len) */
+    /* Build CRC-covered header bytes: [payload_len(4)][entry_id(8)][ts_unix_secs(8)]
+     * = 20 bytes. The confirmed byte (offset 24) is NOT included in the CRC. */
+    uint8_t crc_hdr[CRC_HEADER_BYTES];
+    vw_write_u32le(crc_hdr + 0,  stored_plen);
+    vw_write_u64le(crc_hdr + 4,  eid);
+    vw_write_u64le(crc_hdr + 12, ts_secs);
+
+    /* CRC covers: crc_hdr(20) + op_type(1) + payload(payload_len) */
     uint32_t crc = 0;
     crc = crc32_update(crc, crc_hdr, CRC_HEADER_BYTES);
     uint8_t op_byte = (uint8_t)op_type;
@@ -723,8 +734,8 @@ vw_err_t vw_oplog_append(vw_oplog_t *ctx,
         crc = crc32_update(crc, payload, payload_len);
 
     /* Serialise full entry into one buffer for a single write syscall.
-     * Layout: [crc32(4)][payload_len(4)][entry_id(8)][confirmed(1)][op_type(1)][op_payload(N)]
-     * Total  = ENTRY_HDR_SIZE(17) + stored_plen bytes. */
+     * Layout: [crc32(4)][payload_len(4)][entry_id(8)][ts_unix_secs(8)][confirmed(1)][op_type(1)][op_payload(N)]
+     * Total  = ENTRY_HDR_SIZE(25) + stored_plen bytes. */
     size_t total = ENTRY_HDR_SIZE + stored_plen;
     uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf) { mutex_unlock(&ctx->mu); return VW_ERR_OOM; }
@@ -732,10 +743,11 @@ vw_err_t vw_oplog_append(vw_oplog_t *ctx,
     vw_write_u32le(buf + 0, crc);
     vw_write_u32le(buf + 4, stored_plen);
     vw_write_u64le(buf + 8, eid);
+    vw_write_u64le(buf + ENTRY_TS_OFF, ts_secs);
     buf[ENTRY_CONFIRMED_OFF] = 0;   /* confirmed = 0 (pending) */
-    buf[17]                  = op_byte;
+    buf[ENTRY_HDR_SIZE]      = op_byte;
     if (payload_len > 0)
-        memcpy(buf + 18, payload, payload_len);
+        memcpy(buf + ENTRY_HDR_SIZE + 1, payload, payload_len);
 
     /* Record the byte offset of the confirmed field before incrementing seg_bytes.
      * O_APPEND / FILE_APPEND_DATA writes start at file offset ctx->seg_bytes. */
@@ -872,7 +884,7 @@ vw_err_t vw_oplog_abort(vw_oplog_t *ctx, uint64_t entry_id)
 
 vw_err_t vw_oplog_replay_from(vw_oplog_t *ctx,
                                uint64_t from_entry_id,
-                               int (*callback)(uint64_t, vw_oplog_op_t,
+                               int (*callback)(uint64_t, vw_oplog_op_t, uint64_t,
                                                const void *, uint32_t, void *),
                                void *userdata)
 {
@@ -930,7 +942,7 @@ vw_err_t vw_oplog_replay_from(vw_oplog_t *ctx,
             continue;
         }
 
-        uint8_t hdr[ENTRY_HDR_SIZE]; /* 17 bytes */
+        uint8_t hdr[ENTRY_HDR_SIZE]; /* 25 bytes */
         for (;;) {
             int n = fd_read(fd, hdr, ENTRY_HDR_SIZE);
             if (n <= 0) break;                  /* EOF or error */
@@ -939,7 +951,8 @@ vw_err_t vw_oplog_replay_from(vw_oplog_t *ctx,
             uint32_t stored_crc  = vw_read_u32le(hdr + 0);
             uint32_t stored_plen = vw_read_u32le(hdr + 4);
             uint64_t entry_id    = vw_read_u64le(hdr + 8);
-            uint8_t  confirmed   = hdr[ENTRY_CONFIRMED_OFF]; /* offset 16 */
+            uint64_t ts_secs     = vw_read_u64le(hdr + ENTRY_TS_OFF);
+            uint8_t  confirmed   = hdr[ENTRY_CONFIRMED_OFF]; /* offset 24 */
 
             if (stored_plen == 0) break; /* malformed */
             if (stored_plen > VW_OPLOG_SEGMENT_MAX) break; /* malformed — exceeds segment cap */
@@ -955,7 +968,7 @@ vw_err_t vw_oplog_replay_from(vw_oplog_t *ctx,
             }
             if (got < stored_plen) { free(payload); break; } /* partial payload */
 
-            /* Verify CRC: hdr[4..15] + payload (confirmed byte excluded) */
+            /* Verify CRC: hdr[4..23] + payload (confirmed byte excluded) */
             uint32_t crc = 0;
             crc = crc32_update(crc, hdr + 4, CRC_HEADER_BYTES);
             crc = crc32_update(crc, payload, stored_plen);
@@ -973,7 +986,7 @@ vw_err_t vw_oplog_replay_from(vw_oplog_t *ctx,
                 /* Pass NULL when op_len==0 to prevent one-past-end pointer */
                 const void   *op_data = (op_len > 0) ? (payload + 1) : NULL;
 
-                int cbrc = callback(entry_id, op_type, op_data, op_len, userdata);
+                int cbrc = callback(entry_id, op_type, ts_secs, op_data, op_len, userdata);
                 if (cbrc != 0) stop = 1;
             }
 
@@ -1062,6 +1075,7 @@ typedef struct {
 } read_range_ctx_t;
 
 static int read_range_cb(uint64_t entry_id, vw_oplog_op_t op_type,
+                         uint64_t ts_secs,
                          const void *payload, uint32_t payload_len,
                          void *userdata)
 {
@@ -1071,10 +1085,14 @@ static int read_range_cb(uint64_t entry_id, vw_oplog_op_t op_type,
     uint32_t stored_plen = payload_len + 1u;
     uint32_t entry_total = ENTRY_HDR_SIZE + stored_plen;
 
-    /* Build CRC-covered header bytes: [payload_len(4)][entry_id(8)] */
+    /* Build CRC-covered header bytes: [payload_len(4)][entry_id(8)][ts_unix_secs(8)].
+     * ts_secs is the original append-time value read back from disk by
+     * vw_oplog_replay_from — reusing it here (rather than re-stamping) keeps
+     * this rebuilt entry byte-identical to what's on disk. */
     uint8_t crc_hdr[CRC_HEADER_BYTES];
-    vw_write_u32le(crc_hdr + 0, stored_plen);
-    vw_write_u64le(crc_hdr + 4, entry_id);
+    vw_write_u32le(crc_hdr + 0,  stored_plen);
+    vw_write_u64le(crc_hdr + 4,  entry_id);
+    vw_write_u64le(crc_hdr + 12, ts_secs);
     uint8_t op_byte = (uint8_t)op_type;
     uint32_t crc = 0;
     crc = crc32_update(crc, crc_hdr, CRC_HEADER_BYTES);
@@ -1096,10 +1114,11 @@ static int read_range_cb(uint64_t entry_id, vw_oplog_op_t op_type,
     vw_write_u32le(dst + 0,  crc);
     vw_write_u32le(dst + 4,  stored_plen);
     vw_write_u64le(dst + 8,  entry_id);
+    vw_write_u64le(dst + ENTRY_TS_OFF, ts_secs);
     dst[ENTRY_CONFIRMED_OFF] = 1;  /* confirmed — safe for replica to apply */
-    dst[17]                  = op_byte;
+    dst[ENTRY_HDR_SIZE]      = op_byte;
     if (payload_len > 0)
-        memcpy(dst + 18, payload, payload_len);
+        memcpy(dst + ENTRY_HDR_SIZE + 1, payload, payload_len);
 
     rctx->buf_len       += entry_total;
     rctx->count++;
@@ -1165,12 +1184,15 @@ vw_err_t vw_oplog_append_raw(vw_oplog_t    *oplog,
     if (entry_id != expected_entry_id)
         return VW_ERR_PROTO_INVALID;
 
-    /* Verify CRC: covers entry_bytes[4..15] (payload_len + entry_id)
-     * plus entry_bytes[17..end] (op_type + op_payload).
-     * The confirmed byte at offset 16 is intentionally excluded. */
+    /* Verify CRC: covers entry_bytes[4..23] (payload_len + entry_id + ts_unix_secs)
+     * plus entry_bytes[ENTRY_HDR_SIZE..end] (op_type + op_payload).
+     * The confirmed byte at offset 24 is intentionally excluded.
+     * ts_unix_secs (bytes [16..23], part of this CRC-covered range) is never
+     * touched below — it rides through verbatim from the primary, which is
+     * what keeps a given entry_id's timestamp identical on every node. */
     uint32_t crc = 0;
-    crc = crc32_update(crc, entry_bytes + 4,  CRC_HEADER_BYTES); /* [4..15] */
-    crc = crc32_update(crc, entry_bytes + 17, stored_plen);      /* [17..end] */
+    crc = crc32_update(crc, entry_bytes + 4, CRC_HEADER_BYTES);              /* [4..23] */
+    crc = crc32_update(crc, entry_bytes + ENTRY_HDR_SIZE, stored_plen);      /* [ENTRY_HDR_SIZE..end] */
     if (crc != stored_crc) return VW_ERR_PROTO_INVALID;
 
     mutex_lock(&oplog->mu);
