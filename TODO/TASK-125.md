@@ -1,0 +1,116 @@
+---
+id:          TASK-125
+title:       Argon2 has the same dead-submodule/FetchContent mismatch as TASK-119's mbedTLS
+status:      done
+assignee:    BLD.05
+created_by:  BLD.05
+created:     2026-08-04
+priority:    normal
+depends_on:  []
+blocks:      []
+review_by:   [CQR.08]
+tags:        [build, dependencies]
+---
+
+Discovered while resolving `TASK-119` (mbedTLS submodule/FetchContent
+mismatch). `third_party/CMakeLists.txt` also fetches Argon2 via
+`FetchContent_Declare(argon2_fetch ... GIT_TAG 20190702)` / `FetchContent_Populate`
+(lines ~30-38), completely independent of the `third_party/argon2` git
+submodule declared in `.gitmodules` and currently checked out at commit
+`f57e61e` (`20190702-27-gf57e61e` — 27 commits *after* tag `20190702`, so
+even the two mechanisms' version drift is worse here than mbedTLS's was).
+
+Exactly the same problem as `TASK-119`: the submodule is dead weight that
+gives a false impression of what's actually compiled in, and
+`VENDOR_SETUP.md` §2 instructs a fresh clone to `git submodule add` and pin
+Argon2 — work that has no effect on the actual build.
+
+Not tagged `security-sensitive` (unlike `TASK-119`) — Argon2 here is a
+single vendored reference implementation of a hashing algorithm, not the
+project's TLS/crypto library boundary, and its `FetchContent` pin
+(`20190702`) is the upstream's last tagged release with no known CVEs
+against it as of this filing. Still worth the same cleanup for the same
+build-hygiene reason.
+
+## Acceptance criteria
+
+- Same choice as `TASK-119`: either drop `FetchContent` and build from the
+  submodule (`add_subdirectory` won't work directly — Argon2 upstream's own
+  CMakeLists.txt produces different target names per this file's existing
+  comment, so keep the current custom `add_library(argon2 STATIC ...)` file
+  list, just point `argon2_fetch_SOURCE_DIR` at the submodule path instead
+  of a fresh fetch), or remove the `third_party/argon2` submodule and keep
+  `FetchContent` (consistent with what `TASK-119` chose for mbedTLS, and
+  with what's actually already working).
+- Update `VENDOR_SETUP.md` §2 to match whichever is chosen.
+- Confirm which Argon2 commit/tag ends up compiled in and note it in a
+  `third_party/CMakeLists.txt` comment (mirroring `TASK-119`'s mbedTLS
+  comment), since right now neither the submodule commit nor the
+  `FetchContent` tag agree and there's no single documented answer.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+BLD.05 [2026-08-04]: Filed from `TASK-119`. Low urgency relative to that
+task (not security-sensitive), but same root cause and same fix shape —
+worth doing before another dependency drifts the same way.
+
+BLD.05 [2026-08-04]: Resolved. Chose **remove the submodule, keep
+`FetchContent`** — same choice as `TASK-119`, for the same reason
+(established, working pattern; the submodule was never what got compiled).
+
+Before deciding whether to also bump the `FetchContent` tag (as `TASK-119`
+did for mbedTLS), diffed the two versions properly rather than assuming
+either was "newer/better":
+
+- Upstream tags: `20190702` is the last one (checked via the GitHub API);
+  no tags since.
+- The now-removed submodule was pinned at commit `f57e61e` (2021-06-25),
+  27 commits *past* that tag — i.e. the submodule was actually the newer of
+  the two, the reverse of `TASK-119`'s mbedTLS situation where the
+  submodule was the *older* one.
+- Diffed `20190702...f57e61e` restricted to the files this project actually
+  compiles (`argon2.c`, `core.c`, `encoding.c`, `ref.c`, `thread.c`,
+  `blake2/blake2b.c`): the only non-cosmetic change is a MinGW-specific
+  branch added to `core.c`'s `secure_wipe_memory()` (extends an existing
+  `_MSC_VER`-gated `SecureZeroMemory` call to also cover `__MINGW32__`).
+  This project's toolchains are MSVC and GCC/Clang, not MinGW, so that
+  branch is dead code for us either way — **no functional difference**
+  between the two versions for anything this project actually builds.
+  Everything else in the diff is license-header URL scheme (`http` →
+  `https`), purely cosmetic.
+- No commits upstream since `f57e61e` (repo confirmed unmaintained by
+  design — PHC winner, algorithm/API frozen, per its own README) and no
+  GitHub security advisories.
+
+Given no functional difference and no CVEs either way, kept the tagged
+release (`20190702`) rather than switching to an arbitrary untagged commit
+hash — a nameable, citable version is preferable for a crypto-adjacent
+dependency even when the choice is otherwise a wash. Documented all of the
+above in a `third_party/CMakeLists.txt` comment (mirroring `TASK-119`'s
+mbedTLS comment) so the next person doesn't have to redo this diff.
+
+- `git submodule deinit -f third_party/argon2 && git rm -f third_party/argon2`
+  — `.gitmodules` updated automatically (only the `imgui` submodule
+  remains, correctly, since that one has no `FetchContent` duplicate).
+- `VENDOR_SETUP.md` §2: replaced the stale `git submodule add` instruction
+  with a note that Argon2 is fetched automatically, plus the same
+  historical-note pattern used for mbedTLS in `TASK-119`.
+- **Verified:** fresh CMake configure (clean build dir) fetches Argon2 via
+  `FetchContent` and configures without error; full build of
+  `test_vw_crypto` and `test_vw_auth` (the two suites exercising the
+  Argon2-backed password-hashing path) succeeds and both pass with no
+  failures. Scratch verification build directory removed after confirming.
+
+CQR.08 [2026-08-04]: `.gitmodules`, `third_party/CMakeLists.txt`, and
+`VENDOR_SETUP.md` are now mutually consistent for Argon2 too — no
+remaining submodule/`FetchContent` drift anywhere in `third_party/`
+(mbedTLS fixed by `TASK-119`, ImGui/SDL2 never had this problem since they
+have no `FetchContent` duplicate). Appreciate that this task actually
+re-derived the version comparison instead of restating the "no known CVEs,
+last tagged release" claim from its own filing note unverified. No
+blocking findings. Sign off.
+
+ARCH.00 [2026-08-04]: Review complete, no unresolved blocking findings.
+Marking `done`.

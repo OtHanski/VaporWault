@@ -1,7 +1,7 @@
 ---
 id:          TASK-119
 title:       Resolve mbedTLS version mismatch between vendored submodule and FetchContent pin
-status:      todo
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-04
@@ -68,3 +68,78 @@ ARCH.00 [2026-08-04]: Filed from a project-state review the user requested.
 Priority high — cheap to fix, and "which crypto library version are we
 actually building" should never be an ambiguous question for the project's
 one approved TLS dependency.
+
+BLD.05 [2026-08-04]: Resolved. Chose **(b): removed the submodule, kept
+`FetchContent`** — this task's own draft claimed (a) would match "the same
+pattern already used for Argon2", but that claim is wrong: Argon2 also has
+its own `FetchContent_Declare` in `third_party/CMakeLists.txt` that ignores
+its submodule identically to mbedTLS (filed as `TASK-125`, out of this
+task's scope since it isn't `security-sensitive`). So the actual
+established, working pattern for CMake-buildable deps in this repo is
+`FetchContent` — the manually-vendored submodule pattern (ImGui, SDL2) is
+only used for libraries that *can't* be `FetchContent_MakeAvailable`'d
+(ImGui ships no CMakeLists.txt upstream; SDL2 on Windows needs a prebuilt
+binary package, not a source checkout). Switching mbedTLS to
+`add_subdirectory()` on the submodule would have been the actual
+pattern-break here, and would have meant reworking and re-verifying a
+build path (submodule-driven CMake subproject) this repo doesn't currently
+exercise anywhere, for no real gain over the `FetchContent` path already
+proven to work.
+
+Changes:
+- `git submodule deinit -f third_party/mbedtls && git rm -f third_party/mbedtls`
+  — removes the submodule from the working tree, the index, and
+  `.gitmodules` (the latter updated automatically by `git rm`).
+- `third_party/CMakeLists.txt`: bumped the `FetchContent` pin from
+  `v3.6.3` to **`v3.6.7`** (see below — this went further than "pick one
+  mechanism," per this task's own acceptance criterion to check the
+  chosen version against mbedTLS's published CVE list) and added a comment
+  documenting the version and the CVEs it fixes relative to what was
+  previously pinned.
+- `VENDOR_SETUP.md` §1: replaced the stale "run `git submodule add`
+  ... `git checkout v3.6.2`" instructions (which a fresh clone would have
+  followed for literally no effect on the build) with a note that mbedTLS
+  is fetched automatically, plus a historical note explaining why the
+  submodule existed and was removed.
+
+**CVE check (acceptance criterion 2):** queried the upstream
+`Mbed-TLS/mbedtls` GitHub repo directly (tags + per-tag commit dates +
+`ChangeLog`) rather than trusting a scraped/summarized release page, which
+initially returned a nonsensical (non-chronological) version list.
+Confirmed 3.6.x tag chronology: v3.6.2 (2024-10-14) → v3.6.3 (2025-03-20) →
+v3.6.3.1 (2025-05-08) → v3.6.4 (2025-06-25) → v3.6.5 (2025-10-13) → v3.6.6
+(2026-03-26) → **v3.6.7 (2026-07-07, latest)**. Both previously-pinned
+versions — the submodule's v3.6.2 and `FetchContent`'s v3.6.3 — predate
+fixes for multiple since-assigned CVEs in the v3.6.7 `ChangeLog`, including
+CVE-2026-50587 (RSA PKCS#1 v1.5 timing side channel enabling a
+Bleichenbacher attack), CVE-2026-54435 (ECC side-channel long-term key
+recovery), and CVE-2026-35336 (buffer overflow in
+`mbedtls_ecdh_calc_secret`), among others. Given the task explicitly asked
+to check against the CVE list "at the time this task closes," landing on a
+version already known to be vulnerable would have defeated the point —
+bumped to v3.6.7, the current latest 3.6.x LTS patch, instead of stopping
+at deduplicating on either previously-pinned version.
+
+**Verified:** fresh CMake configure (clean build dir, no cache reuse)
+successfully fetches mbedTLS v3.6.7 via `FetchContent` and configures
+without error. Full rebuild of `test_vw_oplog`, `test_vw_file_handlers`,
+`test_vw_crypto`, `test_vw_auth`, and `test_vw_net` against the new mbedTLS
+version succeeds (MSVC, `/W4 /WX`), and all five test binaries pass with
+no failures — including `test_vw_crypto`, which exercises the mbedTLS-
+backed primitives most directly. Scratch verification build directory
+removed after confirming.
+
+SEC.07 [2026-08-04]: Reviewed the CVE research and the version bump.
+Confirmed the tag-chronology and CVE claims above against the same
+upstream sources (repo tags/commit dates, `ChangeLog` at `v3.6.7`) —
+accurate. No blocking findings; the version bump is exactly what this
+security-sensitive task should produce; removing the submodule doesn't
+weaken anything since it was never what got compiled in. Sign off.
+
+CQR.08 [2026-08-04]: `.gitmodules`, `third_party/CMakeLists.txt`, and
+`VENDOR_SETUP.md` are now mutually consistent — no remaining doc/config
+drift for mbedTLS. `TASK-125` correctly scopes out the analogous Argon2
+issue rather than silently folding it into this diff. Sign off.
+
+ARCH.00 [2026-08-04]: All `review_by` sign-offs recorded, no unresolved
+blocking findings. Marking `done`.

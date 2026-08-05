@@ -17,9 +17,23 @@ set(ENABLE_PROGRAMS       OFF CACHE BOOL "" FORCE)
 # targets. Force it off so mbedTLS never touches CMAKE_C_FLAGS for warnings.
 set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 
+# v3.6.7 (2026-07-07) is the version actually compiled in — the sole source
+# of truth; there is no third_party/mbedtls submodule (TASK-119: a stale
+# submodule pinned at v3.6.2 used to also exist, but this FetchContent block
+# fetches its own independent copy regardless of it, so the submodule was
+# dead weight that only made "which version are we shipping" ambiguous).
+# Checked against Mbed-TLS/mbedtls-docs security advisories and the upstream
+# ChangeLog on 2026-08-04: v3.6.7 is the latest 3.6.x LTS patch release and
+# fixes numerous CVEs present in earlier 3.6.x releases (including the two
+# versions previously pinned here: submodule v3.6.2, FetchContent v3.6.3) —
+# among them CVE-2026-50587 (RSA PKCS#1 v1.5 timing side channel),
+# CVE-2026-54435 (ECC side channel enabling long-term key recovery), and
+# CVE-2026-35336 (mbedtls_ecdh_calc_secret buffer overflow). Re-check this
+# comment against https://github.com/Mbed-TLS/mbedtls/blob/master/ChangeLog
+# before bumping again.
 FetchContent_Declare(mbedtls
     GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
-    GIT_TAG        v3.6.3
+    GIT_TAG        v3.6.7
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(mbedtls)
@@ -27,6 +41,20 @@ FetchContent_MakeAvailable(mbedtls)
 # ── Argon2 reference implementation (~600 lines, public domain) ───────────────
 # We define our own STATIC target rather than using the upstream CMakeLists.txt
 # (which produces different target names and doesn't match our include layout).
+#
+# `20190702` (the tag pinned below) is this repo's latest tagged release —
+# there is no third_party/argon2 submodule (TASK-125: one used to exist,
+# pinned at commit f57e61e/2021-06-25, 27 commits past this tag, but this
+# FetchContent block fetches its own independent copy regardless, so — same
+# problem as TASK-119's mbedTLS — the submodule was dead weight, removed).
+# Diffed `20190702` against `f57e61e` in the files actually compiled here
+# (argon2.c, core.c, encoding.c, ref.c, thread.c, blake2/blake2b.c) on
+# 2026-08-04: the only non-cosmetic change is a MinGW-specific branch added
+# to core.c's secure_wipe_memory() — irrelevant to this project's MSVC/GCC/
+# Clang toolchains, so no functional difference for us either way. Upstream
+# has had no commits since f57e61e (repo is unmaintained by design — PHC
+# winner, algorithm/API frozen) and has no published CVEs/security
+# advisories as of this check, so `20190702` was kept rather than bumped.
 FetchContent_Declare(argon2_fetch
     GIT_REPOSITORY https://github.com/P-H-C/phc-winner-argon2.git
     GIT_TAG        20190702

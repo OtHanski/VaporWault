@@ -1,6 +1,7 @@
 # VaporWault — Vendor Setup
 
-All third-party code lives under `third_party/` as git submodules.
+Most third-party code lives under `third_party/` as git submodules, but not
+all of it — see each entry below for which mechanism applies.
 Run the commands below from the repository root **before** your first CMake configure.
 
 ---
@@ -9,10 +10,18 @@ Run the commands below from the repository root **before** your first CMake conf
 
 ### 1. mbedTLS (TLS 1.3, crypto primitives)
 
-```sh
-git submodule add https://github.com/Mbed-TLS/mbedtls.git third_party/mbedtls
-cd third_party/mbedtls && git checkout v3.6.2 && cd ../..
-```
+**No manual step required.** `third_party/CMakeLists.txt` fetches mbedTLS
+automatically via CMake's `FetchContent` at configure time (currently pinned
+to `v3.6.7` — check that file's comment for the exact version and the CVEs
+it was last checked against). This is not a submodule; there is no
+`third_party/mbedtls` directory to vendor.
+
+(Historical note, `TASK-119`: a `third_party/mbedtls` submodule pinned at
+`v3.6.2` used to exist alongside this `FetchContent` block, giving the false
+impression that the submodule's checkout was what got built — it never was.
+Removed rather than kept in sync, since `FetchContent` is what actually
+works today and matches how mbedTLS is already consumed elsewhere in this
+repo's history.)
 
 The project-specific config header is already in place at
 `third_party/mbedtls_config.h`. CMake passes it to the mbedTLS build via
@@ -21,12 +30,16 @@ copy step is required.
 
 ### 2. Argon2 reference implementation (password hashing)
 
-```sh
-git submodule add https://github.com/P-H-C/phc-winner-argon2.git third_party/argon2
-```
+**No manual step required.** Fetched automatically via CMake `FetchContent`
+at configure time, pinned to tag `20190702` (upstream's latest tagged
+release — the repo has had no commits since 2021 and is unmaintained by
+design, the PHC-winning algorithm and API being frozen). This is not a
+submodule; there is no `third_party/argon2` directory to vendor.
 
-HEAD is used; the reference implementation is stable and public-domain.
-No tag pin is necessary, but re-pin if the upstream ever bumps the ABI.
+(Historical note, `TASK-125`: a `third_party/argon2` submodule pinned at
+commit `f57e61e` used to exist alongside this `FetchContent` block, same
+dead-weight problem as `TASK-119`'s mbedTLS submodule — removed rather than
+kept in sync, for the same reason.)
 
 ### 3. Dear ImGui + SDL2 backend (GUI component only)
 
