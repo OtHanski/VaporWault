@@ -208,10 +208,15 @@ vapourwault-server-cli --admin-socket /run/vapourwault/admin.sock user-list
 ```
 
 ```
-USER_ID   ADMIN  ACTV   USERNAME                                                          QUOTA             USED
-1         yes    yes    admin                                                             0                 0
-2         no     yes    alice                                                             10737418240       0
+USER_ID   ADMIN  ACTV   USERNAME                                                          QUOTA             USED              ADMIN_CAPS
+1         yes    yes    admin                                                             0                 0                 full
+2         no     yes    alice                                                             10737418240       0                 -
 ```
+
+(`ADMIN_CAPS` shows `full` for an admin account with no capability
+restrictions set — the default for a freshly-created `--admin` account —
+or a comma-separated list like `user_mgmt,quota_mgmt` if it's been
+narrowed with `set-admin-caps`. `-` for a non-admin account.)
 
 ---
 
