@@ -6,8 +6,11 @@
  *   → vw_auth_open → vw_server_ctx_open → vw_net_listen
  *   → vw_admin_server_start → PID file → accept loop → clean shutdown
  *
- * Accept loop (single-threaded, Phase 4):
- *   For each accepted connection:
+ * Accept loop:
+ *   Main thread accepts and enqueues each connection onto a fixed-size
+ *   worker pool (pthreads on POSIX; a pthread-compatible shim over Win32
+ *   CreateThread/CRITICAL_SECTION/CONDITION_VARIABLE on Windows — see the
+ *   "Thread pool" section below). Each worker, per connection:
  *     1. Set 30 s recv timeout (slow-loris guard).
  *     2. vw_server_conn_handle — auth handshake.
  *     3. On success: recv messages and dispatch to vw_server_dispatch_file_op.
@@ -55,6 +58,49 @@
 #  define VW_GETPID() ((unsigned long)getpid())
 #endif
 
+#ifdef _WIN32
+/* Windows pthread-compatibility shim — lets the worker pool and log mutex
+ * below (written once against the pthreads API) run unmodified on both
+ * platforms, instead of maintaining two parallel concurrency mechanisms. */
+typedef HANDLE             pthread_t;
+typedef CRITICAL_SECTION   pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+
+typedef struct { void *(*fn)(void *); void *arg; } vw__thread_thunk_t;
+
+static DWORD WINAPI vw__thread_thunk(LPVOID p) {
+    vw__thread_thunk_t *t = (vw__thread_thunk_t *)p;
+    t->fn(t->arg);
+    free(t);
+    return 0;
+}
+
+static int pthread_create(pthread_t *h, void *attr, void *(*fn)(void *), void *arg) {
+    (void)attr;
+    vw__thread_thunk_t *t = (vw__thread_thunk_t *)malloc(sizeof(*t));
+    if (!t) return 1;
+    t->fn = fn; t->arg = arg;
+    *h = CreateThread(NULL, 0, vw__thread_thunk, t, 0, NULL);
+    if (!*h) { free(t); return 1; }
+    return 0;
+}
+static int pthread_join(pthread_t h, void **ret) {
+    (void)ret;
+    WaitForSingleObject(h, INFINITE);
+    CloseHandle(h);
+    return 0;
+}
+static int pthread_mutex_init(pthread_mutex_t *m, void *attr)      { (void)attr; InitializeCriticalSection(m); return 0; }
+static int pthread_mutex_destroy(pthread_mutex_t *m)               { DeleteCriticalSection(m); return 0; }
+static int pthread_mutex_lock(pthread_mutex_t *m)                  { EnterCriticalSection(m); return 0; }
+static int pthread_mutex_unlock(pthread_mutex_t *m)                { LeaveCriticalSection(m); return 0; }
+static int pthread_cond_init(pthread_cond_t *c, void *attr)        { (void)attr; InitializeConditionVariable(c); return 0; }
+static int pthread_cond_destroy(pthread_cond_t *c)                 { (void)c; return 0; }
+static int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) { return SleepConditionVariableCS(c, m, INFINITE) ? 0 : 1; }
+static int pthread_cond_signal(pthread_cond_t *c)                   { WakeConditionVariable(c); return 0; }
+static int pthread_cond_broadcast(pthread_cond_t *c)                { WakeAllConditionVariable(c); return 0; }
+#endif
+
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 
 typedef enum { LOG_ERROR = 0, LOG_WARN, LOG_INFO, LOG_DEBUG } vw_log_level_t;
@@ -93,15 +139,17 @@ static void log_rotate(void) {
     g_log_size = 0;
 }
 
-/* Protects the log FILE* and g_log_size; also serialises vw_log calls from workers. */
+/* Protects the log FILE* and g_log_size; also serialises vw_log calls from
+ * workers. POSIX statically initialises via PTHREAD_MUTEX_INITIALIZER;
+ * Windows' CRITICAL_SECTION has no static-init form, so vw_server_main_run
+ * calls pthread_mutex_init(&g_log_mutex, NULL) before the first log line. */
 #ifndef _WIN32
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
-#  define LOG_LOCK()   pthread_mutex_lock(&g_log_mutex)
-#  define LOG_UNLOCK() pthread_mutex_unlock(&g_log_mutex)
 #else
-#  define LOG_LOCK()   (void)0
-#  define LOG_UNLOCK() (void)0
+static pthread_mutex_t g_log_mutex;
 #endif
+#define LOG_LOCK()   pthread_mutex_lock(&g_log_mutex)
+#define LOG_UNLOCK() pthread_mutex_unlock(&g_log_mutex)
 
 static void vw_log(vw_log_level_t level, const char *fmt, ...) {
     if (level > g_log_level) return;
@@ -419,12 +467,12 @@ static int cfg_validate(const vw_server_main_cfg_t *c, int check_only) {
     return 0;
 }
 
-/* ── Thread pool (POSIX only) ────────────────────────────────────────────── */
+/* ── Thread pool ──────────────────────────────────────────────────────────
+ * Shared implementation for both platforms: pthreads on POSIX, the
+ * pthread-compatible shim (defined above) over Win32 primitives on Windows.
+ */
 
-#define POOL_WORKERS_MAX  64u   /* also used on Windows for config clamping */
-
-#ifndef _WIN32
-
+#define POOL_WORKERS_MAX  64u
 #define POOL_QUEUE_MIN    16u
 
 typedef struct {
@@ -515,8 +563,6 @@ static void pool_shutdown_and_join(pthread_t *threads, uint32_t n) {
     pthread_cond_destroy(&g_pool.not_full);
 }
 
-#endif /* !_WIN32 */
-
 /* ── Connection handler ──────────────────────────────────────────────────── */
 
 static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn) {
@@ -564,6 +610,12 @@ done:
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 int vw_server_main_run(int argc, char *argv[]) {
+#ifdef _WIN32
+    /* CRITICAL_SECTION has no static-init form (unlike PTHREAD_MUTEX_INITIALIZER) —
+     * must be initialised before the first vw_log call below. */
+    pthread_mutex_init(&g_log_mutex, NULL);
+#endif
+
     const char *cfg_path   = NULL;
     int         do_daemon  = 0;
     int         check_only = 0;
@@ -794,8 +846,9 @@ int vw_server_main_run(int argc, char *argv[]) {
 
     signals_install();
 
-#ifndef _WIN32
-    /* ── Thread pool startup ───────────────────────────────────────────────── */
+    /* ── Thread pool startup ─────────────────────────────────────────────────
+     * Same worker-pool mechanism on both platforms — see the pthread shim
+     * near the top of this file for how Windows implements the primitives. */
     pthread_t workers[POOL_WORKERS_MAX];
     uint32_t  n_workers = 0;
 
@@ -804,7 +857,7 @@ int vw_server_main_run(int argc, char *argv[]) {
 
     for (; n_workers < cfg.max_workers; n_workers++) {
         if (pthread_create(&workers[n_workers], NULL, pool_worker, NULL) != 0) {
-            vw_log(LOG_ERROR, "pthread_create failed at worker %u", n_workers);
+            vw_log(LOG_ERROR, "worker thread create failed at worker %u", n_workers);
             break;
         }
     }
@@ -837,29 +890,6 @@ int vw_server_main_run(int argc, char *argv[]) {
 
     vw_log(LOG_INFO, "shutting down — draining %u worker(s)", n_workers);
     pool_shutdown_and_join(workers, n_workers);
-
-#else   /* Windows — single-threaded (thread pool not implemented) */
-    vw_log(LOG_INFO, "VaporWault server listening on %s:%u (single-threaded)",
-           cfg.listen_host[0] ? cfg.listen_host : "0.0.0.0", cfg.listen_port);
-
-    while (g_running) {
-        if (g_reload_cert) {
-            g_reload_cert = 0;
-            if (vw_net_ctx_reload_cert(net_ctx, cfg.cert_pem_path, cfg.key_pem_path) == VW_OK)
-                vw_log(LOG_INFO, "TLS certificate reloaded");
-            else
-                vw_log(LOG_WARN, "cert reload failed");
-        }
-        vw_conn_t *conn = NULL;
-        if (vw_net_accept(net_ctx, &conn) != VW_OK) break;
-        char peer[64] = "";
-        vw_net_peer_addr(conn, peer, sizeof(peer));
-        vw_log(LOG_DEBUG, "accepted connection from %s", peer);
-        handle_connection(sctx, conn);
-        vw_net_close(conn);
-    }
-    vw_log(LOG_INFO, "shutting down");
-#endif  /* _WIN32 */
 
     rc = 0;
 

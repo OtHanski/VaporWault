@@ -5,8 +5,8 @@
  * vw_server_main — VaporWault server entry point and lifecycle.
  *
  * Owns: config file parsing, startup sequencing (oplog → store → auth →
- * net listen), the single-threaded accept loop, signal handling, log
- * rotation, and PID file management.
+ * net listen), the worker-pool accept loop, signal handling, log rotation,
+ * and PID file management.
  *
  * Usage (from main.c):
  *   return vw_server_main_run(argc, argv);
