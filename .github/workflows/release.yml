@@ -272,6 +272,7 @@ jobs:
       - name: Build installer packages (.msi)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           Push-Location build
           cpack -G WIX `
             -D CPACK_COMPONENTS_ALL=server `
@@ -279,6 +280,7 @@ jobs:
             -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/server-patch.xml)" `
             -D CPACK_WIX_EXTENSIONS=WixFirewallExtension `
             -D CPACK_PACKAGE_FILE_NAME="vaporwault-server-$env:PKG_VERSION-win64"
+          $serverExit = $LASTEXITCODE
           cpack -G WIX `
             -D CPACK_COMPONENTS_ALL=client `
             -D CPACK_WIX_UPGRADE_GUID=88FDD57B-FD91-4214-B6F5-B1343F75ABBB `
@@ -287,6 +289,21 @@ jobs:
             -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/client-patch.xml)" `
             -D CPACK_WIX_CANDLE_EXTRA_FLAGS="-dVW_WIX_DIR=$(Resolve-Path ../packaging/windows/wix)" `
             -D CPACK_PACKAGE_FILE_NAME="vaporwault-client-$env:PKG_VERSION-win64"
+          $clientExit = $LASTEXITCODE
+          # Diagnostics: a bare "Problem running WiX" from CPack doesn't
+          # show the underlying candle/light error in the workflow's own
+          # console output at all — it's only in wix.log on disk. Dump it
+          # on failure so a CI failure here is actually debuggable instead
+          # of requiring a local repro (which is what TASK-151 initially
+          # had to resort to).
+          if ($serverExit -ne 0 -or $clientExit -ne 0) {
+            Write-Host "::group::wix.log"
+            Get-Content "_CPack_Packages/win64/WIX/wix.log" -ErrorAction SilentlyContinue
+            Write-Host "::endgroup::"
+            $ErrorActionPreference = 'Stop'
+            throw "cpack -G WIX failed (server exit=$serverExit, client exit=$clientExit)"
+          }
+          $ErrorActionPreference = 'Stop'
           Pop-Location
           Copy-Item build/*.msi .
           Get-ChildItem *.msi | ForEach-Object {

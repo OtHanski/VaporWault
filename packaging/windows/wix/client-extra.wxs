@@ -36,6 +36,18 @@
   user, which for this PER-USER (no elevation) install context is the
   session's own user throughout anyway (see TASK-145's SEC.07-resolved
   elevation-scope requirement).
+
+  ONE Fragment, deliberately (not split across two, as an earlier revision
+  had it): light.exe drops any Fragment nothing else references (its
+  dead-Fragment elimination is per-Fragment, not per-entity), which a real
+  install test caught (TASK-152) after the split version compiled and
+  linked with zero errors/warnings but silently produced an MSI whose
+  CustomAction table had NEITHER of these two actions in it at all, since
+  nothing referenced that second fragment specifically. Referencing the
+  Component below (client-patch.xml's ComponentRef) is what pulls this
+  whole Fragment in, CustomActions and InstallExecuteSequence included;
+  splitting them back out into their own Fragment would silently
+  reintroduce the exact same bug.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
 
@@ -61,9 +73,7 @@
               Source="$(var.VW_WIX_DIR)\register-client-task.ps1" />
       </Component>
     </DirectoryRef>
-  </Fragment>
 
-  <Fragment>
     <!-- Register (install / reinstall / repair, never on uninstall) -->
     <CustomAction Id="SetRegisterClientTaskData"
         Property="RegisterClientTask"
