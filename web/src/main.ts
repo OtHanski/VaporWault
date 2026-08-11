@@ -13,7 +13,18 @@ import {
   deleteFile,
   uploadFile,
   downloadFile,
+  listVersions,
+  restoreVersion,
+  grantShare,
+  revokeShare,
+  listShares,
+  createLink,
+  revokeLink,
+  listLinks,
   type FileEntry,
+  type VersionEntry,
+  type ShareEntry,
+  type LinkEntry,
 } from "./api.js";
 
 // ── Element lookups ─────────────────────────────────────────────────────────
@@ -40,6 +51,27 @@ const browserError = el<HTMLElement>("browser-error");
 const uploadBtn = el<HTMLButtonElement>("upload-btn");
 const uploadInput = el<HTMLInputElement>("upload-input");
 const transferList = el<HTMLUListElement>("transfer-list");
+
+const historyView = el<HTMLElement>("history-view");
+const historyFileLabel = el<HTMLElement>("history-file-label");
+const historyBackBtn = el<HTMLButtonElement>("history-back-btn");
+const versionTableBody = el<HTMLTableSectionElement>("version-table-body");
+const historyError = el<HTMLElement>("history-error");
+
+const shareView = el<HTMLElement>("share-view");
+const shareFileLabel = el<HTMLElement>("share-file-label");
+const shareBackBtn = el<HTMLButtonElement>("share-back-btn");
+const shareUsernameInput = el<HTMLInputElement>("share-username");
+const sharePermissionSelect = el<HTMLSelectElement>("share-permission");
+const shareGrantBtn = el<HTMLButtonElement>("share-grant-btn");
+const shareTableBody = el<HTMLTableSectionElement>("share-table-body");
+const linkCreateBtn = el<HTMLButtonElement>("link-create-btn");
+const linkNewTokenBox = el<HTMLElement>("link-new-token");
+const linkNewTokenInput = el<HTMLInputElement>("link-new-token-input");
+const linkCopyBtn = el<HTMLButtonElement>("link-copy-btn");
+const linkDismissBtn = el<HTMLButtonElement>("link-dismiss-btn");
+const linkTableBody = el<HTMLTableSectionElement>("link-table-body");
+const shareError = el<HTMLElement>("share-error");
 
 // ── State ────────────────────────────────────────────────────────────────
 //
@@ -224,7 +256,22 @@ function renderFileRow(entry: FileEntry): HTMLTableRowElement {
       void handleDownload(entry);
     });
     actionsCell.appendChild(downloadBtn);
+
+    const historyBtn = document.createElement("button");
+    historyBtn.textContent = "History";
+    historyBtn.className = "row-action";
+    historyBtn.addEventListener("click", () => {
+      void enterHistoryView(entry);
+    });
+    actionsCell.appendChild(historyBtn);
   }
+  const shareBtn = document.createElement("button");
+  shareBtn.textContent = "Share";
+  shareBtn.className = "row-action";
+  shareBtn.addEventListener("click", () => {
+    void enterShareView(entry);
+  });
+  actionsCell.appendChild(shareBtn);
   const deleteBtn = document.createElement("button");
   deleteBtn.textContent = "Delete";
   deleteBtn.className = "row-action";
@@ -393,6 +440,271 @@ async function handleDownload(entry: FileEntry): Promise<void> {
     );
   }
 }
+
+// ── Version history view (TASK-140) ─────────────────────────────────────
+
+let historyPath = "";
+
+async function enterHistoryView(entry: FileEntry): Promise<void> {
+  historyPath = joinPath(currentPath, entry.name);
+  historyFileLabel.textContent = entry.name;
+  browserView.hidden = true;
+  historyView.hidden = false;
+  await refreshVersionList();
+}
+
+historyBackBtn.addEventListener("click", () => {
+  historyView.hidden = true;
+  browserView.hidden = false;
+});
+
+async function refreshVersionList(): Promise<void> {
+  clearError(historyError);
+  const result = await listVersions(historyPath);
+  if (!result.ok) {
+    showError(historyError, `Could not list versions: ${result.data.status ?? "error"}`);
+    return;
+  }
+  renderVersionTable(result.data);
+}
+
+function renderVersionTable(entries: VersionEntry[]): void {
+  versionTableBody.replaceChildren();
+  const sorted = [...entries].sort((a, b) => b.version_id - a.version_id);
+  for (const v of sorted) {
+    versionTableBody.appendChild(renderVersionRow(v));
+  }
+}
+
+function renderVersionRow(v: VersionEntry): HTMLTableRowElement {
+  const row = document.createElement("tr");
+
+  const idCell = document.createElement("td");
+  idCell.textContent = `#${v.version_id}`;
+  row.appendChild(idCell);
+
+  const sizeCell = document.createElement("td");
+  sizeCell.textContent = formatSize(v.size_bytes);
+  row.appendChild(sizeCell);
+
+  const createdCell = document.createElement("td");
+  createdCell.textContent = formatMtime(v.created_at);
+  row.appendChild(createdCell);
+
+  const actionsCell = document.createElement("td");
+  const restoreBtn = document.createElement("button");
+  restoreBtn.textContent = "Restore";
+  restoreBtn.className = "row-action";
+  restoreBtn.addEventListener("click", () => {
+    void handleRestoreVersion(v);
+  });
+  actionsCell.appendChild(restoreBtn);
+  row.appendChild(actionsCell);
+
+  return row;
+}
+
+async function handleRestoreVersion(v: VersionEntry): Promise<void> {
+  if (!window.confirm(`Restore version #${v.version_id} as the new current version?`)) return;
+  const result = await restoreVersion(historyPath, v.version_id);
+  if (!result.ok) {
+    showError(historyError, `Could not restore: ${result.data.status ?? "error"}`);
+    return;
+  }
+  await refreshVersionList();
+}
+
+// ── Sharing / public links view (TASK-140) ──────────────────────────────
+//
+// Security note (carried from TASK-134/140): a link_token is a bearer
+// credential. It is shown exactly once, right after creation, in a
+// readonly field with an explicit Copy action - never as plain inline
+// text left sitting in the page, and never passed to console.log/any
+// telemetry (api.ts's own note - this module doesn't log it either).
+
+let shareFileId = 0;
+
+function permissionLabel(p: number): string {
+  switch (p) {
+    case 1: return "View";
+    case 2: return "Edit";
+    case 3: return "Owner";
+    default: return `#${p}`;
+  }
+}
+
+async function enterShareView(entry: FileEntry): Promise<void> {
+  shareFileId = entry.file_id;
+  shareFileLabel.textContent = entry.name;
+  browserView.hidden = true;
+  shareView.hidden = false;
+  linkNewTokenInput.value = "";
+  linkNewTokenBox.hidden = true;
+  await refreshShareLists();
+}
+
+shareBackBtn.addEventListener("click", () => {
+  shareView.hidden = true;
+  browserView.hidden = false;
+  linkNewTokenInput.value = "";
+  linkNewTokenBox.hidden = true;
+});
+
+async function refreshShareLists(): Promise<void> {
+  clearError(shareError);
+
+  const sharesResult = await listShares(0);
+  if (sharesResult.ok) {
+    renderShareTable(sharesResult.data.filter((s) => s.file_id === shareFileId));
+  } else {
+    showError(shareError, `Could not list shares: ${sharesResult.data.status ?? "error"}`);
+  }
+
+  const linksResult = await listLinks(shareFileId);
+  if (linksResult.ok) {
+    renderLinkTable(linksResult.data);
+  } else {
+    showError(shareError, `Could not list links: ${linksResult.data.status ?? "error"}`);
+  }
+}
+
+function renderShareTable(entries: ShareEntry[]): void {
+  shareTableBody.replaceChildren();
+  for (const s of entries) {
+    shareTableBody.appendChild(renderShareRow(s));
+  }
+}
+
+function renderShareRow(s: ShareEntry): HTMLTableRowElement {
+  const row = document.createElement("tr");
+
+  const userCell = document.createElement("td");
+  userCell.textContent = s.target_username;
+  row.appendChild(userCell);
+
+  const permCell = document.createElement("td");
+  permCell.textContent = permissionLabel(s.permission);
+  row.appendChild(permCell);
+
+  const statusCell = document.createElement("td");
+  statusCell.textContent = s.revoked ? "Revoked" : "Active";
+  row.appendChild(statusCell);
+
+  const actionsCell = document.createElement("td");
+  if (!s.revoked) {
+    const revokeBtn = document.createElement("button");
+    revokeBtn.textContent = "Revoke";
+    revokeBtn.className = "row-action";
+    revokeBtn.addEventListener("click", () => {
+      void handleRevokeShare(s.share_id);
+    });
+    actionsCell.appendChild(revokeBtn);
+  }
+  row.appendChild(actionsCell);
+
+  return row;
+}
+
+async function handleRevokeShare(shareId: number): Promise<void> {
+  const result = await revokeShare(shareId);
+  if (!result.ok) {
+    showError(shareError, `Could not revoke: ${result.data.status ?? "error"}`);
+    return;
+  }
+  await refreshShareLists();
+}
+
+shareGrantBtn.addEventListener("click", () => {
+  void handleGrantShare();
+});
+
+async function handleGrantShare(): Promise<void> {
+  const username = shareUsernameInput.value.trim();
+  if (!username) return;
+  const permission = Number(sharePermissionSelect.value);
+
+  const result = await grantShare(shareFileId, username, permission);
+  if (!result.ok) {
+    showError(shareError, `Could not grant access: ${result.data.status ?? "error"}`);
+    return;
+  }
+  shareUsernameInput.value = "";
+  await refreshShareLists();
+}
+
+function renderLinkTable(entries: LinkEntry[]): void {
+  linkTableBody.replaceChildren();
+  for (const l of entries) {
+    linkTableBody.appendChild(renderLinkRow(l));
+  }
+}
+
+function renderLinkRow(l: LinkEntry): HTMLTableRowElement {
+  const row = document.createElement("tr");
+
+  const nameCell = document.createElement("td");
+  nameCell.textContent = `Link #${l.share_id}`;
+  row.appendChild(nameCell);
+
+  const permCell = document.createElement("td");
+  permCell.textContent = permissionLabel(l.permission);
+  row.appendChild(permCell);
+
+  const statusCell = document.createElement("td");
+  statusCell.textContent = l.revoked ? "Revoked" : "Active";
+  row.appendChild(statusCell);
+
+  const actionsCell = document.createElement("td");
+  if (!l.revoked) {
+    const revokeBtn = document.createElement("button");
+    revokeBtn.textContent = "Revoke";
+    revokeBtn.className = "row-action";
+    revokeBtn.addEventListener("click", () => {
+      void handleRevokeLink(l.share_id);
+    });
+    actionsCell.appendChild(revokeBtn);
+  }
+  row.appendChild(actionsCell);
+
+  return row;
+}
+
+async function handleRevokeLink(shareId: number): Promise<void> {
+  const result = await revokeLink(shareId);
+  if (!result.ok) {
+    showError(shareError, `Could not revoke link: ${result.data.status ?? "error"}`);
+    return;
+  }
+  await refreshShareLists();
+}
+
+linkCreateBtn.addEventListener("click", () => {
+  void handleCreateLink();
+});
+
+async function handleCreateLink(): Promise<void> {
+  const permission = Number(sharePermissionSelect.value);
+  const result = await createLink(shareFileId, permission);
+  if (!result.ok) {
+    showError(shareError, `Could not create link: ${result.data.status ?? "error"}`);
+    return;
+  }
+  // Shown exactly once, per TASK-134/140's "never re-display" convention
+  // - not stored anywhere in this module's own state beyond this input's
+  // DOM value, which is cleared on Done/navigate-away.
+  linkNewTokenInput.value = result.data.link_token;
+  linkNewTokenBox.hidden = false;
+  await refreshShareLists();
+}
+
+linkCopyBtn.addEventListener("click", () => {
+  void navigator.clipboard.writeText(linkNewTokenInput.value);
+});
+
+linkDismissBtn.addEventListener("click", () => {
+  linkNewTokenInput.value = "";
+  linkNewTokenBox.hidden = true;
+});
 
 // Breadcrumb navigation: clicking the path label goes up one level.
 currentPathLabel.addEventListener("click", () => {

@@ -1,7 +1,7 @@
 ---
 id:          TASK-140
 title:       Frontend version history + sharing/public-link management views
-status:      todo
+status:      review
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -35,6 +35,57 @@ screenshotted/shared alongside unrelated content.
 ## Notes
 
 <!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+WEB.09 [2026-08-11]: Implemented as two new views in `web/` (`index.html`,
+`style.css`, `main.ts`), toggled the same way as the existing login/
+browser views (`hidden`, no router library): a version-history view
+(`History` row action, files only — folders have no version history) and
+a sharing view (`Share` row action on any entry) covering grant/revoke/
+list shares and create/revoke/list public links. `api.ts` gained the
+corresponding thin wrappers over `TASK-133`'s version endpoints and
+`TASK-134`'s sharing endpoints.
+
+**Public-link-token handling, per this task's own security note**: the
+raw token is held only in `linkNewTokenInput`'s DOM value, shown exactly
+once right after creation (matching the server's own never-re-display
+convention), with an explicit Copy button (`navigator.clipboard.writeText`)
+and a Done button that clears the field — never left as plain inline text.
+Grepped `api.ts` and `main.ts` for `console.log`/`console.error` calls
+touching a token or link variable: none exist. The list endpoints
+(`listLinks`) never return the raw token at all (matches
+`vw_client_link_list`'s own doc), so there's no path for an already-
+displayed link to leak back into a table row later either.
+
+**A real, known gap surfaced while implementing link creation, not
+resolved here**: this view lets a user *create* a public link and get its
+token, but there is no page anywhere in `web/` for someone *without* an
+account to actually redeem one (the gateway's `/api/links/access`,
+`TASK-134`, has no frontend caller). `TASK-140`'s own acceptance criteria
+only cover the management side ("create/revoke/list... work end-to-end
+from a browser"), which this delivers and verifies — but a link minted
+this way isn't yet usable by its intended recipient through this web
+client. Flagging for ARCH.00 to decide whether this becomes its own task
+(an anonymous landing view driven by `/api/links/access`) rather than
+silently treating link creation as feature-complete.
+
+Verified against the real gateway+server (not mocked), via the compiled
+`web/dist/api.js` from Node: restored an older file version and confirmed
+`versions/list` reflects the new HEAD version; granted a share to `bob`,
+confirmed it appears in `shares/list`, revoked it; created a public link,
+confirmed the token is exactly 64 hex chars (32 bytes) and never appears
+in `links/list`, revoked it. Did not print the actual token value in this
+test's own console output either, to model the same discipline expected
+of the shipped code.
+
+Not verified in a real browser DOM: the view-switching, form submission,
+and Copy-button click handling (same no-browser-available caveat as
+`TASK-136`-`139`).
+
+Builds clean under `tsc --strict`.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
+`security-sensitive` tag; SEC.07 should double check the "never logged"
+claim independently and weigh in on the link-redemption gap above.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` for the public-

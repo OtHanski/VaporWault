@@ -40,6 +40,61 @@
       <p id="browser-error" class="error" hidden></p>
       <ul id="transfer-list"></ul>
     </section>
+
+    <section id="history-view" hidden>
+      <header>
+        <span id="history-file-label"></span>
+        <button id="history-back-btn">Back</button>
+      </header>
+      <table id="version-table">
+        <thead>
+          <tr><th>Version</th><th>Size</th><th>Created</th><th></th></tr>
+        </thead>
+        <tbody id="version-table-body"></tbody>
+      </table>
+      <p id="history-error" class="error" hidden></p>
+    </section>
+
+    <section id="share-view" hidden>
+      <header>
+        <span id="share-file-label"></span>
+        <button id="share-back-btn">Back</button>
+      </header>
+
+      <h3>Grant access</h3>
+      <div id="share-grant-form" class="inline-form">
+        <input id="share-username" type="text" placeholder="Username">
+        <select id="share-permission">
+          <option value="1">View</option>
+          <option value="2">Edit</option>
+        </select>
+        <button id="share-grant-btn">Grant</button>
+      </div>
+      <table id="share-table">
+        <thead>
+          <tr><th>User</th><th>Permission</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="share-table-body"></tbody>
+      </table>
+
+      <h3>Public links</h3>
+      <div class="inline-form">
+        <button id="link-create-btn">Create public link</button>
+      </div>
+      <div id="link-new-token" class="inline-form" hidden>
+        <input id="link-new-token-input" type="text" readonly>
+        <button id="link-copy-btn">Copy</button>
+        <button id="link-dismiss-btn">Done</button>
+      </div>
+      <table id="link-table">
+        <thead>
+          <tr><th>Link</th><th>Permission</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="link-table-body"></tbody>
+      </table>
+
+      <p id="share-error" class="error" hidden></p>
+    </section>
   </div>
   <script type="module" src="dist/main.js"></script>
 </body>

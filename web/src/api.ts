@@ -25,6 +25,34 @@ export interface StatusResponse {
   status: string;
 }
 
+export interface VersionEntry {
+  version_id: number;
+  created_at: number;
+  size_bytes: number;
+}
+
+// permission: 1 = VIEW, 2 = EDIT, 3 = OWNER (vw_perm_t, docs/PROTOCOL.md).
+export interface ShareEntry {
+  share_id: number;
+  file_id: number;
+  share_type: number; // 0 = user grant, 1 = public link
+  target_username: string;
+  permission: number;
+  created_at: number;
+  expires_at: number;
+  revoked: boolean;
+}
+
+export interface LinkEntry {
+  share_id: number;
+  file_id: number;
+  name: string;
+  permission: number;
+  created_at: number;
+  expires_at: number;
+  revoked: boolean;
+}
+
 /*
  * A successful response's body is the endpoint's own T; every error
  * response (any non-2xx status) is always {"status": "..."} shaped
@@ -229,4 +257,68 @@ export async function downloadFile(
     onProgress?.(bytesDone, totalSize);
   }
   return new Blob(parts);
+}
+
+/*
+ * Version history (TASK-140, over TASK-133's version endpoints).
+ */
+
+export function listVersions(path: string): Promise<ApiResult<VersionEntry[]>> {
+  return apiPost("/api/versions/list", { path });
+}
+
+export function restoreVersion(
+  path: string,
+  versionId: number,
+): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/versions/restore", { path, version_id: versionId });
+}
+
+/*
+ * Sharing + public links (TASK-140, over TASK-134's endpoints).
+ *
+ * Security note carried from TASK-134/140: a link_token is a bearer
+ * credential. This module never logs one (no console.log anywhere here)
+ * and returns it to the caller exactly once, on creation, matching the
+ * gateway/server's own "never re-display" convention - main.ts's UI is
+ * responsible for not leaving it visible/copyable longer than necessary.
+ */
+
+export function grantShare(
+  fileId: number,
+  targetUsername: string,
+  permission: number,
+  expiresAt = 0,
+): Promise<ApiResult<{ share_id: number }>> {
+  return apiPost("/api/shares/grant", {
+    file_id: fileId,
+    target_username: targetUsername,
+    permission,
+    expires_at: expiresAt,
+  });
+}
+
+export function revokeShare(shareId: number): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/shares/revoke", { share_id: shareId });
+}
+
+// mode: 0 = shares I created, 1 = shares granted to me.
+export function listShares(mode: 0 | 1): Promise<ApiResult<ShareEntry[]>> {
+  return apiPost("/api/shares/list", { mode });
+}
+
+export function createLink(
+  fileId: number,
+  permission: number,
+  expiresAt = 0,
+): Promise<ApiResult<{ share_id: number; link_token: string }>> {
+  return apiPost("/api/links/create", { file_id: fileId, permission, expires_at: expiresAt });
+}
+
+export function revokeLink(shareId: number): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/links/revoke", { share_id: shareId });
+}
+
+export function listLinks(fileIdFilter = 0): Promise<ApiResult<LinkEntry[]>> {
+  return apiPost("/api/links/list", { file_id_filter: fileIdFilter });
 }

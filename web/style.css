@@ -80,7 +80,7 @@ button:hover {
   margin: 0;
 }
 
-#browser-view header {
+#browser-view header, #history-view header, #share-view header {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -103,18 +103,38 @@ button:hover {
   gap: 0.5rem;
 }
 
-#file-table {
+#history-view h3, #share-view h3 {
+  font-size: 0.95rem;
+  color: var(--muted);
+  margin: 1.5rem 0 0.5rem;
+}
+
+.inline-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.inline-form input[type="text"] {
+  flex: 1;
+}
+
+#file-table, #version-table, #share-table, #link-table {
   width: 100%;
   border-collapse: collapse;
 }
 
-#file-table th, #file-table td {
+#file-table th, #file-table td,
+#version-table th, #version-table td,
+#share-table th, #share-table td,
+#link-table th, #link-table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
 }
 
-#file-table th {
+#file-table th, #version-table th, #share-table th, #link-table th {
   color: var(--muted);
   font-weight: 600;
   font-size: 0.85rem;
