@@ -1,0 +1,14 @@
+{
+  "name": "vaporwault-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VaporWault browser client (TASK-136) - plain TypeScript, no SPA framework. Compiled to static JS served by nginx alongside the gateway (see docs/DEPLOYMENT.md).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

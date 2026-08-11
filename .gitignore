@@ -2,7 +2,12 @@ build/
 build-wsl/
 build-wsl-werror/
 build-msvc*/
+build-gw-*/
 third_party/SDL2/
 *.log
 __pycache__/
 .pytest_cache/
+web/node_modules/
+web/dist/
+tests/integration/test.crt
+tests/integration/test.key

@@ -1,7 +1,7 @@
 ---
 id:          TASK-135
 title:       Implement gateway vault registry endpoints (create/key-fetch/list)
-status:      todo
+status:      review
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -45,6 +45,52 @@ Endpoints:
 ## Notes
 
 <!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+WEB.09 [2026-08-11]: Implemented in `src/gateway/vw_gateway_api.c`:
+`POST /api/vault/create`, `/api/vault/key_fetch`, `/api/vault/list` over
+`vw_client_vault_create/_key_fetch/_list`. `wrapped_vk`/`kdf_salt`/
+`kdf_params` all move as lowercase-hex JSON string fields (same convention
+as `link_token`, `TASK-134`) — capped at `VW_GATEWAY_MAX_WRAPPED_VK_BYTES`
+(2048 raw bytes / 4096 hex chars) and `VW_GATEWAY_MAX_KDF_PARAMS_BYTES`
+(512/1024) as a sanity bound against a malicious/broken caller sending an
+absurdly large blob, not because either field is expected to approach
+those sizes in practice (a real wrapped VK is on the order of 60 bytes:
+32-byte VK + 12-byte nonce + 16-byte tag).
+
+**Structural no-passphrase check, not just behavioral**: grepped this
+task's three handlers and the shared JSON field-decoding helpers they use
+— no code path reads a JSON key named anything passphrase-shaped, and
+there is no function in this file that calls into `vw_crypto_vault_derive_kek`
+or any KEK/decrypt primitive. The gateway's vault JSON schemas structurally
+cannot carry a passphrase because no field-extraction call for one exists.
+
+Verified against the real gateway+server (not mocked): alice creates a
+folder, registers it as a vault with a random 60-byte wrapped-VK blob +
+16-byte salt + 12-byte params (all `/dev/urandom`, opaque to both ends by
+construction — nothing about the *content* matters to this test, only
+that it round-trips), fetches it back via `key_fetch` and confirms all
+three fields plus `folder_file_id` match byte-for-byte, then confirms
+`vault/list` shows the vault with no key material present in the listing.
+
+Shares the `send_file_op_error` helper with `TASK-133`/`TASK-134` — the
+`VW_ERR_AUTH_REQUIRED` mapping fix documented in `TASK-134`'s note applies
+here too (an expired/invalidated session on any of these three endpoints
+now gets a clean `401` instead of falling into the generic-error/evict
+catch-all), though it wasn't separately triggered in this task's own
+testing.
+
+Builds clean under both MSVC `/W4 /WX` (`build-gw-test`) and GCC
+(`build-gw-e2e`, WSL).
+
+Not implemented/verified: no frontend vault UI yet (`TASK-141`, the
+biggest remaining piece — in-browser Argon2id-to-WASM for the KEK
+derivation this endpoint set deliberately never touches). This task is
+registry-plumbing-only per its own scope.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off; SEC.07's primary
+question per this task's own note ("does this code path ever see a
+passphrase") is answered no by construction, worth confirming
+independently rather than taking WEB.09's word for it.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive`/`crypto` — this is

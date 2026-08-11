@@ -1,0 +1,40 @@
+# nginx site config example for VaporWault's web client (TASK-136/145).
+# Copy to /etc/nginx/sites-available/vaporwault and adjust paths/domain,
+# then symlink into sites-enabled and reload nginx.
+#
+# nginx serves the compiled static frontend (web/dist/ + index.html +
+# style.css) directly and reverse-proxies /api/* to the gateway's
+# loopback-only HTTP listener (TASK-129 - vw_http deliberately trusts
+# nginx as its ONLY upstream, so the gateway must never be reachable any
+# other way; see ARCHITECTURE.md's Gateway listener bind address
+# decision).
+
+server {
+    listen 443 ssl;
+    server_name vaporwault.example.invalid;
+
+    ssl_certificate     /etc/vaporwault/web.crt;
+    ssl_certificate_key /etc/vaporwault/web.key;
+
+    # Static frontend
+    root /usr/share/vaporwault/web;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # Gateway API - loopback only, matches vapourwault-web-gateway's
+    # --listen-host 127.0.0.1 default.
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+
+server {
+    listen 80;
+    server_name vaporwault.example.invalid;
+    return 301 https://$host$request_uri;
+}

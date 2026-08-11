@@ -1,7 +1,7 @@
 ---
 id:          TASK-137
 title:       Frontend login view (+ 2FA) against gateway auth endpoints
-status:      todo
+status:      review
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -41,6 +41,42 @@ Scope:
 ## Notes
 
 <!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+WEB.09 [2026-08-11]: Implemented in `web/src/main.ts` — username/password
+form, 2FA step (shown only after the gateway responds `otp_required`),
+generic non-enumerating error message for bad credentials, logout button.
+Credentials are held in memory only between the two login steps
+(module-level `let`, never `localStorage`/`sessionStorage`) and cleared
+immediately on success or final failure, per this task's own scope note.
+
+**A real TypeScript compiler error caught while wiring this up**: the
+initial `ApiResult<T>` type claimed `data: T` unconditionally, but an
+error response's actual JSON shape is always `{status: string}`,
+*never* `T` (e.g. `T = FileEntry[]` for the list endpoint) — accessing
+`result.data.status` in the error-handling branch didn't type-check.
+Fixed by making `ApiResult<T>` a proper discriminated union on `ok`
+(`{ok:true, data:T} | {ok:false, data:StatusResponse}`), which is exactly
+the kind of bug static typing exists to catch before it becomes a runtime
+"undefined is not an object" in a real browser.
+
+**Verified against the real, running gateway + server** (not mocked):
+wrote a throwaway Node script (deleted after use, not shipped) that
+imports the *compiled* `dist/api.js` and drives it against
+`vapourwault-web-gateway`/`vapourwaultd` running in WSL — confirmed wrong
+password fails, correct password succeeds and sets a cookie, an
+authenticated call succeeds, logout invalidates the session, and a
+post-logout call correctly gets `auth_required` again. This exercises the
+same `login`/`logout`/`listFiles`/`mkdir` functions `main.ts` calls,
+just without a DOM.
+
+**Not verified**: the actual login *form* (DOM events, 2FA field
+show/hide, error message rendering) has not been exercised in a real
+browser — no GUI browser available in this environment. `TASK-136`'s note
+flags this as the top follow-up check.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
+`security-sensitive` tag, with the no-real-browser-test gap called out
+explicitly.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` — this view is the

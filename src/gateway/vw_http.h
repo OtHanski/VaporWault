@@ -6,7 +6,7 @@
  * vapourwault-web-gateway (TASK-129).
  *
  * Scope: this module trusts nginx as its ONLY upstream — nginx
- * reverse-proxies /api/* from the browser and terminates browser-facing
+ * reverse-proxies "/api/" paths from the browser and terminates browser-facing
  * TLS; this listener speaks plain HTTP on loopback only (vw_net.h cannot be
  * reused here: it is TLS-only by design). Deliberately out of scope, since
  * the only client is a well-behaved reverse proxy: HTTP/1.0, pipelining,

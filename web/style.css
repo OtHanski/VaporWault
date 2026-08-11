@@ -1,0 +1,141 @@
+/* Minimal, framework-free styling for VaporWault's web client (TASK-136). */
+
+:root {
+  --bg: #0f1117;
+  --panel: #1a1d27;
+  --border: #2c3040;
+  --text: #e6e8ef;
+  --muted: #9aa0b0;
+  --accent: #4f8cff;
+  --error: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+#login-view {
+  display: flex;
+  justify-content: center;
+  padding-top: 4rem;
+}
+
+#login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
+  max-width: 320px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2rem;
+}
+
+#login-form h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+  text-align: center;
+}
+
+input, button {
+  font-size: 1rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+input {
+  background: var(--bg);
+  color: var(--text);
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  cursor: pointer;
+}
+
+button:hover {
+  opacity: 0.9;
+}
+
+.error {
+  color: var(--error);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+#browser-view header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+#current-path {
+  font-family: monospace;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+#current-path:hover {
+  color: var(--text);
+}
+
+#toolbar {
+  margin-bottom: 1rem;
+}
+
+#file-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+#file-table th, #file-table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+#file-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+#file-table a {
+  color: var(--text);
+  text-decoration: none;
+}
+
+#file-table a:hover {
+  color: var(--accent);
+}
+
+.row-action {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.row-action:hover {
+  border-color: var(--error);
+  color: var(--error);
+}

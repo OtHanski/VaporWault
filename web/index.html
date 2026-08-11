@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VaporWault</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <section id="login-view">
+      <form id="login-form">
+        <h1>VaporWault</h1>
+        <input id="login-username" type="text" placeholder="Username" autocomplete="username" required>
+        <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" required>
+        <div id="otp-field" hidden>
+          <input id="login-otp" type="text" placeholder="2FA code" autocomplete="one-time-code">
+        </div>
+        <button type="submit">Log in</button>
+        <p id="login-error" class="error" hidden></p>
+      </form>
+    </section>
+
+    <section id="browser-view" hidden>
+      <header>
+        <span id="current-path" title="Click to go up one level">/</span>
+        <button id="logout-btn">Log out</button>
+      </header>
+      <div id="toolbar">
+        <button id="mkdir-btn">New folder</button>
+      </div>
+      <table id="file-table">
+        <thead>
+          <tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr>
+        </thead>
+        <tbody id="file-table-body"></tbody>
+      </table>
+      <p id="browser-error" class="error" hidden></p>
+    </section>
+  </div>
+  <script type="module" src="dist/main.js"></script>
+</body>
+</html>

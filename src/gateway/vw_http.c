@@ -1,4 +1,5 @@
 #include "vw_http.h"
+#include "../core/vw_crypto.h"
 
 #include <mbedtls/net_sockets.h>
 
@@ -274,6 +275,12 @@ vw_err_t vw_http_recv_request(vw_http_conn_t *conn, vw_http_request_t *out_req) 
 
 void vw_http_request_free(vw_http_request_t *req) {
     if (req == NULL) return;
+    /* Request bodies routinely carry passwords/OTP codes in plaintext
+     * JSON (TASK-132's login endpoints) - wipe before freeing rather than
+     * leaving them sitting in a freed-but-not-yet-reused heap block. */
+    if (req->body != NULL) {
+        vw_crypto_secure_zero(req->body, req->body_len);
+    }
     free(req->body);
     req->body = NULL;
     req->body_len = 0;

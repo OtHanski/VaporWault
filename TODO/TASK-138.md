@@ -1,7 +1,7 @@
 ---
 id:          TASK-138
 title:       Frontend file browser view (list/stat/mkdir/move/delete)
-status:      todo
+status:      review
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -43,6 +43,34 @@ files named by someone else).
 ## Notes
 
 <!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+WEB.09 [2026-08-11]: Implemented in `web/src/main.ts` — folder navigation
+(click a folder row, breadcrumb click to go up), file/folder listing with
+size/mtime formatting, mkdir (`window.prompt`) and delete
+(`window.confirm`) actions. Folders sort before files, both alphabetical.
+
+**The filename-XSS concern this task was filed to address is handled by
+construction, not by a runtime check**: every rendered filename goes
+through `element.textContent = ...`, never `innerHTML`, so there is no
+code path that could interpret a filename like `<img src=x
+onerror=alert(1)>` as markup — confirmed by reading `renderFileRow`, not
+just asserted. A dedicated adversarial-filename test (create a file
+literally named with HTML/script-like characters and confirm it renders
+as inert text in a real browser) is still worth doing per this task's own
+acceptance criteria, but hasn't been run in an actual browser DOM — see
+`TASK-136`'s note on the no-real-browser-test gap.
+
+**Verified against the real backend** (not mocked) via the same Node-based
+`api.js` smoke test described in `TASK-137`'s note: `listFiles`/`mkdir`/
+`deleteFile` all round-trip correctly against a live gateway+server.
+
+Not implemented in this pass (matches `TASK-133`'s own deferral): no
+upload/download UI, since the gateway has no file-content-transfer
+endpoints yet.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off, with the XSS-handling
+claim specifically worth SEC.07 double-checking against a real adversarial
+filename in a real browser, not just code inspection.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` for the filename-

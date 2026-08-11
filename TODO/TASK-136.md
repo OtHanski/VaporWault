@@ -1,7 +1,7 @@
 ---
 id:          TASK-136
 title:       Scaffold web/ TypeScript frontend build + nginx reverse-proxy config
-status:      todo
+status:      review
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -50,6 +50,27 @@ Scope:
 ## Notes
 
 <!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+WEB.09 [2026-08-11]: Implemented (`web/`): `package.json`/`tsconfig.json`
+(plain `tsc` compile, no bundler/framework), `index.html` + `style.css`,
+an `api.ts` fetch wrapper, and `nginx.conf.example`. Compiles clean with
+`tsc --strict` (caught one real type-safety bug along the way — see
+`TASK-137`'s note). `web/node_modules/`, `web/dist/` gitignored (build
+output/dev deps, not committed).
+
+Verified beyond just "it compiles": served the static output with a
+plain HTTP server and confirmed every asset (`index.html`, `dist/main.js`,
+`dist/api.js`, `style.css`) loads with the right content-type; separately,
+ran the *compiled* `api.js` from Node against the real running gateway
+(not just TypeScript type-checking) — see `TASK-137`/`TASK-138`'s note for
+the actual request/response log. Did **not** open this in a real GUI
+browser (none available in this environment) — the DOM-manipulation code
+in `main.ts` (`TASK-137`/`TASK-138`) is therefore unverified in an actual
+browser specifically; recommend that as the first manual check before
+considering those two tasks fully done, not just this scaffold.
+
+Moving to `review` — needs CQR.08 sign-off, with the "never opened in a
+real browser" gap flagged explicitly.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave.

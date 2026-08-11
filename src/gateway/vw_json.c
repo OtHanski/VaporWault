@@ -14,9 +14,9 @@ static void skip_ws(const char *p, size_t len, size_t *i) {
 
 /*
  * Advances *i past one JSON string literal starting at p[*i] == '"'.
- * On success *i points just past the closing quote; *out_start/*out_len
- * (either may be NULL) describe the still-escaped content between the
- * quotes.
+ * On success *i points just past the closing quote; out_start and
+ * out_len (either may be NULL) describe the still-escaped content between
+ * the quotes.
  */
 static vw_err_t skip_string(const char *p, size_t len, size_t *i,
                              const char **out_start, size_t *out_len) {
