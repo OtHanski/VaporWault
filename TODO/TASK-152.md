@@ -106,33 +106,43 @@ would have shipped completely non-functional if this specific check hadn't
 been done — the earlier "unit file lands at the right systemd path"
 verification (`TASK-149`) could not have caught it.
 
-**Still genuinely unverified — this is what remains for this task**:
-1. **Windows real installs.** Both MSIs were only structurally verified
-   (`msiexec /a` administrative extraction — unpacks files, registers
-   nothing). Nobody has run `msiexec /i` for real on either package. This
-   is the one remaining high-priority gap: does the server's
-   `ServiceInstall` actually register and start a working Windows Service,
-   does the firewall rule actually apply, does the client's custom action
-   actually register a working Scheduled Task under the correct (non-
-   elevated) identity, and does uninstall clean up correctly for both —
-   none of this is confirmed. Needs a disposable VM (Docker's Windows-
-   container mode was considered and rejected for this — see `TASK-152`'s
-   own discussion in-conversation: switching modes disables the Linux
-   containers used for everything else in this task, and even then,
-   Windows Service/firewall/Scheduled-Task behavior inside a container's
-   isolated namespace wouldn't give trustworthy signal for exactly the
-   things that matter here).
-2. **A real GitHub Actions run of `release.yml`** (`TASK-151`) — a
-   `workflow_dispatch` dry run costs nothing and would confirm the
-   `choco`-vs-NuGet-zip WiX fallback branch behavior on an actual
-   `windows-latest` runner (unconfirmed which path a real runner takes)
-   and the `gh release create`/`upload` step with the full 8-artifact list.
+**Item 2 (real GitHub Actions run) is now done**, per the user's explicit
+request to actually dispatch it. Took three attempts and found two more
+real bugs neither local testing nor the earlier container-based Linux
+testing could have caught (full detail in `TASK-151`'s implementation
+note): a diagnostics gap (CPack's "Problem running WiX" hid the actual
+`wix.log` content on failure), and an MSI version-format bug
+(`Product/@Version` must be strictly numeric, and the dry run's own
+default tag broke it). Third attempt was fully green: both platform
+builds succeeded, `Publish GitHub Release` correctly skipped (dry runs
+never publish), and all 8 expected artifacts were downloaded and confirmed
+present with correct names.
 
-Everything else originally scoped here (Linux fresh install/upgrade/
-remove/purge for both formats, `shellcheck`/`PSScriptAnalyzer`, and the
-client's real `systemctl --user` startup) is now done, for real, with one
-real bug found and fixed along the way (the `%h/.local/bin` vs `/usr/bin`
-systemd unit mismatch — see the note above). Not moving to `review` yet —
-items 1-2 above are still real, unstarted work, not just formality
-sign-off, and item 1 specifically needs a resource (a Windows VM) this
-session doesn't have.
+**Item 1 (Windows real installs) is partially done, for real, on the
+user's own dev machine** (explicitly authorized) — not a VM, since none
+was available, but genuinely installed via `msiexec /i`, not simulated:
+
+- **Client MSI**: installed and uninstalled for real. Found and fixed a
+  real bug — the custom action never ran at all on the first attempt
+  (WiX's linker drops any Fragment nothing references; confirmed via
+  direct MSI-database inspection that the `CustomAction` table was
+  completely empty of the intended entries). Fixed and re-verified the
+  same way. After the fix, the custom action ran with correctly-resolved
+  arguments (confirmed via the verbose MSI log), but `Register-ScheduledTask`
+  itself failed with "Access is denied" — isolated to this specific
+  machine's Group Policy blocking non-admin creation of **logon-triggered**
+  scheduled tasks specifically (`/SC ONCE` succeeds, `/SC ONLOGON` doesn't,
+  tested independently of the MSI entirely via bare `schtasks.exe`). Full
+  task registration remains unverified — needs a machine without this
+  specific policy (a personal/unmanaged Windows install, or a real VM).
+- **Server MSI**: still not installed. This session is not running
+  elevated (confirmed: `IsAdmin: False`), and the server MSI's
+  `ServiceInstall` genuinely requires Administrator rights — there's no
+  way to self-elevate without real admin credentials, which this session
+  doesn't have access to. Offered the user two paths (run it themselves
+  elevated and report back, or leave this as a follow-up); awaiting their
+  choice.
+
+Not moving to `review` yet — the server MSI real-install gap and the
+client MSI's Scheduled-Task-under-Group-Policy gap are both still real,
+unstarted verification, not formality sign-off.

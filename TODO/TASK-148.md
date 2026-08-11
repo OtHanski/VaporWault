@@ -128,17 +128,40 @@ extraction) exit code 0, extracted tree contains exactly the expected
 three files (`vapourwault-daemon.exe`, `vapourwault-cli.exe`,
 `register-client-task.ps1`).
 
-**Not verified** (same boundary as `TASK-147`): that the custom action
-actually executes correctly and registers a working Scheduled Task under
-the right identity at real install time, and that uninstall actually
-removes it. This is exactly the kind of thing that compiles fine but can
-misbehave at runtime — `TASK-152` must treat this package's real
-install/uninstall as its highest-priority check, not a formality. Also not
-done in this pass: the config-template-if-absent step (item 4 in this
-task's scope) — the MSI as built only deploys binaries + the task-runner
-script; a follow-up note should be added if config templating via MSI
-turns out to need its own custom action too (the "only if absent" rule
-isn't natively expressible via a plain `<File>` install).
+**Update — actually installed for real (`msiexec /i`), not just
+structurally verified**, and it found a real bug: the custom action never
+ran at all on first install. Root cause: WiX's linker (`light.exe`) drops
+any `<Fragment>` that nothing else references — the original filing split
+the Component (File install) and the CustomActions/InstallExecuteSequence
+into two separate Fragments, and only the first was referenced (via
+`client-patch.xml`'s `ComponentRef`). The compiled MSI's `CustomAction`
+table was completely empty of both `SetRegisterClientTaskData` and
+`RegisterClientTask` — confirmed directly by querying the MSI database via
+`WindowsInstaller.Installer` COM automation, not inferred. **Fixed** by
+merging everything into the one Fragment that's actually referenced;
+re-verified the same way — the `CustomAction` table now correctly lists
+all four actions (register + unregister pairs).
+
+After that fix, `msiexec /i` correctly ran the custom action with
+correctly-resolved `CustomActionData` (confirmed via the verbose MSI log:
+`"...\register-client-task.ps1" -DaemonExe "...\vapourwault-daemon.exe"
+-StateDir "...\VaporWault"` — the two-step immediate/deferred pattern
+works as designed). But `Register-ScheduledTask` (and, tested
+independently, the older `schtasks.exe` too) failed with **"Access is
+denied"** — isolated by testing trigger types individually: `/SC ONCE`
+succeeds, `/SC ONLOGON` is denied. This is a Group Policy restriction on
+the specific (Azure AD-managed) test machine blocking non-admin creation
+of logon-triggered scheduled tasks specifically — not a bug in this
+task's WiX/PowerShell authoring, which reaches the OS API call correctly.
+Full task registration therefore remains unverified on an unrestricted
+machine — flagged for whoever runs `TASK-152` next, ideally on a personal/
+unmanaged Windows install where this policy doesn't apply.
+
+Also not done in this pass: the config-template-if-absent step (item 4 in
+this task's scope) — the MSI as built only deploys binaries + the
+task-runner script; a follow-up note should be added if config templating
+via MSI turns out to need its own custom action too (the "only if absent"
+rule isn't natively expressible via a plain `<File>` install).
 
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag.

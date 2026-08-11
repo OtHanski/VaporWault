@@ -158,3 +158,48 @@ real tag).
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag (this workflow handles a `GH_TOKEN` with
 `contents: write` and fetches third-party binaries into the build).
+
+BLD.05 [2026-08-11]: Update — actually dispatched this workflow for real
+against a pushed branch (`workflow_dispatch`, not just local script
+extraction), per the user's explicit request. Took three attempts, each
+catching a real bug local testing never exercised:
+
+1. First attempt: both `cpack -G WIX` invocations failed with a bare
+   "Problem running WiX" and no visible cause — the workflow didn't
+   surface `wix.log`'s actual content on failure at all. Added diagnostics
+   (dump `wix.log` on non-zero exit) before investigating further, since
+   guessing blindly wasn't productive.
+2. Second attempt (with diagnostics): revealed `error CNDL0108: The
+   Product/@Version attribute's value, '0.0.0-dryrun', is not a valid
+   version` — MSI's `Product/@Version` must be strictly numeric dotted
+   (`x.x.x.x`), unlike DEB/RPM (which had already succeeded with that same
+   raw string in this exact run). The `workflow_dispatch` dry-run's
+   default tag (`v0.0.0-dryrun`) is exactly the kind of value this bug
+   needed to reproduce — a real release tag (`v0.2.0`) wouldn't have hit
+   it, but dry runs are the documented way to validate this workflow
+   before cutting one, so it was a real bug, not a dry-run-only
+   non-issue. Fixed by computing a sanitized `$msiVersion` (strip
+   anything from the first non-numeric/non-dot character onward,
+   falling back to `0.0.0` if empty) and passing it via
+   `-D CPACK_PACKAGE_VERSION=` to both WIX invocations specifically —
+   verified the regex against `0.0.0-dryrun`, `0.2.0`, `1.2.3-rc1`, and
+   empty-string inputs before pushing again.
+3. This also incidentally confirms the `choco install wixtoolset` path
+   works fine on the real `windows-latest` runner (the sandboxed local
+   environment's earlier lock-file failure was indeed sandbox-specific,
+   as suspected) — the WiX 3.14 toolset installed and was used
+   successfully, no NuGet-zip fallback needed.
+4. Third attempt: **fully green**. Both `Build / Linux / x86_64` and
+   `Build / Windows / x86_64` succeeded; `Publish GitHub Release`
+   correctly skipped (workflow_dispatch dry runs never publish, by
+   design — confirmed this guard still works). Downloaded and inspected
+   both artifact bundles directly: all 8 expected files present and
+   correctly named — `linux-release/` has the tarball+checksum plus
+   `vapourwault-{server,client}_..._amd64.deb` and
+   `vapourwault-{server,client}-..-1.x86_64.rpm` (RPM's own tooling
+   auto-sanitized the `-dryrun` suffix to `_dryrun` in version fields,
+   handled gracefully unlike WiX); `windows-release/` has the zip+checksum
+   plus `vaporwault-{server,client}-0.0.0-dryrun-win64.msi`.
+
+This is now a workflow that has actually run successfully on GitHub's real
+infrastructure, not just one that looks correct on paper.
