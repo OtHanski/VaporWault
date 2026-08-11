@@ -91,3 +91,142 @@ export function moveFile(
     new_parent_dir_id: newParentDirId,
   });
 }
+
+/*
+ * Chunk transfer (TASK-139): the browser drives CHUNK_UPLOAD/FILE_COMMIT
+ * and VERSION_CHUNKS/CHUNK_DOWNLOAD_REQ directly, one HTTP request per
+ * chunk (gateway side: TASK-133's addendum) - this is what gives real
+ * per-file byte progress without any status-polling API. Hashing uses
+ * the browser's native SubtleCrypto (no crypto library needed for
+ * plaintext SHA-256).
+ */
+
+const CHUNK_SIZE = 4 * 1024 * 1024; // matches VW_CHUNK_SIZE_DEFAULT (docs/PROTOCOL.md)
+
+export interface ChunkListResponse {
+  chunk_hashes: string[];
+  vault_id: number;
+  wrapped_dek: string | null;
+}
+
+export interface CommitResponse {
+  file_id: number;
+  version_id: number;
+}
+
+function bufToHex(buf: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return bufToHex(digest);
+}
+
+async function uploadChunk(hash: string, data: ArrayBuffer): Promise<ApiResult<StatusResponse>> {
+  const res = await fetch("/api/chunks/upload", {
+    method: "POST",
+    headers: { "X-Vw-Chunk-Hash": hash },
+    credentials: "same-origin",
+    body: data,
+  });
+  const data2 = (await res.json()) as StatusResponse;
+  return res.ok
+    ? { ok: true, status: res.status, data: data2 }
+    : { ok: false, status: res.status, data: data2 };
+}
+
+async function downloadChunk(hash: string): Promise<ArrayBuffer> {
+  const res = await fetch("/api/chunks/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ hash }),
+  });
+  if (!res.ok) {
+    const body = (await res.json()) as StatusResponse;
+    throw new Error(`chunk download failed: ${body.status}`);
+  }
+  return res.arrayBuffer();
+}
+
+export function commitFile(opts: {
+  path?: string;
+  fileId?: number;
+  leafName?: string;
+  logicalSize: number;
+  chunkHashes: string[];
+}): Promise<ApiResult<CommitResponse>> {
+  const body: Record<string, unknown> = {
+    logical_size: opts.logicalSize,
+    chunk_hashes: opts.chunkHashes,
+  };
+  if (opts.path) body.path = opts.path;
+  if (opts.fileId !== undefined) body.file_id = opts.fileId;
+  if (opts.leafName) body.leaf_name = opts.leafName;
+  return apiPost("/api/files/commit", body);
+}
+
+export function getVersionChunks(versionId: number): Promise<ApiResult<ChunkListResponse>> {
+  return apiPost("/api/versions/chunks", { version_id: versionId });
+}
+
+export type ProgressCb = (bytesDone: number, bytesTotal: number) => void;
+
+/* Uploads file to `path`, chunk by chunk, reporting cumulative byte
+ * progress. Fails cleanly (returns the failing chunk's error, uploads
+ * nothing further) rather than committing a partial file. */
+export async function uploadFile(
+  path: string,
+  file: File,
+  onProgress?: ProgressCb,
+): Promise<ApiResult<CommitResponse>> {
+  const totalSize = file.size;
+  const chunkHashes: string[] = [];
+  let bytesDone = 0;
+
+  for (let offset = 0; offset < totalSize; offset += CHUNK_SIZE) {
+    const chunk = file.slice(offset, Math.min(offset + CHUNK_SIZE, totalSize));
+    const buf = await chunk.arrayBuffer();
+    const hash = await sha256Hex(buf);
+    const result = await uploadChunk(hash, buf);
+    if (!result.ok) {
+      return { ok: false, status: result.status, data: result.data };
+    }
+    chunkHashes.push(hash);
+    bytesDone += buf.byteLength;
+    onProgress?.(bytesDone, totalSize);
+  }
+
+  return commitFile({ path, logicalSize: totalSize, chunkHashes });
+}
+
+/* Downloads versionId's content as a Blob, chunk by chunk, reporting
+ * cumulative byte progress against the caller-supplied totalSize (from
+ * the file's own listed size_bytes - the chunk list alone doesn't carry
+ * a total ahead of time). */
+export async function downloadFile(
+  versionId: number,
+  totalSize: number,
+  onProgress?: ProgressCb,
+): Promise<Blob> {
+  const chunksResult = await getVersionChunks(versionId);
+  if (!chunksResult.ok) {
+    throw new Error(`could not fetch version chunk list: ${chunksResult.data.status}`);
+  }
+  if (chunksResult.data.vault_id !== 0) {
+    throw new Error("vault-encrypted downloads are not yet supported (TASK-141)");
+  }
+
+  const parts: ArrayBuffer[] = [];
+  let bytesDone = 0;
+  for (const hash of chunksResult.data.chunk_hashes) {
+    const buf = await downloadChunk(hash);
+    parts.push(buf);
+    bytesDone += buf.byteLength;
+    onProgress?.(bytesDone, totalSize);
+  }
+  return new Blob(parts);
+}

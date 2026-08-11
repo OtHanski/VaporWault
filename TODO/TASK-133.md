@@ -110,10 +110,55 @@ endpoints still behave correctly after the change (no regression; the
 fix only changes which HTTP status an already-unusual case gets, not the
 happy-path behavior).
 
+WEB.09 [2026-08-11]: Closed the deferred upload/download gap while
+implementing `TASK-139`'s backend prerequisite. Added to
+`src/gateway/vw_gateway_api.c`: `POST /api/versions/list`,
+`/api/versions/restore` (this task's own original scope, plain JSON), and
+the chunk-transfer set — `POST /api/chunks/upload` (raw binary body, chunk
+hash via `X-Vw-Chunk-Hash` header, over
+`vw_client_chunk_upload_if_missing`), `POST /api/files/commit` (JSON
+`{path | file_id[+leaf_name], logical_size, chunk_hashes: [hex,...]}`,
+mirrors the three addressing modes `vw_client_file_upload`/`_to_id`/
+`_into_folder` already support, over `vw_client_file_commit_raw`),
+`POST /api/versions/chunks` (hex-encoded hash list + `vault_id`/
+`wrapped_dek` for the vault-download path `TASK-141` will need, over
+`vw_client_version_chunks_raw`), and `POST /api/chunks/download` (JSON
+request, raw binary `application/octet-stream` response body on success,
+over `vw_client_chunk_download_raw`).
+
+This resolves the "binary content doesn't fit the JSON-body convention"
+concern noted above **without** a base64 layer or new routing mechanism:
+`vw_http_request_t.body`/`vw_http_send_response` were already plain byte
+buffers (not JSON-typed), so chunk upload/download bodies are just raw
+bytes with `Content-Type: application/octet-stream` — metadata (the chunk
+hash) travels in a header instead, and vw_http's Content-Length-driven
+body reading doesn't care about content type at all (confirmed by reading
+`vw_http_recv_request`, not assumed).
+
+**Verified against the real gateway+server with an actual multi-chunk
+file, not a single small blob**: generated a 10 MiB random file (3 chunks:
+4+4+2 MiB, `VW_CHUNK_SIZE_DEFAULT` is 4 MiB), uploaded each chunk with its
+own SHA-256 hash header, committed it, fetched `versions/chunks`,
+downloaded each chunk back, and reassembled — the reassembled file is
+byte-for-byte identical to the original (`cmp`, not just size-equal).
+Also verified version history end-to-end: committed a second, much
+smaller version to the same path, confirmed `versions/list` shows both,
+restored `version_id=1`, confirmed the server creates a *new* version
+(`version_id=3`) with version 1's original 10 MiB content as the new
+HEAD — matches `vw_client_version_restore`'s own documented "creates a
+new version record" behavior, not an in-place revert. Negative paths
+checked too: downloading an unknown (but correctly 64-hex-char) hash
+returns a clean `404 not_found`; a malformed chunk-hash header (wrong
+length) returns `400 bad_request` without ever reaching
+`vw_client_chunk_upload_if_missing`.
+
+Builds clean under both MSVC `/W4 /WX` and GCC; full regression pass on
+this task's own list/stat/mkdir/delete/move endpoints afterward (no
+breakage from the new code sharing the same file/helpers).
+
 Moving to `review` — needs SEC.07 + CQR.08 sign-off. `TASK-155`'s
-resolution should be tracked separately; this task's own scope (metadata
-endpoints + the containment mitigation) is complete modulo the deferred
-upload/download work.
+resolution should be tracked separately; this task's own scope, including
+the previously-deferred content-transfer endpoints, is now complete.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` — file/path

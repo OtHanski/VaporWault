@@ -4,7 +4,17 @@
  * library and no SPA framework (TASK-136's constraint).
  */
 
-import { login, loginWithOtp, logout, listFiles, mkdir, deleteFile, type FileEntry } from "./api.js";
+import {
+  login,
+  loginWithOtp,
+  logout,
+  listFiles,
+  mkdir,
+  deleteFile,
+  uploadFile,
+  downloadFile,
+  type FileEntry,
+} from "./api.js";
 
 // ── Element lookups ─────────────────────────────────────────────────────────
 
@@ -27,6 +37,9 @@ const mkdirBtn = el<HTMLButtonElement>("mkdir-btn");
 const currentPathLabel = el<HTMLElement>("current-path");
 const fileTableBody = el<HTMLTableSectionElement>("file-table-body");
 const browserError = el<HTMLElement>("browser-error");
+const uploadBtn = el<HTMLButtonElement>("upload-btn");
+const uploadInput = el<HTMLInputElement>("upload-input");
+const transferList = el<HTMLUListElement>("transfer-list");
 
 // ── State ────────────────────────────────────────────────────────────────
 //
@@ -203,6 +216,15 @@ function renderFileRow(entry: FileEntry): HTMLTableRowElement {
   row.appendChild(mtimeCell);
 
   const actionsCell = document.createElement("td");
+  if (!isDir) {
+    const downloadBtn = document.createElement("button");
+    downloadBtn.textContent = "Download";
+    downloadBtn.className = "row-action";
+    downloadBtn.addEventListener("click", () => {
+      void handleDownload(entry);
+    });
+    actionsCell.appendChild(downloadBtn);
+  }
   const deleteBtn = document.createElement("button");
   deleteBtn.textContent = "Delete";
   deleteBtn.className = "row-action";
@@ -241,6 +263,135 @@ async function handleMkdir(): Promise<void> {
     return;
   }
   await refreshFileList();
+}
+
+// ── Upload / download with progress (TASK-139) ──────────────────────────
+//
+// The browser drives the chunk loop itself (api.ts's uploadFile/
+// downloadFile), one HTTP request per chunk - this is what gives real
+// per-file byte progress without any gateway-side status/polling API
+// (TASK-127's design note). A transfer item's label and bar are updated
+// via textContent/style.width only, never innerHTML - same XSS-safety
+// rule as the file table (TASK-138), since a transfer label embeds a
+// user-controlled filename.
+
+interface TransferHandle {
+  setProgress(bytesDone: number, bytesTotal: number): void;
+  /* onRetry, if given, adds a Retry button that re-runs the transfer from
+   * scratch (chunk-level dedup, TASK-133's chunk_upload_if_missing, means
+   * a retry doesn't re-transfer bytes the server already has - only a
+   * fresh commit is needed for chunks that did land). */
+  setFailed(message: string, onRetry?: () => void): void;
+  remove(): void;
+}
+
+function createTransferItem(label: string): TransferHandle {
+  const item = document.createElement("li");
+  item.className = "transfer-item";
+
+  const labelRow = document.createElement("div");
+  labelRow.className = "transfer-label";
+  const nameSpan = document.createElement("span");
+  nameSpan.textContent = label;
+  const statSpan = document.createElement("span");
+  statSpan.textContent = "0%";
+  labelRow.appendChild(nameSpan);
+  labelRow.appendChild(statSpan);
+
+  const track = document.createElement("div");
+  track.className = "transfer-bar-track";
+  const fill = document.createElement("div");
+  fill.className = "transfer-bar-fill";
+  track.appendChild(fill);
+
+  item.appendChild(labelRow);
+  item.appendChild(track);
+  transferList.appendChild(item);
+
+  return {
+    setProgress(bytesDone: number, bytesTotal: number) {
+      const pct = bytesTotal > 0 ? Math.round((bytesDone / bytesTotal) * 100) : 100;
+      fill.style.width = `${pct}%`;
+      statSpan.textContent = `${pct}%`;
+    },
+    setFailed(message: string, onRetry?: () => void) {
+      item.classList.add("failed");
+      statSpan.textContent = message;
+      if (onRetry) {
+        const retryBtn = document.createElement("button");
+        retryBtn.textContent = "Retry";
+        retryBtn.className = "row-action";
+        retryBtn.addEventListener("click", () => {
+          item.classList.remove("failed");
+          retryBtn.remove();
+          onRetry();
+        });
+        labelRow.appendChild(retryBtn);
+      }
+    },
+    remove() {
+      item.remove();
+    },
+  };
+}
+
+uploadBtn.addEventListener("click", () => {
+  uploadInput.click();
+});
+
+uploadInput.addEventListener("change", () => {
+  const files = uploadInput.files;
+  uploadInput.value = ""; // allow re-selecting the same file later
+  if (!files || files.length === 0) return;
+  void handleUpload(Array.from(files));
+});
+
+async function handleUpload(files: File[]): Promise<void> {
+  for (const file of files) {
+    await uploadOne(file);
+  }
+  await refreshFileList();
+}
+
+async function uploadOne(file: File): Promise<void> {
+  const path = joinPath(currentPath, file.name);
+  const handle = createTransferItem(`Uploading ${file.name}`);
+  try {
+    const result = await uploadFile(path, file, (done, total) => handle.setProgress(done, total));
+    if (!result.ok) {
+      // No partial/corrupt commit is possible here: uploadFile only
+      // calls FILE_COMMIT after every chunk has landed, so a mid-upload
+      // failure just leaves the file's prior state untouched - retrying
+      // is always safe to re-run from scratch.
+      handle.setFailed(`Failed: ${result.data.status ?? "error"}`, () => void uploadOne(file));
+      return;
+    }
+    handle.setProgress(file.size, file.size || 1);
+    setTimeout(() => handle.remove(), 1500);
+    await refreshFileList();
+  } catch (err) {
+    handle.setFailed(err instanceof Error ? err.message : "Upload failed", () => void uploadOne(file));
+  }
+}
+
+async function handleDownload(entry: FileEntry): Promise<void> {
+  const handle = createTransferItem(`Downloading ${entry.name}`);
+  try {
+    const blob = await downloadFile(entry.version_id, entry.size_bytes, (done, total) =>
+      handle.setProgress(done, total),
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = entry.name;
+    a.click();
+    URL.revokeObjectURL(url);
+    setTimeout(() => handle.remove(), 1500);
+  } catch (err) {
+    handle.setFailed(err instanceof Error ? err.message : "Download failed", () =>
+      void handleDownload(entry),
+    );
+  }
 }
 
 // Breadcrumb navigation: clicking the path label goes up one level.

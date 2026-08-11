@@ -489,6 +489,364 @@ static void handle_file_move(vw_gateway_session_pool_t *pool,
     send_json_status(conn, 200, "ok", NULL);
 }
 
+/* ── Version history endpoints (TASK-133's own scope, deferred to this
+ * pass alongside chunk transfer below) ──────────────────────────────────── */
+
+static void write_version_entry(vw_json_writer_t *w, const vw_version_entry_t *e) {
+    vw_json_write_object_start(w);
+    vw_json_write_key(w, "version_id");
+    vw_json_write_uint(w, e->version_id);
+    vw_json_write_key(w, "created_at");
+    vw_json_write_int(w, e->created_at);
+    vw_json_write_key(w, "size_bytes");
+    vw_json_write_uint(w, e->size_bytes);
+    vw_json_write_object_end(w);
+}
+
+static void handle_version_list(vw_gateway_session_pool_t *pool,
+                                 const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    char path[VW_MAX_PATH_BYTES];
+    if (get_json_string_field(req, "path", path, sizeof(path)) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    vw_version_entry_t *entries = NULL;
+    uint32_t count = 0;
+    vw_err_t err = vw_client_version_list(sess, path, &entries, &count);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char *buf = malloc(65536);
+    if (buf == NULL) { free(entries); send_error(conn, 500, "error"); return; }
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, 65536);
+    vw_json_write_array_start(&w);
+    for (uint32_t i = 0; i < count; i++) write_version_entry(&w, &entries[i]);
+    vw_json_write_array_end(&w);
+    free(entries);
+
+    size_t len = 0;
+    if (vw_json_writer_result(&w, &len) != VW_OK) {
+        free(buf);
+        send_error(conn, 500, "response_too_large");
+        return;
+    }
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+    free(buf);
+}
+
+static void handle_version_restore(vw_gateway_session_pool_t *pool,
+                                    const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    char path[VW_MAX_PATH_BYTES];
+    uint64_t version_id = 0;
+    if (get_json_string_field(req, "path", path, sizeof(path)) != VW_OK ||
+        get_json_uint_field(req, "version_id", &version_id) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    vw_err_t err = vw_client_version_restore(sess, path, version_id);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+    send_json_status(conn, 200, "ok", NULL);
+}
+
+/* ── Chunk transfer endpoints (TASK-139's backend prerequisite) ───────────
+ *
+ * The browser drives CHUNK_QUERY/CHUNK_UPLOAD/FILE_COMMIT (upload) and
+ * VERSION_CHUNKS/CHUNK_DOWNLOAD_REQ (download) directly, one HTTP request
+ * per chunk step, per TASK-127/TASK-139's own design note - this is what
+ * gives real per-file byte progress without inventing a status/polling
+ * API. Chunk hashes are hex-encoded (matches this file's existing
+ * convention for opaque binary fields); chunk BODIES are raw binary, not
+ * JSON/base64-wrapped - vw_http_request_t.body is already a plain byte
+ * buffer (TASK-129's own doc anticipated this: VW_HTTP_MAX_BODY_BYTES is
+ * sized as "one VW_CHUNK_SIZE_DEFAULT chunk plus headroom"), so there is
+ * no encoding overhead or new routing mechanism needed for the two
+ * endpoints that carry chunk content itself.
+ */
+
+#define VW_GATEWAY_CHUNK_HASH_HEADER   "X-Vw-Chunk-Hash"
+/* Sanity bound on chunk_hashes[] length in a single FILE_COMMIT request -
+ * matches vw_client_file_list's own "max 65535 entries" precedent, not a
+ * real expected size (65536 chunks * 4 MiB is a 256 GiB file). */
+#define VW_GATEWAY_MAX_CHUNK_COUNT     65536u
+
+static void handle_chunk_upload(vw_gateway_session_pool_t *pool,
+                                 const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+
+    const char *hash_hex = vw_http_header_get(req, VW_GATEWAY_CHUNK_HASH_HEADER);
+    if (hash_hex == NULL || strlen(hash_hex) != VW_HASH_BYTES * 2u ||
+        req->body == NULL || req->body_len == 0 ||
+        req->body_len > VW_CHUNK_SIZE_DEFAULT) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+    uint8_t hash[VW_HASH_BYTES];
+    if (vw_crypto_hex_decode(hash_hex, VW_HASH_BYTES * 2u, hash) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    vw_err_t err = vw_client_chunk_upload_if_missing(sess, hash, req->body, req->body_len);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+    send_json_status(conn, 200, "ok", NULL);
+}
+
+typedef struct {
+    uint8_t *buf;
+    uint32_t count;
+    uint32_t cap;
+    int      error;
+} chunk_hash_decode_ctx_t;
+
+static int count_array_elem_cb(void *ud, vw_json_value_t element) {
+    (void)element;
+    uint32_t *count = (uint32_t *)ud;
+    (*count)++;
+    return 0;
+}
+
+static int decode_chunk_hash_cb(void *ud, vw_json_value_t element) {
+    chunk_hash_decode_ctx_t *ctx = (chunk_hash_decode_ctx_t *)ud;
+    if (ctx->count >= ctx->cap || element.kind != VW_JSON_STRING) {
+        ctx->error = 1;
+        return 1;
+    }
+    char hex[VW_HASH_BYTES * 2u + 1u];
+    size_t out_len = 0;
+    if (vw_json_string_decode(element.start, element.len, hex, sizeof(hex), &out_len) != VW_OK ||
+        out_len != VW_HASH_BYTES * 2u ||
+        vw_crypto_hex_decode(hex, out_len, ctx->buf + (size_t)ctx->count * VW_HASH_BYTES) != VW_OK) {
+        ctx->error = 1;
+        return 1;
+    }
+    ctx->count++;
+    return 0;
+}
+
+static void handle_file_commit(vw_gateway_session_pool_t *pool,
+                                const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    char path[VW_MAX_PATH_BYTES];
+    path[0] = '\0';
+    uint64_t file_id = 0;
+    char leaf_name[256];
+    leaf_name[0] = '\0';
+    uint64_t logical_size = 0;
+
+    (void)get_json_string_field(req, "path", path, sizeof(path));
+    (void)get_json_uint_field(req, "file_id", &file_id);
+    (void)get_json_string_field(req, "leaf_name", leaf_name, sizeof(leaf_name));
+
+    if (get_json_uint_field(req, "logical_size", &logical_size) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    const char *name_or_path = NULL;
+    uint16_t name_len = 0;
+    uint64_t commit_file_id = 0;
+    if (path[0] != '\0') {
+        name_or_path = path;
+        name_len = (uint16_t)strlen(path);
+        commit_file_id = 0;
+    } else if (file_id != 0 && leaf_name[0] != '\0') {
+        name_or_path = leaf_name;
+        name_len = (uint16_t)strlen(leaf_name);
+        commit_file_id = file_id;
+    } else if (file_id != 0) {
+        name_or_path = NULL;
+        name_len = 0;
+        commit_file_id = file_id;
+    } else {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    vw_json_value_t arr;
+    if (vw_json_object_get((const char *)req->body, req->body_len, "chunk_hashes", &arr) != VW_OK ||
+        arr.kind != VW_JSON_ARRAY) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint32_t chunk_count = 0;
+    if (vw_json_array_foreach(arr.start, arr.len, count_array_elem_cb, &chunk_count) != VW_OK ||
+        chunk_count == 0 || chunk_count > VW_GATEWAY_MAX_CHUNK_COUNT) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint8_t *hashes = malloc((size_t)chunk_count * VW_HASH_BYTES);
+    if (hashes == NULL) { send_error(conn, 500, "error"); return; }
+
+    chunk_hash_decode_ctx_t ctx = { hashes, 0, chunk_count, 0 };
+    if (vw_json_array_foreach(arr.start, arr.len, decode_chunk_hash_cb, &ctx) != VW_OK ||
+        ctx.error || ctx.count != chunk_count) {
+        free(hashes);
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint64_t out_file_id = 0, out_version_id = 0;
+    vw_err_t err = vw_client_file_commit_raw(sess, commit_file_id, name_or_path, name_len,
+                                              logical_size, chunk_count, hashes,
+                                              0, NULL, 0,
+                                              &out_file_id, &out_version_id);
+    free(hashes);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[192];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "file_id");
+    vw_json_write_uint(&w, out_file_id);
+    vw_json_write_key(&w, "version_id");
+    vw_json_write_uint(&w, out_version_id);
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
+static void handle_version_chunks(vw_gateway_session_pool_t *pool,
+                                   const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    uint64_t version_id = 0;
+    if (get_json_uint_field(req, "version_id", &version_id) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint8_t *hashes = NULL;
+    uint32_t chunk_count = 0;
+    uint64_t vault_id = 0;
+    uint8_t *wrapped_dek = NULL;
+    uint16_t wrapped_dek_len = 0;
+
+    vw_err_t err = vw_client_version_chunks_raw(sess, version_id, &hashes, &chunk_count,
+                                                 &vault_id, &wrapped_dek, &wrapped_dek_len);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    /* Every hex-encoded hash is 64 chars + 2 quotes + comma; generous
+     * per-entry budget plus a fixed allowance for the object's other
+     * fields and the wrapped_dek hex (bounded by
+     * VW_GATEWAY_MAX_KDF_PARAMS_BYTES-scale content in practice). */
+    size_t cap = (size_t)chunk_count * 72u + 4096u + (size_t)wrapped_dek_len * 2u;
+    char *buf = malloc(cap);
+    if (buf == NULL) {
+        free(hashes); free(wrapped_dek);
+        send_error(conn, 500, "error");
+        return;
+    }
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, cap);
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "chunk_hashes");
+    vw_json_write_array_start(&w);
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        char hex[VW_HASH_BYTES * 2u + 1u];
+        vw_crypto_hex_encode(hashes + (size_t)i * VW_HASH_BYTES, VW_HASH_BYTES, hex);
+        vw_json_write_string(&w, hex, VW_HASH_BYTES * 2u);
+    }
+    vw_json_write_array_end(&w);
+    vw_json_write_key(&w, "vault_id");
+    vw_json_write_uint(&w, vault_id);
+    vw_json_write_key(&w, "wrapped_dek");
+    if (wrapped_dek_len > 0) {
+        char *dek_hex = malloc((size_t)wrapped_dek_len * 2u + 1u);
+        if (dek_hex != NULL) {
+            vw_crypto_hex_encode(wrapped_dek, wrapped_dek_len, dek_hex);
+            vw_json_write_string(&w, dek_hex, strlen(dek_hex));
+            free(dek_hex);
+        } else {
+            vw_json_write_null(&w);
+        }
+    } else {
+        vw_json_write_null(&w);
+    }
+    vw_json_write_object_end(&w);
+    free(hashes);
+    free(wrapped_dek);
+
+    size_t len = 0;
+    if (vw_json_writer_result(&w, &len) != VW_OK) {
+        free(buf);
+        send_error(conn, 500, "response_too_large");
+        return;
+    }
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+    free(buf);
+}
+
+static void handle_chunk_download(vw_gateway_session_pool_t *pool,
+                                   const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    char hex[VW_HASH_BYTES * 2u + 1u];
+    if (get_json_string_field(req, "hash", hex, sizeof(hex)) != VW_OK ||
+        strlen(hex) != VW_HASH_BYTES * 2u) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+    uint8_t hash[VW_HASH_BYTES];
+    if (vw_crypto_hex_decode(hex, VW_HASH_BYTES * 2u, hash) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    vw_err_t err = vw_client_chunk_download_raw(sess, hash, &data, &data_len);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    vw_http_send_response(conn, 200, "application/octet-stream", NULL, data, data_len);
+    free(data);
+}
+
 /* ── Sharing endpoints (TASK-134) ─────────────────────────────────────────
  *
  * Thin translators over vw_client_share_grant/_revoke/_list and
@@ -1033,6 +1391,30 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/move") == 0) {
         handle_file_move(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/versions/list") == 0) {
+        handle_version_list(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/versions/restore") == 0) {
+        handle_version_restore(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/versions/chunks") == 0) {
+        handle_version_chunks(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/chunks/upload") == 0) {
+        handle_chunk_upload(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/chunks/download") == 0) {
+        handle_chunk_download(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/commit") == 0) {
+        handle_file_commit(pool, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/shares/grant") == 0) {
