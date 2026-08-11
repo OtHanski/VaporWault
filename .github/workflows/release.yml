@@ -273,9 +273,23 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          # MSI's Product/@Version field is strictly numeric dotted
+          # (x.x.x.x, no suffix) -- unlike DEB/RPM, which accepted
+          # PKG_VERSION as-is. The workflow_dispatch dry-run default tag
+          # (v0.0.0-dryrun -> PKG_VERSION "0.0.0-dryrun") fails WiX's
+          # candle.exe with CNDL0108 for exactly this reason; a real
+          # release tag (e.g. v0.2.0) would not have hit this, but dry
+          # runs are exactly how this workflow is meant to be validated
+          # before cutting one (docs/RELEASE.md) so it needed fixing, not
+          # dismissing as dry-run-only. Strips everything from the first
+          # non-numeric/non-dot character onward.
+          $msiVersion = $env:PKG_VERSION -replace '[^0-9.].*$', ''
+          if (-not $msiVersion) { $msiVersion = "0.0.0" }
+          Write-Host "PKG_VERSION=$env:PKG_VERSION -> MSI version=$msiVersion"
           Push-Location build
           cpack -G WIX `
             -D CPACK_COMPONENTS_ALL=server `
+            -D CPACK_PACKAGE_VERSION=$msiVersion `
             -D CPACK_WIX_UPGRADE_GUID=5ADE0205-57FF-4286-849A-C112AF550215 `
             -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/server-patch.xml)" `
             -D CPACK_WIX_EXTENSIONS=WixFirewallExtension `
@@ -283,6 +297,7 @@ jobs:
           $serverExit = $LASTEXITCODE
           cpack -G WIX `
             -D CPACK_COMPONENTS_ALL=client `
+            -D CPACK_PACKAGE_VERSION=$msiVersion `
             -D CPACK_WIX_UPGRADE_GUID=88FDD57B-FD91-4214-B6F5-B1343F75ABBB `
             -D CPACK_WIX_INSTALL_SCOPE=perUser `
             -D CPACK_WIX_EXTRA_SOURCES="$(Resolve-Path ../packaging/windows/wix/client-extra.wxs)" `
