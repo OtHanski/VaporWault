@@ -1,0 +1,14 @@
+#!/bin/sh
+# packaging/linux/scripts/client/postrm — DEB-specific post-removal
+# wrapper for vapourwault-client (TASK-149). Deliberately a no-op even on
+# purge: all client state (daemon.conf, session.tok, cache.db) lives under
+# each individual user's own home directory
+# (~/.local/share/vapourwault, ~/.config/systemd/user for the
+# manual/tarball install path — this package instead uses
+# /usr/lib/systemd/user, see client/postinst), never anywhere
+# system-wide this package could reach or would be appropriate to delete
+# from a root-run maintainer script. A user who wants to remove their own
+# data does so themselves (`rm -rf ~/.local/share/vapourwault`), same as
+# uninstalling any other per-user application on Linux.
+
+exit 0

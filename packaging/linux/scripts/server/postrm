@@ -1,0 +1,46 @@
+#!/bin/sh
+# packaging/linux/scripts/server/postrm — DEB-specific post-removal
+# wrapper for vapourwault-server (TASK-149). DEB's postrm receives the
+# action as its first argument ("remove", "purge", "upgrade",
+# "failed-upgrade", ...) — only "purge" (a real `apt purge`/`dpkg
+# --purge`, not a plain `apt remove`) should delete data/config/the
+# service user.
+#
+# The delete logic is inlined here rather than factored into a shared
+# helper script: dpkg does NOT preserve a package's regular installed
+# files for postrm to reference — by the time postrm runs (even in
+# "remove" mode), dpkg has already removed the package's payload files, and
+# only the maintainer control scripts themselves (postinst/prerm/postrm)
+# survive to be invoked. RPM's %postun (packaging/linux/scripts/rpm/server-postun,
+# TASK-150) uses a different removal-argument convention ($1 =
+# install-count, not an action string) and keeps its own equivalent inline
+# copy of this same delete logic for the same reason, rather than trying
+# to parse both conventions in one script or share a helper file that
+# wouldn't reliably exist at removal time.
+
+set -e
+
+SERVICE_USER="vapourwault"
+DATA_DIR="/var/lib/vapourwault"
+CONF_DIR="/etc/vapourwault"
+RUN_DIR="/run/vapourwault"
+
+case "$1" in
+    purge)
+        rm -rf "${DATA_DIR}"
+        rm -rf "${CONF_DIR}"
+        rm -rf "${RUN_DIR}"
+        if id "${SERVICE_USER}" >/dev/null 2>&1; then
+            userdel "${SERVICE_USER}" || true
+        fi
+        ;;
+    *)
+        # remove / upgrade / failed-upgrade / etc: keep config and data.
+        ;;
+esac
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

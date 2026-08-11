@@ -1,0 +1,102 @@
+---
+id:          TASK-130
+title:       Implement minimal JSON encode/decode for the web gateway (vw_json)
+status:      review
+assignee:    WEB.09
+created_by:  ARCH.00
+created:     2026-08-10
+priority:    high
+depends_on:  [TASK-127, TASK-128]
+blocks:      [TASK-131]
+review_by:   [SEC.07, CQR.08]
+tags:        [gateway, web, security-sensitive]
+---
+
+Per `TASK-127`, hand-roll a small JSON encoder/decoder (new
+`src/gateway/vw_json.{h,c}`) rather than vendoring a JSON library — the
+gateway's request/response shapes are all fixed and known ahead of time
+(defined by `TASK-132`–`TASK-135`'s endpoint set), so a general-purpose
+JSON library is more than the requirement. `src/server/vw_acme.c`'s
+`json_str`/`json_find_dns01`/`json_find_http01`/`json_first_array_str`
+(lines ~161-260) is the existing precedent for hand-rolled JSON extraction
+in this codebase, though that code is ACME-specific and not reusable
+as-is — this task builds a general-enough encode/decode pair for the
+gateway's own use, not a shared library.
+
+Scope:
+
+- **Decode**: parse a JSON object into a small fixed set of typed fields
+  the caller requests by key (string, integer, boolean, nested
+  object/array where an endpoint needs one) — no need for a fully generic
+  DOM/tree JSON value type if the fixed-shape approach covers every
+  endpoint in `TASK-132`–`TASK-135`.
+- **Encode**: build a JSON response from C values — string escaping
+  (including control characters and the vault's base64-ish wrapped-key
+  blobs), integers, booleans, arrays of objects (e.g. file listings).
+- Reject malformed/truncated JSON cleanly (no silent partial-parse,
+  no unbounded recursion on deeply nested attacker-controlled input).
+
+## Acceptance criteria
+
+- Round-trips every request/response shape needed by `TASK-132`–`TASK-135`
+  (auth, file ops, sharing, vault registry), verified by unit tests.
+- String escaping is correct for all control characters and non-ASCII
+  filenames (the file browser will render arbitrary user filenames — see
+  `TASK-138`'s XSS note).
+- No unbounded recursion/stack depth on nested-object input — SEC.07 should
+  specifically check this, matching the project's "buffer overflow, integer
+  overflow" C-parser review responsibility.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
+initial implementation wave. Tagged `security-sensitive` for the same
+reason as `TASK-129` — a hand-rolled parser handling client-controlled
+input.
+
+WEB.09 [2026-08-10]: Implemented (`src/gateway/vw_json.{h,c}`), with a
+different shape than originally sketched: rather than a fixed-field
+decoder, it's a small object/array field-extractor (`vw_json_object_get`,
+`vw_json_array_foreach`) returning raw value spans, plus separate
+`vw_json_string_decode` (unescape) and a streaming `vw_json_writer_t` for
+encoding. This still avoids a general DOM/tree type as originally intended,
+just via a slightly different API shape than the filing sketched.
+
+Recursion-safety (the main acceptance criterion): decoding never makes a
+recursive function call at any nesting depth. `skip_value`'s internal
+handling of nested `{}`/`[]` uses an iterative bracket-depth counter over
+the *same* bracket type the value opened with, treating the other bracket
+type as an ordinary character while inside — this is correct (not just
+fast) because valid JSON guarantees each bracket type is independently
+balanced regardless of what's nested inside it; traced through mixed
+nesting (`{"a":[{"x":1},{"y":2}]}`) and same-type nesting
+(`[[1,2],[3,4]]`) by hand to confirm. A caller wanting to look inside a
+returned ARRAY/OBJECT span explicitly re-invokes
+`vw_json_object_get`/`_array_foreach` on it — recursion depth is bounded by
+how many times the gateway's own code does that (fixed and small for this
+project's endpoint shapes), never by attacker-controlled input depth.
+
+Other scope notes:
+- NUMBER values are integers only, by design — a value containing
+  `.`/`e`/`E` is rejected as `VW_ERR_PROTO_INVALID` rather than silently
+  truncated by `strtoll` (the failure mode called out as a risk during
+  design).
+- `vw_json_string_decode` handles `\uXXXX` including surrogate pairs,
+  decoding to UTF-8 — needed since `TASK-138`'s file browser will round-trip
+  arbitrary (non-ASCII) filenames through this layer.
+- The writer (`vw_json_write_string` in particular) escapes all control
+  characters and `"`/`\`, which is what makes `TASK-138`'s filename-XSS
+  concern a browser-rendering problem rather than a JSON-encoding one —
+  called out explicitly in `vw_json.h`'s doc comment so this connection
+  isn't lost.
+
+Verified: compiles clean under MSVC `/W4 /WX` as part of `TASK-128`'s
+build. Same gap as `TASK-129`: no automated unit test yet exercising
+malformed/deeply-nested/truncated input — reasoned through by hand (traced
+several nesting cases above) but not yet fuzzed or unit-tested. Flagging
+for the reviewer, same as `TASK-129`.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
+`security-sensitive` tag, with the test gap above called out explicitly.

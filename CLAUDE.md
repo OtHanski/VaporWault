@@ -29,6 +29,7 @@ architecture notes to make authorship and routing unambiguous.
 | QA.06   | QA / Integration Tester     | Testing, validation               |
 | SEC.07  | Security Reviewer           | Security audit                    |
 | CQR.08  | Code Quality Reviewer       | Code quality, consistency         |
+| WEB.09  | Web Gateway / Frontend Dev  | Browser client, HTTP/JSON gateway |
 
 ---
 
@@ -187,6 +188,39 @@ Writes: review findings tagged `blocking` or `advisory`, style decisions that ap
 project-wide (recorded in `docs/STYLE.md`)
 
 **Tech**: All C/C++ in the repository
+
+---
+
+### WEB.09 — Web Gateway / Frontend Developer
+
+**Responsibilities**
+- Owns `vapourwault-web-gateway`: a standalone executable that speaks the wire protocol
+  (`vw/1`) directly to the VaporWault server as its own authenticated client — it is a
+  sibling of the client daemon, not a bridge over its IPC — and translates it to an
+  HTTP/JSON API consumed by the browser frontend
+- Owns the static HTML/TypeScript frontend: file browser, upload/download with progress,
+  login/2FA, version history, sharing/public-link management, vault create/unlock/browse
+- In-browser cryptography for the E2EE vault: Argon2id (via a WASM build of the existing
+  vendored Argon2 source) and AES-256-GCM (via `SubtleCrypto`) — the passphrase and
+  plaintext must never reach the gateway process; only wrapped keys and ciphertext cross
+  that boundary
+- Session lifecycle for browser clients: one live server session per logged-in browser,
+  keyed by a gateway-issued session identifier
+
+**Constraint**: No SPA framework — plain TypeScript compiled to static assets, served by
+nginx, which reverse-proxies `/api/*` to the gateway over loopback HTTP (nginx terminates
+browser-facing TLS; the gateway's own TLS 1.3 connection to the VaporWault server reuses
+`vw_core` like every other client). The gateway trusts nginx as its sole upstream, so it
+does not need to handle malformed or non-HTTP/1.1 traffic itself.
+
+**TODO interactions**  
+Reads: ARCH.00-assigned tasks, SEC.07 findings on the gateway/frontend, PRT.04's
+`docs/PROTOCOL.md` (consumed as-is; this role does not modify the wire protocol)  
+Writes: completed gateway/frontend tasks, protocol questions for PRT.04 (never
+unilaterally reinterpreted), out-of-domain issues discovered
+
+**Tech**: C (gateway), TypeScript/HTML/CSS (frontend), minimal external deps in both —
+see `ARCHITECTURE.md`'s Approved External Dependencies table
 
 ---
 

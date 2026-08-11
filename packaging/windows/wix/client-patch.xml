@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CPack WIX patch file for the `client` component MSI (TASK-148).
+
+  WiX requires every Component to be referenced by some Feature or it is
+  silently excluded from the installed tree. CPack's auto-generated
+  features.wxs defines <FeatureRef Id="CM_C_client"> listing the client
+  component's own binaries — this patch adds a <ComponentRef> for the
+  register-client-task.ps1 component defined in client-extra.wxs (see its
+  header comment) into that same FeatureRef, matched by Id.
+
+  FRAGILITY NOTE: "CM_C_client" is CPack's auto-derived Feature id for the
+  `client` CPack component (COMPONENT client in CMakeLists.txt's
+  install()). If that CPack component name ever changes, this patch's
+  target id changes too and it silently stops matching (verify the
+  compiled MSI's Feature table still includes the task-script component
+  after any such rename, the same caution as server-patch.xml's).
+-->
+<CPackWiXPatch>
+  <CPackWiXFragment Id="CM_C_client">
+    <ComponentRef Id="CM_C_ClientTaskScript" />
+  </CPackWiXFragment>
+</CPackWiXPatch>

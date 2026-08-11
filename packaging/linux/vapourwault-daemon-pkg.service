@@ -1,0 +1,27 @@
+# vapourwault-daemon-pkg.service — used ONLY by the .deb/.rpm package
+# installs (TASK-149/150/152), which place the binary at /usr/bin/. This
+# is deliberately a separate file from vapourwault-daemon.service (used by
+# client_install.sh's manual/tarball install, which places the binary at
+# $HOME/.local/bin/ instead) — a real bug this session found by actually
+# starting the packaged service via `systemctl --user` in a disposable
+# container: the shared unit file's `ExecStart=%h/.local/bin/...` doesn't
+# exist at all for a package install, so the service failed with
+# systemd's exit code 203 (exec: file not found) every time. Keep these
+# two files in sync for everything EXCEPT the ExecStart binary path.
+[Unit]
+Description=VaporWault client sync daemon
+Documentation=https://github.com/vapourwault/vapourwault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vapourwault-daemon --state-dir %h/.local/share/vapourwault
+Restart=on-failure
+RestartSec=10s
+
+# Give the daemon time to finish an in-progress sync before we kill it.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

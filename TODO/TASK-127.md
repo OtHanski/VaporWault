@@ -1,0 +1,182 @@
+---
+id:          TASK-127
+title:       Design web gateway + browser client architecture
+status:      done
+assignee:    ARCH.00
+created_by:  ARCH.00
+created:     2026-08-10
+priority:    high
+depends_on:  []
+blocks:      [TASK-128, TASK-129, TASK-130, TASK-131, TASK-132, TASK-133, TASK-134, TASK-135, TASK-136, TASK-142]
+review_by:   [SEC.07, CQR.08]
+tags:        [protocol, gateway, web, client, server, security-sensitive]
+---
+
+Otto asked for a browser-accessible UI for VaporWault: a simple nginx-hostable
+static page, HTML/TypeScript rather than a heavy SPA framework. A codebase
+scoping pass (three parallel explorations, 2026-08-10) confirmed there is no
+web-facing surface anywhere today — no HTTP server, no JSON library, no
+REST/WebSocket mention in `ARCHITECTURE.md` or `TODO/`. Both existing
+frontends (CLI, ImGui GUI) are thin clients of the local
+`vapourwault-daemon`'s loopback-only binary IPC protocol (`src/client/vw_ipc.h`,
+port 47832, no TLS, one-shot connections, OS-peer-identity trust) — neither
+talks to the VaporWault server directly. A web UI needs an entirely new
+component; it cannot be bolted onto anything that already speaks HTTP.
+
+Two architectural decisions were made with Otto before this design was
+written up (recorded in `ARCHITECTURE.md`'s Architectural Decisions table):
+
+1. **Independent protocol client, not an IPC bridge.** The new component
+   (`vapourwault-web-gateway`) authenticates and drives `vw/1` directly
+   against the server — architecturally a sibling of `vapourwault-daemon`,
+   not a client of it — so the web UI works from any browser, not only one
+   sitting next to a running daemon. It reuses `vw_core` (TLS/framing/crypto)
+   and `src/client/vw_client_core.c` directly (compiled into the gateway's
+   source list, the same "no shared lib, reuse the source file" pattern
+   `vapourwault-cli`/`vapourwault-gui` already use for `vw_ipc.c` — see
+   `src/gui/client/CMakeLists.txt`). It does **not** link `vw_sync`/`vw_cache`/
+   `vw_daemon`: the gateway is request/response per browser action, not a
+   persistent local-folder sync engine.
+2. **In-browser vault decryption.** For E2EE vault files, the passphrase and
+   plaintext never reach the gateway. Argon2id KEK derivation (via a WASM
+   build of the already-vendored Argon2 reference source, `third_party/`
+   `FetchContent`) and AES-256-GCM decrypt (via `SubtleCrypto`) run in
+   TypeScript in the browser. The gateway only ever handles ciphertext and
+   wrapped keys — preserving the zero-knowledge property `TASK-089`'s vault
+   design was built around.
+
+Full module map, dependency graph, repo-structure entries, and a new Phase 11
+row are now in `ARCHITECTURE.md` (2026-08-10 edit). Key points not obvious
+from those tables:
+
+- **HTTP/JSON layer is hand-rolled, not vendored.** nginx is mandatory in
+  front of the gateway in this deployment model and is its only upstream —
+  the gateway never has to parse malformed/non-HTTP1.1/raw browser traffic,
+  which is most of what makes a general-purpose HTTP server non-trivial.
+  Given the project's existing "hand-roll rather than vendor a heavy dep"
+  precedent (`vw_acme.c`'s minimal JSON scraper), a new `vw_http`/`vw_json`
+  pair (`src/gateway/`) is the better fit than adding a third-party HTTP
+  server library to `ARCHITECTURE.md`'s Approved External Dependencies
+  table — one less external attack surface for SEC.07 to review. TypeScript
+  build tooling (`tsc`/esbuild) is dev-time only and does not ship to the
+  browser, so it doesn't count against the "minimal external dependencies"
+  constraint the same way a runtime C dependency would.
+- **New agent role.** This component doesn't fit any existing agent's scope
+  — GUI.03 is Dear ImGui/C++ specifically, CLI.02 is the sync engine,
+  SRV.01 is the server. Added `WEB.09 — Web Gateway / Frontend Developer`
+  to `CLAUDE.md` (2026-08-10 edit) covering both the new gateway component
+  and the TypeScript frontend, since they're one tightly-coupled feature.
+- **Gateway session model is new work.** `vapourwault-daemon` only ever
+  needs one server session (single desktop user); the gateway is a genuine
+  multi-user, multi-session process — one live `vw_client_sess_t` per
+  logged-in browser session, keyed by a gateway-issued session identifier,
+  with real lifecycle/timeout/concurrency-safety requirements that don't
+  exist anywhere in the codebase today.
+- **Progress reporting needs no new status API.** The existing IPC status
+  message only carries aggregate pending-upload/download counts
+  (`vw_ipc.h`'s `VW_IPC_STATUS_RESP`) — no per-file byte progress crosses
+  any boundary today. Not a gap here: the browser drives the chunk-upload/
+  download loop itself (`CHUNK_QUERY`/`CHUNK_UPLOAD`/`CHUNK_DOWNLOAD_REQ`,
+  per `docs/PROTOCOL.md` §9), so per-file progress falls out for free
+  without a new wire message.
+- **Carried-forward hardening item, not new scope for this task:** the
+  client daemon's `session.tok` file has no real Windows ACL restriction
+  today (`vw_daemon.c:246`'s comment claims one that isn't actually applied)
+  and no OS keychain integration anywhere. The gateway's own session storage
+  should not copy that gap forward into a richer, more attractive target —
+  flagged for `TASK-131` and `TASK-144`, not solved by this design task.
+
+## Acceptance criteria
+
+- Design covers: integration point (independent `vw/1` client), HTTP/JSON
+  approach (hand-rolled, nginx-fronted), vault-decryption locus (in-browser),
+  session model, and the new-agent-role decision — all now in `CLAUDE.md`
+  and `ARCHITECTURE.md`.
+- SEC.07 reviews this design (new externally-reachable attack surface,
+  session/auth handling, and the vault zero-knowledge boundary) before any
+  implementation task in the initial wave (`TASK-128`–`TASK-141`) is picked
+  up for real, per the `security-sensitive` tag and this project's standing
+  practice for high-risk designs (`TASK-089`).
+- Follow-up implementation tasks filed with `depends_on: [TASK-127]`:
+  `TASK-128`–`TASK-144` (18 tasks total — gateway core, HTTP/JSON layer,
+  session manager, auth/file/sharing/vault endpoints, frontend views and
+  in-browser crypto, packaging, integration tests, security review).
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-08-10]: Design published in `ARCHITECTURE.md` and `CLAUDE.md`
+per the decisions above, reached in direct discussion with the project
+owner. Filing the initial implementation wave now (`TASK-128`–`TASK-144`),
+same pattern `TASK-089` used for the vault feature — implementation tasks
+are filed alongside the design so dependency edges are visible immediately,
+even though they're blocked on this task's `review` status closing.
+
+Moving to `review`: design-and-publish is this task's actual scope, and per
+its own acceptance criteria SEC.07 must sign off (tagged `security-sensitive`
+for the reasons above — new externally-reachable surface, session/auth
+handling, and the vault E2EE boundary) before this closes and before
+`TASK-128` onward can start in earnest. Not fabricating that sign-off here —
+it's a real review pass for whichever agent/session picks this up next.
+
+SEC.07 [2026-08-10]: Adversarial design review complete. Three `blocking`
+findings, all now resolved in `ARCHITECTURE.md`'s Architectural Decisions
+table:
+
+**Blocking (resolved):**
+
+1. **No mandatory cap on the gateway's session pool.** `TASK-131`'s original
+   wording ("a concurrency limit / eviction policy so one gateway process
+   can't be trivially exhausted") was advisory phrasing for what is
+   actually a hard requirement — an unbounded pool of live `vw_client_sess_t`
+   connections is a trivial single-request-loop DoS against a shared,
+   multi-user process, unlike the daemon (one session, one desktop user,
+   not attacker-reachable the same way). **Resolved**: added to
+   `ARCHITECTURE.md`'s Gateway session model decision row as a mandatory
+   hard cap, not a recommendation.
+2. **No explicit requirement that the gateway verify the server's TLS
+   certificate.** `vw_net_connect`'s `cert_verify` parameter makes
+   `VW_CERT_VERIFY_NONE` one flag away — fine for its designed test-only
+   escape hatch, but nothing in the original design explicitly ruled it out
+   for the gateway's own server connection, and a convenience-driven
+   default during implementation is a plausible failure mode (this project
+   has precedent for exactly that kind of gap — see the Windows session-
+   file ACL comment that claimed a restriction that was never actually
+   applied, `vw_daemon.c:246`). **Resolved**: added as an explicit
+   `ARCHITECTURE.md` decision — `VW_CERT_VERIFY_REQUIRED` with a real CA
+   cert path is mandatory.
+3. **No stated bind-address default for the gateway's own HTTP listener.**
+   `TASK-129`'s hand-rolled `vw_http` scoping (parser assumes nginx as sole
+   upstream, deliberately skips handling malformed/non-HTTP1.1 traffic) is
+   only safe if the listener is actually unreachable except through nginx.
+   The original design stated this as an operational assumption
+   (`TASK-142`'s deployment doc) but not as a gateway-enforced default —
+   a deployment mistake (e.g. a misconfigured container network) could
+   expose the reduced-hardening listener directly. **Resolved**: added as
+   an explicit `ARCHITECTURE.md` decision — the gateway defaults to binding
+   `127.0.0.1` only; exposing it more broadly requires an explicit,
+   documented opt-in, not the default.
+
+**Advisory:**
+
+- `TASK-132`'s login endpoint relies entirely on the server's existing
+  `AUTH_FAIL` lockout behavior (per-account, server-side) for brute-force
+  protection — confirmed sufficient since every login attempt still
+  round-trips through a real `AUTH_REQUEST` to the server; the gateway
+  adds no new unthrottled guess surface. No change needed, noted for the
+  record so a future reviewer doesn't have to re-derive this.
+
+**Verified sound:** the core integration-point decision (independent `vw/1`
+client, not an IPC bridge), the in-browser-only vault decryption boundary,
+and the new `WEB.09` role split are all architecturally sound and
+consistent with this project's existing patterns (source-file reuse
+instead of a new shared lib, per-module ownership by tech stack).
+
+ARCH.00 [2026-08-10]: All three blocking findings resolved in
+`ARCHITECTURE.md` as SEC.07 describes above; the advisory required no
+change. Re-checked each new decision row against the finding it responds to
+— confirmed accurate. `TASK-131`'s session-cap language and `TASK-129`'s
+scoping note will get their acceptance criteria tightened to match when
+those tasks are picked up. SEC.07 sign-off requirement satisfied. Moving
+status to `done`. `TASK-128` is cleared to start.

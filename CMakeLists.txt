@@ -71,6 +71,13 @@ option(VW_BUILD_CLIENT "Build the client daemon and CLI" ON)
 option(VW_BUILD_GUI    "Build GUI targets (requires VW_BUILD_SERVER or VW_BUILD_CLIENT)" ON)
 option(VW_BUILD_TOOLS  "Build admin tools (vwdump)" ON)
 option(VW_BUILD_TESTS  "Build unit and integration tests" ON)
+option(VW_BUILD_WEB_GATEWAY "Build vapourwault-web-gateway (TASK-127/128)" OFF)
+
+# Release version for installer packages (TASK-145/146). Local/dev builds
+# default to a clearly-non-release value; CI passes the real tag with the
+# leading "v" stripped (e.g. -DVW_VERSION=0.2.0 for tag v0.2.0), since
+# .deb/.rpm/MSI version fields don't accept an arbitrary leading letter.
+set(VW_VERSION "0.0.0-dev" CACHE STRING "VaporWault release version (no leading 'v')")
 
 # Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -102,6 +109,10 @@ if(VW_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+if(VW_BUILD_WEB_GATEWAY)
+    add_subdirectory(src/gateway)
+endif()
+
 if(VW_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
@@ -116,30 +127,82 @@ endif()
 # Usage: cmake --install <build-dir> [--prefix /usr/local]
 # Installs binaries to <prefix>/bin and (on Linux) the systemd unit file.
 
+# COMPONENT tags below (server/client) drive TASK-146's CPack packaging —
+# see cmake/Packaging.cmake. The web gateway has no installer component yet
+# (TASK-128 built it as a plain executable only); file a follow-up if/when
+# it needs one.
+
 if(VW_BUILD_SERVER)
     install(TARGETS vapourwaultd vapourwault-server-cli
-            RUNTIME DESTINATION bin)
+            RUNTIME DESTINATION bin
+            COMPONENT server)
 endif()
 
 if(VW_BUILD_SERVER AND VW_BUILD_GUI)
     install(TARGETS vapourwault-server-gui
             RUNTIME DESTINATION bin
-            OPTIONAL)
+            OPTIONAL
+            COMPONENT server)
+endif()
+
+if(VW_BUILD_SERVER AND VW_BUILD_TOOLS)
+    install(TARGETS vwdump
+            RUNTIME DESTINATION bin
+            COMPONENT server)
 endif()
 
 if(VW_BUILD_CLIENT)
     install(TARGETS vapourwault-daemon vapourwault-cli
+            RUNTIME DESTINATION bin
+            COMPONENT client)
+endif()
+
+if(VW_BUILD_CLIENT AND VW_BUILD_GUI)
+    install(TARGETS vapourwault-gui
+            RUNTIME DESTINATION bin
+            OPTIONAL
+            COMPONENT client)
+endif()
+
+if(VW_BUILD_WEB_GATEWAY)
+    install(TARGETS vapourwault-web-gateway
             RUNTIME DESTINATION bin)
 endif()
 
 if(UNIX AND NOT APPLE)
     install(FILES packaging/linux/vapourwaultd.service
             DESTINATION lib/systemd/system
-            OPTIONAL)
+            OPTIONAL
+            COMPONENT server)
     if(VW_BUILD_CLIENT)
-        install(FILES packaging/linux/vapourwault-daemon.service
+        # NOT vapourwault-daemon.service (that one is for
+        # client_install.sh's manual/tarball path, ExecStart=%h/.local/bin/...
+        # which doesn't exist for a package install) -- see
+        # vapourwault-daemon-pkg.service's own header comment. Installed
+        # under the package's real name so `systemctl --user` sees
+        # "vapourwault-daemon.service" either way.
+        install(FILES packaging/linux/vapourwault-daemon-pkg.service
                 DESTINATION lib/systemd/user
+                RENAME vapourwault-daemon.service
+                OPTIONAL
+                COMPONENT client)
+    endif()
+    if(VW_BUILD_WEB_GATEWAY)
+        install(FILES packaging/linux/vapourwault-web-gateway.service
+                DESTINATION lib/systemd/system
                 OPTIONAL)
+    endif()
+    # Config templates for the DEB/RPM postinst scripts (TASK-149/150) to
+    # install as /etc/vapourwault/server.conf / daemon.conf, only if absent.
+    if(VW_BUILD_SERVER)
+        install(FILES packaging/linux/server.conf.example
+                DESTINATION share/vapourwault
+                COMPONENT server)
+    endif()
+    if(VW_BUILD_CLIENT)
+        install(FILES packaging/linux/client.conf.example
+                DESTINATION share/vapourwault
+                COMPONENT client)
     endif()
 endif()
 
@@ -166,3 +229,8 @@ if(UNIX AND VW_BUILD_SERVER AND VW_BUILD_TESTS)
         USES_TERMINAL
     )
 endif()
+
+# ── Installer packaging (CPack: DEB/RPM/WIX) ─────────────────────────────────
+# TASK-145/146. Split into its own file for readability; see
+# cmake/Packaging.cmake and docs/RELEASE.md.
+include(cmake/Packaging.cmake)

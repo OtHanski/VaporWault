@@ -16,9 +16,9 @@ On every push of a tag matching `v*`, three jobs run:
 
 | Job             | Runner           | Produces |
 |-----------------|------------------|----------|
-| `build-linux`   | `ubuntu-latest`  | `vaporwault-<tag>-linux-x86_64.tar.gz` (+ `.sha256`) |
-| `build-windows` | `windows-latest` | `vaporwault-<tag>-windows-x86_64.zip` (+ `.sha256`) |
-| `publish`       | `ubuntu-latest`  | A GitHub Release named `<tag>` with both archives attached |
+| `build-linux`   | `ubuntu-latest`  | `vaporwault-<tag>-linux-x86_64.tar.gz` (+ `.sha256`), plus `vapourwault-server`/`vapourwault-client` `.deb` and `.rpm` packages |
+| `build-windows` | `windows-latest` | `vaporwault-<tag>-windows-x86_64.zip` (+ `.sha256`), plus `vapourwault-server`/`vapourwault-client` `.msi` installers |
+| `publish`       | `ubuntu-latest`  | A GitHub Release named `<tag>` with all of the above attached |
 
 Both platform builds compile with `CMAKE_BUILD_TYPE=Release`, `VW_WERROR=ON`
 (matching CI's warning bar), `VW_BUILD_TESTS=OFF` (correctness is already validated
@@ -33,6 +33,68 @@ server/client/tools:
 - `vapourwault-server-gui`, `vapourwault-gui` (GUI, GUI-enabled builds only)
 - `vwdump` (admin tool)
 - `README.md`
+
+### Installer packages (`.deb` / `.rpm` / `.msi`)
+
+Since `TASK-145`–`TASK-151`, the workflow also builds proper OS-native
+installer packages via CMake's CPack (`cmake/Packaging.cmake`), one per
+component — **`server`** and **`client`** are independently installable,
+matching how `packaging/linux/install.sh` vs `client_install.sh` (and the
+two `Install-VaporWault*.ps1` scripts) were always split. These packages
+are additive: the plain tarball/zip above is still produced and still
+useful for scripted or air-gapped deployments.
+
+| Format | Server package | Client package |
+|--------|---------------|----------------|
+| Debian/Ubuntu (`.deb`) | `vapourwault-server_<version>_amd64.deb` | `vapourwault-client_<version>_amd64.deb` |
+| Fedora/RHEL (`.rpm`)   | `vapourwault-server-<version>-1.x86_64.rpm` | `vapourwault-client-<version>-1.x86_64.rpm` |
+| Windows (`.msi`)       | `vapourwault-server-<version>-win64.msi` | `vapourwault-client-<version>-win64.msi` |
+
+What each package does on install (maintainer scripts:
+`packaging/linux/scripts/`; WiX fragments: `packaging/windows/wix/`):
+
+- **Server** (`.deb`/`.rpm`/`.msi`, requires root/Administrator): creates
+  the `vapourwault` system user, `/etc/vapourwault`, `/var/lib/vapourwault`,
+  `/run/vapourwault` (or the Windows equivalents), installs a
+  `server.conf` template only if one doesn't already exist, and registers
+  the service (`systemd` unit on Linux, a real Windows Service —
+  `ServiceInstall`/`ServiceControl` — plus a firewall rule on Windows). It
+  does **not** enable/start the service automatically — configure
+  `server.conf` first, then start it yourself (same philosophy
+  `install.sh` always used).
+- **Client** (`.deb`/`.rpm`/`.msi`, no elevation required): installs the
+  daemon/CLI binaries and a systemd **user** unit
+  (`/usr/lib/systemd/user/`, available to any user via `systemctl --user`)
+  or, on Windows, registers a per-user Scheduled Task (logon trigger) via
+  an MSI custom action. Since the daemon is a per-user service, the
+  package itself does not (and cannot, from a root-run install script)
+  start it for a specific user — run `systemctl --user enable --now
+  vapourwault-daemon` (Linux) yourself after installing, or let the
+  Windows Scheduled Task start at your next logon.
+
+**Removing a package — DEB and RPM behave differently, by design of each
+ecosystem, not a bug**:
+
+| Action | DEB | RPM |
+|--------|-----|-----|
+| `apt remove` / `dnf remove` | Keeps config (`/etc/vapourwault`) and data (`/var/lib/vapourwault`) | **Deletes everything** — RPM has no separate "purge" concept distinct from final removal |
+| `apt purge` | Deletes config, data, and the `vapourwault` system user | *(not applicable — `dnf remove` already does this)* |
+
+If you're moving from Debian/Ubuntu habits to a Fedora/RHEL host, note that
+`dnf remove` is the equivalent of `apt purge`, not `apt remove` — there is
+no gentler removal option on the RPM side. An in-place **upgrade**
+(`apt install` over an existing version, or `rpm -U`/`dnf upgrade`) never
+deletes config or data on either format, and an admin-edited `server.conf`
+is never overwritten by a reinstall or upgrade on any package format.
+
+**These packages are unsigned.** No code-signing certificate or GPG
+signing key currently exists for this project. Installing them will
+trigger the normal OS warnings for unsigned software — `apt`/`dnf` will
+warn about an unsigned package (still installable, since these aren't
+pulled from a signed repository at all), and Windows will show its usual
+SmartScreen/unknown-publisher prompt for the `.msi`. This is an accepted
+gap, not an oversight — revisit if/when this project sets up
+code-signing infrastructure.
 
 ## 2. Cutting a release
 
@@ -110,7 +172,28 @@ sha256sum sdl2.zip
 local/manual vendoring — keep that minimum consistent with whatever version
 `release.yml` pins when bumping either one.
 
-## 6. Security notes
+## 6. WiX Toolset vendoring (Windows installer build)
+
+CPack's WIX generator (used to build the `.msi` installers, `TASK-147`/`TASK-148`)
+needs WiX Toolset **v3** (`candle.exe`/`light.exe` — not the newer v4/v5 unified
+CLI). `windows-latest` doesn't ship it, so the workflow installs it via
+Chocolatey (`choco install wixtoolset`) first. If that fails, it falls back to
+fetching the `wix` NuGet package directly (a plain zip containing the same
+binaries) and adding its `tools/` directory to `PATH` — this fallback path is
+proven to work (it's exactly how this feature's own implementation was verified,
+since the Chocolatey install hit a sandbox-specific permission error in that
+environment) but has not been exercised by a real CI run yet, since the primary
+`choco` path hasn't been confirmed to fail there. Watch the "Install WiX Toolset
+v3" step's log on the first real release build to see which path was taken.
+
+`cpack -G WIX` is invoked **twice** — once per component (`server`, `client`),
+each with its own `CPACK_WIX_UPGRADE_GUID` (permanently fixed per product; never
+regenerate) and its own `CPACK_PACKAGE_FILE_NAME` override. The explicit filename
+override matters: without it, both invocations produce the same default filename
+and the second silently overwrites the first's `.msi` — a real bug caught while
+building this feature, not a hypothetical.
+
+## 7. Security notes
 
 - The workflow's default token permission is `contents: read`; only the `publish`
   job elevates to `contents: write` (needed for `gh release create`/`upload`).
@@ -119,9 +202,15 @@ local/manual vendoring — keep that minimum consistent with whatever version
   `$env:TAG`) — never interpolated directly as a `${{ }}` expression inside a
   `run:` block. Direct interpolation of ref-controlled values into a shell script
   is a known GitHub Actions script-injection vector; this workflow was reviewed
-  and fixed for that pattern (see `TODO/TASK-081.md`).
+  and fixed for that pattern (see `TODO/TASK-081.md`). `PKG_VERSION` (the
+  installer packages' version string, `TASK-151`) follows the same discipline —
+  derived from `$TAG`/`$env:TAG`, never from a raw `${{ }}` expression.
+- The installer packages' maintainer scripts (`packaging/linux/scripts/`) run as
+  root during install/removal on the end user's machine, and the client MSI's
+  custom action shells out to PowerShell (`packaging/windows/wix/`) — reviewed
+  for the same class of argument-injection risk as above; see `TODO/TASK-153.md`.
 
-## 7. Known limitations / follow-ups
+## 8. Known limitations / follow-ups
 
 Tracked in `TODO/TASK-082.md`:
 
@@ -135,3 +224,15 @@ Tracked in `TODO/TASK-082.md`:
 - Third-party actions (`actions/checkout`, `actions/upload-artifact`,
   `actions/download-artifact`, `ilammy/msvc-dev-cmd`) are pinned to version tags,
   not commit SHAs, matching `ci.yml`'s existing convention.
+
+Tracked in `TODO/TASK-151.md`/`TASK-152.md` (installer packages, `TASK-145`):
+
+- The packages themselves have been installed, upgraded, and removed for real in
+  disposable containers/build environments during development (see
+  `TODO/TASK-149.md`/`TASK-150.md`'s implementation notes) — but never yet
+  through an actual GitHub Actions run of this workflow. The `choco`-vs-NuGet-zip
+  WiX fallback (§6 above) and the `gh release create`/`upload` step with the
+  larger 8-artifact file list are both unverified against the real runner
+  environment.
+- No automated test installs the Windows MSIs on a real Windows machine — that
+  remains manual/VM-based verification (`TODO/TASK-152.md`).

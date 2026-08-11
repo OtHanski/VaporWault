@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CPack WIX patch file for the `server` component MSI (TASK-147).
+
+  Injects a ServiceInstall/ServiceControl pair and a firewall exception
+  into the auto-generated <Component> that carries vapourwaultd.exe,
+  matched by the Id CPack derives from the install destination
+  (COMPONENT server, RUNTIME DESTINATION bin -> "server/bin/vapourwaultd.exe"
+  -> "CM_CP_server.bin.vapourwaultd.exe"). This is what actually replaces
+  Install-VaporWault.ps1's manual New-Service/sc.exe/New-NetFirewallRule
+  calls for this install path — those scripts are kept as-is for the
+  manual/advanced path (TASK-145's design), not removed.
+
+  FRAGILITY NOTE: the "CM_CP_server.bin.vapourwaultd.exe" id is derived
+  mechanically by CPack from the install() COMPONENT/DESTINATION in
+  CMakeLists.txt. If that COMPONENT name or RUNTIME DESTINATION ever
+  changes, this id changes too and this patch silently stops matching
+  (CPack does not error on an unmatched CPackWiXFragment id — verify this
+  patch is still being applied after any install() destination change, by
+  checking the compiled MSI actually registers the service, e.g. via
+  `msiexec /a` extraction + `light.exe`'s own build log, not just that the
+  build succeeds).
+
+  Requires -D CPACK_WIX_EXTENSIONS=WixFirewallExtension at cpack
+  invocation time (see docs/RELEASE.md) for the fire: namespace elements
+  below to resolve.
+-->
+<CPackWiXPatch>
+  <CPackWiXFragment Id="CM_CP_server.bin.vapourwaultd.exe">
+    <ServiceInstall
+        Id="VaporWaultServerServiceInstall"
+        Type="ownProcess"
+        Name="VaporWault"
+        DisplayName="VaporWault Cloud File Server"
+        Description="VaporWault self-hosted file sync server"
+        Start="auto"
+        Account="LocalSystem"
+        ErrorControl="normal"
+        Arguments="--config &quot;[CommonAppDataFolder]VaporWault\server.conf&quot;" />
+    <ServiceControl
+        Id="VaporWaultServerServiceControl"
+        Name="VaporWault"
+        Start="install"
+        Stop="both"
+        Remove="uninstall"
+        Wait="yes" />
+    <fire:FirewallException
+        xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension"
+        Id="VaporWaultServerFirewallRule"
+        Name="VaporWault-TLS"
+        Port="4430"
+        Protocol="tcp"
+        Scope="any" />
+  </CPackWiXFragment>
+</CPackWiXPatch>

@@ -13,8 +13,12 @@ VaporWault is a self-hosted cloud file hosting system. It consists of:
 - **Client daemon** (Linux + Windows): background process that syncs local folders to the server
 - **GUIs** (C++ / Dear ImGui): thin clients that connect to the server GUI process or local client daemon via IPC
 - **CLIs** (pure C): also thin clients connecting to the server process or local client daemon via IPC
+- **Web gateway + browser client** (Linux; design published 2026-08-10, `TASK-127`): a
+  standalone executable that speaks `vw/1` directly to the server as its own authenticated
+  client (a sibling of the client daemon, not a bridge over its IPC), translating it to an
+  HTTP/JSON API for a static HTML/TypeScript frontend served by nginx. Owned by `WEB.09`.
 
-All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure C except the Dear ImGui GUIs (C++).
+All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure C except the Dear ImGui GUIs (C++) and the web frontend (TypeScript/HTML/CSS).
 
 ---
 
@@ -52,6 +56,19 @@ All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure
 | Oplog two-phase commit | confirmed byte (u8, NOT CRC-covered) at offset 16 in each entry header | Allows in-place atomic confirm write without CRC recomputation; seg_scan uses `continue` (not `break`) on confirmed==0 to preserve confirmed entries that follow unconfirmed holes in concurrent transaction patterns |
 | vw_net recv timeout | Per-connection `_Atomic uint32_t recv_timeout_ms` in struct vw_conn; custom BIO callbacks read it directly | Allows per-connection deadlines without mutating the shared ssl_config; set via vw_net_conn_set_recv_timeout() post-accept |
 | AUTH_FAIL lockout_remaining_secs | u16 (max 65535s) | u8 (max 255s) cannot represent the 600-second OTP lockout window; wire format change introduced in protocol v2 |
+| Web UI integration point | New independent `vw/1` client (web gateway), not a bridge over the daemon's loopback IPC | Works from any browser without a local daemon running; the daemon IPC has no TLS and assumes a trusted local OS peer, wrong trust model for a browser-facing service (`TASK-127`) |
+| Gateway HTTP/JSON layer | Hand-rolled minimal HTTP/1.1 parser + JSON encoder/decoder (new `vw_http`/`vw_json` modules), no vendored HTTP server library | nginx is the mandatory front door in this deployment model and is the gateway's only upstream, so the gateway never has to handle malformed/non-HTTP1.1/chunked-edge-case traffic — a full general-purpose HTTP server is more than the actual requirement; avoids adding a third-party HTTP server's attack surface to `ARCHITECTURE.md`'s dependency table, consistent with the project's existing hand-rolled-JSON precedent in `vw_acme.c` (`TASK-127`) |
+| Vault decryption locus for the web client | In-browser (TypeScript/WASM), never the gateway | Preserves the zero-knowledge property `TASK-089`'s vault design was built around — the gateway only ever sees ciphertext and wrapped keys, never the passphrase or plaintext (`TASK-127`) |
+| Gateway session model | One live `vw_client_sess_t` per logged-in browser session, keyed by a gateway-issued session identifier, held in a gateway-managed pool, with a **mandatory hard concurrency cap** | The gateway is a genuine multi-user, multi-session server process (unlike the single-user daemon), so session lifecycle/isolation is new work, not reused from `vw_daemon`'s single-session assumption; the cap is mandatory (not merely recommended) since an unbounded session pool is a trivial resource-exhaustion DoS against a single shared process (`TASK-127`, hardened during SEC.07 review) |
+| Gateway↔server TLS verification | `vw_client_cfg_t.cert_verify` MUST be `VW_CERT_VERIFY_REQUIRED` with a real `ca_cert_pem_path`, never `VW_CERT_VERIFY_NONE` | `vw_net_connect`'s API makes disabling verification one flag away, which is fine for the test-only escape hatch it was designed for but unacceptable for a production gateway process authenticating real users — enforced as a build-time/config-time requirement, not left to a developer's default choice (`TASK-127`, hardened during SEC.07 review) |
+| Gateway listener bind address | Defaults to loopback (`127.0.0.1`) only, even though nginx is the intended and only supported upstream | Defense-in-depth against a reverse-proxy misconfiguration or a future deployment mistake exposing the gateway directly — `vw_http`'s reduced parser surface (`TASK-129`) assumes a trusted upstream, so an accidental direct exposure would hand its full, less-hardened input space to arbitrary internet traffic (`TASK-127`, hardened during SEC.07 review) |
+| Installer packaging mechanism | CMake's built-in CPack, driven by the existing `install()` rules, rather than a hand-rolled packaging step | Reuses the CMake install graph that already exists (`CMakeLists.txt`'s per-target `install()` blocks) instead of maintaining a second, parallel list of "what ships where"; CPack's DEB/RPM/WIX generators are all built into the CMake distribution already in use, so this adds no new external dependency (`TASK-145`) |
+| Installer component split | Two CPack components, `server` and `client` (each pulling in its GUI binary when `VW_BUILD_GUI=ON`); `vwdump` ships with `server` | Mirrors the existing install-script split (`packaging/linux/install.sh` vs `client_install.sh`, and the two separate `Install-VaporWault*.ps1` scripts) — server and client are normally installed on different machines, so they stay separate installable units rather than one bundle (`TASK-145`) |
+| Linux package formats | `.deb` (CPack DEB) and `.rpm` (CPack RPM), one package per component — four artifacts total (`server`/`client` × `deb`/`rpm`) | Covers both major Linux packaging ecosystems; per-component packages (not one combined package with optional components) match how `apt`/`dnf` users expect to install a specific piece of software (`TASK-145`) |
+| Linux maintainer scripts | Shared, portable POSIX-sh logic (`packaging/linux/scripts/`) invoked as both DEB's `postinst`/`prerm`/`postrm` and RPM's `%post`/`%preun`/`%postun` scriptlets | DEB and RPM scriptlet *content* can be identical portable shell; only their invocation argument conventions differ (DEB: `postrm remove` vs `postrm purge`; RPM: `$1` install-count semantics) — kept as one reviewed script per lifecycle stage instead of duplicating install.sh's logic three times (`TASK-145`) |
+| Windows package format | One MSI per component (CPack WIX generator, WiX Toolset v3 `candle`/`light`), not one combined MSI with feature selection | Keeps the artifact shape symmetric with the Linux `.deb`/`.rpm` split (one installable unit per component) rather than introducing a different selection model on Windows only (`TASK-145`) |
+| Windows service registration (server) | WiX native `<ServiceInstall>`/`<ServiceControl>` elements, replacing `Install-VaporWault.ps1`'s manual `New-Service`/`sc.exe` calls | Native MSI service registration participates correctly in MSI's own install/uninstall/rollback transaction, unlike a script run after the fact; the existing PowerShell installer scripts are kept as a documented manual/advanced-use alternative, not removed (`TASK-145`) |
+| Windows client registration | A WiX-invoked deferred custom action running the existing scheduled-task-registration logic from `Install-VaporWaultClient.ps1`, rather than reimplementing Scheduled Task XML authoring in raw WiX | The client daemon is a per-user Scheduled Task (logon trigger), not a Windows Service — deliberately not native MSI territory; reusing the already-shipped, already-reasoned-through PowerShell logic is lower-risk than a from-scratch WiX Scheduled-Task fragment that can't be fully integration-tested in this environment (`TASK-145`) |
 
 ---
 
@@ -66,6 +83,8 @@ VaporWault/
     gui/
       server/       # vw_server_gui (C++, Dear ImGui)
       client/       # vw_client_gui (C++, Dear ImGui)
+    gateway/        # vapourwault-web-gateway (C) — new independent vw/1 client + HTTP/JSON API (TASK-127)
+  web/              # Static TypeScript/HTML/CSS frontend, built to plain JS, served by nginx (TASK-127)
   third_party/
     imgui/          # vendored (git submodule, docking branch)
     SDL2/           # vendored manually on Windows only (VENDOR_SETUP.md); Linux/macOS use the system package
@@ -148,6 +167,24 @@ VaporWault/
 > sync — that's a product-scope decision (ARCH.00/the project owner's
 > call), not something to assume from a stale doc line.
 
+### Web gateway + browser client modules (design, `TASK-127` — not yet implemented)
+
+| Module | File(s) | Owner | Language | Responsibility |
+|--------|---------|-------|----------|----------------|
+| `vw_gateway_core` | `src/gateway/vw_gateway_core.{h,c}` | WEB.09 | C | Executable entry point; owns the gateway session pool |
+| `vw_gateway_session` | `src/gateway/vw_gateway_session.{h,c}` | WEB.09 | C | Per-browser-session `vw_client_sess_t` lifecycle, timeout, concurrency |
+| `vw_http` | `src/gateway/vw_http.{h,c}` | WEB.09 | C | Minimal HTTP/1.1 request/response parsing, trusts nginx as sole upstream |
+| `vw_json` | `src/gateway/vw_json.{h,c}` | WEB.09 | C | Minimal JSON encode/decode for the gateway's REST endpoints |
+| `vw_gateway_api` | `src/gateway/vw_gateway_api.{h,c}` | WEB.09 | C | Endpoint dispatch: maps HTTP/JSON requests onto `vw_client_core` calls |
+| `web/` frontend | `web/src/*.ts` | WEB.09 | TypeScript | File browser, upload/download progress, login/2FA, sharing, vault UI |
+| `web/vault-crypto` | `web/src/vault/*.ts` + WASM Argon2 build | WEB.09 | TypeScript/WASM | In-browser Argon2id (WASM) + AES-256-GCM (`SubtleCrypto`); passphrase/plaintext never leave the browser |
+
+> Reuses `vw_core` and `src/client/vw_client_core.c` directly (compiled into the gateway
+> executable's source list), the same "no shared lib, reuse the source file" pattern
+> `vapourwault-cli`/`vapourwault-gui` already use for `vw_ipc.c`. Does **not** link
+> `vw_sync`/`vw_cache`/`vw_daemon` — the gateway is request/response per browser action,
+> not a persistent local-folder sync engine.
+
 ### Tools
 
 | Tool | File(s) | Owner | Purpose |
@@ -191,6 +228,13 @@ vw_watch_windows ← (Win32 only)
 vw_daemon       ← vw_sync, vw_ipc, vw_watch_linux|vw_watch_windows, vw_client_core
 vw_client_cli   ← vw_ipc
 vw_client_gui   ← vw_ipc  (C++)
+
+vw_json           ← (libc only)
+vw_http            ← vw_json
+vw_gateway_session ← vw_net, vw_proto, vw_client_core   (one vw_client_sess_t per browser session)
+vw_gateway_api     ← vw_http, vw_json, vw_gateway_session, vw_client_core
+vw_gateway_core    ← vw_gateway_api, vw_gateway_session   (executable entry point)
+web/ frontend      ← (no C dependency; talks HTTP/JSON to vw_gateway_api over the network)
 ```
 
 No circular dependencies are permitted. A module may not import from a module that depends on it.
@@ -439,6 +483,7 @@ See `TODO/` for the active task list. Phases in order:
 | 8 | Hardening | Security audit, fuzz testing, integration suite, CI, and every bug/gap found by exercising previously-untested features for the first time | SEC.07, CQR.08, QA.06, all agents | **in progress, open-ended by design** — this phase has no fixed end, since real-world bugs keep surfacing as previously-untested features get exercised for the first time. Spans `TASK-054`–`TASK-093` and continues through the current task range (`TASK-102`–`TASK-117`, `TASK-119`, `TASK-121`–`TASK-125`), covering GUI wiring (`TASK-107`/`TASK-108`), oplog format hardening (`TASK-121`–`TASK-124`), dependency build hygiene (`TASK-119`/`TASK-125`), and this doc refresh itself (`TASK-118`). `TASK-120` (tutorial doc) is the one item still open as of 2026-08-05. |
 | 9 | Vault / End-to-end encryption | `vw_vault` (client + server), envelope encryption, vault UI | PRT.04 (design), SRV.01/CLI.02/GUI.03 (impl), QA.06 | **complete** — design published 2026-07-29 (`docs/PROTOCOL.md` §7.11, `TASK-089`); server storage (`TASK-098`), client vault module (`TASK-099`), GUI (`TASK-100`), and regression tests (`TASK-101`) all closed `done`. |
 | 10 | Packaging, deployment docs, end-to-end tests | Linux/Windows service packaging (server + client daemon), `docs/DEPLOYMENT.md`, benchmark suite, e2e sync tests | BLD.05, QA.06 | **complete** (TASK-062–069 done) |
+| 11 | Web gateway + browser client | `vw_gateway_core`, `vw_gateway_session`, `vw_http`, `vw_json`, `vw_gateway_api`, `web/` TypeScript frontend, in-browser vault crypto (WASM Argon2id + `SubtleCrypto` AES-256-GCM) | WEB.09 (design + impl), BLD.05 (build/packaging), SEC.07 (review), QA.06 (tests) | **design published, implementation not started** — design in `TASK-127` (this table's entry written the same day); `TASK-128`–`TASK-144` filed as the initial implementation wave, blocked on `TASK-127` closing (requires SEC.07 sign-off, `security-sensitive`). Sized comparably to Phase 4/9 (sharing/vault); expect follow-up hardening tasks once real implementation surfaces issues, same pattern as Phase 8. |
 
 > **2026-07-29 audit note**: this table (and the Module Map / on-disk-layout sections above) was found to contain at least one fabricated completion claim (Phase 4, corrected above) that cited unrelated task IDs and referenced a module (`vw_users`) that was never created. The rest of this document has not been re-audited line-by-line against the current codebase — treat "complete" markers here as unverified until spot-checked against `TODO/` and the actual source tree, the same way Phase 4's was. `TODO/` task files (which get appended-to, never rewritten wholesale) are more trustworthy than this document's prose for "did X actually happen."
 >
@@ -472,3 +517,6 @@ See `TODO/` for the active task list. Phases in order:
 | Protocol parser vulnerable to malformed input | High | QA.06 fuzz testing every phase; SEC.07 review |
 | Chunk dedup GC races with uploads | Medium | Ref count incremented before chunk committed; GC only frees ref_count == 0 |
 | Oplog recovery logic incomplete | High | Every multi-table operation must have idempotent replay; QA.06 crash-injection tests |
+| Web gateway is new externally-reachable attack surface (sessions, HTTP parsing, XSS from rendered filenames, CSRF) | High | Hand-rolled HTTP/JSON layer scoped to trust nginx as sole upstream (smaller parser surface than a general HTTP server); mandatory SEC.07 review before `TASK-127` closes and before any implementation task reaches `done`; `TASK-144` dedicated review pass |
+| Gateway becomes a bridge that silently weakens vault E2EE if a future change routes decryption server-side | Medium | Design decision recorded (`TASK-127`, in-browser decryption only); `TASK-143` integration tests must assert the gateway process never deserializes a passphrase field, not just that decryption "works" |
+| Session-token file storage precedent (no real Windows ACL, no OS keychain) carried into a richer multi-session gateway target | Medium | Flagged in `TASK-131`/`TASK-144`; gateway session identifiers should not reuse the daemon's `session.tok` file scheme without fixing the Windows ACL gap for real this time |

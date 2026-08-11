@@ -1,0 +1,13 @@
+#!/bin/sh
+# packaging/linux/scripts/server/prerm — shared pre-removal logic for vapourwault-server
+# (TASK-149 DEB, TASK-150 RPM). Stops the service before its files are
+# removed, on both upgrade and removal — safe either way, since the
+# service gets started again post-upgrade by the admin/systemd as before.
+
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop vapourwaultd 2>/dev/null || true
+fi
+
+exit 0

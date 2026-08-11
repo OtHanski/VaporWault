@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Extra WiX source for the `client` component MSI (TASK-148), linked in via
+  -D CPACK_WIX_EXTRA_SOURCES alongside CPack's auto-generated fragments.
+
+  Adds:
+    1. The register-client-task.ps1 helper as an installed file (deployed
+       next to vapourwault-daemon.exe, under the same auto-generated
+       CM_DP_client.bin directory CPack created for the client component's
+       binaries).
+    2. A pair of CustomActions (immediate "Set*Data" + deferred "exe
+       command") per the standard WiX two-step pattern for deferred custom
+       actions that need Property/File-table values: a deferred custom
+       action has NO access to the Property table at actual execution
+       time, only to whatever a same-named immediate CustomAction stashed
+       into CustomActionData beforehand. All path/property substitution
+       ([#FileId], [AppDataFolder], ...) happens in the IMMEDIATE action's
+       Value (which does have table access); the deferred action's
+       ExeCommand is a fixed string with only the single [CustomActionData]
+       token, which MSI resolves via its own dedicated mechanism.
+    3. InstallExecuteSequence entries scheduling registration after files
+       are installed (skipped on REMOVE, i.e. not run again on repair/
+       uninstall) and unregistration before files are removed (only when
+       REMOVE~="ALL" - a genuine uninstall, not an in-place upgrade,
+       matching the MSI convention used throughout Windows Installer
+       authoring for "only run cleanup on final removal").
+
+  Not run with Return="ignore" by accident: a scheduled-task registration
+  failure should not abort the whole (otherwise successful) file install —
+  the manual PowerShell script remains available as a fallback per
+  TASK-145's design. This is a deliberate best-effort tradeoff, not an
+  oversight; flagged for SEC.07/QA review (TASK-153/TASK-152) since a
+  silent failure here means "files installed but daemon never
+  auto-starts," which could go unnoticed. `Impersonate="yes"` matches the
+  MSI convention for actions that should run as the acting interactive
+  user, which for this PER-USER (no elevation) install context is the
+  session's own user throughout anyway (see TASK-145's SEC.07-resolved
+  elevation-scope requirement).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <Fragment>
+    <DirectoryRef Id="CM_DP_client.bin">
+      <!-- Fixed GUID (not "*"): WiX cannot auto-generate a component guid
+           for a component that mixes a registry-value KeyPath with a
+           File resource (CNDL0230). This fixed value must never change
+           once shipped. -->
+      <Component Id="CM_C_ClientTaskScript" Guid="F5D76859-3F79-4193-BA72-ED6107ED115A">
+        <!-- Per-user-directory components must use an HKCU registry value
+             as their KeyPath, not a file (WiX ICE38), matching the same
+             convention CPack's own auto-generated RemoveFolderComponent
+             entries use in directories.wxs for this per-user
+             (CPACK_WIX_INSTALL_SCOPE=perUser) install. -->
+        <RegistryValue Root="HKCU"
+            Key="Software\VaporWault\vaporwault\Components"
+            Name="CM_C_ClientTaskScript"
+            Type="string"
+            Value="1"
+            KeyPath="yes" />
+        <File Id="CM_F_ClientTaskScript"
+              Source="$(var.VW_WIX_DIR)\register-client-task.ps1" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <!-- Register (install / reinstall / repair, never on uninstall) -->
+    <CustomAction Id="SetRegisterClientTaskData"
+        Property="RegisterClientTask"
+        Value="&quot;[#CM_F_ClientTaskScript]&quot; -DaemonExe &quot;[#CM_FP_client.bin.vapourwault_daemon.exe]&quot; -StateDir &quot;[AppDataFolder]VaporWault&quot;" />
+    <CustomAction Id="RegisterClientTask"
+        Directory="TARGETDIR"
+        Execute="deferred"
+        Return="ignore"
+        Impersonate="yes"
+        ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File [CustomActionData]" />
+
+    <!-- Unregister (uninstall only, not upgrade/repair) -->
+    <CustomAction Id="SetUnregisterClientTaskData"
+        Property="UnregisterClientTask"
+        Value="&quot;[#CM_F_ClientTaskScript]&quot; -Uninstall" />
+    <CustomAction Id="UnregisterClientTask"
+        Directory="TARGETDIR"
+        Execute="deferred"
+        Return="ignore"
+        Impersonate="yes"
+        ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File [CustomActionData]" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SetRegisterClientTaskData" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="RegisterClientTask" After="SetRegisterClientTaskData">NOT REMOVE</Custom>
+      <Custom Action="SetUnregisterClientTaskData" Before="RemoveFiles">REMOVE~="ALL"</Custom>
+      <Custom Action="UnregisterClientTask" After="SetUnregisterClientTaskData">REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+
+</Wix>

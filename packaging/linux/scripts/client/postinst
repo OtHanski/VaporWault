@@ -1,0 +1,36 @@
+#!/bin/sh
+# packaging/linux/scripts/client/postinst — post-install logic for
+# vapourwault-client (TASK-149 DEB, TASK-150 RPM).
+#
+# Deliberately minimal, unlike server/postinst: the client daemon is a
+# PER-USER systemd --user service, not a system service, and this script
+# runs as root (dpkg/rpm always run maintainer scripts as root) at package
+# install time, when no specific end user is known yet. There is no
+# system-wide directory/user to create — each user's own state
+# (~/.local/share/vapourwault, daemon.conf, session.tok, cache.db) is
+# created by vapourwault-daemon itself on first run, same as the
+# manual/tarball install path (packaging/linux/client_install.sh).
+#
+# The systemd user unit is installed to /usr/lib/systemd/user/ (a
+# system-wide location systemd makes available to every user's --user
+# manager), NOT ~/.config/systemd/user/ (which client_install.sh uses,
+# correctly, since IT runs as a specific unprivileged user with no package
+# manager in the picture) — see the install(FILES ... DESTINATION
+# lib/systemd/user) rule in the top-level CMakeLists.txt.
+
+set -e
+
+# Every already-logged-in user's systemd --user instance needs its own
+# daemon-reload to pick up the newly-installed unit file; this can't be
+# done from a root-run postinst for arbitrary other users, so each user
+# does this themselves (systemd also re-scans on next login regardless).
+cat <<'EOF'
+vapourwault-client installed.
+
+To start syncing, run as the user who will use it (not root):
+  systemctl --user daemon-reload
+  systemctl --user enable --now vapourwault-daemon
+  vapourwault-cli login <password>
+EOF
+
+exit 0

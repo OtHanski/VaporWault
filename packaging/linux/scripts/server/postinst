@@ -1,0 +1,47 @@
+#!/bin/sh
+# packaging/linux/scripts/server/postinst — shared post-install logic for
+# the vapourwault-server package (TASK-149 DEB, TASK-150 RPM). Portable
+# POSIX sh: invoked directly as DEB's postinst, and via a thin rpm-specific
+# wrapper for RPM's %post (see packaging/linux/scripts/rpm/server-post)
+# since RPM's scriptlet argument convention differs (TASK-150).
+#
+# Mirrors packaging/linux/install.sh's logic exactly (that script remains
+# the manual/tarball install path, unchanged) — create the system user,
+# directories, and config template; reload systemd. Deliberately does NOT
+# `systemctl enable --now`, matching install.sh's existing behavior of
+# letting the admin configure server.conf before the service starts.
+#
+# Idempotent: safe to run on every install, reinstall, and upgrade.
+
+set -e
+
+SERVICE_USER="vapourwault"
+DATA_DIR="/var/lib/vapourwault"
+CONF_DIR="/etc/vapourwault"
+RUN_DIR="/run/vapourwault"
+CONF_FILE="${CONF_DIR}/server.conf"
+CONF_TEMPLATE="/usr/share/vapourwault/server.conf.example"
+
+if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+    useradd --system \
+            --no-create-home \
+            --home-dir "${DATA_DIR}" \
+            --shell /usr/sbin/nologin \
+            --comment "VaporWault server" \
+            "${SERVICE_USER}"
+fi
+
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${DATA_DIR}"
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${CONF_DIR}"
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${RUN_DIR}"
+
+if [ ! -f "${CONF_FILE}" ] && [ -f "${CONF_TEMPLATE}" ]; then
+    install -m 640 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+        "${CONF_TEMPLATE}" "${CONF_FILE}"
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

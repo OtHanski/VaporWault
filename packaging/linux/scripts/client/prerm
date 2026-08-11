@@ -1,0 +1,19 @@
+#!/bin/sh
+# packaging/linux/scripts/client/prerm — pre-removal logic for
+# vapourwault-client (TASK-149 DEB, TASK-150 RPM).
+#
+# Deliberately a no-op: vapourwault-daemon runs as a PER-USER systemd
+# --user service. This script runs as root and has no reliable, safe way
+# to reach into every logged-in user's own systemd --user session to stop
+# their instance before the binary is removed (reaching into another
+# user's session bus from a root maintainer script is exactly the kind of
+# fragile, easy-to-get-subtly-wrong thing this project avoids elsewhere —
+# see server/prerm's simple direct `systemctl stop` for the contrast
+# that IS safe, because the server is a real system service). Accepted,
+# documented limitation: removing the package while a user's daemon is
+# running leaves that instance running until they next log out/in or
+# manually stop it — not ideal, but not unsafe either (the daemon simply
+# keeps running against its already-loaded binary in memory, same as
+# `rm`-ing any running executable on Linux).
+
+exit 0

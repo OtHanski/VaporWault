@@ -26,6 +26,12 @@ env:
   # keep SDL2_VERSION in sync with that minimum when bumping either one.
   SDL2_VERSION: "2.32.10"
   SDL2_ZIP_SHA256: "af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e"
+  # WiX Toolset v3 fallback (TASK-151/153) — only fetched if the primary
+  # `choco install` path fails. Pinned and checksum-verified for the same
+  # reason SDL2 is above: don't silently link/build against a tampered or
+  # unexpectedly-changed third-party binary fetched mid-CI-run.
+  WIX_VERSION: "3.11.2"
+  WIX_ZIP_SHA256: "ac2fff0541f87756b530c93ca3a45ff2dfb1ebe392c269901de0c19074bec5d0"
   # Computed once, shared by every job — see the "TAG comes from workflow-level
   # env" comments below for why this is never interpolated directly into a
   # `run:` block.
@@ -46,7 +52,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            ninja-build python3 git libsdl2-dev
+            ninja-build python3 git libsdl2-dev dpkg-dev rpm
+
+      # PKG_VERSION strips the leading "v" from TAG (workflow-level env,
+      # never interpolated directly into a shell script — same discipline
+      # as every other TAG use in this workflow, TASK-081) since .deb/.rpm
+      # version fields don't accept an arbitrary leading letter.
+      - name: Compute package version
+        run: echo "PKG_VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Configure
         run: |
@@ -57,7 +70,8 @@ jobs:
             -DVW_BUILD_GUI=ON     \
             -DVW_BUILD_TOOLS=ON   \
             -DVW_BUILD_TESTS=OFF  \
-            -DVW_WERROR=ON
+            -DVW_WERROR=ON        \
+            -DVW_VERSION="$PKG_VERSION"
 
       - name: Build
         run: cmake --build build --parallel
@@ -90,6 +104,24 @@ jobs:
           tar czf "${STAGE}.tar.gz" "$STAGE"
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
+      # TASK-145/149/150: proper .deb/.rpm packages alongside the tarball
+      # above (kept, not replaced — still useful for scripted/air-gapped
+      # deployments). One package per CPack component (server/client) per
+      # format, verified locally (TASK-149/150) via real install/upgrade/
+      # remove/purge testing in disposable containers.
+      # Packages are built inside build/ (that's where the CPackConfig.cmake
+      # generated at configure time lives) then copied up to the workspace
+      # root so the upload-artifact path list below only ever references
+      # flat, top-level filenames — same convention the tarball above
+      # already uses, and avoids relying on how upload-artifact flattens
+      # (or doesn't) nested directory structure across mixed path patterns.
+      - name: Build installer packages (.deb, .rpm)
+        run: |
+          (cd build && cpack -G DEB && cpack -G RPM)
+          cp build/*.deb build/*.rpm .
+          sha256sum *.deb *.rpm > linux-packages.sha256
+          cat linux-packages.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -97,6 +129,9 @@ jobs:
           path: |
             vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz
             vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz.sha256
+            *.deb
+            *.rpm
+            linux-packages.sha256
           if-no-files-found: error
 
   build-windows:
@@ -115,6 +150,44 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
+
+      # PKG_VERSION strips the leading "v" from TAG (workflow-level env,
+      # never interpolated directly into a shell script — TASK-081's
+      # discipline) since MSI version fields don't accept a leading letter.
+      - name: Compute package version
+        shell: pwsh
+        run: "'PKG_VERSION=' + $env:TAG.TrimStart('v') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8"
+
+      # TASK-145/147/148: WiX Toolset v3 (candle.exe/light.exe) is required
+      # by CPack's WIX generator; it does not ship on windows-latest.
+      # Try the package manager first (simplest); if it fails the same way
+      # this session's sandboxed dev environment did (a Chocolatey
+      # lock-file permission error, TASK-151's filing note — possibly
+      # sandbox-specific, not necessarily reproducible on a real hosted
+      # runner) fall back to fetching the same NuGet package this
+      # session's manual verification used.
+      - name: Install WiX Toolset v3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          choco install wixtoolset -y --no-progress
+          $chocoOk = $LASTEXITCODE -eq 0
+          $ErrorActionPreference = 'Stop'
+          if ($chocoOk -and (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            Write-Host "WiX Toolset installed via Chocolatey."
+          } else {
+            Write-Host "Chocolatey install unavailable/failed; fetching WiX $env:WIX_VERSION NuGet package directly."
+            Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/wix/$env:WIX_VERSION" -OutFile wix.zip
+
+            $actualHash = (Get-FileHash wix.zip -Algorithm SHA256).Hash
+            if ($actualHash -ne $env:WIX_ZIP_SHA256) {
+              Write-Error "WiX zip checksum mismatch: expected $env:WIX_ZIP_SHA256, got $actualHash"
+              exit 1
+            }
+
+            Expand-Archive -Path wix.zip -DestinationPath wix-tools
+            Add-Content -Path $env:GITHUB_PATH -Value "$(Resolve-Path wix-tools\tools)"
+          }
 
       - name: Vendor SDL2 (VC devel package)
         shell: pwsh
@@ -141,7 +214,8 @@ jobs:
             -DVW_BUILD_GUI=ON     `
             -DVW_BUILD_TOOLS=ON   `
             -DVW_BUILD_TESTS=OFF  `
-            -DVW_WERROR=ON
+            -DVW_WERROR=ON        `
+            -DVW_VERSION="$env:PKG_VERSION"
 
       - name: Build
         run: cmake --build build --parallel
@@ -177,6 +251,49 @@ jobs:
           $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "$stage.zip.sha256" -Value "$hash  $stage.zip" -NoNewline -Encoding ascii
 
+      # TASK-145/147/148: one MSI per CPack component (server/client), not
+      # one combined MSI — CPack's WIX generator does not natively split
+      # components into separate MSIs the way DEB/RPM do, so `cpack` is
+      # invoked once per component with different -D overrides (verified
+      # empirically this session — see TASK-147/148's implementation
+      # notes for why). CPACK_WIX_UPGRADE_GUID values are permanently
+      # fixed per product; never regenerate them.
+      # Same "stage flat at workspace root" reasoning as the Linux job's
+      # package step above.
+      #
+      # CPACK_PACKAGE_FILE_NAME is set explicitly and MUST differ between
+      # the two invocations: without it, both `cpack -G WIX` calls produce
+      # the exact same default output filename (unlike DEB/RPM, whose
+      # default naming already varies by component), so the second
+      # invocation silently overwrites the first's .msi on disk. Caught by
+      # actually running this exact two-invocation sequence end-to-end in
+      # this session (TASK-151) — the first attempt produced only one
+      # surviving file where two were expected.
+      - name: Build installer packages (.msi)
+        shell: pwsh
+        run: |
+          Push-Location build
+          cpack -G WIX `
+            -D CPACK_COMPONENTS_ALL=server `
+            -D CPACK_WIX_UPGRADE_GUID=5ADE0205-57FF-4286-849A-C112AF550215 `
+            -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/server-patch.xml)" `
+            -D CPACK_WIX_EXTENSIONS=WixFirewallExtension `
+            -D CPACK_PACKAGE_FILE_NAME="vaporwault-server-$env:PKG_VERSION-win64"
+          cpack -G WIX `
+            -D CPACK_COMPONENTS_ALL=client `
+            -D CPACK_WIX_UPGRADE_GUID=88FDD57B-FD91-4214-B6F5-B1343F75ABBB `
+            -D CPACK_WIX_INSTALL_SCOPE=perUser `
+            -D CPACK_WIX_EXTRA_SOURCES="$(Resolve-Path ../packaging/windows/wix/client-extra.wxs)" `
+            -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/client-patch.xml)" `
+            -D CPACK_WIX_CANDLE_EXTRA_FLAGS="-dVW_WIX_DIR=$(Resolve-Path ../packaging/windows/wix)" `
+            -D CPACK_PACKAGE_FILE_NAME="vaporwault-client-$env:PKG_VERSION-win64"
+          Pop-Location
+          Copy-Item build/*.msi .
+          Get-ChildItem *.msi | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Add-Content -Path windows-packages.sha256 -Encoding ascii
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -184,6 +301,8 @@ jobs:
           path: |
             vaporwault-${{ env.TAG }}-windows-x86_64.zip
             vaporwault-${{ env.TAG }}-windows-x86_64.zip.sha256
+            *.msi
+            windows-packages.sha256
           if-no-files-found: error
 
   publish:
