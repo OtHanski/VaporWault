@@ -29,6 +29,8 @@ def pytest_addoption(parser):
                      help="Path to TLS certificate (PEM)")
     parser.addoption("--test-key",    default=None,
                      help="Path to TLS private key (PEM)")
+    parser.addoption("--gateway-bin", default=None,
+                     help="Path to vapourwault-web-gateway binary (TASK-143)")
 
 
 # ── Pytest marks ──────────────────────────────────────────────────────────────
@@ -55,11 +57,15 @@ class Binaries:
         self.test_cert  = config.getoption("--test-cert")
         self.test_key   = config.getoption("--test-key")
 
+        self.gateway_bin = config.getoption("--gateway-bin")
+
         # Auto-discover if not explicitly provided (useful for local dev).
         if not self.server_bin:
             self.server_bin = self._find("vapourwaultd")
         if not self.admin_cli:
             self.admin_cli = self._find("vapourwault-server-cli")
+        if not self.gateway_bin:
+            self.gateway_bin = self._find("vapourwault-web-gateway")
 
     @staticmethod
     def _find(name):
@@ -80,6 +86,10 @@ class Binaries:
             pytest.skip(f"TLS cert not found (--test-cert={self.test_cert!r})")
         if not self.test_key or not os.path.isfile(self.test_key):
             pytest.skip(f"TLS key not found (--test-key={self.test_key!r})")
+
+    def require_gateway(self):
+        if not self.gateway_bin or not os.path.isfile(self.gateway_bin):
+            pytest.skip(f"vapourwault-web-gateway binary not found (--gateway-bin={self.gateway_bin!r})")
 
 
 @pytest.fixture(scope="session")
@@ -211,6 +221,81 @@ def default_user(server):
     password = "TestP@ssw0rd!"
     server.create_user(username, password)
     return username, password
+
+
+# ── TASK-143 fixtures: vapourwault-web-gateway ─────────────────────────────────
+
+class GatewayInstance:
+    """A running vapourwault-web-gateway process pointed at a ServerInstance."""
+
+    def __init__(self, binaries: Binaries, server: ServerInstance):
+        self.binaries = binaries
+        self.server = server
+        self.host = "127.0.0.1"
+        self.port = _free_port()
+        self._proc = None
+
+    @property
+    def base_url(self):
+        return f"http://{self.host}:{self.port}"
+
+    def start(self, timeout=10):
+        self._proc = subprocess.Popen(
+            [
+                self.binaries.gateway_bin,
+                "--server-host", self.server.host,
+                "--server-port", str(self.server.port),
+                "--ca-cert", self.server.cert,
+                "--listen-host", self.host,
+                "--listen-port", str(self.port),
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        # No admin socket/readiness signal of its own (unlike vapourwaultd) -
+        # poll the listener with a real HTTP request until it responds.
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._proc.poll() is not None:
+                raise RuntimeError(
+                    f"gateway process exited with code {self._proc.returncode}"
+                )
+            try:
+                with socket.create_connection((self.host, self.port), timeout=0.5):
+                    return
+            except OSError:
+                if time.monotonic() > deadline:
+                    self.stop()
+                    raise RuntimeError(f"gateway did not start listening within {timeout}s")
+                time.sleep(0.1)
+
+    def stop(self):
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            self._proc = None
+
+    def restart(self, timeout=10):
+        """Kill and relaunch the gateway process - used to simulate the
+        in-memory session pool being wiped (TASK-131: no persistence)."""
+        self.stop()
+        self.start(timeout=timeout)
+
+
+@pytest.fixture(scope="module")
+def gateway(binaries, server):
+    """
+    Start a vapourwault-web-gateway instance for the current test module,
+    pointed at the module's server.
+    """
+    binaries.require_gateway()
+
+    gw = GatewayInstance(binaries, server)
+    gw.start()
+    yield gw
+    gw.stop()
 
 
 # ── TASK-055 fixtures ─────────────────────────────────────────────────────────
