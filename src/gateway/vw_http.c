@@ -2,6 +2,7 @@
 #include "../core/vw_crypto.h"
 
 #include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h> /* MBEDTLS_ERR_SSL_TIMEOUT, for net_recv_with_timeout's return value */
 
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,32 @@ struct vw_http_ctx {
 struct vw_http_conn {
     mbedtls_net_context fd;
 };
+
+/*
+ * SEC.07 finding (TASK-144): every socket read in this module used
+ * mbedtls_net_recv with NO timeout. Combined with main.c's fully
+ * single-threaded, one-connection-at-a-time accept loop, a single client
+ * that connects and then sends nothing (or trickles bytes forever) could
+ * hang the entire gateway process indefinitely — every other browser
+ * session's requests, on every other TCP connection, would never even
+ * get accept()ed while stuck reading the stalled one. This is not
+ * theoretical: it requires no auth, no valid HTTP, just an open TCP
+ * connection that never completes a request. Fixed by bounding every
+ * read with mbedtls_net_recv_timeout instead — a slow/stalled peer now
+ * gets dropped after VW_HTTP_RECV_TIMEOUT_MS, freeing the accept loop for
+ * everyone else, rather than wedging the whole process. This is a
+ * mitigation, not a fix for the single-threaded design itself (a
+ * misbehaving-but-eventually-timing-out client still blocks other users
+ * for up to the timeout) — a real concurrency model (thread-per-
+ * connection or an event loop) would be the complete fix, but is a much
+ * larger change than this task's scope; noted for a future task rather
+ * than done here.
+ */
+#define VW_HTTP_RECV_TIMEOUT_MS (30u * 1000u)
+
+static int net_recv_with_timeout(mbedtls_net_context *fd, uint8_t *buf, size_t len) {
+    return mbedtls_net_recv_timeout(fd, buf, len, VW_HTTP_RECV_TIMEOUT_MS);
+}
 
 /* ── Small local helpers (no libc case-insensitive compare is portable
  * across MSVC/GCC/Clang without platform #ifdefs, so hand-roll one) ──────── */
@@ -118,7 +145,8 @@ static vw_err_t read_header_block(vw_http_conn_t *conn, uint8_t *buf, size_t buf
     for (;;) {
         if (total >= bufsize) return VW_ERR_PROTO_TOO_LARGE;
 
-        int n = mbedtls_net_recv(&conn->fd, buf + total, bufsize - total);
+        int n = net_recv_with_timeout(&conn->fd, buf + total, bufsize - total);
+        if (n == MBEDTLS_ERR_SSL_TIMEOUT) return VW_ERR_NET_TIMEOUT;
         if (n <= 0) return VW_ERR_NET_CLOSED;
         total += (size_t)n;
 
@@ -256,11 +284,11 @@ vw_err_t vw_http_recv_request(vw_http_conn_t *conn, vw_http_request_t *out_req) 
 
         size_t got = already_buffered;
         while (got < content_length) {
-            int n = mbedtls_net_recv(&conn->fd, body + got, content_length - got);
+            int n = net_recv_with_timeout(&conn->fd, body + got, content_length - got);
             if (n <= 0) {
                 free(body);
                 free(buf);
-                return VW_ERR_NET_CLOSED;
+                return (n == MBEDTLS_ERR_SSL_TIMEOUT) ? VW_ERR_NET_TIMEOUT : VW_ERR_NET_CLOSED;
             }
             got += (size_t)n;
         }

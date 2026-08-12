@@ -35,10 +35,23 @@ void vw_gateway_session_pool_destroy(vw_gateway_session_pool_t *pool) {
     free(pool);
 }
 
+/*
+ * SEC.07 finding (TASK-144): this used to compare cookies with strcmp(),
+ * which short-circuits on the first mismatched byte - a textbook timing
+ * side-channel for a secret value (this project already has
+ * vw_crypto_constant_time_eq specifically "for token and hash
+ * comparison", per its own doc comment; this code just hadn't used it).
+ * The length check below is safe to short-circuit on - cookie_hex's
+ * LENGTH isn't secret (both `wrong length` and `right length, wrong
+ * content` end up rejected either way), only its CONTENT is, which is
+ * why the actual byte comparison goes through the constant-time helper.
+ */
 static int find_by_cookie(vw_gateway_session_pool_t *pool, const char *cookie_hex) {
+    if (strlen(cookie_hex) != VW_GATEWAY_COOKIE_HEX_LEN) return -1;
     for (uint32_t i = 0; i < VW_GATEWAY_MAX_SESSIONS; i++) {
         if (pool->slots[i].in_use &&
-            strcmp(pool->slots[i].cookie_hex, cookie_hex) == 0) {
+            vw_crypto_constant_time_eq(pool->slots[i].cookie_hex, cookie_hex,
+                                        VW_GATEWAY_COOKIE_HEX_LEN)) {
             return (int)i;
         }
     }
