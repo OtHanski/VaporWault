@@ -219,3 +219,72 @@ task's own close-out.
 
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per this task's own
 `review_by`.
+
+SEC.07/CQR.08 [2026-08-12]: Review pass on the fix above.
+
+**Blocking finding, found and fixed during this review**: the backward-
+shift deletion (`path_ht_cyclic_in_range`, as originally shipped) had an
+inverted cyclic-range check — it tested whether the *displaced entry's
+home slot* falls in `(freed, cur]`, when the correct condition is whether
+the *freed hole* falls in `[home, cur)`. These are not equivalent. Net
+effect: deleting an entry that sat exactly at its own home slot, with at
+least one other entry immediately following it in the same collision
+chain, permanently stranded every entry after it — not a rare edge case;
+it's the ordinary shape of any hash collision, and the very
+`mkdir → move → stat` bug this task exists to fix commonly produces
+exactly one deleted entry per rename. None of this task's original 5
+tests caught it because none forced a real multi-entry probe-chain
+collision (a handful of essentially-random names in a fresh 64-slot
+table essentially never collide by chance).
+
+Found by re-deriving the algorithm from first principles against the
+originally-shipped code rather than re-trusting the "looks like the
+standard algorithm" comment it shipped with, then confirming with a
+concrete 3-entry manual trace before touching any code. Fixed by
+correcting the check to `hole ∈ [home, cur)` (`path_ht_hole_on_probe_path`
+in the current diff) and adding a 6th unit test,
+`tests/unit/test_vw_file_handlers.c`'s "deleting a collision-chain entry
+at its own home slot..." — uses `"aa.txt"`/`"em.txt"`/`"ft.txt"`, three
+names brute-force found (owner_id=100, cap=64) to genuinely collide on
+`path_ht_probe_start`, so the shift logic is deterministically exercised
+rather than left to chance. Confirmed the fix's necessity the same way
+as the original fix: reverted just the algorithm to the buggy version,
+reran — the new test failed exactly as predicted (`em.txt`/`ft.txt`
+became unresolvable), restored the fix, reran — 174/174 assertions pass.
+
+**Other findings, on `tests/integration/test_gateway.py` (TASK-143's
+suite, since TASK-157 touched the same test-move path)**:
+- `test_vault_passphrase_never_sent_to_gateway` asserted the literal
+  `passphrase` variable string never appeared in a captured request
+  body — but that flow never plumbs `passphrase` into any call to begin
+  with (`wrapped_vk` is `os.urandom(60)`), so the assertion was true by
+  construction regardless of gateway behavior; it verified the test
+  script, not the gateway's contract, weaker than the acceptance
+  criteria's "structural check" framing implied. Strengthened with an
+  explicit field-name allow-list check on every vault-request body
+  (`VAULT_REQUEST_ALLOWED_FIELDS`) — this catches *any* unexpected field,
+  not one presupposed name. Confirmed it has teeth: temporarily added a
+  bogus field to `vault_create`'s request body, reran, watched it fail
+  with the new assertion; removed the bogus field, reran clean.
+- Two `from vw_client import VW_PERM_VIEW` imports were local to their
+  test functions, inconsistent with every other integration test file's
+  convention (module-level import) — moved to the top of the file.
+- Full 21-test suite reruns clean (21/21) after both changes, against a
+  real rebuilt `vapourwaultd` + `vapourwault-web-gateway` pair.
+
+**Verification of the corrected build claim**: the earlier note in this
+file said "clean under MSVC (`/W4`)" — checking `build-msvc-105`'s
+CMake cache showed `VW_WERROR=OFF` there, meaning the actual flags used
+were `/W3` (no `-Werror` equivalent), not `/W4 /WX` as claimed.
+Reconfigured with `-DVW_WERROR=ON`, rebuilt clean under genuine
+`/W4 /WX`, reran the unit suite (174/174), then reconfigured back to
+`OFF` to leave the tree in its prior state. `build-gw-e2e` (GCC/WSL)
+already had `VW_WERROR=ON` (`-Wall -Wextra -Wpedantic -Werror`) the whole
+time, so that toolchain's "clean build" claim was accurate as originally
+stated.
+
+No other blocking findings. The `handle_file_move` duplicate-name gap
+noted above remains flagged, not fixed, unchanged from the prior note.
+
+Sign-off: both `SEC.07` and `CQR.08` review requirements satisfied.
+Ready for ARCH.00 to move to `done` alongside `TASK-143`.

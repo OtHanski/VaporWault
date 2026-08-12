@@ -247,38 +247,41 @@ static int path_ht_insert(struct vw_file_store *fs,
  * probing elsewhere relies on an empty slot terminating the probe chain, so
  * a naive "just clear it" delete would break lookups for every entry whose
  * probe sequence passes through the freed slot). Standard algorithm: clear
- * the target slot, then walk forward through the contiguous run of occupied
- * slots that follows; for each entry found, pull it back into the most
- * recently freed slot if doing so keeps it within its own probe sequence
- * (i.e. its home slot lies in the cyclic range (freed, current]).
+ * the target slot (the "hole"), then walk forward through the contiguous
+ * run of occupied slots that follows; an entry at `cur` must be pulled back
+ * into the current hole iff its own home slot lies on the forward probe
+ * path from home to cur — i.e. the hole is in the cyclic range
+ * [home, cur) — since that's exactly the condition under which a lookup
+ * for that entry, probing forward from its home slot, would hit the empty
+ * hole and wrongly report "not found" before ever reaching `cur`.
  */
-static int path_ht_cyclic_in_range(size_t home, size_t freed, size_t cur)
+static int path_ht_hole_on_probe_path(size_t home, size_t hole, size_t cur)
 {
     if (home <= cur)
-        return home > freed && home <= cur;
-    return home > freed || home <= cur;
+        return hole >= home && hole < cur;
+    return hole >= home || hole < cur;
 }
 
 static void path_ht_remove_at(struct vw_file_store *fs, size_t slot)
 {
     size_t cap = fs->path_ht_cap;
     path_ht_entry_t *ht = fs->path_ht;
-    size_t freed = slot;
+    size_t hole = slot;
 
-    memset(&ht[freed], 0, sizeof(ht[freed]));
+    memset(&ht[hole], 0, sizeof(ht[hole]));
     fs->path_ht_len--;
 
-    size_t cur = freed;
+    size_t cur = hole;
     for (;;) {
         cur = (cur + 1) % cap;
         if (ht[cur].owner_id == 0) break; /* end of probe chain */
 
         size_t home = (size_t)path_ht_probe_start(ht[cur].owner_id,
                                                     ht[cur].name_hash, cap);
-        if (path_ht_cyclic_in_range(home, freed, cur)) {
-            ht[freed] = ht[cur];
+        if (path_ht_hole_on_probe_path(home, hole, cur)) {
+            ht[hole] = ht[cur];
             memset(&ht[cur], 0, sizeof(ht[cur]));
-            freed = cur;
+            hole = cur;
         }
     }
 }

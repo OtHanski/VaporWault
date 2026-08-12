@@ -520,6 +520,62 @@ VW_TEST_CASE("TASK-157: repeated rename chain leaves only the final name resolva
     stack_close(&s);
 }
 
+VW_TEST_CASE("TASK-157: deleting a collision-chain entry at its own home slot "
+             "does not strand later entries in the chain (path_ht_remove_at "
+             "backward-shift correctness)") {
+    /*
+     * SEC.07/CQR.08 review finding on this task's first fix attempt: the
+     * initial path_ht_remove_at() shipped with an inverted cyclic-range
+     * check (compared "is home in (freed, cur]" instead of the correct
+     * "is the freed hole in [home, cur)"), which left every entry
+     * displaced by a hash collision permanently unreachable as soon as
+     * the entry occupying its own home slot was deleted — silently
+     * corrupting path_ht rather than just failing to fix TASK-157. None
+     * of the tests above exercise this because none of them force a real
+     * probe-chain collision (cap=64, a handful of essentially-random
+     * names — collisions are vanishingly unlikely by chance).
+     *
+     * "aa.txt", "em.txt", "ft.txt" are not arbitrary: they were found by
+     * brute-force replicating fnv1a()/path_ht_probe_start() from this
+     * file for owner_id=100 at the initial path_ht capacity (64) — all
+     * three hash to the same home slot. Created in this order in a fresh
+     * store, "aa.txt" occupies its own home slot and "em.txt"/"ft.txt"
+     * are displaced one and two slots forward by the collision. If this
+     * hash function or PATH_HT_INITIAL_CAP ever changes, this test may
+     * need new colliding names — a spurious pass (no actual collision)
+     * would still leave the other TASK-157 tests as coverage, but
+     * wouldn't be testing what this test claims to test.
+     */
+    fh_stack_t s; stack_open(&s, "task157_collision");
+    uint64_t owner = 100;
+    uint64_t fid_a = make_entry(&s, owner, 0, "aa.txt", VW_ENTRY_FILE);
+    uint64_t fid_b = make_entry(&s, owner, 0, "em.txt", VW_ENTRY_FILE);
+    uint64_t fid_c = make_entry(&s, owner, 0, "ft.txt", VW_ENTRY_FILE);
+
+    /* Sanity check the premise: all three must already be resolvable
+     * before any deletion exercises the shift logic. */
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/aa.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid_a);
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/em.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid_b);
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/ft.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid_c);
+
+    /* Delete the entry sitting at the shared home slot. This is the exact
+     * scenario the inverted check mishandled: em.txt/ft.txt must shift
+     * back to stay reachable from their shared home slot. */
+    VW_ASSERT_OK(rename_entry(&s, fid_a, 0, "aa_renamed.txt"));
+
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/em.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid_b);
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/ft.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid_c);
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/aa_renamed.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid_a);
+    stack_close(&s);
+}
+
 VW_TEST_CASE("TASK-157: update that does not change name/parent leaves path_ht untouched") {
     fh_stack_t s; stack_open(&s, "task157_noop");
     uint64_t owner = 100;

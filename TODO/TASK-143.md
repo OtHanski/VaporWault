@@ -154,6 +154,39 @@ updated that test's docstring accordingly. Full 21-test suite reruns
 clean (21/21) with the stricter assertions in place, against a real
 rebuilt `vapourwaultd` + `vapourwault-web-gateway` pair.
 
+SEC.07/CQR.08 [2026-08-12]: Review pass (see `TASK-157`'s own notes for
+the review of the server-side fix and the algorithm bug found+fixed
+there). On this task's own deliverable, `tests/integration/test_gateway.py`:
+
+- **Finding, fixed**: `test_vault_passphrase_never_sent_to_gateway`'s
+  original assertion (passphrase string absent from captured bodies) was
+  true by construction — the test flow never plumbed the passphrase
+  variable into any request to begin with, so the assertion couldn't
+  have failed regardless of gateway behavior. This fell short of the
+  task's own acceptance criteria language ("a structural check... not
+  just 'decryption works'"). Replaced/supplemented with an explicit
+  field-name allow-list check on every vault-request body, which catches
+  any unexpected field rather than one presupposed name. Verified this
+  has real discriminating power by temporarily injecting a bogus field
+  into a vault request and confirming the test fails on it, then
+  reverting and confirming clean.
+- **Finding, fixed (advisory/style)**: two `from vw_client import
+  VW_PERM_VIEW` imports were local to their test functions, inconsistent
+  with every other integration test file's module-level-import
+  convention (`test_sharing.py`, `test_file_ops.py`). Moved to the top
+  of the file.
+- Everything else reviewed and found sound: `ClientFactory`/`clients`
+  teardown discipline, `GatewayInstance`'s readiness-polling and process
+  lifecycle in `conftest.py`, the Secure-cookie-stripping workaround
+  (correctly scoped to test-only, doesn't affect production), the
+  malformed-HTTP/JSON tests' "still responsive after" follow-up checks,
+  multi-session isolation coverage, and the TASK-144 regression tests'
+  framing of what is/isn't portably assertable in CI (timing safety).
+- Full 21-test suite reruns clean (21/21) after both fixes.
+
+Sign-off: both `SEC.07` and `CQR.08` review requirements satisfied.
+Ready for ARCH.00 to move to `done` alongside `TASK-157`.
+
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Depends on the full initial implementation set
 since it's an end-to-end pass across the whole feature, matching how

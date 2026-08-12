@@ -43,6 +43,8 @@ import time
 import pytest
 import requests
 
+from vw_client import VW_PERM_VIEW
+
 PASSWORD = "GatewayTestP@ss1"
 
 
@@ -384,7 +386,6 @@ def test_share_grant_list_revoke(server, clients, unique_username):
     r = owner.mkdir("shared_dir")
     dir_id = r.json()["dir_id"]
 
-    from vw_client import VW_PERM_VIEW
     r = owner.share_grant(dir_id, grantee_name, VW_PERM_VIEW)
     assert r.status_code == 200, r.text
     share_id = r.json()["share_id"]
@@ -405,7 +406,6 @@ def test_public_link_create_redeem_revoke(server, clients, unique_username):
     r = owner.mkdir("link_test_dir")
     dir_id = r.json()["dir_id"]
 
-    from vw_client import VW_PERM_VIEW
     r = owner.link_create(dir_id, VW_PERM_VIEW)
     assert r.status_code == 200, r.text
     link_data = r.json()
@@ -452,6 +452,17 @@ def test_vault_passphrase_never_sent_to_gateway(server, clients, unique_username
     TASK-135's endpoints promise to treat opaquely regardless of content —
     does the passphrase string ever cross the wire to the gateway, under
     any field name, in any request.
+
+    SEC.07/CQR.08 review note (TASK-157 review pass): the first version of
+    this test only asserted the literal `passphrase` variable string never
+    appeared in a captured body. Since this test never plumbs `passphrase`
+    into `vault_create`'s arguments to begin with (`wrapped_vk` is
+    `os.urandom(60)`, unrelated to it), that assertion was true by
+    construction regardless of what the gateway does — it verified this
+    test script, not the gateway's contract. Strengthened below with an
+    explicit allow-list check on every vault-request body's field names:
+    that catches ANY unexpected field (a real passphrase leak included),
+    not just one specific presupposed name.
     """
     passphrase = "vault-zero-knowledge-test-passphrase"
     client = clients.login(unique_username, server=server)
@@ -495,13 +506,35 @@ def test_vault_passphrase_never_sent_to_gateway(server, clients, unique_username
         "passphrase string appeared in a request body sent to the gateway - "
         "zero-knowledge boundary violated"
     )
-    # Also confirm no request body ever has a key literally named
-    # "passphrase" - structural, not just "this specific string never
-    # showed up by coincidence."
+
+    # Structural check, independent of any specific string this test
+    # happens to hold: every vault-request body must contain ONLY the
+    # documented opaque/descriptor fields (docs/PROTOCOL.md's vault
+    # registry ops) - anything else, including a hypothetical passphrase-
+    # carrying field this test never constructed itself, fails here.
+    VAULT_REQUEST_ALLOWED_FIELDS = {
+        "folder_file_id", "wrapped_vk", "kdf_salt", "kdf_params", "vault_id",
+    }
+    vault_shaped_bodies_checked = 0
     for body in seen_bodies:
-        if body.startswith("{"):
-            assert "passphrase" not in json.loads(body), \
-                "a request body has a 'passphrase' field at all"
+        if not body.startswith("{"):
+            continue
+        parsed = json.loads(body)
+        if not isinstance(parsed, dict):
+            continue
+        assert "passphrase" not in parsed, "a request body has a 'passphrase' field at all"
+        if not (set(parsed) & VAULT_REQUEST_ALLOWED_FIELDS):
+            continue  # not a vault-related body (e.g. the mkdir call above)
+        vault_shaped_bodies_checked += 1
+        unexpected = set(parsed) - VAULT_REQUEST_ALLOWED_FIELDS
+        assert not unexpected, (
+            f"vault request body has field(s) {unexpected} outside the "
+            f"documented opaque/descriptor set {VAULT_REQUEST_ALLOWED_FIELDS}"
+        )
+    # Guard against the allow-list check silently checking nothing at all
+    # (e.g. if a future refactor changes field names and the intersection
+    # test above stops matching any recorded body).
+    assert vault_shaped_bodies_checked >= 2  # vault_create + vault_key_fetch, at least
 
 
 # ── 3. Multi-session concurrency / isolation ─────────────────────────────────
