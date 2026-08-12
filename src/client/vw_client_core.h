@@ -126,16 +126,16 @@ typedef struct {
     uint64_t version_id;    /* current HEAD version; 0 if directory           */
     char     name[256];     /* leaf name, NUL-terminated                      */
     uint64_t vault_id;      /* TASK-100: current version's vault, 0 if
-                              * unencrypted. Populated by vw_client_file_stat/
-                              * _stat_by_id (FILE_STAT_RESP carries it); always
-                              * 0 from vw_client_file_list (FILE_LIST_RESP does
-                              * not carry per-entry vault_id — a folder listing
-                              * would need one version lookup per entry to
-                              * populate this honestly, so it doesn't claim to;
-                              * callers needing per-entry encrypted-indicators
-                              * for a whole listing should FILE_STAT each entry
-                              * of interest, same as any other on-demand
-                              * metadata this project doesn't batch). */
+                              * unencrypted or a directory. Populated by
+                              * vw_client_file_stat/_stat_by_id (FILE_STAT_RESP
+                              * carries it) and, since TASK-156, by
+                              * vw_client_file_list/_file_list_by_id too
+                              * (FILE_LIST_RESP's trailing vault_id array) — an
+                              * old server that hasn't been upgraded leaves
+                              * this at its calloc-zeroed 0 for every entry
+                              * instead, the same best-effort backward
+                              * compatibility every other trailing-field
+                              * extension in this protocol already gets. */
 } vw_file_entry_t;
 
 /*

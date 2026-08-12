@@ -66,6 +66,31 @@ static vw_err_t pr_raw(const uint8_t *b, uint32_t sz, uint32_t *o, void *dst, ui
     return VW_OK;
 }
 
+/*
+ * Reads and discards exactly n bytes off the wire (TASK-155). Used only
+ * when vw_proto_recv already knows the caller's buffer can't hold the
+ * incoming payload but the message itself is still within
+ * VW_MAX_MSG_BYTES - a legitimate message this specific caller's buffer
+ * happens to be too small for, NOT an attacker-declared unbounded length
+ * (that case is rejected before this point without draining - see
+ * vw_proto_recv's own comment). Without this, the payload's bytes stay
+ * queued on the socket and the *next* recv on this connection reads them
+ * as a bogus message header - a permanent desync, not a recoverable
+ * per-call error, and the normal (not rare) outcome whenever a server's
+ * generic error response is a few bytes larger than a caller's
+ * success-sized ACK buffer.
+ */
+static vw_err_t drain_bytes(vw_conn_t *conn, uint32_t n) {
+    uint8_t scratch[4096];
+    while (n > 0) {
+        uint32_t chunk = (n > sizeof(scratch)) ? (uint32_t)sizeof(scratch) : n;
+        vw_err_t err = vw_net_recv(conn, scratch, chunk);
+        if (err != VW_OK) return err;
+        n -= chunk;
+    }
+    return VW_OK;
+}
+
 /* ── Send ────────────────────────────────────────────────────────────────── */
 
 vw_err_t vw_proto_send(vw_conn_t *conn, vw_msg_type_t type,
@@ -106,8 +131,22 @@ vw_err_t vw_proto_recv(vw_conn_t *conn, vw_msg_type_t *out_type,
 
     uint32_t payload_len = total_len - VW_PROTO_HEADER_SIZE;
 
-    /* Ensure caller buffer is large enough */
-    if (payload_len > buf_size) return VW_ERR_PROTO_TOO_LARGE;
+    /* Ensure caller buffer is large enough. payload_len is already bounded
+     * by VW_MAX_MSG_BYTES above (checked before this point, on the raw
+     * wire header, without reading anything caller-buffer-sized) - a
+     * legitimate, bounded message this specific caller's buffer is just
+     * too small for, not an attacker-controlled unbounded length. Drain
+     * it off the wire before returning the error (TASK-155) - the payload
+     * bytes are otherwise left queued on the socket and the next
+     * vw_proto_recv on this connection reads them as a bogus message
+     * header, permanently desyncing the connection. If the drain itself
+     * fails (a real network error mid-drain), propagate that instead -
+     * the connection is unusable either way at that point. */
+    if (payload_len > buf_size) {
+        vw_err_t drain_err = drain_bytes(conn, payload_len);
+        if (drain_err != VW_OK) return drain_err;
+        return VW_ERR_PROTO_TOO_LARGE;
+    }
 
     *out_type = (vw_msg_type_t)vw_read_u16le(hdr + 4);
     /* proto_version at hdr+6 is informational; checked in negotiate() */

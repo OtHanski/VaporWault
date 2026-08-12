@@ -568,14 +568,5 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
     render_share_dialog(app);
     render_decrypt_dialog(app);
 
-    /* Conflict modal */
-    if (ImGui::BeginPopupModal("Conflict##browser", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("A conflict copy exists for this file.");
-        ImGui::Text("Resolve via CLI: vapourwault-cli resolve <path>");
-        if (ImGui::Button("Close##conflict")) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-
     ImGui::End();
 }

@@ -392,8 +392,21 @@ done:
      * protocol version bump needed, unlike the per-entry-wrapping approach
      * TODO/TASK-109.md originally sketched — a trailing parallel array
      * sidesteps that entirely because it doesn't interleave new data
-     * inside each entry's own byte range. */
-    uint32_t resp_cap = 4u + (uint32_t)all_len * (2u + 64u + 8u + 8u + 8u + 2u + 8u);
+     * inside each entry's own byte range.
+     * TASK-156: followed by a second trailing, parallel array of all_len *
+     * u64 vault_id (0 = unencrypted or a directory). Revision 14
+     * deliberately did NOT add this, reasoning that populating it would
+     * cost "one version lookup per entry" and that a caller wanting
+     * per-entry encrypted status should FILE_STAT each entry of interest
+     * instead — but both real consumers that have since needed this
+     * (vw_view_browser.cpp's refresh_vault_badges, capped at 200 lookups
+     * precisely because a real per-file round trip is far more expensive
+     * than the in-process version lookup this array now does instead; the
+     * web gateway's `TASK-141` folder-level-only workaround) prove the
+     * "just FILE_STAT it" alternative was actually costlier than the thing
+     * it was avoiding. Same trailing-array technique as TASK-109's
+     * version_id array, appended after it — no protocol version bump. */
+    uint32_t resp_cap = 4u + (uint32_t)all_len * (2u + 64u + 8u + 8u + 8u + 2u + 8u + 8u);
     uint8_t *resp = malloc(resp_cap);
     if (!resp) { free(all); return (send_error(conn, VW_ERR_OOM), VW_OK); }
 
@@ -416,6 +429,29 @@ done:
         for (uint32_t i = 0; i < all_len; i++) {
             uint64_t vid = (all[i].entry_type == VW_ENTRY_DIR) ? 0u : all[i].current_version_id;
             vw_write_u64le(resp + roff, vid); roff += 8;
+        }
+    }
+
+    /* TASK-156: vault_id trailing array — see the comment above resp_cap.
+     * Directories and files with no current version (current_version_id
+     * == 0, e.g. a freshly-created, never-committed file) both encode 0
+     * without a lookup; anything else costs exactly one
+     * vw_store_version_get call, same as handle_file_stat already pays
+     * for a single entry. A lookup failure (shouldn't happen for a live
+     * current_version_id, but this is still attacker/state-reachable, not
+     * assumed impossible) degrades to 0 rather than aborting the whole
+     * response — one entry's vault status being unknown doesn't justify
+     * failing a listing that is otherwise entirely valid. */
+    if (err == VW_OK) {
+        for (uint32_t i = 0; i < all_len; i++) {
+            uint64_t vault_id = 0;
+            if (all[i].entry_type != VW_ENTRY_DIR && all[i].current_version_id != 0) {
+                vw_version_record_t ver;
+                if (vw_store_version_get(fs, all[i].current_version_id, &ver) == VW_OK) {
+                    vault_id = ver.vault_id;
+                }
+            }
+            vw_write_u64le(resp + roff, vault_id); roff += 8;
         }
     }
 

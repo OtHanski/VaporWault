@@ -1,7 +1,7 @@
 ---
 id:          TASK-155
 title:       vw_proto_recv leaves unread bytes on the wire on VW_ERR_PROTO_TOO_LARGE, permanently desyncing the connection
-status:      todo
+status:      done
 assignee:    PRT.04
 created_by:  WEB.09
 created:     2026-08-11
@@ -142,3 +142,96 @@ connection rather than other users' sessions. Did not attempt to fix
 `vw_proto.c`/`vw_client_core.c` directly — out of `WEB.09`'s domain per
 `CLAUDE.md`'s routing rule for out-of-domain discoveries; a mitigation was
 added gateway-side instead (see `TASK-133`'s implementation note).
+
+PRT.04 [2026-08-12]: Fixed via option 1 (systemic fix at the source),
+per this task's own recommendation, in `src/core/vw_proto.c`.
+
+**Root cause confirmed exactly as filed**: `vw_proto_recv` (line ~110)
+returned `VW_ERR_PROTO_TOO_LARGE` when the caller's buffer couldn't hold
+the incoming payload, without ever reading those bytes off the socket —
+they stayed queued on the connection and the next `vw_proto_recv` call
+decoded them as a bogus message header instead of the real next message.
+
+**Fix**: added `drain_bytes()`, a small helper that reads and discards
+exactly N bytes off the wire in bounded 4 KiB chunks. `vw_proto_recv` now
+calls it before returning `VW_ERR_PROTO_TOO_LARGE` at line ~110, so the
+connection stays correctly positioned at the start of the *next* real
+message rather than mid-payload of the rejected one. **Deliberately
+scoped to only this one check**, not the earlier `total_len >
+VW_MAX_MSG_BYTES` check a few lines above it: that check runs on a raw,
+not-yet-validated header field that could claim any value up to
+`UINT32_MAX` — draining an attacker-declared unbounded length would be
+its own resource-exhaustion vector. The line-110 check this fix targets
+only ever sees a `payload_len` that has *already* been validated against
+`VW_MAX_MSG_BYTES` (a real, bounded, 8 MiB ceiling) by the check above
+it — it's a legitimate, bounded message that happens to be larger than
+this *specific caller's* buffer, exactly the scenario this task's own
+reproduction describes (a real `VW_MSG_ERROR` that just doesn't fit a
+4-byte success-sized `rbuf`), not attacker-controlled in a way that
+draining could weaponize. If the drain itself hits a real network error,
+that error propagates instead of the original `TOO_LARGE` — the
+connection is unusable either way at that point, so the more specific
+failure is more useful to the caller.
+
+Per-caller audit (option 2, not done as the primary fix but checked
+regardless): did not resize every small fixed-ACK-buffer caller in
+`vw_client_core.c` — the systemic fix means they no longer need to be
+exactly right, which was the point of choosing option 1.
+
+**Verified, not just read the diff**:
+- New regression test, `tests/integration/test_proto_recv_drain.c`
+  (`integration_proto_recv_drain` in `ctest`) — two cases, both driving a
+  real TLS-connected `vw_conn_t` pair (no server/auth stack needed, just
+  raw `vw_proto_send`/`vw_proto_recv`): (1) a 6-byte payload into a
+  4-byte buffer (the exact real-world shape — `VW_MSG_ERROR`'s minimum
+  encoding into `vw_client_file_move`'s real `rbuf[4]`), then a second,
+  distinguishable message on the *same* connection, asserting the second
+  `vw_proto_recv` call correctly receives the second message rather than
+  a bogus header; (2) an off-by-one case (buffer exactly one byte short).
+- **Confirmed the test actually catches the regression, not just
+  exercises the happy path**: reverted just `vw_proto.c` (via `git
+  stash`), rebuilt, reran — both cases failed exactly as predicted (the
+  second `vw_proto_recv` call got `VW_OK` with garbage `type`/`plen`
+  instead of the real second message); restored the fix, rebuilt, reran
+  — 19/19 assertions pass.
+- Rebuilt clean under both MSVC (`build-msvc-105`, `/W4`) and GCC (WSL
+  `build-gw-e2e`, `-Wall -Wextra -Wpedantic -Werror`) — the GCC build
+  needed one portability fix in the new test file itself (missing
+  `<sys/stat.h>` for `mkdir` on POSIX, caught immediately by
+  `-Werror=implicit-function-declaration`).
+- Full existing suite reruns clean: 16/16 `ctest` (MSVC, including the
+  new test), and the full 22-test gateway integration suite
+  (`tests/integration/test_gateway.py`) against a rebuilt
+  `vapourwaultd` + `vapourwault-web-gateway` pair in WSL — this exercises
+  the exact `TASK-133`-reported real-world path (a rejected file
+  operation through the gateway) with the fix in place, not just the new
+  isolated unit test.
+
+**On `TASK-133`'s gateway-side mitigation**: per this task's own
+acceptance criteria, left in place, not removed — a session that
+receives a truly unrecognized error is still evicted defensively. With
+this fix, that mitigation should simply trigger far less often in
+practice (the connection itself no longer desyncs on the *ordinary*
+generic-error-rejection path this task was filed from), not that it's
+now redundant in every case.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off per this task's own
+`review_by`, given the `security-sensitive`/`critical` tags.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `vw_proto.c`'s change directly.
+The scoping decision (drain only the already-bounded line-110 case, not
+the raw-header `total_len > VW_MAX_MSG_BYTES` case) is correct and
+exactly the right line to draw — confirmed by tracing that `payload_len`
+at the drain call site is provably `<= VW_MAX_MSG_BYTES -
+VW_PROTO_HEADER_SIZE` (checked immediately above, before any drain-
+related code runs), so `drain_bytes` never reads an attacker-unbounded
+amount. `drain_bytes` itself has no overflow/underflow risk (`n -=
+chunk` where `chunk <= n` by construction of the `min()`). Error
+propagation from a failed drain is sound (surfaces the real network
+error rather than masking it as `TOO_LARGE`). The regression test
+meaningfully exercises the two-call desync shape (not just single-call
+encode/decode, which `test_vw_proto.c`'s own header comment already
+flags as insufficient for this class of bug) and was confirmed via
+revert-and-rerun to actually catch the bug, not just pass trivially. No
+blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

@@ -1,7 +1,7 @@
 ---
 id:          TASK-131
 title:       Implement gateway session manager (per-browser vw_client_sess_t pool)
-status:      todo
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -72,3 +72,56 @@ state management is exactly SEC.07's "authentication and session
 management review" remit. This is the task most likely to need real design
 back-and-forth with SEC.07 before implementation, similar to how `TASK-099`
 (vault client module) was flagged as highest-risk in the vault feature.
+
+ARCH.00 [2026-08-12]: **Bookkeeping correction, not new work.** This
+task's implementation (`src/gateway/vw_gateway_session.{h,c}`) was
+actually built as prerequisite work during `TASK-127`'s initial wave —
+`TASK-132`/`133`/`134`/`135`/`137`/`138`/`140`/`141` all depend on it and
+have been implemented, reviewed (including a dedicated pass in
+`TASK-144`), and moved to `done` for weeks on top of it. This task's own
+file was simply never updated to match — a `status:` file that never
+tracked the real state, not a task that's actually still outstanding.
+Filing the missing status update now, per `CLAUDE.md`'s own rule that a
+mismatched status/folder is itself a bug to fix.
+
+Mapping the actual implementation to this task's scope:
+1. Gateway-issued cookie, distinct from the server's `session_token`:
+   `vw_gateway_session_create` mints a random 32-byte value via
+   `vw_crypto_random`/CTR-DRBG — the browser never sees the raw server
+   token.
+2. "Concurrency-safe map" was implemented as a **single-threaded-only**
+   fixed-slot array with no internal locking, matching the gateway's own
+   deliberately single-threaded accept loop (documented explicitly in
+   `vw_gateway_session.h`'s module comment, reviewed and accepted in
+   `TASK-144`) — a real, documented scope decision, not an oversight.
+3. Idle timeout (`vw_gateway_session_reap_idle`, `VW_GATEWAY_SESSION_IDLE_SECS`
+   = 30 min, called from `main.c`'s loop every 60s) and explicit logout
+   (`vw_gateway_session_remove`, which calls `vw_client_logout`) both
+   exist and work.
+4. Hard cap: `VW_GATEWAY_MAX_SESSIONS` = 256, enforced in
+   `vw_gateway_session_create`. **Honest note on the eviction-policy
+   half of this item**: the implementation does not do active
+   oldest-idle-first eviction *at* the cap — a login attempt when
+   already at 256 live sessions is rejected outright
+   (`503 too_many_sessions`, `handle_login`), and idle sessions are only
+   reclaimed passively via the 60s reap timer. This satisfies the
+   "can't be trivially exhausted" intent (the resource ceiling is real
+   and enforced, and idle abandonment can't grow it unboundedly) without
+   literally implementing the suggested "evict oldest to admit a new
+   login" policy — forcibly logging out an *active* user to let a new
+   login in would itself be a footgun, so rejecting the new login is
+   arguably the safer choice anyway. Documented here rather than left
+   implicit.
+5. Persistence decision: in-memory only, confirmed by grep (no
+   file-write API anywhere in `src/gateway/`, re-confirmed during
+   `TASK-144`'s review) — the daemon's Windows-ACL gap has no equivalent
+   surface here since nothing is written to disk at all.
+
+CQR.08 [2026-08-12]: Reviewed `vw_gateway_session.{h,c}` directly (also
+covered as part of the `TASK-133` gateway-core review pass). Constant-
+time cookie comparison, leak-free create/remove/reap paths, `count`/
+`in_use` invariants consistent across every mutation site. No findings.
+Sign-off: `SEC.07` (via `TASK-144`'s dedicated session/auth review,
+which explicitly covered cookie attributes, fixation, multi-session
+isolation, and fixed the one real finding — the `strcmp` timing
+side-channel) + `CQR.08` requirements satisfied. Ready for `done`.

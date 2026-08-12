@@ -382,6 +382,20 @@ static vw_err_t recv_file_list_resp(vw_conn_t *conn, vw_file_entry_t **out, uint
         for (uint32_t i = 0; i < count; i++) {
             entries[i].version_id = vw_read_u64le(rbuf + off); off += 8;
         }
+
+        /* TASK-156: a second optional trailing parallel array of
+         * count * u64 vault_id, appended after version_id's (same
+         * reasoning — absent/short both just leave vault_id at 0, an old
+         * server or a version_id-only server both look identical to a
+         * short remainder here). Deliberately gated on version_id's own
+         * array actually being present first — reading this one without
+         * that one already having succeeded would misinterpret bytes
+         * that don't exist as a real vault_id array. */
+        if (rplen - off >= (uint32_t)count * 8u) {
+            for (uint32_t i = 0; i < count; i++) {
+                entries[i].vault_id = vw_read_u64le(rbuf + off); off += 8;
+            }
+        }
     }
 
     free(rbuf);

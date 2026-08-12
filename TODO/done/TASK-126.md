@@ -1,7 +1,7 @@
 ---
 id:          TASK-126
 title:       Client GUI's "Conflict" popup is dead code and cites a CLI command that doesn't exist
-status:      todo
+status:      done
 assignee:    GUI.03
 created_by:  GUI.03
 created:     2026-08-05
@@ -71,3 +71,31 @@ wanted to describe conflict handling accurately and found the in-app text
 would have told users to run a command that doesn't exist, had it ever
 actually been shown. Low priority: it's unreachable, so no user has ever
 actually seen this wrong text in practice.
+
+GUI.03 [2026-08-12]: Took the "remove entirely" branch of this task's
+acceptance criteria, not the "rewrite and wire up" branch. Checked
+whether a conflict-notification popup would actually add anything: it
+wouldn't — `render_browser` already shows every file's `sync_state` via
+a persistent, always-visible, color-coded label in the file table
+(`sync_colour`/`sync_label`, `vw_view_browser.cpp:15-37` — state `3`
+renders as red "Conflict" text on every row currently in that state).
+That's strictly better UX than a one-off intrusive modal for the same
+information (no dismiss-and-forget, visible for every conflicted file
+at once, not just whichever one triggered a popup) — wiring up the dead
+modal would have added a second, redundant, and easily-inconsistent
+path for the same signal. Removed the unreachable
+`BeginPopupModal("Conflict##browser", ...)` block
+(`vw_view_browser.cpp`) entirely, including its wrong `vapourwault-cli
+resolve` text. No functional/behavior change (nothing called it, so
+nothing observes its removal) — confirmed by rebuilding
+`vapourwault-gui` clean under MSVC `/W4 /WX` with no new warnings.
+
+Moving to `review` — needs CQR.08 sign-off per `review_by`. Trivial,
+purely-subtractive change; low risk.
+
+CQR.08 [2026-08-12]: Confirmed via grep that nothing in the codebase
+referenced `"Conflict##browser"` before or after this change (it was
+truly dead), and that the persistent per-row conflict indicator this
+note relies on (`sync_colour`/`sync_label`) does cover state `3`
+correctly. Rebuilt clean, no warnings. No findings.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.

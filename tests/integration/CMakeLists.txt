@@ -47,6 +47,90 @@ set_tests_properties(integration_auth_handshake PROPERTIES
     LABELS  "integration;auth"
 )
 
+# test_proto_recv_drain: TASK-155 regression — vw_proto_recv used to leave
+# a too-large message's payload bytes queued on the wire when it returned
+# VW_ERR_PROTO_TOO_LARGE, permanently desyncing the connection's next
+# recv. Only needs vw_core (vw_proto.c + vw_net.c) — no server/auth stack,
+# unlike test_auth_handshake.
+
+add_executable(test_proto_recv_drain
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_proto_recv_drain.c
+)
+
+target_include_directories(test_proto_recv_drain PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_proto_recv_drain PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_proto_recv_drain PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_proto_recv_drain PRIVATE ws2_32)
+endif()
+
+add_test(NAME integration_proto_recv_drain
+         COMMAND test_proto_recv_drain)
+
+set_tests_properties(integration_proto_recv_drain PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;protocol"
+)
+
+# test_file_list_vault_id: TASK-156 regression — FILE_LIST_RESP now carries
+# a per-entry vault_id (it never did before). Needs the full server module
+# set (same list as vw_server_lib / test_vw_file_handlers, duplicated here
+# for the same reason those two do — see vw_server_lib's own CMakeLists
+# comment) since handle_file_list's dispatch path pulls in most of it.
+
+add_executable(test_file_list_vault_id
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_file_list_vault_id.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_server_core.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_file_handlers.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_admin.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_acme.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ddns.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_cluster.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_conn_registry.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_vault.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+)
+
+target_include_directories(test_file_list_vault_id PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_file_list_vault_id PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_file_list_vault_id PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_file_list_vault_id PRIVATE ws2_32)
+endif()
+
+add_test(NAME integration_file_list_vault_id
+         COMMAND test_file_list_vault_id)
+
+set_tests_properties(integration_file_list_vault_id PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;protocol;vault"
+)
+
 # test_vault_e2ee: TASK-099 client vault module, end-to-end against a real
 # already-running server (unlike test_auth_handshake, this does NOT self-host
 # one — see test_vault_e2ee.c's file header). No ctest add_test entry here:
