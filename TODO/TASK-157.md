@@ -1,7 +1,7 @@
 ---
 id:          TASK-157
 title:       FILE_MOVE never updates the path_ht index — renamed/moved files become permanently unresolvable by path
-status:      todo
+status:      review
 assignee:    SRV.01
 created_by:  WEB.09
 created:     2026-08-12
@@ -139,3 +139,83 @@ asserting path-based `stat` immediately after a `move` in the affected
 test (see `test_gateway.py`'s own note at that test) — `FILE_LIST`-based
 assertions are used instead where the test only needs to confirm the
 rename itself took effect, which isn't affected by this bug.
+
+SRV.01 [2026-08-12]: Fixed. Root cause confirmed exactly as filed:
+`vw_store_file_update` (`src/server/vw_store_files.c`) wrote the new
+record to disk but never touched `path_ht` regardless of what changed.
+
+**Fix** — `vw_store_file_update` now:
+1. `fs_pread`s the current on-disk record *before* overwriting it (the
+   function previously never read the old record at all).
+2. After the write/sync/oplog-confirm succeeds, compares old vs. new
+   `name`/`parent_dir_id`. If either changed: removes the old
+   `(owner_id, old_name)` → slot entry from `path_ht` (skipped if the old
+   record was already soft-deleted, matching the existing "deleted
+   records aren't indexed" invariant) and inserts the new
+   `(owner_id, new_name)` → slot entry (skipped if the new record is
+   itself soft-deleted). No-op, as before, when name/parent don't change
+   (soft-delete/restore calls to this same function untouched).
+3. This required a genuine new primitive, `path_ht_remove` /
+   `path_ht_remove_at` — the open-addressed table has no tombstones (an
+   empty slot terminates every probe chain), so a naive clear-and-leave-
+   empty delete would break lookups for any other entry whose probe chain
+   passes through the freed slot. Implemented as standard backward-shift
+   deletion: clear the target slot, then walk the contiguous run of
+   occupied slots that follows, pulling each one back into the most
+   recently freed slot whenever its own home slot lies within the freed
+   entry's probe range — otherwise it must stay put to remain reachable
+   from its own home slot. `path_ht_find_in_dir`/`path_ht_insert`/
+   `path_ht_grow` were not touched.
+
+**Verification (mechanical, not just read-reasoned):**
+- Added 5 new unit tests to `tests/unit/test_vw_file_handlers.c` calling
+  `vw_store_files.c`'s public API directly (no gateway, no wire protocol):
+  rename-in-place, move-to-a-different-directory, rename-then-reuse-the-
+  freed-old-name (proves the removed entry doesn't shadow future creates,
+  not just that lookups miss it), a 3-hop rename chain (proves the
+  backward-shift delete doesn't corrupt the table across repeated
+  remove/insert cycles), and a no-op update (touches an unrelated field,
+  same name/parent — confirms the guard condition doesn't fire and
+  existing entries are left alone). **Confirmed these actually catch the
+  regression**: stashed the `vw_store_files.c` fix, rebuilt, reran — 5/154
+  assertions failed exactly as expected (`VW_ERR_NOT_FOUND` where `VW_OK`
+  was expected on the post-rename path); restored the fix, rebuilt, all
+  154 passed again. (One of the 5 new tests, move-to-a-different-
+  directory-with-the-same-name, passed even on the buggy build — `path_ht`
+  keys on `owner_id + name_hash` only, not `parent_dir_id`, and the disk-
+  record cross-check reads the already-correctly-updated `parent_dir_id`,
+  so a same-name cross-directory move was accidentally never broken by
+  this bug. Kept the test anyway; it's still real coverage of this code
+  path, just not a discriminating regression check on its own — the other
+  4 are.)
+- Built clean under both toolchains this project targets: MSVC
+  (`build-msvc-105`, `/W4`) and GCC (WSL `build-gw-e2e`), no new warnings.
+- Ran the full unit suite (`ctest` in `build-msvc-105`): 15/15 passed,
+  including `unit_vw_file_handlers` (154/154 assertions).
+- Re-enabled the stat-after-move assertions in `TASK-143`'s
+  `test_gateway.py::test_move_renames_and_is_reflected_in_listing` that
+  QA.06 had deliberately left out specifically because of this bug (see
+  that test's own note, now updated) — reran the full 21-test gateway
+  integration suite against a real rebuilt `vapourwaultd` +
+  `vapourwault-web-gateway` pair: **21/21 passed**, including the
+  restored `stat("/move_dst_dir")` / `stat("/move_src_dir")` assertions.
+
+**Acceptance criteria status**: all four met — new-path `FILE_STAT`
+resolves on the first call (no restart), old-path `FILE_STAT` still
+correctly 404s, regression coverage added at both the unit and
+integration layers, no restart needed anywhere in verification.
+
+**Scope note for SEC.07/CQR.08 review**: while reading `handle_file_move`
+(`src/server/vw_file_handlers.c:2021-2119`) to confirm this fix's call
+site, noticed it has no duplicate-name check against the destination
+directory before calling `vw_store_file_update` — unlike
+`vw_store_file_create`, which does check via `path_ht_find_in_dir` before
+writing. Whether two files can end up sharing a name in the same
+directory after a move is a separate, unconfirmed question from this
+task's own scope (path_ht staleness) and not something this fix touches
+or relies on either way — flagging here rather than investigating further
+or filing speculatively; worth a look during review, not blocking this
+task's own close-out.
+
+Moving to `review` — needs SEC.07 + CQR.08 sign-off per this task's own
+`review_by`.

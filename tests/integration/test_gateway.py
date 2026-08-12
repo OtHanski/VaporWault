@@ -301,17 +301,16 @@ def test_file_list_mkdir_delete_round_trip(server, clients, unique_username):
 
 def test_move_renames_and_is_reflected_in_listing(server, clients, unique_username):
     """
-    Covers TASK-143's move round-trip. Deliberately asserts the rename via
-    files/list rather than files/stat-by-new-path immediately afterward -
-    see TASK-157 (filed from this exact test failing during development):
-    FILE_MOVE never updates the server's path_ht index, so FILE_STAT
-    cannot resolve a renamed item by either its old or new name until the
-    server restarts, even though the record itself (and FILE_LIST, which
-    doesn't use that index) is correctly updated. That's a real,
-    independently-reproduced (via the raw wire protocol, not just through
-    the gateway) server bug out of this suite's own scope to fix - this
-    test covers what move actually guarantees today without tripping over
-    a known, already-filed gap.
+    Covers TASK-143's move round-trip, plus a regression check for TASK-157
+    (filed from this exact test failing during development, now fixed):
+    FILE_MOVE used to never update the server's path_ht index, so FILE_STAT
+    couldn't resolve a renamed item by either its old or new name until the
+    server restarted, even though the record itself (and FILE_LIST, which
+    doesn't use that index) was correctly updated. vw_store_file_update now
+    removes the stale path_ht entry and inserts the new one whenever name/
+    parent_dir_id changes (src/server/vw_store_files.c) - both the listing
+    view and the stat-by-path view are asserted here so a regression in
+    either would be caught.
     """
     client = clients.login(unique_username, server=server)
 
@@ -329,6 +328,16 @@ def test_move_renames_and_is_reflected_in_listing(server, clients, unique_userna
     assert "move_src_dir" not in names
     moved_entry = next(e for e in r.json() if e["name"] == "move_dst_dir")
     assert moved_entry["file_id"] == dir_id
+
+    # TASK-157 regression: the new path must resolve on the first stat call,
+    # no restart required, and the old path must stay a clean 404.
+    r = client.stat("/move_dst_dir")
+    assert r.status_code == 200, r.text
+    assert r.json()["file_id"] == dir_id
+
+    r = client.stat("/move_src_dir")
+    assert r.status_code == 404
+    assert r.json()["status"] == "not_found"
 
 
 def test_upload_download_multi_chunk_round_trip(server, clients, unique_username):

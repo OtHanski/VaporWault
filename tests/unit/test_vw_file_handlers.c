@@ -138,6 +138,19 @@ static uint64_t make_entry(fh_stack_t *s, uint64_t owner_id,
     return file_id;
 }
 
+/* Rename/move in place (TASK-157 regression tests below) — same
+ * update-in-place pattern handle_file_move uses: mutate a copy of the
+ * current record, call vw_store_file_update. */
+static vw_err_t rename_entry(fh_stack_t *s, uint64_t file_id,
+                              uint64_t new_parent_dir_id, const char *new_name) {
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_id(s->fs, file_id, &rec));
+    rec.parent_dir_id = new_parent_dir_id;
+    memset(rec.name, 0, sizeof(rec.name));
+    snprintf(rec.name, sizeof(rec.name), "%s", new_name);
+    return vw_store_file_update(s->fs, file_id, &rec);
+}
+
 VW_TEST_SUITE("vw_file_handlers")
 
 VW_ASSERT_OK(vw_crypto_init()); /* needed for vw_crypto_random (link tokens) */
@@ -418,6 +431,107 @@ VW_TEST_CASE("permission_on_dir_or_root: real directory, VIEW-only grantee is no
     vw_perm_t p = permission_on_dir_or_root(s.ss, s.fs, folder, owner, grantee, 0);
     VW_ASSERT_EQ((int)p, (int)VW_PERM_VIEW);
     VW_ASSERT(p < VW_PERM_EDIT);
+    stack_close(&s);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * TASK-157 regression — vw_store_file_update() must keep path_ht in sync
+ * with a name/parent_dir_id change, so FILE_STAT (vw_store_file_get_by_path)
+ * resolves correctly immediately after a rename or move, no server restart
+ * required. Exercises vw_store_files.c's public API directly (no gateway,
+ * no wire protocol) via the same fh_stack_t fixture used above (rename_entry
+ * helper defined above VW_TEST_SUITE, alongside make_entry).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+VW_TEST_CASE("TASK-157: rename resolves by new path immediately, old path is NOT_FOUND") {
+    fh_stack_t s; stack_open(&s, "task157_rename");
+    uint64_t owner = 100;
+    uint64_t fid = make_entry(&s, owner, 0, "before.txt", VW_ENTRY_FILE);
+
+    VW_ASSERT_OK(rename_entry(&s, fid, 0, "after.txt"));
+
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/after.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid);
+
+    VW_ASSERT_ERR(vw_store_file_get_by_path(s.fs, owner, "/before.txt", &rec),
+                  VW_ERR_NOT_FOUND);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("TASK-157: move to a different directory resolves by new path immediately") {
+    fh_stack_t s; stack_open(&s, "task157_move");
+    uint64_t owner = 100;
+    uint64_t src_dir = make_entry(&s, owner, 0, "src", VW_ENTRY_DIR);
+    uint64_t dst_dir = make_entry(&s, owner, 0, "dst", VW_ENTRY_DIR);
+    uint64_t fid = make_entry(&s, owner, src_dir, "item.txt", VW_ENTRY_FILE);
+
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/src/item.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid);
+
+    VW_ASSERT_OK(rename_entry(&s, fid, dst_dir, "item.txt"));
+
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/dst/item.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid);
+
+    VW_ASSERT_ERR(vw_store_file_get_by_path(s.fs, owner, "/src/item.txt", &rec),
+                  VW_ERR_NOT_FOUND);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("TASK-157: renaming to a stale name frees it for reuse by a new file") {
+    fh_stack_t s; stack_open(&s, "task157_reuse");
+    uint64_t owner = 100;
+    uint64_t fid = make_entry(&s, owner, 0, "first.txt", VW_ENTRY_FILE);
+
+    VW_ASSERT_OK(rename_entry(&s, fid, 0, "renamed.txt"));
+
+    /* The old name must be genuinely free — not just NOT_FOUND on lookup,
+     * but actually creatable again (proves the stale path_ht entry, if any,
+     * no longer shadows this name for duplicate-detection purposes). */
+    uint64_t fid2 = make_entry(&s, owner, 0, "first.txt", VW_ENTRY_FILE);
+    VW_ASSERT_NE((int)fid2, (int)fid);
+
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/first.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid2);
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/renamed.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("TASK-157: repeated rename chain leaves only the final name resolvable") {
+    fh_stack_t s; stack_open(&s, "task157_chain");
+    uint64_t owner = 100;
+    uint64_t fid = make_entry(&s, owner, 0, "v1.txt", VW_ENTRY_FILE);
+
+    VW_ASSERT_OK(rename_entry(&s, fid, 0, "v2.txt"));
+    VW_ASSERT_OK(rename_entry(&s, fid, 0, "v3.txt"));
+    VW_ASSERT_OK(rename_entry(&s, fid, 0, "v4.txt"));
+
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/v4.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid);
+
+    VW_ASSERT_ERR(vw_store_file_get_by_path(s.fs, owner, "/v1.txt", &rec), VW_ERR_NOT_FOUND);
+    VW_ASSERT_ERR(vw_store_file_get_by_path(s.fs, owner, "/v2.txt", &rec), VW_ERR_NOT_FOUND);
+    VW_ASSERT_ERR(vw_store_file_get_by_path(s.fs, owner, "/v3.txt", &rec), VW_ERR_NOT_FOUND);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("TASK-157: update that does not change name/parent leaves path_ht untouched") {
+    fh_stack_t s; stack_open(&s, "task157_noop");
+    uint64_t owner = 100;
+    uint64_t fid = make_entry(&s, owner, 0, "steady.txt", VW_ENTRY_FILE);
+
+    vw_file_record_t rec;
+    VW_ASSERT_OK(vw_store_file_get_by_id(s.fs, fid, &rec));
+    rec.entry_type = rec.entry_type; /* touch a non-path field, same name/parent */
+    VW_ASSERT_OK(vw_store_file_update(s.fs, fid, &rec));
+
+    VW_ASSERT_OK(vw_store_file_get_by_path(s.fs, owner, "/steady.txt", &rec));
+    VW_ASSERT_EQ((int)rec.file_id, (int)fid);
     stack_close(&s);
 }
 

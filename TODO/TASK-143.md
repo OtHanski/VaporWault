@@ -146,6 +146,14 @@ Moving to `review` — needs SEC.07 + CQR.08 sign-off per this task's own
 `review_by`. `TASK-157`'s resolution should be tracked separately; this
 task's own required coverage is otherwise complete and passing for real.
 
+SRV.01 [2026-08-12]: `TASK-157` is fixed (see that task's own notes for
+the fix and its verification). Restored the stat-after-move assertions in
+`test_move_renames_and_is_reflected_in_listing` that this note's own
+workaround had deliberately left out because of the then-open bug —
+updated that test's docstring accordingly. Full 21-test suite reruns
+clean (21/21) with the stricter assertions in place, against a real
+rebuilt `vapourwaultd` + `vapourwault-web-gateway` pair.
+
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Depends on the full initial implementation set
 since it's an end-to-end pass across the whole feature, matching how

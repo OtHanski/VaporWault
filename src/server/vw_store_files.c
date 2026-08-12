@@ -243,6 +243,77 @@ static int path_ht_insert(struct vw_file_store *fs,
 }
 
 /*
+ * Backward-shift deletion for the open-addressed path_ht (no tombstones —
+ * probing elsewhere relies on an empty slot terminating the probe chain, so
+ * a naive "just clear it" delete would break lookups for every entry whose
+ * probe sequence passes through the freed slot). Standard algorithm: clear
+ * the target slot, then walk forward through the contiguous run of occupied
+ * slots that follows; for each entry found, pull it back into the most
+ * recently freed slot if doing so keeps it within its own probe sequence
+ * (i.e. its home slot lies in the cyclic range (freed, current]).
+ */
+static int path_ht_cyclic_in_range(size_t home, size_t freed, size_t cur)
+{
+    if (home <= cur)
+        return home > freed && home <= cur;
+    return home > freed || home <= cur;
+}
+
+static void path_ht_remove_at(struct vw_file_store *fs, size_t slot)
+{
+    size_t cap = fs->path_ht_cap;
+    path_ht_entry_t *ht = fs->path_ht;
+    size_t freed = slot;
+
+    memset(&ht[freed], 0, sizeof(ht[freed]));
+    fs->path_ht_len--;
+
+    size_t cur = freed;
+    for (;;) {
+        cur = (cur + 1) % cap;
+        if (ht[cur].owner_id == 0) break; /* end of probe chain */
+
+        size_t home = (size_t)path_ht_probe_start(ht[cur].owner_id,
+                                                    ht[cur].name_hash, cap);
+        if (path_ht_cyclic_in_range(home, freed, cur)) {
+            ht[freed] = ht[cur];
+            memset(&ht[cur], 0, sizeof(ht[cur]));
+            freed = cur;
+        }
+    }
+}
+
+/*
+ * Remove the path_ht entry inserted for (owner_id, name) -> meta_slot.
+ * name must be the record's name at the time it was indexed (i.e. the name
+ * being replaced, not the new one). No-op if no matching entry is found —
+ * callers that are merely defensive about index consistency may call this
+ * even when unsure an entry exists.
+ */
+static void path_ht_remove(struct vw_file_store *fs,
+                            uint64_t owner_id, const char *name,
+                            uint64_t meta_slot)
+{
+    if (!fs->path_ht_cap) return;
+    uint64_t nh = fnv1a(name, strlen(name));
+    uint64_t h = path_ht_probe_start(owner_id, nh, fs->path_ht_cap);
+    size_t i;
+
+    for (i = 0; i < fs->path_ht_cap; i++) {
+        size_t idx = (size_t)((h + (uint64_t)i) % (uint64_t)fs->path_ht_cap);
+        path_ht_entry_t *e = &fs->path_ht[idx];
+
+        if (e->owner_id == 0) break; /* empty slot — end of probe chain */
+
+        if (e->owner_id == owner_id && e->name_hash == nh &&
+            e->slot == meta_slot) {
+            path_ht_remove_at(fs, idx);
+            return;
+        }
+    }
+}
+
+/*
  * Find a file by (owner_id, name_component, parent_dir_id) using the path HT.
  * Reads candidates from disk to resolve hash collisions.
  * Returns UINT64_MAX on miss; slot index on hit.
@@ -631,6 +702,17 @@ vw_err_t vw_store_file_update(vw_file_store_t *fs,
     uint64_t slot = fs->fid_to_slot[file_id];
     uint64_t off  = slot * (uint64_t)sizeof(vw_file_record_t);
 
+    /* Read the current record so a name/parent_dir_id change (rename or
+     * move) can be reflected in path_ht — see TASK-157: this function used
+     * to leave path_ht entirely untouched, so a moved/renamed file became
+     * unresolvable by path (old AND new name) until the next server
+     * restart rebuilt the index from disk. */
+    vw_file_record_t old;
+    int have_old = (fs_pread(fs->meta_path, &old, sizeof(old), off) == 0);
+    int path_changed = have_old &&
+        (old.parent_dir_id != new_rec->parent_dir_id ||
+         strncmp(old.name, new_rec->name, sizeof(old.name)) != 0);
+
     rc = vw_oplog_append(fs->oplog, VW_OPLOG_FILE_UPDATE,
                          &file_id, (uint32_t)sizeof(file_id), &eid);
     if (rc != VW_OK) { rwlock_wrunlock(&fs->files_lock); return rc; }
@@ -660,6 +742,22 @@ vw_err_t vw_store_file_update(vw_file_store_t *fs,
 
     rc = vw_oplog_confirm(fs->oplog, eid);
     (void)rc;
+
+    if (path_changed) {
+        if (!old.deleted)
+            path_ht_remove(fs, old.owner_id, old.name, slot);
+        if (!w.deleted) {
+            uint64_t nh = fnv1a(w.name, strlen(w.name));
+            /* Record is already durable on disk at this point; an OOM here
+             * only leaves this session's in-memory index stale for this one
+             * entry until the next restart rebuilds it from disk — same
+             * trade-off vw_store_file_create already makes. */
+            if (path_ht_insert(fs, w.owner_id, nh, slot) != 0) {
+                rwlock_wrunlock(&fs->files_lock);
+                return VW_ERR_OOM;
+            }
+        }
+    }
 
     rwlock_wrunlock(&fs->files_lock);
     return VW_OK;
