@@ -234,17 +234,17 @@ building this feature, not a hypothetical.
   `$env:TAG`) — never interpolated directly as a `${{ }}` expression inside a
   `run:` block. Direct interpolation of ref-controlled values into a shell script
   is a known GitHub Actions script-injection vector; this workflow was reviewed
-  and fixed for that pattern (see `TODO/TASK-081.md`). `PKG_VERSION` (the
+  and fixed for that pattern (see `TASK-081`). `PKG_VERSION` (the
   installer packages' version string, `TASK-151`) follows the same discipline —
   derived from `$TAG`/`$env:TAG`, never from a raw `${{ }}` expression.
 - The installer packages' maintainer scripts (`packaging/linux/scripts/`) run as
   root during install/removal on the end user's machine, and the client MSI's
   custom action shells out to PowerShell (`packaging/windows/wix/`) — reviewed
-  for the same class of argument-injection risk as above; see `TODO/TASK-153.md`.
+  for the same class of argument-injection risk as above; see `TASK-153`.
 
 ## 8. Known limitations / follow-ups
 
-Tracked in `TODO/TASK-082.md`:
+Tracked in `TASK-082`:
 
 - The GUI+SDL2 build combination is only ever compiled here, in the release
   workflow — `ci.yml` always builds with `VW_BUILD_GUI=OFF`. A GUI build/link
@@ -257,19 +257,19 @@ Tracked in `TODO/TASK-082.md`:
   `actions/download-artifact`, `ilammy/msvc-dev-cmd`) are pinned to version tags,
   not commit SHAs, matching `ci.yml`'s existing convention.
 
-Tracked in `TODO/TASK-151.md`/`TASK-152.md` (installer packages, `TASK-145`):
+Tracked in `TASK-151`/`TASK-152.md` (installer packages, `TASK-145`):
 
 - The packages themselves have been installed, upgraded, and removed for real in
   disposable containers/build environments during development (see
-  `TODO/TASK-149.md`/`TASK-150.md`'s implementation notes) — but never yet
+  `TASK-149`/`TASK-150.md`'s implementation notes) — but never yet
   through an actual GitHub Actions run of this workflow. The `choco`-vs-NuGet-zip
   WiX fallback (§6 above) and the `gh release create`/`upload` step with the
   larger 8-artifact file list are both unverified against the real runner
   environment.
 - No automated test installs the Windows MSIs on a real Windows machine — that
-  remains manual/VM-based verification (`TODO/TASK-152.md`).
+  remains manual/VM-based verification (`TASK-152`).
 
-Tracked in `TODO/TASK-142.md` (web gateway + frontend deployment docs):
+Tracked in `TASK-142` (web gateway + frontend deployment docs):
 
 - `release.yml` does not build `vapourwault-web-gateway` or `web/`'s static
   frontend at all (`VW_BUILD_WEB_GATEWAY` stays at its `OFF` default in both

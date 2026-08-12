@@ -1,3 +1,11 @@
+<!--
+  This is a template, not a task — do not edit it in place.
+  Copy this file to TODO/todo/TASK-NNN.md (new tasks always start in
+  TODO/todo/, since status starts at "todo") and fill it in there.
+  See CLAUDE.md's "TODO-List Protocol" for the todo/ vs review/ vs done/
+  folder rules — the file must move folders every time status crosses a
+  stage boundary.
+-->
 ---
 id:          TASK-NNN
 title:       Short imperative description of the work

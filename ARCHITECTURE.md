@@ -1,7 +1,7 @@
 # VaporWault — System Architecture
 
 **Owner**: ARCH.00  
-**Last updated**: 2026-08-05 (`TASK-118` — full phase-status/doc-drift audit against `TODO/TASK-001`–`TASK-125`; see the 2026-08-05 audit-note follow-up under Implementation Phases for what was found and fixed. Prior entry, 2026-07-14, covered Phase 10 packaging/e2e-test completion — see `TASK-066`–`TASK-069` for that level of detail; superseded here rather than kept verbatim, since `TODO/` is the trustworthy record of what shipped, not this header.)
+**Last updated**: 2026-08-05 (`TASK-118` — full phase-status/doc-drift audit against `TASK-001`–`TASK-125`; see the 2026-08-05 audit-note follow-up under Implementation Phases for what was found and fixed. Prior entry, 2026-07-14, covered Phase 10 packaging/e2e-test completion — see `TASK-066`–`TASK-069` for that level of detail; superseded here rather than kept verbatim, since `TODO/` is the trustworthy record of what shipped, not this header.)
 
 ---
 
@@ -402,7 +402,7 @@ boundary must be disclosed plainly in the GUI, not just documented here.
 storage, client crypto/vault module, GUI (setup wizard, unlock prompts,
 encrypted indicators, and all three required disclosures — passphrase-loss,
 metadata-scope, delta-sync cost), and the regression suite are all done and
-verified (`docs/PROTOCOL.md` §7.11.5, `TODO/TASK-098.md`–`TASK-101.md`).
+verified (`docs/PROTOCOL.md` §7.11.5, `TASK-098`–`TASK-101`).
 Two decisions emerged during implementation that the design stage didn't
 anticipate: (1) per-chunk content is sized at `VW_CHUNK_SIZE_DEFAULT -
 16 bytes` rather than the full chunk size, so a full ciphertext+GCM-tag
@@ -457,7 +457,7 @@ Design, implemented across five pieces:
    that `FILE_LIST_RESP` never carries `version_id` per entry, so ongoing
    (non-first-time) remote-change detection driven by `FILE_LIST` alone was
    silently broken for *every* sync folder, not just shared ones — see
-   `TODO/TASK-109.md`. Worked around for both owned and shared folders with
+   `TASK-109`. Worked around for both owned and shared folders with
    a client-local, wire-safe fix (`compute_actions` also compares
    `mtime_unix`/`size_bytes`, which `FILE_LIST_RESP` already carries
    correctly) rather than the real fix, which means safely extending a
@@ -476,7 +476,7 @@ See `TODO/` for the active task list. Phases in order:
 | 1 | Authentication | `vw_auth`, `vw_auth_provider`, `vw_store` (users/sessions), `vw_smtp` | PRT.04, SRV.01 | **complete** (TASK-007–020 done) |
 | 2 | File Transfer | `vw_store` (files/versions), `vw_storage` (chunks/dedup), `vw_file_handlers`, `vw_client_core` file transfer | SRV.01, CLI.02 | **complete** (TASK-021–025 done) |
 | 3 | Sync Engine | `vw_cache`, `vw_watch_*`, `vw_sync`, `vw_daemon`, `vw_ipc`, `vw_client_cli`; server quota enforcement | CLI.02, SRV.01 | **complete** (TASK-026–033 done) |
-| 4 | Sharing | `vw_share` (new module), permission checks in `vw_file_handlers`, shared-folder sync | SRV.01, CLI.02 | **complete** — design published 2026-07-29 (`docs/PROTOCOL.md` §7.5/§7.10, `TASK-088`); server (`TASK-094`), client library (`TASK-095`), GUI (`TASK-096`), and integration tests (`TASK-097`) all closed `done`. Shared-folder local sync (`vw_sync` awareness of `remote_dir_id`-rooted folders) followed as `TASK-106`, hardened by `TASK-109`/`TASK-111`–`TASK-113`. Verified against `TODO/TASK-094.md`–`TASK-097.md`, `TASK-106.md` 2026-08-05 (`TASK-118`) — this row previously read "design complete, implementation not started" well after implementation had actually finished. |
+| 4 | Sharing | `vw_share` (new module), permission checks in `vw_file_handlers`, shared-folder sync | SRV.01, CLI.02 | **complete** — design published 2026-07-29 (`docs/PROTOCOL.md` §7.5/§7.10, `TASK-088`); server (`TASK-094`), client library (`TASK-095`), GUI (`TASK-096`), and integration tests (`TASK-097`) all closed `done`. Shared-folder local sync (`vw_sync` awareness of `remote_dir_id`-rooted folders) followed as `TASK-106`, hardened by `TASK-109`/`TASK-111`–`TASK-113`. Verified against `TASK-094`–`TASK-097`, `TASK-106` 2026-08-05 (`TASK-118`) — this row previously read "design complete, implementation not started" well after implementation had actually finished. |
 | 5 | DDNS, ACME, Admin | `vw_ddns`, `vw_acme`, thread pool, admin CLI, integration tests | SRV.01, PRT.04 | **complete** (TASK-036–041 done) |
 | 6 | GC, Invites, Recovery | `vw_gc`, invite tokens, recovery email | SRV.01, PRT.04 | **complete** (TASK-042–046 done) |
 | 7 | GUIs + Cluster | `vw_client_gui`, `vw_server_gui`, `vw_cluster` replication | GUI.03, SRV.01 | **complete** (TASK-047–053 done) |
@@ -488,8 +488,8 @@ See `TODO/` for the active task list. Phases in order:
 > **2026-07-29 audit note**: this table (and the Module Map / on-disk-layout sections above) was found to contain at least one fabricated completion claim (Phase 4, corrected above) that cited unrelated task IDs and referenced a module (`vw_users`) that was never created. The rest of this document has not been re-audited line-by-line against the current codebase — treat "complete" markers here as unverified until spot-checked against `TODO/` and the actual source tree, the same way Phase 4's was. `TODO/` task files (which get appended-to, never rewritten wholesale) are more trustworthy than this document's prose for "did X actually happen."
 >
 > **2026-08-05 follow-up (`TASK-118`)**: re-audited every phase-status claim
-> in the table above against `TODO/TASK-*.md` status fields (all 125 task
-> files checked, not sampled) rather than against memory of past
+> in the table above against every `TODO/` task file's status field (all 125
+> task files checked, not sampled) rather than against memory of past
 > conversations. Found Phase 4 (Sharing) was, ironically, *still* wrong —
 > the 2026-07-29 fix correctly identified the original fabrication but by
 > this date the real implementation had since finished, and the row hadn't

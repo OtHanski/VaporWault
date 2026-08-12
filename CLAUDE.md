@@ -226,8 +226,28 @@ see `ARCHITECTURE.md`'s Approved External Dependencies table
 
 ## TODO-List Protocol
 
-Tasks live in the `TODO/` directory, one file per task: `TODO/TASK-NNN.md`.  
+Tasks live under the `TODO/` directory, one file per task: `TODO/<folder>/TASK-NNN.md`.
 The template is at `TODO/TEMPLATE.md`. Copy it; do not edit the template itself.
+
+`TODO/` has exactly three subfolders, and every task file lives in exactly one of them:
+
+| Folder          | Holds tasks with `status:` |
+|-----------------|-----------------------------|
+| `TODO/todo/`    | `todo`, `in_progress`, or `blocked` (when blocked before reaching review) |
+| `TODO/review/`  | `review`, or `blocked` (when blocked mid-review) |
+| `TODO/done/`    | `done`                       |
+
+The folder tracks which **stage** a task is in (pre-review, in-review, closed); the
+`status:` field tracks the precise state within that stage. `blocked` is not a folder of
+its own — a blocked task stays in whichever of the two open folders matches where it
+got stuck, with `status: blocked` and the blocker task ID noted in the body.
+
+**Whenever an agent changes a task's `status:` field across a stage boundary (`todo`/
+`in_progress` → `review`, or `review` → `done`), it MUST `git mv` the file into the
+matching folder in the same change.** A task file's folder must always agree with its
+`status:` field — if you ever find one that doesn't, that is itself a bug: fix it by
+moving the file, don't just edit the status. New tasks are created directly in
+`TODO/todo/` (status starts at `todo`).
 
 ### Task file format
 
@@ -257,11 +277,15 @@ todo  →  in_progress  →  review  →  done
                                 ↘  blocked
 ```
 
-- `todo`: created, not yet picked up
-- `in_progress`: assignee is actively working
-- `review`: work is complete; reviewers listed in `review_by` are notified
-- `done`: all reviewers have signed off; ARCH.00 confirms
-- `blocked`: assignee cannot proceed; blocker task ID noted in the body
+- `todo`: created, not yet picked up — file in `TODO/todo/`
+- `in_progress`: assignee is actively working — file stays in `TODO/todo/`
+- `review`: work is complete; reviewers listed in `review_by` are notified — move the
+  file to `TODO/review/` in the same change that sets this status
+- `done`: all reviewers have signed off; ARCH.00 confirms — move the file to
+  `TODO/done/` in the same change that sets this status
+- `blocked`: assignee cannot proceed; blocker task ID noted in the body — the file does
+  **not** move for this transition; it stays put (`TODO/todo/` or `TODO/review/`,
+  whichever it already was in)
 
 ### Routing rules
 
@@ -279,7 +303,9 @@ todo  →  in_progress  →  review  →  done
    discovery in the current task's body. It does not fix the out-of-domain issue itself.
 
 5. **Task deletion** — only ARCH.00 may delete or reorder tasks. All other agents
-   append and update status only.
+   append and update status only (which includes moving the file to the matching
+   `TODO/todo/` / `TODO/review/` / `TODO/done/` folder — see TODO-List Protocol above;
+   that is a status update, not a reorder).
 
 6. **Blocking findings** — a reviewer's `blocking` finding prevents `status: done`.
    The assignee must resolve the finding and the reviewer must confirm resolution before
@@ -341,4 +367,4 @@ project evolves. Do not move or rename them without updating this file.
 | `docs/PROTOCOL.md`    | PRT.04  | Wire protocol specification and version history. |
 | `docs/STYLE.md`       | CQR.08  | C/C++ style decisions that apply project-wide.   |
 | `docs/RELEASE.md`     | BLD.05  | Build-and-release workflow: versioning, artifacts, dry-run/verification. |
-| `TODO/`               | All     | One file per task. See protocol above.           |
+| `TODO/`               | All     | One file per task, in `todo/`/`review/`/`done/` by status. See protocol above. |

@@ -6,7 +6,7 @@ NOT Python — it's in the compiled C binary test_vault_e2ee (built from
 test_vault_e2ee.c), which links vw_client_core.c + vw_vault.c directly and
 exercises the real production client code (not a Python reimplementation
 of the wire protocol, which is all vw_client.py is). This was a deliberate
-choice (see TODO/TASK-099.md's notes) over the two alternatives: hand-wiring
+choice (see TASK-099's notes) over the two alternatives: hand-wiring
 a full server context in C (like test_auth_handshake.c does, but that
 pattern only wires up the auth handshake, not the file-op dispatch loop),
 or reimplementing the crypto in Python (which would never call vw_vault.c

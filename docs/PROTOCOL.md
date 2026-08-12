@@ -302,7 +302,7 @@ matters: `TASK-109` was originally filed because `FILE_LIST_RESP` shipped
 (`TASK-021`) with no `version_id` at all, silently breaking the sync
 engine's ongoing remote-change detection (`vw_sync.c`'s `compute_actions`
 compared it against a value that was always 0 on both sides — see
-`TODO/TASK-109.md`). Fixing a *repeated* structure's per-entry layout looked
+`TASK-109`). Fixing a *repeated* structure's per-entry layout looked
 at first like it would need an entry-length wrapper (so an old client could
 skip unknown per-entry trailing bytes) and therefore a protocol version
 bump — but a trailing parallel array avoids that: an old client's decode
