@@ -1,7 +1,7 @@
 ---
 id:          TASK-157
 title:       FILE_MOVE never updates the path_ht index — renamed/moved files become permanently unresolvable by path
-status:      review
+status:      done
 assignee:    SRV.01
 created_by:  WEB.09
 created:     2026-08-12
@@ -288,3 +288,5 @@ noted above remains flagged, not fixed, unchanged from the prior note.
 
 Sign-off: both `SEC.07` and `CQR.08` review requirements satisfied.
 Ready for ARCH.00 to move to `done` alongside `TASK-143`.
+
+ARCH.00 [2026-08-12]: Both required reviewers signed off, moving to `done`.

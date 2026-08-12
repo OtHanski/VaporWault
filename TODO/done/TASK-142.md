@@ -1,7 +1,7 @@
 ---
 id:          TASK-142
 title:       Packaging + deployment docs for the web gateway and nginx frontend
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-10
@@ -175,3 +175,13 @@ UNIX-guarded copy step, both of which need root — still a real gap, just
 a smaller one than "the unit has never been started by any systemd."
 
 Moving to `review` for CQR.08 sign-off per `review_by`.
+
+CQR.08 [2026-08-12]: Reviewed against the actual source. Every claim
+cross-checks: CLI flags/defaults (`127.0.0.1:8080`) match
+`src/gateway/main.c`, the CMake option name (`VW_BUILD_WEB_GATEWAY`)
+matches the top-level `CMakeLists.txt`, and the systemd unit's directives
+(`Type=simple`, `Restart=on-failure`, hardening block, `User=vapourwault`)
+match `packaging/linux/vapourwault-web-gateway.service`. The
+"never internet-facing" warning is stated prominently and consistently in
+both the doc and the unit file's own header comment. No findings.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.

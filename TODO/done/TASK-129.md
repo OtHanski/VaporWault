@@ -1,7 +1,7 @@
 ---
 id:          TASK-129
 title:       Implement minimal HTTP/1.1 layer for the web gateway (vw_http)
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -119,3 +119,19 @@ entirely to `TASK-143`.
 Moving to `review` — implementation complete; needs SEC.07 + CQR.08
 sign-off per the `security-sensitive` tag, with the unit-test gap above
 called out explicitly for the reviewer's attention.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `src/gateway/vw_http.{h,c}` in full.
+Traced `read_header_block`'s 3-byte-rescan window and every size
+computation by hand — no underflow (`header_len` is always ≥4 before
+`header_len-2` is computed), every error path frees `buf`/`body`
+correctly, `Content-Length` is bounds-checked before any allocation. One
+advisory, not blocking: `strtoul` on `Content-Length` accepts a leading
+`+`/`-` (a `"-1"` value wraps to a huge unsigned number) — not
+exploitable, since the size cap still rejects it, just imprecise
+parsing; worth a stricter digit-only check if this module is ever
+touched again. The originally-flagged "no dedicated malformed-input
+test" gap is now closed: `tests/integration/test_gateway.py`
+(`TASK-143`) covers truncated headers and oversized `Content-Length`
+against a real running gateway, confirmed by reading that test file
+directly. No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

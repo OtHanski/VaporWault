@@ -1,7 +1,7 @@
 ---
 id:          TASK-133
 title:       Implement gateway file endpoints (list/stat/mkdir/move/delete, chunk upload/download, versions)
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -171,6 +171,78 @@ note for the full repro.
 Moving to `review` — needs SEC.07 + CQR.08 sign-off. `TASK-155`'s
 resolution should be tracked separately; this task's own scope, including
 the previously-deferred content-transfer endpoints, is now complete.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `src/gateway/vw_gateway_api.c` (all
+~1500 lines) directly. **Two blocking findings, both fixed and
+re-verified live, not just re-read.**
+
+**1. Blocking — stack overread via an unterminated buffer from a failed
+optional-field decode (memory-safety bug, not just a style issue).**
+`handle_file_move`'s `new_name` and `handle_file_commit`'s `path`/
+`leaf_name` were populated via `(void)get_json_string_field(...)`
+(return code ignored, "it's an optional field") and then gated on the
+buffer's *content* (`new_name[0]`, `path[0]`) rather than the decode's
+return code. `vw_json_string_decode` (`TASK-130`) could return an error
+*after* writing a partial, non-empty prefix and *without*
+NUL-terminating it (that module's own bug, fixed under `TASK-130`'s own
+note). Since these stack buffers are only ever explicitly zeroed at
+index 0, a `new_name`/`path`/`leaf_name` value long enough to make the
+decode fail (>255/2047 bytes) left the buffer non-empty and
+unterminated — the immediate callee (`vw_client_file_move`/
+`_commit_raw`) then `strlen()`s past the buffer's bound into adjacent
+stack memory until it happens to hit a zero byte. Reachable by any
+authenticated user with one crafted `/api/files/move` or
+`/api/files/commit` request; on this gateway's single-threaded process,
+a resulting crash is a total DoS for every logged-in user, not just the
+attacker — and a non-crashing overread can leak adjacent stack bytes
+into a stored filename readable back by the same attacker.
+
+**Fixed in two places**: the root cause in `vw_json_string_decode`
+itself (`TASK-130`'s note has the detail — it now always leaves
+`out_buf` terminated), and defensively at both call sites here —
+`handle_file_move`/`handle_file_commit` now explicitly reset the
+buffer to empty on a decode failure instead of trusting whatever
+partial bytes a failed decode left behind, so this class of bug can't
+recur here even if a future caller elsewhere forgets to check the
+return code.
+
+**Verified the bug was real and the fix closes it, not just read the
+diff**: added a regression test
+(`tests/integration/test_gateway.py::test_move_with_oversized_new_name_decodes_safely`,
+a `new_name` of 1000 bytes against a 256-byte buffer) and confirmed it
+fails against the pre-fix code (`500 error` from corrupted stack data —
+reproduced by temporarily stashing the fix and rebuilding, not
+hypothesized) and passes cleanly against the fix. Full 22-test gateway
+integration suite reruns clean (22/22) with the fix in place, in a real
+WSL-hosted `vapourwaultd` + `vapourwault-web-gateway` pair. Rebuilt
+clean under both MSVC `/W4 /WX` and GCC.
+
+**2. Blocking — `send_file_op_error`'s switch was still missing
+`VW_ERR_VERSION_NOT_FOUND` (601-603 range, `vw_proto.h`).** Same class
+of gap this project has now hit and fixed four times
+(`AUTH_REQUIRED`/`ALREADY_EXISTS`/`RATE_LIMITED`, and now this one) — an
+entirely ordinary outcome (`/api/versions/restore` with a stale/foreign
+`version_id`: a double-click, superseded version, normal UI race) fell
+into the catch-all "unrecognized error → evict + 500" branch, forcing a
+scary error and a full re-login for a completely normal outcome.
+**Fixed**: added an explicit `VW_ERR_VERSION_NOT_FOUND` → `404
+version_not_found` case, no eviction, matching the pattern of the three
+prior fixes exactly. Not independently regression-tested with its own
+new test in this pass (same low-risk mechanical pattern as the three
+prior fixes, which do have coverage) — flagging as a good `TASK-143`-suite
+addition for whoever next touches this file, not blocking this sign-off.
+
+**Everything else reviewed and confirmed sound**: `TASK-134`'s
+unauthenticated `/api/links/access` design and anti-enumeration
+behavior (confirmed by direct code read, `handle_link_access`);
+`TASK-135`'s "never touches a passphrase" claim (confirmed — no
+function in this file calls any KEK/decrypt primitive, no
+passphrase-shaped field extraction exists); `vw_gateway_session.c`'s
+constant-time cookie comparison, leak-free create/remove/reap paths,
+and `count`/`in_use` invariants across all mutation sites.
+
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied — both blocking
+findings resolved and re-verified. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` — file/path

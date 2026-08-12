@@ -1,7 +1,7 @@
 ---
 id:          TASK-153
 title:       Security review — installer packaging surface
-status:      review
+status:      done
 assignee:    SEC.07
 created_by:  ARCH.00
 created:     2026-08-11
@@ -132,3 +132,17 @@ Moving to `review` — the one blocking finding is resolved and
 re-verified; recommend this task (and `TASK-145`/`TASK-147`–`TASK-151`,
 all of which depend on this sign-off per `CLAUDE.md`'s routing rules) can
 move to `done` once CQR.08 confirms the fix.
+
+CQR.08 [2026-08-12]: Reviewed this review pass itself (this task's
+`review_by` is `CQR.08` only). The blocking WiX-supply-chain finding was
+verified both positively (real fetch, checksum matches) and negatively
+(deliberately wrong hash correctly rejected) — a stronger check than a
+one-sided "it downloads fine" confirmation. The static-analysis items
+(shellcheck at strictest severity, PSScriptAnalyzer) are actually run,
+not just claimed, and the one real finding from that pass (missing BOM)
+was fixed with reasoning for why a BOM fix vs. an ASCII rewrite was
+chosen. The accepted-advisory items (empty catch blocks) are justified
+by direct comparison against pre-existing shipped code, not just
+declared conventional. All six scope items have a specific finding,
+verification method, and outcome. No gaps found in the review process.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.

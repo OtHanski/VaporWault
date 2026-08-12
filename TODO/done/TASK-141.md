@@ -1,7 +1,7 @@
 ---
 id:          TASK-141
 title:       In-browser vault crypto (WASM Argon2id + SubtleCrypto AES-256-GCM) and vault UI
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -201,6 +201,53 @@ or independently re-verify at least the AES-GCM wrap-blob and HKDF-nonce
 cross-checks rather than take this note's word for them, and confirm the
 passphrase-never-sent check by running their own network capture during
 manual testing rather than relying solely on this task's scripted check.
+
+SEC.07/CQR.08 [2026-08-12]: Independently re-derived the nonce/wrap-format
+scheme against `docs/PROTOCOL.md` §7.11.3 by reading `chunkNonce`/
+`wrapKey`/`unwrapKey` in `vault-crypto.ts` cold (not re-using the prior
+verification's own numbers) — matches exactly: HKDF-SHA256, empty salt,
+`"vw-chunk-nonce" || chunk_index` (LE64) info, first 12 bytes; AES-GCM
+wrap blob = `nonce‖ciphertext‖tag`, 60 bytes for a 32-byte key. Confirmed
+passphrase-never-sent independently by reading every request-body
+construction site in `api.ts`/`main.ts` — no code path plumbs the
+passphrase into any `fetch()` call.
+
+**Two advisory findings, both fixed** (crypto-hygiene inconsistencies,
+not correctness bugs — the derived values were correct, just not
+cleared from memory as carefully as sibling values elsewhere in this
+same codebase):
+- `deriveKek`'s `finally` block zeroed the WASM-heap passphrase copy
+  before freeing it, but never zeroed the derived-KEK output buffer
+  (`outPtr`) before freeing *that* — the KEK's raw bytes remained in
+  freed WASM linear memory. **Fixed**: added the same
+  `Module.HEAPU8.fill(0, ...)` treatment for `outPtr`, after the
+  `.slice()` copy (the actual return value) has already been taken, so
+  the caller's value is unaffected.
+- The per-file DEK (`uploadFileEncrypted`/`downloadFileEncrypted`,
+  `api.ts`) was never `.fill(0)`-ed after use, unlike `kek`/`vk`
+  elsewhere in `main.ts`, which are explicitly zeroed — same
+  sensitivity class, inconsistent treatment. **Fixed**: both functions
+  now zero `dek` once it's no longer needed (after wrapping, for
+  upload; after the last chunk decrypt, for download).
+
+Verified: `tsc --strict` compiles clean after both fixes; the returned/
+already-in-flight values (the KEK actually handed to the caller, the
+ciphertext already produced from the DEK) are unaffected since zeroing
+happens strictly after each value's last use — traced by reading the
+control flow, not assumed.
+
+**One advisory, not fixed**: `web/wasm/build.sh` clones Argon2 by git tag
+only (`20190702`), no commit-hash/checksum pin — inconsistent with this
+project's `SDL2_ZIP_SHA256`/`WIX_ZIP_SHA256` supply-chain precedent.
+Lower urgency and left as-is: this is a local dev-only toolchain script,
+never invoked by CI or the release pipeline (confirmed — no reference to
+it in `.github/workflows/`), and a git tag is a substantially stronger
+provenance anchor than the raw NuGet-zip URLs those two precedents were
+guarding against. Worth tightening if this build ever gets wired into
+CI.
+
+No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive`/`crypto` — highest

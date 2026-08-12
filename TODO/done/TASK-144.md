@@ -1,7 +1,7 @@
 ---
 id:          TASK-144
 title:       Security review pass — web gateway + browser client
-status:      review
+status:      done
 assignee:    SEC.07
 created_by:  ARCH.00
 created:     2026-08-10
@@ -198,6 +198,19 @@ Moving to `review` — needs CQR.08 sign-off per this task's own
 `review_by`. Both blocking findings are fixed and re-verified; `TASK-143`
 should add regression coverage for both (a stalled-connection test and a
 cookie-timing-adjacent note) per standing project policy.
+
+CQR.08 [2026-08-12]: Reviewed this review pass itself (this task's
+`review_by` is `CQR.08` only — auditing the review's own rigor, not
+re-doing the security analysis). Both blocking findings are backed by
+live before/after verification rather than assumed from a diff read
+(the 2s-timeout stall test for item 1, the constant-time-compare grep
+plus rebuild for item 2). Advisory item (single-threaded architecture)
+is correctly left for ARCH.00 rather than unilaterally scoped into a
+fix. Every one of the six numbered items has an explicit, falsifiable
+answer with a code reference, not a bare "looks fine." `TASK-143`'s
+regression coverage for both findings is confirmed present (its own
+sign-off note, item 4). No gaps found in the review process.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. This is the feature's dedicated security

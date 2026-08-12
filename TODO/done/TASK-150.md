@@ -1,7 +1,7 @@
 ---
 id:          TASK-150
 title:       Linux .rpm packages for server & client (CPack RPM, reusing TASK-149 scripts)
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -118,3 +118,12 @@ as a harmless distro-specific wart.
 
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `packaging/linux/scripts/rpm/
+server-postun.sh` directly. `$1`-install-count interpretation is
+correct (`0` = final removal triggers cleanup, `>=1` = upgrade skips
+it), quoting is consistent with the DEB scripts reviewed under
+`TASK-149`, and the documented DEB/RPM removal-semantics asymmetry
+matches the actual script logic (not just the container-test
+observation). No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

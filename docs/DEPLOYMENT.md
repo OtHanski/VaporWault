@@ -40,7 +40,12 @@ macOS is not yet supported.
 
 ## 2. Installation
 
-### Linux
+**Recommended path**: install from the OS-native packages (`.deb`/`.rpm`/`.msi`)
+described in §12 — they handle the system user, directories, config template,
+and service registration for you. The manual/from-source path below remains
+fully supported for scripted, air-gapped, or otherwise advanced deployments.
+
+### Linux (manual, from source)
 
 Build from source first:
 
@@ -65,7 +70,7 @@ The script creates the `vapourwault` system user, installs binaries to
 `/usr/local/bin`, creates `/var/lib/vapourwault` and `/etc/vapourwault`, and
 installs the systemd unit.
 
-### Windows
+### Windows (manual, from source)
 
 Build from source (MSVC or MinGW) then run as Administrator in PowerShell:
 
@@ -365,6 +370,16 @@ vapourwault-server-cli --admin-socket /run/vapourwault/admin.sock \
 ---
 
 ## 8. Upgrading
+
+**If you installed via a package** (§12): `apt install ./<new>.deb`,
+`rpm -U <new>.rpm`/`dnf upgrade <new>.rpm`, or re-running the `.msi` all
+upgrade in place — config and data are preserved by every package format's
+upgrade path (only *removal*, not upgrade, has the DEB/RPM asymmetry
+described in §12.3). Restart the service afterward (package upgrades do not
+restart a running service automatically, matching the "don't act on a
+config you haven't reviewed" philosophy used throughout this project).
+
+**If you installed manually from source**:
 
 1. Download and build the new version.
 2. Stop the service (`systemctl stop vapourwaultd` / `Stop-Service VaporWault`).
@@ -704,3 +719,109 @@ across hosts by adjusting `--server-host`/`--ca-cert` and the nginx
    gateway) and port 4430 (the server, if colocated) should **not** be
    reachable from outside this host at all — re-read §11.1's warning if
    you're tempted to open either for convenience.
+
+---
+
+## 12. Installing via OS packages (.deb / .rpm / .msi)
+
+Since `TASK-145`–`TASK-151`, every tagged release publishes OS-native
+installer packages alongside the plain tarball/zip (see `docs/RELEASE.md`'s
+"Installer packages" section for what the release workflow produces). This
+is the **recommended** install path — §2's manual/from-source scripts remain
+supported for scripted or air-gapped deployments, but the packages handle
+user/directory/service setup for you and are the easier default.
+
+Server and client are **independently installable** — install only the
+component you need on a given host (e.g. a headless server on one machine,
+the client daemon on your desktop).
+
+### 12.1 Debian / Ubuntu (`.deb`)
+
+```bash
+# Server (requires root)
+sudo apt install ./vapourwault-server_<version>_amd64.deb
+
+# Client (no root required for daemon operation; apt itself still needs root to install the package)
+sudo apt install ./vapourwault-client_<version>_amd64.deb
+```
+
+The server package creates the `vapourwault` system user and
+`/etc/vapourwault`, `/var/lib/vapourwault`, `/run/vapourwault`, installs a
+`server.conf` template only if one doesn't already exist, and registers
+(but does not enable/start) the `vapourwaultd` systemd unit — configure
+`server.conf` first (§3), then:
+
+```bash
+sudo systemctl enable --now vapourwaultd
+```
+
+The client package installs a systemd **user** unit. Since it's per-user,
+`apt install` cannot start it for a specific user — after installing, each
+user who wants sync runs:
+
+```bash
+systemctl --user enable --now vapourwault-daemon
+```
+
+**Removing**: `sudo apt remove vapourwault-server` keeps `/etc/vapourwault`
+and `/var/lib/vapourwault` (config and data survive); `sudo apt purge
+vapourwault-server` deletes both, plus the `vapourwault` system user. An
+in-place upgrade (`apt install` over an existing version) never deletes
+config or data, and never overwrites an admin-edited `server.conf`.
+
+### 12.2 Fedora / RHEL (`.rpm`)
+
+```bash
+sudo dnf install ./vapourwault-server-<version>-1.x86_64.rpm
+sudo dnf install ./vapourwault-client-<version>-1.x86_64.rpm
+```
+
+Install/enable steps are identical to §12.1's DEB instructions (same
+maintainer-script logic underneath, just packaged for `rpm`/`dnf`).
+
+**Removing — important difference from DEB**: RPM has no separate "purge"
+concept. `sudo dnf remove vapourwault-server` behaves like DEB's `apt
+purge`, **not** `apt remove` — it deletes `/etc/vapourwault`,
+`/var/lib/vapourwault`, and the `vapourwault` system user immediately. If
+you're coming from Debian/Ubuntu habits, there is no gentler removal option
+on Fedora/RHEL; back up `/etc/vapourwault` and `/var/lib/vapourwault`
+first if you might want them back. As with DEB, an in-place upgrade
+(`rpm -U`/`dnf upgrade`) never deletes config or data.
+
+### 12.3 Windows (`.msi`)
+
+Double-click the `.msi`, or from PowerShell:
+
+```powershell
+msiexec /i vapourwault-server-<version>-win64.msi
+msiexec /i vapourwault-client-<version>-win64.msi
+```
+
+**Server MSI** requires Administrator elevation (UAC prompt) — it installs
+to `Program Files`, registers a real Windows Service (`ServiceInstall`) with
+a firewall rule for the TLS listen port, and installs a `server.conf`
+template to `%ProgramData%\VaporWault\server.conf` only if one doesn't
+already exist. It does not start the service automatically — configure
+`server.conf` first, then start the `VaporWault` service from `services.msc`
+or `Start-Service VaporWault`.
+
+**Client MSI** installs **per-user, with no elevation** (no UAC prompt) —
+it installs to `%LOCALAPPDATA%`/`%APPDATA%` and registers a per-user
+Scheduled Task (logon trigger) that starts `vapourwault-daemon`
+automatically at your next logon.
+
+**Removing/upgrading**: uninstall from "Apps & Features" (or `msiexec /x
+<path-to-msi>`), or simply run a newer version's `.msi` — CPack's WiX
+upgrade handling (`CPACK_WIX_UPGRADE_GUID`, fixed per product) replaces the
+old version in place without a separate uninstall step, preserving
+`server.conf`/`daemon.conf`.
+
+### 12.4 All packages are unsigned
+
+No code-signing certificate or GPG key currently exists for this project.
+Expect the normal OS warnings for unsigned software: `apt`/`dnf` will warn
+about an unsigned package (still installable — these aren't served from a
+signed repository at all, so there's no signature to check against), and
+Windows will show its usual SmartScreen/unknown-publisher prompt for the
+`.msi`. This is an accepted, documented gap, not an oversight — revisit if
+this project ever sets up code-signing infrastructure.

@@ -1,9 +1,11 @@
 #!/bin/sh
 # packaging/linux/scripts/server/postinst — shared post-install logic for
 # the vapourwault-server package (TASK-149 DEB, TASK-150 RPM). Portable
-# POSIX sh: invoked directly as DEB's postinst, and via a thin rpm-specific
-# wrapper for RPM's %post (see packaging/linux/scripts/rpm/server-post)
-# since RPM's scriptlet argument convention differs (TASK-150).
+# POSIX sh: invoked directly as both DEB's postinst and RPM's %post — this
+# script's own idempotent logic doesn't depend on which package manager
+# invoked it, unlike %postun/postrm (see packaging/linux/scripts/rpm/
+# server-postun.sh), where RPM's differing scriptlet-argument convention
+# does need a thin RPM-specific wrapper (TASK-150).
 #
 # Mirrors packaging/linux/install.sh's logic exactly (that script remains
 # the manual/tarball install path, unchanged) — create the system user,

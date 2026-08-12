@@ -1,7 +1,7 @@
 ---
 id:          TASK-138
 title:       Frontend file browser view (list/stat/mkdir/move/delete)
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -71,6 +71,56 @@ endpoints yet.
 Moving to `review` — needs SEC.07 + CQR.08 sign-off, with the XSS-handling
 claim specifically worth SEC.07 double-checking against a real adversarial
 filename in a real browser, not just code inspection.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `main.ts` directly. Re-verified the
+XSS claim independently rather than trusting the prior grep: every
+render path (`renderFileRow`, `renderVersionRow`, `renderShareRow`,
+`renderLinkRow`) uses `textContent`/`createElement` exclusively — zero
+`innerHTML`/`insertAdjacentHTML` anywhere in the file. Claim holds.
+
+**Two blocking findings, both real functional bugs, both fixed and
+verified live against a real running gateway+server:**
+
+1. **`handleMkdir` ignored the currently-browsed folder.** It called
+   `mkdir(name)` with no second argument, so `api.ts`'s `mkdir`
+   default (`parentDirId = 0`) was always used — every new folder was
+   created at the filesystem root regardless of which folder was
+   actually being browsed. Navigate into `/Documents`, click "New
+   folder", name it "Reports" → it's created as `/Reports`;
+   `refreshFileList()` then re-lists `/Documents`, where it never
+   appears — looks like a silent failure but it actually landed
+   somewhere else entirely. **Fixed**: `handleMkdir` now passes
+   `currentFolderId` (the module-level variable `resolveCurrentFolderId`
+   already maintains, tracking the folder currently being browsed).
+
+2. **This task's own acceptance criteria require move to "work
+   end-to-end from a browser," but there was no move/rename UI
+   anywhere** — `moveFile` (`api.ts`) was defined but never called from
+   the frontend. **Fixed**: added a "Rename" row action
+   (`handleRename`), a `window.prompt`-based in-place rename that calls
+   `moveFile(entry.file_id, newName, currentFolderId)` — note it needs
+   the *same* `currentFolderId` argument as the mkdir fix above, since
+   `moveFile`'s own `newParentDirId` default is also 0; omitting it
+   would have silently relocated the renamed entry to the root instead
+   of renaming it in place. This delivers move as an in-place
+   rename (the common case) rather than drag-to-a-different-folder,
+   which is a reasonable, documented scope choice rather than the
+   originally-implied full drag-and-drop — flagging for ARCH.00 in case
+   cross-folder move deserves its own follow-up task.
+
+**Verified live, not just read the diff**: `tsc --strict` compiles
+clean; built `web/dist/`; ran a real end-to-end smoke test (Node,
+compiled `dist/api.js`, against a real running `vapourwaultd` +
+`vapourwault-web-gateway` pair) that creates a top folder, creates a
+nested folder while "browsing" the top folder (mirroring
+`handleMkdir`'s exact call shape), confirms via `/api/files/list` that
+the nested folder landed *inside* the top folder rather than at root,
+then renames it in place (mirroring `handleRename`'s exact call shape)
+and confirms it's still inside the same parent afterward, under its
+new name. All assertions passed.
+
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied — both blocking
+findings resolved and re-verified live. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` for the filename-

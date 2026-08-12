@@ -11,6 +11,7 @@ import {
   listFiles,
   mkdir,
   deleteFile,
+  moveFile,
   uploadFile,
   downloadFile,
   listVersions,
@@ -490,6 +491,13 @@ function renderFileRow(entry: FileEntry): HTMLTableRowElement {
     void enterShareView(entry);
   });
   actionsCell.appendChild(shareBtn);
+  const renameBtn = document.createElement("button");
+  renameBtn.textContent = "Rename";
+  renameBtn.className = "row-action";
+  renameBtn.addEventListener("click", () => {
+    void handleRename(entry);
+  });
+  actionsCell.appendChild(renameBtn);
   const deleteBtn = document.createElement("button");
   deleteBtn.textContent = "Delete";
   deleteBtn.className = "row-action";
@@ -522,9 +530,30 @@ async function handleMkdir(): Promise<void> {
   const name = window.prompt("New folder name:");
   if (!name) return;
 
-  const result = await mkdir(name);
+  // currentFolderId, not the default 0 - otherwise every new folder lands
+  // at the filesystem root regardless of which folder is being browsed
+  // (a real bug found during TASK-138's CQR.08 review: the folder was
+  // created at "/", refreshFileList() then re-listed the folder actually
+  // being browsed, and it silently never appeared there).
+  const result = await mkdir(name, currentFolderId);
   if (!result.ok) {
     showError(browserError, `Could not create "${name}": ${result.data.status ?? "error"}`);
+    return;
+  }
+  await refreshFileList();
+}
+
+async function handleRename(entry: FileEntry): Promise<void> {
+  const newName = window.prompt("Rename to:", entry.name);
+  if (!newName || newName === entry.name) return;
+
+  // Same currentFolderId requirement as handleMkdir above - moveFile's
+  // own newParentDirId default is also 0, so an in-place rename that
+  // omitted this would silently relocate the entry to the filesystem
+  // root instead of renaming it where it sits.
+  const result = await moveFile(entry.file_id, newName, currentFolderId);
+  if (!result.ok) {
+    showError(browserError, `Could not rename "${entry.name}": ${result.data.status ?? "error"}`);
     return;
   }
   await refreshFileList();

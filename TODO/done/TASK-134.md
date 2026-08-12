@@ -1,7 +1,7 @@
 ---
 id:          TASK-134
 title:       Implement gateway sharing endpoints (grants, public links)
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -128,6 +128,19 @@ tokens all return the same `401 bad_credentials`, mirroring
 `send_file_op_error`'s full switch for any other "ordinary outcome"
 `vw_err_t` values still falling into the evict-and-500 catch-all
 unnecessarily.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed alongside `TASK-133` (see that
+task's note for the full pass over `vw_gateway_api.c`, including the
+`send_file_op_error` switch-completeness check this task specifically
+asked for — one more gap found there, `VW_ERR_VERSION_NOT_FOUND`, fixed
+under `TASK-133`). This task's own endpoints (`handle_share_*`,
+`handle_link_*`): the unauthenticated `/api/links/access` design and
+anti-enumeration behavior (`401 bad_credentials` for unknown/revoked/
+expired tokens alike) confirmed correct by direct code read of
+`handle_link_access`. `expires_at`/`file_id_filter` are numeric fields
+(`get_json_uint_field`), so `TASK-133`'s unterminated-buffer finding does
+not apply to this task's own field handling. No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` since public link

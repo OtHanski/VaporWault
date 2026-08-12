@@ -1,7 +1,7 @@
 ---
 id:          TASK-130
 title:       Implement minimal JSON encode/decode for the web gateway (vw_json)
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -100,3 +100,26 @@ for the reviewer, same as `TASK-129`.
 
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag, with the test gap above called out explicitly.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `src/gateway/vw_json.{h,c}` in full.
+Hand-traced `skip_value`'s bracket-depth-counter logic against both
+mixed nesting (`{"a":[{"x":1},{"y":2}]}`) and same-type nesting
+(`[[1,2],[3,4]]`) — correct. `number_span_to_int` correctly rejects
+`.`/`e`/`E`. **Found one real blocking gap in this module, since fixed**
+(discovered while reviewing `TASK-133`'s call sites, not this task's own
+description): `vw_json_string_decode` only NUL-terminated its output
+buffer on the success path — every error return left the buffer
+partially written and unterminated. This is safe for every caller that
+correctly checks the return code before touching the buffer (the
+majority), but is a real memory-safety hazard for the "optional field"
+pattern used in `handle_file_move`/`handle_file_commit`
+(`TASK-133`) — see that task's note for the full exploit chain and fix.
+**Fixed here** (root cause, in this module): the function now
+guarantees a NUL-terminated `out_buf` on every return path via a single
+`fail:` exit point, not just success — `out_buf[oi] = '\0'` is always
+an in-bounds write there since `oi` is kept `< out_buf_size` throughout
+by the existing per-write bounds checks. Rebuilt clean under both MSVC
+`/W4 /WX` and GCC (WSL); full 15-test unit suite and full 22-test
+gateway integration suite (`TASK-143`'s file, including the new
+regression test added under `TASK-133`) rerun and pass.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

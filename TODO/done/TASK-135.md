@@ -1,7 +1,7 @@
 ---
 id:          TASK-135
 title:       Implement gateway vault registry endpoints (create/key-fetch/list)
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -91,6 +91,24 @@ Moving to `review` — needs SEC.07 + CQR.08 sign-off; SEC.07's primary
 question per this task's own note ("does this code path ever see a
 passphrase") is answered no by construction, worth confirming
 independently rather than taking WEB.09's word for it.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed alongside `TASK-133` (see that
+task's note for the full `vw_gateway_api.c` pass). Independently
+confirmed by direct code read, not taking the implementation note's
+word for it: no function in `handle_vault_create`/`_key_fetch`/`_list`
+calls any KEK/decrypt primitive, and no field-extraction call for a
+passphrase-shaped key exists anywhere in this file — the "does this
+code path ever see a passphrase" question is answered no by
+construction. One advisory, not blocking: `handle_vault_key_fetch`
+hex-encodes the returned `wrapped_vk`/`kdf_params` into fixed
+4097/1025-byte stack buffers with no explicit length check against
+`VW_GATEWAY_MAX_WRAPPED_VK_BYTES` before encoding — safe today only
+because the real wrap format is ~60 bytes; a defensive bound check
+would be more robust than relying on the create-side cap holding for
+every possible writer of that data. Not fixed in this pass (no current
+path can trigger it) — worth a follow-up if this format ever changes.
+No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive`/`crypto` — this is

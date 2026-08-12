@@ -1,7 +1,7 @@
 ---
 id:          TASK-146
 title:       CMake/CPack component scaffolding for installer packages
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -119,3 +119,16 @@ itself, though the mbedTLS-leak bug this pass caught is exactly the kind of
 thing `TASK-153`'s feature-level review should double-check doesn't
 regress once `TASK-147`–`TASK-150` add their own generator-specific
 variables on top.
+
+CQR.08 [2026-08-12]: Reviewed `cmake/Packaging.cmake` and every
+`COMPONENT`-tagged `install()` call in the top-level `CMakeLists.txt`
+directly. Component scoping is correct and consistent throughout;
+WIX-specific variables are correctly kept out of this shared,
+generator-agnostic file and supplied only via `-D` at `cpack`
+invocation time (`TASK-147`/`148`/`151`), so there's no cross-
+contamination risk between the server/client `cpack` invocations. One
+pre-existing, already-flagged-elsewhere metadata gap noted but not this
+task's own defect: `CPACK_RPM_PACKAGE_LICENSE "TBD"` is still literally
+`"TBD"` — real, but belongs to whoever finalizes the project's license
+metadata, not to this scaffolding task. No blocking findings.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.

@@ -1,7 +1,7 @@
 ---
 id:          TASK-137
 title:       Frontend login view (+ 2FA) against gateway auth endpoints
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -77,6 +77,24 @@ flags this as the top follow-up check.
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag, with the no-real-browser-test gap called out
 explicitly.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `main.ts`'s login/2FA/logout flow
+directly. Independently confirmed no credential/session token ever
+touches `localStorage`/`sessionStorage`/`console.*` — matches the task's
+own claim. Advisory, not blocking: `handleLoginSubmit` has no
+`try`/`catch` around `login`/`loginWithOtp` — a network failure or a
+non-JSON error body (e.g. nginx's own error page reaching the browser
+directly, bypassing the gateway) throws as an unhandled rejection with
+no user-visible feedback; the login button appears to silently do
+nothing. This is one instance of a pattern that recurs across
+`TASK-138`/`140` as well (see those tasks' notes) — noted once here,
+not fixed in this pass, since it's a UX-robustness gap rather than a
+security or correctness defect and the right fix (a shared
+error-handling wrapper in `apiPost`/every handler) touches all three
+tasks' code at once; flagging as a good follow-up task rather than a
+scattershot partial fix across three review notes.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied (advisory noted,
+no blocking findings). Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` — this view is the

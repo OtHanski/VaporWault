@@ -252,6 +252,15 @@ static void send_file_op_error(vw_gateway_session_pool_t *pool, const char *cook
         case VW_ERR_NOT_FOUND:
             send_error(conn, 404, "not_found");
             return;
+        case VW_ERR_VERSION_NOT_FOUND:
+            /* Found during TASK-153/144 review: /api/versions/restore with
+             * any invalid/foreign version_id (stale UI state, a double
+             * click, a version already superseded) is exactly as ordinary
+             * as VW_ERR_NOT_FOUND above - same class of gap as
+             * VW_ERR_ALREADY_EXISTS/RATE_LIMITED/AUTH_REQUIRED elsewhere in
+             * this switch, doesn't warrant eviction. */
+            send_error(conn, 404, "version_not_found");
+            return;
         case VW_ERR_DIR_NOT_EMPTY:
             send_error(conn, 409, "dir_not_empty");
             return;
@@ -489,7 +498,13 @@ static void handle_file_move(vw_gateway_session_pool_t *pool,
         return;
     }
     (void)get_json_uint_field(req, "new_parent_dir_id", &new_parent_dir_id);
-    (void)get_json_string_field(req, "new_name", new_name, sizeof(new_name));
+    if (get_json_string_field(req, "new_name", new_name, sizeof(new_name)) != VW_OK) {
+        /* Optional field: a decode failure (oversized/malformed value) means
+         * treat it as absent, not as whatever partial bytes landed in the
+         * buffer — checking new_name[0] below must never see a stale or
+         * truncated value from a failed decode. */
+        new_name[0] = '\0';
+    }
 
     vw_err_t err = vw_client_file_move(sess, file_id, new_parent_dir_id,
                                         new_name[0] ? new_name : NULL);
@@ -693,9 +708,17 @@ static void handle_file_commit(vw_gateway_session_pool_t *pool,
     leaf_name[0] = '\0';
     uint64_t logical_size = 0;
 
-    (void)get_json_string_field(req, "path", path, sizeof(path));
+    /* Both are optional fields (one of path/file_id+leaf_name/file_id-alone
+     * addresses the target, per the three modes below) — a decode failure
+     * must be treated as absent, not as whatever partial bytes a failed
+     * decode left behind (see vw_json_string_decode's own doc comment). */
+    if (get_json_string_field(req, "path", path, sizeof(path)) != VW_OK) {
+        path[0] = '\0';
+    }
     (void)get_json_uint_field(req, "file_id", &file_id);
-    (void)get_json_string_field(req, "leaf_name", leaf_name, sizeof(leaf_name));
+    if (get_json_string_field(req, "leaf_name", leaf_name, sizeof(leaf_name)) != VW_OK) {
+        leaf_name[0] = '\0';
+    }
 
     if (get_json_uint_field(req, "logical_size", &logical_size) != VW_OK) {
         send_error(conn, 400, "bad_request");

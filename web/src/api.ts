@@ -435,6 +435,12 @@ export async function uploadFileEncrypted(
   } while (offset < totalSize);
 
   const wrappedDek = await wrapKey(vk, dek);
+  // The per-file DEK is only needed up to this point (every chunk is
+  // already encrypted, and it's now wrapped for storage) - zero it here
+  // rather than leaving it for GC, matching the same sensitivity class as
+  // kek/vk elsewhere in this codebase (main.ts). Found unzeroed during
+  // TASK-141's CQR.08 review.
+  dek.fill(0);
   return commitFile({
     path,
     logicalSize: totalSize,
@@ -476,5 +482,8 @@ export async function downloadFileEncrypted(
     chunkIndex++;
     onProgress?.(bytesDone, totalSize);
   }
+  // Same DEK-zeroing discipline as uploadFileEncrypted above - every chunk
+  // is already decrypted at this point, so the DEK is no longer needed.
+  dek.fill(0);
   return new Blob(parts);
 }

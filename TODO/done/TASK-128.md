@@ -1,7 +1,7 @@
 ---
 id:          TASK-128
 title:       Scaffold vapourwault-web-gateway CMake target
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-10
@@ -86,3 +86,10 @@ Moving to `review` — implementation complete per the acceptance criteria
 above; needs CQR.08 sign-off (not tagged `security-sensitive`, so SEC.07
 isn't required for this task specifically, though `TASK-144`'s
 feature-level pass will still look at the build/packaging surface).
+
+CQR.08 [2026-08-12]: Reviewed `src/gateway/main.c` and `src/gateway/
+CMakeLists.txt` directly. Matches the described scope exactly; no
+leak/UB found in the accept loop, and the lack of shutdown handling is
+reasonable and already documented as an accepted MVP scope limit
+elsewhere (`TASK-144`'s single-threaded-architecture note). No findings.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.

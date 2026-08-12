@@ -1,7 +1,7 @@
 ---
 id:          TASK-151
 title:       Wire installer packages into the release CI workflow
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -203,3 +203,14 @@ catching a real bug local testing never exercised:
 
 This is now a workflow that has actually run successfully on GitHub's real
 infrastructure, not just one that looks correct on paper.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `.github/workflows/release.yml`
+directly, focused on CI logic quality beyond the checksum-gate
+correctness `TASK-153` already verified. Confirmed by reading every
+step: no `${{ }}` ref-derived expression is interpolated directly into
+any `run:`/PowerShell block anywhere in the file — every such value
+routes through job-level `env:` first, matching the `TASK-081`
+discipline exactly. The `wix.log`-dump-on-failure diagnostic and the
+version-sanitization regex are both sound and match their described
+behavior. No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

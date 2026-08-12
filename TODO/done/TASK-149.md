@@ -1,7 +1,7 @@
 ---
 id:          TASK-149
 title:       Linux .deb packages for server & client (CPack DEB + maintainer scripts)
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -166,3 +166,24 @@ Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 end-to-end already, expect this review to focus on the maintainer
 scripts' shell-quoting discipline and the accepted client-side limitations
 above, not "does this even work."
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed all six scripts
+(`packaging/linux/scripts/{server,client}/{postinst,prerm,postrm}`)
+directly, beyond the bare shellcheck-clean claim. All six are correctly
+quoted throughout, idempotent, run under `set -e` with explicit `|| true`
+on the specific calls where that's the correct behavior (non-critical
+best-effort steps), and no unvalidated interpolation into `sh -c`/`eval`.
+
+**Found and fixed**: `server/postinst`'s header comment claimed it runs
+under RPM's `%post` "via a thin rpm-specific wrapper... see
+packaging/linux/scripts/rpm/server-post" — no such file exists (only
+`rpm/server-postun.sh` does; `Packaging.cmake` wires `%post` straight to
+this same `postinst` file with no wrapper at all, since `%post`'s
+argument convention doesn't differ from DEB's the way `%postun`'s does).
+Stale/misleading comment, not a behavioral bug — corrected to describe
+the actual wiring.
+
+No blocking findings. Client-side limitations (near-empty maintainer
+scripts, no root-run systemd --user reach) remain correctly documented
+as accepted design, not oversights.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

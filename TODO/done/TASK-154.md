@@ -1,7 +1,7 @@
 ---
 id:          TASK-154
 title:       Document installer packages in docs/RELEASE.md and docs/DEPLOYMENT.md
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -68,3 +68,35 @@ its own pass rather than a rushed addition here.
 
 Moving to `review` — needs CQR.08 sign-off, with the `docs/DEPLOYMENT.md`
 gap called out explicitly as unfinished scope.
+
+CQR.08 [2026-08-12]: Confirmed the flagged gap was real and still open —
+`docs/DEPLOYMENT.md` had zero install/uninstall/upgrade instructions for
+any `.deb`/`.rpm`/`.msi` package (grepped for `apt install`, `dnf
+install`, `msiexec`, `.deb`, `.rpm`, `.msi`: no matches outside §11's
+web-gateway content), directly failing this task's own acceptance
+criterion ("a new user can go from downloaded release to service running
+using only `docs/DEPLOYMENT.md`, for any of the six package formats").
+`docs/RELEASE.md`'s installer-packages section already had the right
+substance (verified against `TASK-149`/`TASK-150`'s actual container
+testing) but that's the wrong document for an end-user walkthrough.
+
+**Resolved**: added `docs/DEPLOYMENT.md` §12 ("Installing via OS
+packages"), covering install/upgrade/remove for all three formats
+(§12.1 DEB, §12.2 RPM, §12.3 MSI) plus the unsigned-packages disclosure
+(§12.4) and the DEB/RPM removal-semantics asymmetry (§12.1/§12.2, cross-
+referencing the table already in `docs/RELEASE.md`). Updated §2
+(Installation) to point at §12 as the recommended path, relabeling the
+existing content "manual, from source". Updated §8 (Upgrading) with a
+package-manager upgrade path alongside the existing manual-rebuild
+steps. Content is sourced from and consistent with `docs/RELEASE.md`'s
+already-verified package behavior (component split, service
+enable/start-not-automatic convention, per-user client scheduled
+task/systemd unit, MSI elevation scope) — no new claims invented, only
+end-user-facing instructions added for behavior already implemented and
+reviewed elsewhere (`TASK-147`–`TASK-150`, `TASK-153`).
+
+Both acceptance criteria now met: `docs/DEPLOYMENT.md` alone covers every
+package format's install/uninstall/upgrade path, and the unsigned-package
++ removal-asymmetry disclosures are stated plainly in both documents.
+
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.

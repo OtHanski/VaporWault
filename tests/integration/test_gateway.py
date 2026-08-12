@@ -342,6 +342,60 @@ def test_move_renames_and_is_reflected_in_listing(server, clients, unique_userna
     assert r.json()["status"] == "not_found"
 
 
+def test_move_with_oversized_new_name_decodes_safely(server, clients, unique_username):
+    """
+    Regression test for a real memory-safety bug found during the CQR.08/
+    SEC.07 review pass on TASK-133: vw_json_string_decode only NUL-
+    terminated its output buffer on the success path. handle_file_move's
+    `new_name` field is optional and was read via
+    `(void)get_json_string_field(...)` followed by a `new_name[0]` content
+    check rather than checking the return code - so a `new_name` value long
+    enough to make the decode fail (> 255 bytes, the stack buffer's size)
+    left the buffer non-empty and non-terminated. The immediate caller,
+    vw_client_file_move, then strlen()s that buffer and reads past its
+    256-byte bound into adjacent stack memory until it happens to find a
+    zero byte - a stack-memory-disclosure/DoS primitive reachable by any
+    authenticated user with one crafted request, on a single-threaded
+    gateway process where a resulting crash takes down every logged-in
+    user, not just the attacker.
+
+    Fixed in two places: vw_json_string_decode now NUL-terminates its
+    output buffer on every return path (not just success), and
+    handle_file_move/handle_file_commit explicitly reset their optional
+    string fields to empty on a decode failure instead of trusting
+    whatever partial bytes a failed decode left behind.
+    """
+    client = clients.login(unique_username, server=server)
+
+    r = client.mkdir("move_oversized_dir")
+    assert r.status_code == 200, r.text
+    dir_id = r.json()["dir_id"]
+
+    # 1000 bytes is far past the 256-byte new_name buffer - decode must
+    # fail partway through, well before the buffer's own bound.
+    oversized_name = "A" * 1000
+    r = client.move(dir_id, new_name=oversized_name)
+    # An oversized optional field is *not* the same as a malformed request;
+    # it's treated as "no rename requested" - this call succeeds as a
+    # move to the same parent (a no-op relocation), not a 400/500.
+    assert r.status_code == 200, r.text
+
+    # The directory's name must be exactly what it was - never renamed to
+    # a truncated fragment of the oversized value, and never containing
+    # any byte of adjacent stack memory that a pre-fix overread could have
+    # pulled in.
+    r = client.list_files("/")
+    assert r.status_code == 200
+    entry = next(e for e in r.json() if e["file_id"] == dir_id)
+    assert entry["name"] == "move_oversized_dir"
+
+    # The gateway (single-threaded) must still be alive and responsive -
+    # the actual failure mode this bug could cause was a process crash
+    # that would hang every subsequent request in this test session.
+    r = client.list_files("/")
+    assert r.status_code == 200
+
+
 def test_upload_download_multi_chunk_round_trip(server, clients, unique_username):
     client = clients.login(unique_username, server=server)
 

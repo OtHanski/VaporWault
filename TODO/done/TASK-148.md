@@ -1,7 +1,7 @@
 ---
 id:          TASK-148
 title:       Windows client MSI (per-user install + scheduled-task custom action)
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -165,3 +165,27 @@ rule isn't natively expressible via a plain `<File>` install).
 
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `packaging/windows/wix/
+client-extra.wxs`, `client-patch.xml`, and `register-client-task.ps1`
+directly. **Advisory, not blocking**: `client-extra.wxs`'s deferred
+custom action builds `-StateDir "[AppDataFolder]VaporWault"` for the
+PowerShell invocation. `[AppDataFolder]` expands through
+`%LOCALAPPDATA%\<username>\...`; Windows forbids a literal `"` in a
+username so quote-breaking that way is impossible, but a username
+containing a backtick (legal in Windows) could corrupt this argument's
+quoting inside the double-quoted PowerShell string. Blast radius is
+self-contained: this is a per-user, no-elevation install, and the
+action already has `Return="ignore"`, so a corrupted invocation fails
+silently rather than crossing any privilege boundary — consistent with
+this task's own note that there's no privilege boundary for a crafted
+value to cross here. Not fixed in this pass (extremely low real-world
+likelihood, no security boundary crossed) — worth a one-line mention in
+`docs/RELEASE.md`'s known-limitations section for completeness, not a
+blocker. Everything else (the two-step immediate/deferred pattern, the
+GUID/Fragment fixes already documented above) re-verified sound by
+direct reading, matching `TASK-153`'s independent elevation-scope
+confirmation (only the client invocation sets
+`CPACK_WIX_INSTALL_SCOPE=perUser`).
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied (advisory noted,
+no blocking findings). Ready for `done`.

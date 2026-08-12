@@ -1,7 +1,7 @@
 ---
 id:          TASK-136
 title:       Scaffold web/ TypeScript frontend build + nginx reverse-proxy config
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -71,6 +71,22 @@ considering those two tasks fully done, not just this scaffold.
 
 Moving to `review` — needs CQR.08 sign-off, with the "never opened in a
 real browser" gap flagged explicitly.
+
+CQR.08 [2026-08-12]: Reviewed `web/nginx.conf.example`, `web/tsconfig.json`,
+`web/package.json`. **One blocking finding, fixed**: the example config's
+`location /api/` block set no `client_max_body_size`. nginx's own default
+is 1 MiB; a single chunk-upload body (`POST /api/chunks/upload`) can be up
+to `VW_HTTP_MAX_BODY_BYTES` = 6 MiB (`src/gateway/vw_http.h`) — under the
+example config exactly as shipped, every multi-chunk upload gets a `413`
+from nginx before it ever reaches the gateway, breaking the app's core
+upload feature for anyone who deploys this example verbatim. **Fixed**:
+added `client_max_body_size 6m;` to that block, matching the gateway's own
+ceiling exactly. Advisory, not fixed: no `proxy_read_timeout`/
+`proxy_send_timeout` override for large transfers — likely fine at
+loopback/LAN scale, worth a `docs/DEPLOYMENT.md` mention if a real
+deployment ever sees timeouts on slow links.
+Sign-off: `CQR.08` requirement satisfied (one blocking finding, fixed).
+Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave.

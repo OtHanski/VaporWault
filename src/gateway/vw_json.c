@@ -260,21 +260,32 @@ vw_err_t vw_json_string_decode(const char *escaped, size_t escaped_len,
                                 size_t *out_len) {
     if (escaped == NULL || out_buf == NULL || out_buf_size == 0) return VW_ERR_INVALID_ARG;
 
+    /*
+     * oi is always kept < out_buf_size (every advance below is preceded by
+     * a bounds check), so out_buf[oi] = '\0' at `fail` is always an
+     * in-bounds write. This guarantees out_buf is a valid, NUL-terminated
+     * C string on every return path, not just success — a caller that
+     * treats an "optional field" decode failure as "field absent" and
+     * inspects out_buf's *content* rather than checking the return value
+     * must never see a non-terminated buffer, or it reads adjacent stack
+     * memory out of bounds via strlen()/strcpy().
+     */
+    vw_err_t rc;
     size_t oi = 0;
     for (size_t i = 0; i < escaped_len; i++) {
         char c = escaped[i];
         if (c != '\\') {
-            if (oi + 1 >= out_buf_size) return VW_ERR_PROTO_TOO_LARGE;
+            if (oi + 1 >= out_buf_size) { rc = VW_ERR_PROTO_TOO_LARGE; goto fail; }
             out_buf[oi++] = c;
             continue;
         }
 
         i++;
-        if (i >= escaped_len) return VW_ERR_PROTO_INVALID;
+        if (i >= escaped_len) { rc = VW_ERR_PROTO_INVALID; goto fail; }
         char e = escaped[i];
 
         if (e == 'u') {
-            if (i + 4 >= escaped_len) return VW_ERR_PROTO_INVALID;
+            if (i + 4 >= escaped_len) { rc = VW_ERR_PROTO_INVALID; goto fail; }
             unsigned cp = 0;
             for (int k = 1; k <= 4; k++) {
                 char h = escaped[i + (size_t)k];
@@ -282,14 +293,14 @@ vw_err_t vw_json_string_decode(const char *escaped, size_t escaped_len,
                 if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
                 else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
                 else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
-                else return VW_ERR_PROTO_INVALID;
+                else { rc = VW_ERR_PROTO_INVALID; goto fail; }
             }
             i += 4;
 
             uint32_t codepoint = cp;
             if (cp >= 0xD800u && cp <= 0xDBFFu) {
                 if (i + 6 >= escaped_len || escaped[i + 1] != '\\' || escaped[i + 2] != 'u') {
-                    return VW_ERR_PROTO_INVALID;
+                    rc = VW_ERR_PROTO_INVALID; goto fail;
                 }
                 unsigned lo = 0;
                 for (int k = 3; k <= 6; k++) {
@@ -298,9 +309,9 @@ vw_err_t vw_json_string_decode(const char *escaped, size_t escaped_len,
                     if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
                     else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
                     else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
-                    else return VW_ERR_PROTO_INVALID;
+                    else { rc = VW_ERR_PROTO_INVALID; goto fail; }
                 }
-                if (lo < 0xDC00u || lo > 0xDFFFu) return VW_ERR_PROTO_INVALID;
+                if (lo < 0xDC00u || lo > 0xDFFFu) { rc = VW_ERR_PROTO_INVALID; goto fail; }
                 i += 6;
                 codepoint = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
             }
@@ -327,7 +338,7 @@ vw_err_t vw_json_string_decode(const char *escaped, size_t escaped_len,
                 utf8_len = 4;
             }
 
-            if (oi + utf8_len >= out_buf_size) return VW_ERR_PROTO_TOO_LARGE;
+            if (oi + utf8_len >= out_buf_size) { rc = VW_ERR_PROTO_TOO_LARGE; goto fail; }
             memcpy(out_buf + oi, utf8, utf8_len);
             oi += utf8_len;
             continue;
@@ -343,15 +354,20 @@ vw_err_t vw_json_string_decode(const char *escaped, size_t escaped_len,
             case 'n':  decoded = '\n'; break;
             case 'r':  decoded = '\r'; break;
             case 't':  decoded = '\t'; break;
-            default:   return VW_ERR_PROTO_INVALID;
+            default:   rc = VW_ERR_PROTO_INVALID; goto fail;
         }
-        if (oi + 1 >= out_buf_size) return VW_ERR_PROTO_TOO_LARGE;
+        if (oi + 1 >= out_buf_size) { rc = VW_ERR_PROTO_TOO_LARGE; goto fail; }
         out_buf[oi++] = decoded;
     }
 
     out_buf[oi] = '\0';
     if (out_len) *out_len = oi;
     return VW_OK;
+
+fail:
+    out_buf[oi] = '\0';
+    if (out_len) *out_len = oi;
+    return rc;
 }
 
 /* ── Encoding ─────────────────────────────────────────────────────────────── */

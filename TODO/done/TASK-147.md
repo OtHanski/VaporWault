@@ -1,7 +1,7 @@
 ---
 id:          TASK-147
 title:       Windows server MSI (WiX ServiceInstall + firewall rule)
-status:      review
+status:      done
 assignee:    BLD.05
 created_by:  ARCH.00
 created:     2026-08-11
@@ -137,3 +137,17 @@ Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag, with the "not verified: real service
 registration" gap called out explicitly for `TASK-152` to close before
 this feature's milestone is considered done.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `packaging/windows/wix/server-patch.xml`
+directly. The `ServiceInstall`/`ServiceControl`/`FirewallException` triple
+is structurally correct WiX idiom, correctly attached to the
+CPack-generated `<Component>` carrying `vapourwaultd.exe`. The one
+interpolated value in the config-path custom action
+(`--config "[CommonAppDataFolder]VaporWault\server.conf"`) is a fixed
+system path with no attacker- or user-controlled segment — no injection
+surface, consistent with `TASK-153`'s independent elevation-scope
+confirmation (server invocation has no `CPACK_WIX_INSTALL_SCOPE`
+override, correctly defaults to per-machine/elevated). No blocking
+findings. The real-service-registration gap remains correctly deferred
+to `TASK-152`, not this task's own scope.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.

@@ -1,7 +1,7 @@
 ---
 id:          TASK-140
 title:       Frontend version history + sharing/public-link management views
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -86,6 +86,23 @@ Builds clean under `tsc --strict`.
 Moving to `review` — needs SEC.07 + CQR.08 sign-off per the
 `security-sensitive` tag; SEC.07 should double check the "never logged"
 claim independently and weigh in on the link-redemption gap above.
+
+SEC.07/CQR.08 [2026-08-12]: Reviewed `main.ts`'s version-history and
+sharing/link views directly. Re-verified the link-token handling claim
+independently: shown once in a `readonly` field with an explicit Copy
+button, zero `console.log`/`console.error` touching a token or link
+variable anywhere in `main.ts`/`api.ts`. Claim holds. Advisory, not
+blocking: `handleRevokeShare`/`handleGrantShare`/`handleRestoreVersion`/
+`handleCreateLink` etc. have no `try`/`catch`, the same pattern flagged
+under `TASK-137`'s note — not re-fixed here for the same reason (belongs
+to one shared follow-up, not three scattered partial fixes). On the
+link-redemption gap this task's own implementation note raised (no
+frontend caller for `/api/links/access` yet): confirmed still true by
+reading `main.ts` in full — agree with WEB.09's framing that this is a
+scope question for ARCH.00 (a follow-up task), not a defect in what this
+task actually delivered (link creation/management, which does work
+end-to-end as claimed). No blocking findings.
+Sign-off: `SEC.07` + `CQR.08` requirements satisfied. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Tagged `security-sensitive` for the public-

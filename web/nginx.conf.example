@@ -30,6 +30,13 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
+
+        # nginx's own default (1m) is smaller than a single chunk upload
+        # (up to VW_HTTP_MAX_BODY_BYTES = 6 MiB, src/gateway/vw_http.h) -
+        # without this override, every multi-chunk upload gets a 413 from
+        # nginx before it ever reaches the gateway. Match the gateway's own
+        # ceiling exactly so nginx's limit is never the binding one.
+        client_max_body_size 6m;
     }
 }
 

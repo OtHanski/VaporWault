@@ -1,7 +1,7 @@
 ---
 id:          TASK-139
 title:       Frontend upload/download with per-file progress
-status:      review
+status:      done
 assignee:    WEB.09
 created_by:  ARCH.00
 created:     2026-08-10
@@ -86,6 +86,14 @@ Flagging as a reasonable follow-up rather than solving here.
 Builds clean under `tsc --strict`.
 
 Moving to `review` — needs CQR.08 sign-off.
+
+CQR.08 [2026-08-12]: Reviewed the chunk-upload/download loop and progress
+callback in `api.ts`/`main.ts` directly. Matches the implementation
+notes; `uploadOne`/`handleDownload` correctly wrap their calls in
+`try`/`catch` (unlike several other handlers reviewed under `TASK-137`/
+`138`/`140` — this task's own error handling is actually the more
+careful one in the file). No findings.
+Sign-off: `CQR.08` requirement satisfied. Ready for `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave.

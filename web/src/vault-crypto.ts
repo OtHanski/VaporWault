@@ -103,6 +103,13 @@ export async function deriveKek(
     // fundamental JS limitation, not something this function can fix) -
     // this only closes the WASM-heap half of the exposure window.
     Module.HEAPU8.fill(0, passphrasePtr, passphrasePtr + passphraseBytes.length);
+    // Also zero the derived KEK's WASM-heap copy before freeing it - the
+    // `.slice()` above already produced an independent JS-owned copy to
+    // return, so this doesn't touch the caller's value; it just closes the
+    // same exposure window for the KEK that the passphrase zeroing above
+    // already closes for the passphrase (found during TASK-141's CQR.08
+    // review: this buffer was freed without being zeroed first).
+    Module.HEAPU8.fill(0, outPtr, outPtr + VAULT_KEK_BYTES);
     Module._free(passphrasePtr);
     Module._free(saltPtr);
     Module._free(outPtr);

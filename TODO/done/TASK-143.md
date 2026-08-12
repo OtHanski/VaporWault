@@ -1,7 +1,7 @@
 ---
 id:          TASK-143
 title:       Integration tests for the web gateway + browser client
-status:      review
+status:      done
 assignee:    QA.06
 created_by:  ARCH.00
 created:     2026-08-10
@@ -186,6 +186,8 @@ there). On this task's own deliverable, `tests/integration/test_gateway.py`:
 
 Sign-off: both `SEC.07` and `CQR.08` review requirements satisfied.
 Ready for ARCH.00 to move to `done` alongside `TASK-157`.
+
+ARCH.00 [2026-08-12]: Both required reviewers signed off, moving to `done`.
 
 ARCH.00 [2026-08-10]: Filed as part of the `TASK-127` web gateway design's
 initial implementation wave. Depends on the full initial implementation set
