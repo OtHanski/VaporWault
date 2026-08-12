@@ -21,6 +21,12 @@ import {
   createLink,
   revokeLink,
   listLinks,
+  filesStat,
+  vaultCreate,
+  vaultKeyFetch,
+  vaultList,
+  uploadFileEncrypted,
+  downloadFileEncrypted,
   type FileEntry,
   type VersionEntry,
   type ShareEntry,
@@ -51,6 +57,11 @@ const browserError = el<HTMLElement>("browser-error");
 const uploadBtn = el<HTMLButtonElement>("upload-btn");
 const uploadInput = el<HTMLInputElement>("upload-input");
 const transferList = el<HTMLUListElement>("transfer-list");
+const vaultCreateBtn = el<HTMLButtonElement>("vault-create-btn");
+const vaultBanner = el<HTMLElement>("vault-banner");
+const vaultBannerText = el<HTMLElement>("vault-banner-text");
+const vaultUnlockBtn = el<HTMLButtonElement>("vault-unlock-btn");
+const vaultLockBtn = el<HTMLButtonElement>("vault-lock-btn");
 
 const historyView = el<HTMLElement>("history-view");
 const historyFileLabel = el<HTMLElement>("history-file-label");
@@ -83,6 +94,13 @@ const shareError = el<HTMLElement>("share-error");
 let pendingUsername: string | null = null;
 let pendingPassword: string | null = null;
 let currentPath = "/";
+let currentFolderId = 0;
+
+// The unlocked VK lives only in this in-memory variable for as long as
+// the tab is open (TASK-141's own passphrase/key handling scope: no
+// persistence anywhere, cleared on lock/logout/tab close). Nothing here
+// is ever sent to the gateway.
+let unlockedVault: { vaultId: number; folderFileId: number; vk: Uint8Array } | null = null;
 
 function showError(target: HTMLElement, message: string): void {
   target.textContent = message;
@@ -203,6 +221,206 @@ async function refreshFileList(): Promise<void> {
   }
 
   renderFileTable(result.data);
+  await resolveCurrentFolderId();
+  await refreshVaultBanner();
+}
+
+// currentPath is resolved to a file_id via stat, rather than tracked
+// through navigation clicks alone, so breadcrumb "go up" navigation stays
+// correct too (a click into a folder row has the id right on the
+// FileEntry, but going up a breadcrumb level doesn't) - one extra
+// request per navigation, worth it for correctness over both paths.
+async function resolveCurrentFolderId(): Promise<void> {
+  if (currentPath === "/") {
+    currentFolderId = 0;
+    return;
+  }
+  const result = await filesStat(currentPath);
+  currentFolderId = result.ok ? result.data.file_id : 0;
+}
+
+/*
+ * currentFolderVaultId (0 = not a vault folder) is the sole signal this
+ * UI uses to decide plaintext vs. encrypted upload/download - NOT
+ * FileEntry.vault_id from a file listing. That field is real in the wire
+ * protocol (docs/PROTOCOL.md, TASK-100) but FILE_LIST_RESP never actually
+ * populates it (only FILE_STAT_RESP and VERSION_CHUNKS_RESP do — confirmed
+ * by reading vw_client_core.c's recv_file_list_resp, which never sets
+ * entries[i].vault_id at all). This is a pre-existing wire/native-client
+ * gap, not something introduced here — the native GUI has the identical
+ * limitation and can't show a per-file lock icon from a listing either
+ * without an extra FILE_STAT per entry. Worth a follow-up task for
+ * whoever owns the wire protocol; not fixed here. Since every file this
+ * UI ever commits into a vault folder carries that folder's vault_id
+ * (uploadFileEncrypted always does), treating "is the CONTAINING folder a
+ * registered vault" as the per-file signal is correct for anything this
+ * UI itself created, without needing the missing field at all.
+ */
+let currentFolderVaultId = 0;
+
+async function refreshVaultBanner(): Promise<void> {
+  const result = await vaultList();
+  if (!result.ok) {
+    vaultBanner.hidden = true;
+    currentFolderVaultId = 0;
+    return;
+  }
+  const vault = result.data.find((v) => v.folder_file_id === currentFolderId);
+  if (!vault) {
+    vaultBanner.hidden = true;
+    currentFolderVaultId = 0;
+    if (unlockedVault && unlockedVault.folderFileId !== currentFolderId) {
+      // Navigated away from the unlocked vault's folder - lock it rather
+      // than leave the VK sitting in memory scoped to a view the user
+      // isn't even looking at anymore.
+      lockVault();
+    }
+    return;
+  }
+
+  currentFolderVaultId = vault.vault_id;
+  vaultBanner.hidden = false;
+  const isUnlocked = unlockedVault?.vaultId === vault.vault_id;
+  vaultBannerText.textContent = isUnlocked
+    ? `This folder is an encrypted vault (unlocked).`
+    : `This folder is an encrypted vault. Unlock it to upload/download files.`;
+  vaultUnlockBtn.hidden = isUnlocked;
+  vaultLockBtn.hidden = !isUnlocked;
+}
+
+function lockVault(): void {
+  if (unlockedVault) {
+    // Best-effort zero of the in-memory VK - a Uint8Array can be
+    // overwritten, unlike the passphrase string that produced it earlier
+    // in the chain (a JS string is immutable and can't be zeroed; this
+    // is as much as this layer can do).
+    unlockedVault.vk.fill(0);
+  }
+  unlockedVault = null;
+}
+
+vaultLockBtn.addEventListener("click", () => {
+  lockVault();
+  void refreshVaultBanner();
+});
+
+vaultUnlockBtn.addEventListener("click", () => {
+  void handleUnlockVault();
+});
+
+async function handleUnlockVault(): Promise<void> {
+  const passphrase = window.prompt(
+    "Enter this vault's passphrase.\n\n" +
+      "Reminder: if you lose this passphrase, the encrypted contents cannot " +
+      "be recovered by anyone, including the server operator.",
+  );
+  if (!passphrase) return;
+
+  const keyFetchResult = await vaultKeyFetch(currentFolderVaultId);
+  if (!keyFetchResult.ok) {
+    showError(browserError, `Could not unlock vault: ${keyFetchResult.data.status ?? "error"}`);
+    return;
+  }
+
+  try {
+    const { deriveKek, unwrapKey, hexToBytes } = await import("./vault-crypto.js");
+    const salt = hexToBytes(keyFetchResult.data.kdf_salt);
+    const paramsBytes = hexToBytes(keyFetchResult.data.kdf_params);
+    const paramsView = new DataView(
+      paramsBytes.buffer,
+      paramsBytes.byteOffset,
+      paramsBytes.byteLength,
+    );
+    const kdfParams = {
+      memCostKib: paramsView.getUint32(0, true),
+      timeCost: paramsView.getUint32(4, true),
+      parallelism: paramsView.getUint32(8, true),
+    };
+
+    const kek = await deriveKek(passphrase, salt, kdfParams);
+    const wrappedVk = hexToBytes(keyFetchResult.data.wrapped_vk);
+    const vk = await unwrapKey(kek, wrappedVk);
+    kek.fill(0);
+
+    unlockedVault = { vaultId: currentFolderVaultId, folderFileId: currentFolderId, vk };
+    await refreshVaultBanner();
+  } catch (err) {
+    showError(
+      browserError,
+      err instanceof Error ? err.message : "Could not unlock vault (wrong passphrase?)",
+    );
+  }
+}
+
+vaultCreateBtn.addEventListener("click", () => {
+  void handleCreateVault();
+});
+
+async function handleCreateVault(): Promise<void> {
+  if (currentFolderId === 0) {
+    showError(browserError, "The root folder cannot be made a vault - create a subfolder first.");
+    return;
+  }
+
+  const disclosureAccepted = window.confirm(
+    "Make this folder an encrypted vault?\n\n" +
+      "1. Passphrase loss is unrecoverable: if you forget this passphrase, " +
+      "nobody - including the server operator - can recover the contents.\n\n" +
+      "2. Metadata stays visible: filenames, folder structure, and file " +
+      "sizes are still visible to the server. Only file CONTENTS are " +
+      "encrypted.\n\n" +
+      "3. Every edit re-uploads the whole file: encrypted files don't " +
+      "support delta-sync, so editing a large encrypted file re-uploads it " +
+      "in full each time.\n\n" +
+      "Continue?",
+  );
+  if (!disclosureAccepted) return;
+
+  const passphrase = window.prompt("Choose a passphrase for this vault (at least 8 characters):");
+  if (!passphrase || passphrase.length < 8) {
+    if (passphrase !== null) showError(browserError, "Passphrase must be at least 8 characters.");
+    return;
+  }
+  const confirmPassphrase = window.prompt("Re-enter the passphrase to confirm:");
+  if (confirmPassphrase !== passphrase) {
+    showError(browserError, "Passphrases did not match - vault not created.");
+    return;
+  }
+
+  const { randomSalt, deriveKek, randomDek, wrapKey, bytesToHex } = await import(
+    "./vault-crypto.js"
+  );
+
+  // Matches vw_vault.c's own vw_vault_setup floor exactly
+  // (VW_VAULT_ARGON2_MIN_MEM_KB/_MIN_TIME_COST/_PARALLELISM) - a weaker
+  // param set is rejected both by the WASM KDF wrapper and, redundantly,
+  // by the native server-side vw_crypto_vault_derive_kek if this vault is
+  // ever unlocked from the native client instead.
+  const kdfParams = { memCostKib: 19456, timeCost: 2, parallelism: 1 };
+  const salt = randomSalt();
+  const kek = await deriveKek(passphrase, salt, kdfParams);
+  const vk = randomDek(); // same random-32-bytes shape as a DEK; naming reflects its role here
+  const wrappedVk = await wrapKey(kek, vk);
+  kek.fill(0);
+  vk.fill(0);
+
+  const paramsBytes = new Uint8Array(12);
+  new DataView(paramsBytes.buffer).setUint32(0, kdfParams.memCostKib, true);
+  new DataView(paramsBytes.buffer).setUint32(4, kdfParams.timeCost, true);
+  new DataView(paramsBytes.buffer).setUint32(8, kdfParams.parallelism, true);
+
+  const result = await vaultCreate(
+    currentFolderId,
+    bytesToHex(wrappedVk),
+    bytesToHex(salt),
+    bytesToHex(paramsBytes),
+  );
+  if (!result.ok) {
+    showError(browserError, `Could not create vault: ${result.data.status ?? "error"}`);
+    return;
+  }
+
+  await refreshVaultBanner();
 }
 
 function renderFileTable(entries: FileEntry[]): void {
@@ -403,8 +621,23 @@ async function handleUpload(files: File[]): Promise<void> {
 async function uploadOne(file: File): Promise<void> {
   const path = joinPath(currentPath, file.name);
   const handle = createTransferItem(`Uploading ${file.name}`);
+
+  // currentFolderVaultId != 0 means THIS folder is a registered vault -
+  // uploads here must always be encrypted, never fall back to plaintext
+  // just because the vault happens to be locked right now (that would
+  // silently write unencrypted content into a vault folder).
+  if (currentFolderVaultId !== 0 && !(unlockedVault?.vaultId === currentFolderVaultId)) {
+    handle.setFailed("This folder is a locked vault - unlock it before uploading.");
+    return;
+  }
+  const vault = currentFolderVaultId !== 0 ? unlockedVault : null;
+
   try {
-    const result = await uploadFile(path, file, (done, total) => handle.setProgress(done, total));
+    const result = vault
+      ? await uploadFileEncrypted(path, file, vault.vaultId, vault.vk, (done, total) =>
+          handle.setProgress(done, total),
+        )
+      : await uploadFile(path, file, (done, total) => handle.setProgress(done, total));
     if (!result.ok) {
       // No partial/corrupt commit is possible here: uploadFile only
       // calls FILE_COMMIT after every chunk has landed, so a mid-upload
@@ -423,10 +656,23 @@ async function uploadOne(file: File): Promise<void> {
 
 async function handleDownload(entry: FileEntry): Promise<void> {
   const handle = createTransferItem(`Downloading ${entry.name}`);
+  // See currentFolderVaultId's own doc comment: FILE_LIST never actually
+  // populates entry.vault_id (a pre-existing wire/native-client gap), so
+  // "is the CONTAINING folder a registered vault" is the real signal,
+  // not the per-entry field.
+  if (currentFolderVaultId !== 0 && !(unlockedVault?.vaultId === currentFolderVaultId)) {
+    handle.setFailed("This folder is a locked vault - unlock it before downloading.");
+    return;
+  }
+  const vault = currentFolderVaultId !== 0 ? unlockedVault : null;
   try {
-    const blob = await downloadFile(entry.version_id, entry.size_bytes, (done, total) =>
-      handle.setProgress(done, total),
-    );
+    const blob = vault
+      ? await downloadFileEncrypted(entry.version_id, entry.size_bytes, vault.vk, (done, total) =>
+          handle.setProgress(done, total),
+        )
+      : await downloadFile(entry.version_id, entry.size_bytes, (done, total) =>
+          handle.setProgress(done, total),
+        );
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

@@ -255,6 +255,14 @@ static void send_file_op_error(vw_gateway_session_pool_t *pool, const char *cook
         case VW_ERR_DIR_NOT_EMPTY:
             send_error(conn, 409, "dir_not_empty");
             return;
+        case VW_ERR_ALREADY_EXISTS:
+            /* Found via TASK-141 testing: a plain name collision (e.g.
+             * mkdir on an existing name) - as ordinary an outcome as
+             * VW_ERR_NOT_FOUND above, not a connection-health signal.
+             * Same class of gap as VW_ERR_AUTH_REQUIRED below; this one
+             * doesn't warrant eviction either. */
+            send_error(conn, 409, "already_exists");
+            return;
         case VW_ERR_PERMISSION:
             send_error(conn, 403, "forbidden");
             return;
@@ -265,6 +273,9 @@ static void send_file_op_error(vw_gateway_session_pool_t *pool, const char *cook
             return;
         case VW_ERR_QUOTA_EXCEEDED:
             send_error(conn, 507, "quota_exceeded");
+            return;
+        case VW_ERR_RATE_LIMITED:
+            send_error(conn, 429, "rate_limited");
             return;
         case VW_ERR_AUTH_REQUIRED:
             /* A perfectly ordinary outcome, not a "connection might be
@@ -646,6 +657,28 @@ static int decode_chunk_hash_cb(void *ud, vw_json_value_t element) {
     return 0;
 }
 
+#define VW_GATEWAY_MAX_WRAPPED_VK_BYTES 2048u
+#define VW_GATEWAY_MAX_KDF_PARAMS_BYTES 512u
+
+/*
+ * Decodes a hex-encoded JSON string field into an opaque byte buffer -
+ * shared by every endpoint moving a wrapped-key blob (vault create/
+ * key_fetch, TASK-135; an encrypted commit's wrapped_dek, TASK-141)
+ * without ever needing to parse its meaning.
+ */
+static vw_err_t get_json_hex_field(const vw_http_request_t *req, const char *key,
+                                    uint8_t *out, size_t out_cap, size_t *out_len) {
+    char hex[VW_GATEWAY_MAX_WRAPPED_VK_BYTES * 2u + 1u];
+    if (get_json_string_field(req, key, hex, sizeof(hex)) != VW_OK) return VW_ERR_PROTO_INVALID;
+    size_t hex_len = strlen(hex);
+    if (hex_len % 2u != 0u) return VW_ERR_PROTO_INVALID;
+    size_t raw_len = hex_len / 2u;
+    if (raw_len > out_cap) return VW_ERR_PROTO_INVALID;
+    if (vw_crypto_hex_decode(hex, hex_len, out) != VW_OK) return VW_ERR_PROTO_INVALID;
+    *out_len = raw_len;
+    return VW_OK;
+}
+
 static void handle_file_commit(vw_gateway_session_pool_t *pool,
                                 const vw_http_request_t *req, vw_http_conn_t *conn) {
     vw_client_sess_t *sess;
@@ -714,10 +747,30 @@ static void handle_file_commit(vw_gateway_session_pool_t *pool,
         return;
     }
 
+    /* Optional vault fields (TASK-141) - an encrypted commit's wrapped_dek
+     * is this module's usual opaque hex blob, exactly like TASK-135's
+     * vault/create wrapped_vk. vault_id absent or 0 means a plaintext
+     * commit, matching vw_client_file_commit_raw's own convention. */
+    uint64_t vault_id = 0;
+    uint8_t wrapped_dek[VW_GATEWAY_MAX_WRAPPED_VK_BYTES];
+    size_t wrapped_dek_len = 0;
+    (void)get_json_uint_field(req, "vault_id", &vault_id);
+    if (vault_id != 0) {
+        if (get_json_hex_field(req, "wrapped_dek", wrapped_dek, sizeof(wrapped_dek),
+                                &wrapped_dek_len) != VW_OK ||
+            wrapped_dek_len == 0) {
+            free(hashes);
+            send_error(conn, 400, "bad_request");
+            return;
+        }
+    }
+
     uint64_t out_file_id = 0, out_version_id = 0;
     vw_err_t err = vw_client_file_commit_raw(sess, commit_file_id, name_or_path, name_len,
                                               logical_size, chunk_count, hashes,
-                                              0, NULL, 0,
+                                              vault_id,
+                                              vault_id != 0 ? wrapped_dek : NULL,
+                                              (uint16_t)wrapped_dek_len,
                                               &out_file_id, &out_version_id);
     free(hashes);
     if (err != VW_OK) {
@@ -1182,22 +1235,6 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
  * unwrapped key - there is no passphrase field in any of these endpoints'
  * JSON schemas by construction (this task's own acceptance criteria).
  */
-
-#define VW_GATEWAY_MAX_WRAPPED_VK_BYTES 2048u
-#define VW_GATEWAY_MAX_KDF_PARAMS_BYTES 512u
-
-static vw_err_t get_json_hex_field(const vw_http_request_t *req, const char *key,
-                                    uint8_t *out, size_t out_cap, size_t *out_len) {
-    char hex[VW_GATEWAY_MAX_WRAPPED_VK_BYTES * 2u + 1u];
-    if (get_json_string_field(req, key, hex, sizeof(hex)) != VW_OK) return VW_ERR_PROTO_INVALID;
-    size_t hex_len = strlen(hex);
-    if (hex_len % 2u != 0u) return VW_ERR_PROTO_INVALID;
-    size_t raw_len = hex_len / 2u;
-    if (raw_len > out_cap) return VW_ERR_PROTO_INVALID;
-    if (vw_crypto_hex_decode(hex, hex_len, out) != VW_OK) return VW_ERR_PROTO_INVALID;
-    *out_len = raw_len;
-    return VW_OK;
-}
 
 static void handle_vault_create(vw_gateway_session_pool_t *pool,
                                  const vw_http_request_t *req, vw_http_conn_t *conn) {

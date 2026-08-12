@@ -9,5 +9,6 @@ __pycache__/
 .pytest_cache/
 web/node_modules/
 web/dist/
+web/wasm/_deps/
 tests/integration/test.crt
 tests/integration/test.key

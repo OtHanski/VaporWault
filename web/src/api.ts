@@ -104,6 +104,10 @@ export function mkdir(name: string, parentDirId = 0): Promise<ApiResult<{ dir_id
   return apiPost("/api/files/mkdir", { name, parent_dir_id: parentDirId });
 }
 
+export function filesStat(path: string): Promise<ApiResult<FileEntry>> {
+  return apiPost("/api/files/stat", { path });
+}
+
 export function deleteFile(path: string): Promise<ApiResult<StatusResponse>> {
   return apiPost("/api/files/delete", { path });
 }
@@ -186,6 +190,9 @@ export function commitFile(opts: {
   leafName?: string;
   logicalSize: number;
   chunkHashes: string[];
+  // Vault-encrypted commit (TASK-141): both present together, or neither.
+  vaultId?: number;
+  wrappedDekHex?: string;
 }): Promise<ApiResult<CommitResponse>> {
   const body: Record<string, unknown> = {
     logical_size: opts.logicalSize,
@@ -194,6 +201,10 @@ export function commitFile(opts: {
   if (opts.path) body.path = opts.path;
   if (opts.fileId !== undefined) body.file_id = opts.fileId;
   if (opts.leafName) body.leaf_name = opts.leafName;
+  if (opts.vaultId) {
+    body.vault_id = opts.vaultId;
+    body.wrapped_dek = opts.wrappedDekHex;
+  }
   return apiPost("/api/files/commit", body);
 }
 
@@ -321,4 +332,149 @@ export function revokeLink(shareId: number): Promise<ApiResult<StatusResponse>> 
 
 export function listLinks(fileIdFilter = 0): Promise<ApiResult<LinkEntry[]>> {
   return apiPost("/api/links/list", { file_id_filter: fileIdFilter });
+}
+
+/*
+ * Vault registry (TASK-141, over TASK-135's endpoints). All key material
+ * here is opaque hex, exactly like the gateway's own contract — nothing
+ * in this module ever sees a passphrase; that only ever exists in
+ * vault-crypto.ts's deriveKek call and the DOM input it's read from.
+ */
+
+export interface VaultEntry {
+  vault_id: number;
+  folder_file_id: number;
+  created_at: number;
+}
+
+export interface VaultKeyFetchResponse {
+  wrapped_vk: string;
+  kdf_salt: string;
+  kdf_params: string;
+  folder_file_id: number;
+}
+
+export function vaultCreate(
+  folderFileId: number,
+  wrappedVkHex: string,
+  kdfSaltHex: string,
+  kdfParamsHex: string,
+): Promise<ApiResult<{ vault_id: number }>> {
+  return apiPost("/api/vault/create", {
+    folder_file_id: folderFileId,
+    wrapped_vk: wrappedVkHex,
+    kdf_salt: kdfSaltHex,
+    kdf_params: kdfParamsHex,
+  });
+}
+
+export function vaultKeyFetch(vaultId: number): Promise<ApiResult<VaultKeyFetchResponse>> {
+  return apiPost("/api/vault/key_fetch", { vault_id: vaultId });
+}
+
+export function vaultList(): Promise<ApiResult<VaultEntry[]>> {
+  return apiPost("/api/vault/list", {});
+}
+
+/*
+ * Vault-encrypted upload/download (TASK-141): same chunk-transfer loop as
+ * uploadFile/downloadFile above, but every chunk is encrypted/decrypted
+ * client-side via vault-crypto.ts before it ever reaches uploadChunk/
+ * downloadChunk - the gateway only ever sees ciphertext and the opaque
+ * wrapped_dek blob, never plaintext or any key.
+ *
+ * Chunk size differs from the plaintext path: VW_VAULT_PLAINTEXT_CHUNK_BYTES
+ * (CHUNK_SIZE - 16) so that ciphertext+tag lands exactly on CHUNK_SIZE,
+ * matching vw_vault.c's own vault_reader_next sizing exactly - a mismatch
+ * here would silently produce a different chunk count than the native
+ * client would for the same file, which is still byte-correct after
+ * reassembly but worth keeping identical to avoid any doubt.
+ */
+const VAULT_PLAINTEXT_CHUNK_SIZE = CHUNK_SIZE - 16;
+
+async function sha256HexOfBuffer(buf: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return bufToHex(digest);
+}
+
+export async function uploadFileEncrypted(
+  path: string,
+  file: File,
+  vaultId: number,
+  vk: Uint8Array,
+  onProgress?: ProgressCb,
+): Promise<ApiResult<CommitResponse>> {
+  const { randomDek, encryptChunk, wrapKey, bytesToHex: vaultBytesToHex } = await import(
+    "./vault-crypto.js"
+  );
+
+  const totalSize = file.size;
+  const dek = randomDek();
+  const chunkHashes: string[] = [];
+  let bytesDone = 0;
+  let chunkIndex = 0;
+  let offset = 0;
+
+  do {
+    const end = Math.min(offset + VAULT_PLAINTEXT_CHUNK_SIZE, totalSize);
+    const chunk = file.slice(offset, end);
+    const plaintextBuf = await chunk.arrayBuffer();
+    const ciphertextBuf = await encryptChunk(dek, chunkIndex, plaintextBuf);
+    const hash = await sha256HexOfBuffer(ciphertextBuf);
+
+    const result = await uploadChunk(hash, ciphertextBuf);
+    if (!result.ok) {
+      return { ok: false, status: result.status, data: result.data };
+    }
+
+    chunkHashes.push(hash);
+    bytesDone += plaintextBuf.byteLength;
+    chunkIndex++;
+    offset = end;
+    onProgress?.(bytesDone, totalSize);
+  } while (offset < totalSize);
+
+  const wrappedDek = await wrapKey(vk, dek);
+  return commitFile({
+    path,
+    logicalSize: totalSize,
+    chunkHashes,
+    vaultId,
+    wrappedDekHex: vaultBytesToHex(wrappedDek),
+  });
+}
+
+export async function downloadFileEncrypted(
+  versionId: number,
+  totalSize: number,
+  vk: Uint8Array,
+  onProgress?: ProgressCb,
+): Promise<Blob> {
+  const { unwrapKey, decryptChunk, hexToBytes: vaultHexToBytes } = await import(
+    "./vault-crypto.js"
+  );
+
+  const chunksResult = await getVersionChunks(versionId);
+  if (!chunksResult.ok) {
+    throw new Error(`could not fetch version chunk list: ${chunksResult.data.status}`);
+  }
+  if (chunksResult.data.vault_id === 0 || !chunksResult.data.wrapped_dek) {
+    throw new Error("this version is not vault-encrypted");
+  }
+
+  const wrappedDek = vaultHexToBytes(chunksResult.data.wrapped_dek);
+  const dek = await unwrapKey(vk, wrappedDek);
+
+  const parts: ArrayBuffer[] = [];
+  let bytesDone = 0;
+  let chunkIndex = 0;
+  for (const hash of chunksResult.data.chunk_hashes) {
+    const ciphertextBuf = await downloadChunk(hash);
+    const plaintextBuf = await decryptChunk(dek, chunkIndex, ciphertextBuf);
+    parts.push(plaintextBuf);
+    bytesDone += plaintextBuf.byteLength;
+    chunkIndex++;
+    onProgress?.(bytesDone, totalSize);
+  }
+  return new Blob(parts);
 }

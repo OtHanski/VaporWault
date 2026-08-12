@@ -156,6 +156,18 @@ Builds clean under both MSVC `/W4 /WX` and GCC; full regression pass on
 this task's own list/stat/mkdir/delete/move endpoints afterward (no
 breakage from the new code sharing the same file/helpers).
 
+WEB.09 [2026-08-12]: Second addendum, found while implementing `TASK-141`:
+`send_file_op_error` was still missing cases for `VW_ERR_ALREADY_EXISTS`
+(e.g. `mkdir` on a name that already exists) and `VW_ERR_RATE_LIMITED`,
+both falling into the same evict-and-500 catch-all as the
+`VW_ERR_AUTH_REQUIRED` gap fixed above. Added `409 already_exists` and
+`429 rate_limited` respectively, no eviction (both are ordinary business
+outcomes). Reproduced the bug for real first (a duplicate `mkdir`
+returned `500` and evicted the caller's own session for an entirely
+reasonable request), then confirmed the fix: clean `409`, session
+survives, subsequent requests on it succeed normally. See `TASK-141`'s
+note for the full repro.
+
 Moving to `review` — needs SEC.07 + CQR.08 sign-off. `TASK-155`'s
 resolution should be tracked separately; this task's own scope, including
 the previously-deferred content-transfer endpoints, is now complete.
