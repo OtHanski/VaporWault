@@ -34,6 +34,38 @@ server/client/tools:
 - `vwdump` (admin tool)
 - `README.md`
 
+### Web gateway + frontend (`vapourwault-web-gateway`, `web/dist/`)
+
+**Not currently produced by this workflow.** `vapourwault-web-gateway`
+(`src/gateway/`, `TASK-127`–`TASK-135`) and the static frontend (`web/`,
+`TASK-136`–`TASK-141`) are a real release-worthy artifact pair for
+deployments that want the browser client (see `docs/DEPLOYMENT.md`'s "Web
+gateway + nginx + frontend deployment" section, `TASK-142`) — but two things
+stand in the way of `release.yml` producing them alongside everything above:
+
+- `VW_BUILD_WEB_GATEWAY` defaults `OFF` and neither the `build-linux` nor
+  `build-windows` job passes `-DVW_BUILD_WEB_GATEWAY=ON`, so the gateway
+  binary is not compiled at all in a normal release build today.
+- The workflow has no step that runs `web/`'s own build (`npm install &&
+  npm run build`, `web/package.json`) — it's an entirely separate,
+  non-CMake-orchestrated build step (by design, `TASK-136`) that
+  `release.yml` has never been taught to invoke.
+
+Until that's wired up, produce both manually from the same tagged source
+checkout you'd otherwise download the release archive from:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DVW_BUILD_WEB_GATEWAY=ON
+cmake --build build --target vapourwault-web-gateway
+cd web && npm install && npm run build
+```
+
+This produces `build/bin/vapourwault-web-gateway` and `web/dist/` locally,
+same as any other development build — see `docs/DEPLOYMENT.md` §11.2 for
+the full build-and-deploy path. Flagged as a follow-up in §8 below; not
+solved in this pass (`TASK-142` is scoped to packaging/deployment docs, not
+`release.yml` itself).
+
 ### Installer packages (`.deb` / `.rpm` / `.msi`)
 
 Since `TASK-145`–`TASK-151`, the workflow also builds proper OS-native
@@ -236,3 +268,22 @@ Tracked in `TODO/TASK-151.md`/`TASK-152.md` (installer packages, `TASK-145`):
   environment.
 - No automated test installs the Windows MSIs on a real Windows machine — that
   remains manual/VM-based verification (`TODO/TASK-152.md`).
+
+Tracked in `TODO/TASK-142.md` (web gateway + frontend deployment docs):
+
+- `release.yml` does not build `vapourwault-web-gateway` or `web/`'s static
+  frontend at all (`VW_BUILD_WEB_GATEWAY` stays at its `OFF` default in both
+  `build-linux` and `build-windows`, and there's no `npm` build step) — see
+  the "Web gateway + frontend" section above. A future task should add
+  `-DVW_BUILD_WEB_GATEWAY=ON`, a Node.js setup step, and the `npm run build`
+  invocation to both jobs, then decide whether the gateway binary and
+  `web/dist/` ship inside the existing tarball/zip or as their own archive.
+- Relatedly, the gateway has no CPack installer component yet either
+  (`CMakeLists.txt`'s comment above its `install()` rules: "file a follow-up
+  if/when it needs one") — it currently only installs as a plain executable
+  via `cmake --install`, not via any `.deb`/`.rpm`/`.msi`. `docs/DEPLOYMENT.md`
+  §11.5 documents the manual/`cmake --install` path as the only option today.
+- `VENDOR_SETUP.md` does not yet list Node.js/npm as a build prerequisite,
+  even though building `web/` now requires them (`docs/DEPLOYMENT.md` §11.6
+  calls this out inline instead, since updating `VENDOR_SETUP.md` itself was
+  out of this task's scope).

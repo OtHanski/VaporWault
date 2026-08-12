@@ -1,0 +1,58 @@
+# vapourwault-web-gateway.service — HTTP/JSON gateway for the browser
+# frontend (TASK-127/129/142). Sibling service to vapourwaultd.service, not
+# a dependent of it: this process is its own vw/1 client against the
+# VaporWault server (--server-host/--server-port below), which is very
+# often a *different* host than the one running this gateway.
+#
+# This unit's ExecStart is the gateway's only configuration surface — there
+# is no separate gateway config file, only the CLI flags documented by
+# `vapourwault-web-gateway --help` (src/gateway/main.c). Edit the ExecStart
+# line below for your deployment, then:
+#   systemctl daemon-reload
+#   systemctl restart vapourwault-web-gateway
+#
+# See docs/DEPLOYMENT.md's "Web gateway + nginx + frontend" section for the
+# full install walkthrough. IMPORTANT: this listener (--listen-host/
+# --listen-port) must NEVER be reachable directly from the internet — it
+# trusts nginx as its sole upstream (TASK-129's vw_http scoping) and does
+# not itself robustly handle malformed/non-HTTP1.1 traffic. Keep
+# --listen-host at 127.0.0.1 (the gateway's own default too) unless nginx
+# is reachable only via some other address this host doesn't expose
+# publicly either.
+
+[Unit]
+Description=VaporWault web gateway (HTTP/JSON API for the browser frontend)
+Documentation=https://github.com/vapourwault/vapourwault
+After=network-online.target
+Wants=network-online.target
+# Deliberately NOT After=/Wants=vapourwaultd.service: the VaporWault server
+# this gateway connects to is frequently a separate host. If yours happens
+# to be the same host, add vapourwaultd.service to both lines above.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vapourwault-web-gateway --server-host 127.0.0.1 --server-port 4430 --ca-cert /etc/vapourwault/server.crt --listen-host 127.0.0.1 --listen-port 8080
+Restart=on-failure
+RestartSec=5s
+
+User=vapourwault
+Group=vapourwault
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+# No ReadWritePaths entry: unlike vapourwaultd, the gateway has no
+# persistent state of its own to write (its per-browser session pool,
+# TASK-131, is in-memory only and does not survive a restart) — it only
+# ever needs read access to --ca-cert's path, which ProtectSystem=strict
+# leaves readable (it enforces read-only, not inaccessible).
+
+# Allow larger file descriptor count for busy deployments (one FD per live
+# browser session's vw_client_sess_t connection, plus one per in-flight
+# HTTP request from nginx).
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

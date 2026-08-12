@@ -448,3 +448,259 @@ If the server crashed mid-write, it recovers automatically on next start: the op
       above — but strictly better than trusting loopback binding alone), but
       running a personal sync daemon on a shared host is still not a
       configuration this project targets or tests.
+
+---
+
+## 11. Web gateway + nginx + frontend deployment
+
+This section covers `vapourwault-web-gateway` (`src/gateway/`) and the static
+TypeScript frontend (`web/`) — the browser-accessible alternative to the CLI
+and ImGui GUI clients, added in `TASK-127`–`TASK-141`. Everything in Sections
+1–10 above still applies to the VaporWault **server** itself; this section is
+additive, covering the two new pieces that sit in front of it.
+
+### 11.1 How the pieces fit together
+
+```
+Browser
+  │  HTTPS (nginx-terminated TLS)
+  ▼
+nginx  ── serves web/dist/ (+ index.html, style.css) as static files
+  │        for every path except /api/*
+  │
+  │  plain HTTP, loopback only, reverse-proxied
+  ▼
+vapourwault-web-gateway  ── listens on 127.0.0.1:8080 by default
+  │
+  │  vw/1 (TLS, mbedTLS, same wire protocol every other client speaks)
+  ▼
+VaporWault server (vapourwaultd), port 4430
+```
+
+The gateway is **its own `vw/1` client** — a sibling of `vapourwault-daemon`,
+not a bridge over its IPC (`ARCHITECTURE.md`'s Web gateway module map,
+`TASK-127`). It authenticates against the VaporWault server directly, one
+live session per logged-in browser tab. It does not need to run on the same
+host as the server — `--server-host`/`--server-port` below can point at any
+reachable VaporWault server.
+
+**Critically: the gateway's own HTTP listener is not designed to be
+internet-facing.** Its hand-rolled HTTP/1.1 parser (`src/gateway/vw_http.c`,
+`TASK-129`) is deliberately scoped down on the assumption that nginx is its
+*only* upstream — it does not robustly handle malformed or non-HTTP/1.1
+traffic the way a general-purpose HTTP server would, because nginx (which
+does handle that) is standing in front of it. This is an intentional design
+tradeoff (`TASK-127`/`TASK-129`), not a bug or an oversight to be fixed
+later. Concretely:
+
+> **Never bind `--listen-host` to a public or otherwise internet-reachable
+> address.** Leave it at the default `127.0.0.1` (loopback), or at most an
+> internal/private network address reachable *only* by the nginx instance
+> proxying it — never a public IP, never `0.0.0.0` on a host with any public
+> interface. All internet-facing TLS termination, and all hardening against
+> malformed/hostile traffic, is nginx's job in this deployment model, not
+> the gateway's. A misconfiguration that exposes the gateway's listener
+> directly hands its reduced-hardening parser to arbitrary internet traffic.
+
+### 11.2 Building the gateway and frontend
+
+The gateway is a normal CMake target, gated behind its own option flag
+(default `OFF`, since not every deployment wants the web surface at all):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DVW_BUILD_WEB_GATEWAY=ON
+cmake --build build -j$(nproc) --target vapourwault-web-gateway
+```
+
+(Combine `-DVW_BUILD_WEB_GATEWAY=ON` with whatever other flags you already
+use for the server build in Section 2 — it's an independent, additive
+option, not a replacement build.) This produces `build/bin/vapourwault-web-gateway`.
+
+The frontend is a separate, dev-time-only Node/TypeScript build — nothing
+from `node_modules` ships to the browser, only its compiled output
+(`web/package.json`'s own description). It is **not** orchestrated by CMake;
+build it directly with npm (requires Node.js — any reasonably current LTS
+release; this was last verified against Node 18+):
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+This runs `tsc -p tsconfig.json` (see `web/package.json`'s `build` script)
+and produces `web/dist/*.js` alongside the already-present `web/index.html`
+and `web/style.css` — together, `web/index.html`, `web/style.css`, and
+`web/dist/` are the complete static asset set nginx needs to serve.
+
+### 11.3 Gateway configuration
+
+Unlike the server (`server.conf`) or the client daemon (`daemon.conf`), the
+gateway has **no config file** — its only configuration surface is CLI
+flags (`vapourwault-web-gateway --help`, `src/gateway/main.c`):
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--server-host HOST` | Yes | — | VaporWault server to connect to. |
+| `--server-port PORT` | Yes | — | VaporWault server's TLS port (`listen_port` in that server's `server.conf`, default `4430`). |
+| `--ca-cert PATH` | Yes | — | CA certificate (PEM) to verify the server's TLS certificate against. See below — this is **mandatory**, there is no "trust the system store" fallback like the client daemon's `ca_cert_pem_path` has. |
+| `--listen-host HOST` | No | `127.0.0.1` | Address the gateway's own HTTP listener binds to. See the loopback-only warning in §11.1 before changing this. |
+| `--listen-port PORT` | No | `8080` | Port the gateway's own HTTP listener binds to. |
+
+**On `--ca-cert`**: the gateway is itself a `vw/1` client of the VaporWault
+server, and — per `ARCHITECTURE.md`'s Gateway↔server TLS verification
+decision — it always verifies the server's certificate
+(`VW_CERT_VERIFY_REQUIRED`, hardcoded in `src/gateway/vw_gateway_api.c`); it
+never runs with certificate verification disabled, unlike `vw_net_connect`'s
+test-only escape hatch. `main.c` refuses to start at all without
+`--ca-cert` set. What to point it at depends on how the server's certificate
+was issued:
+
+- **Self-signed** (Section 4's manual-PEM example): point `--ca-cert` at
+  that same `server.crt` — a self-signed certificate is its own trust
+  anchor.
+- **CA-signed** (ACME/Let's Encrypt or an organizational CA, Section 4):
+  point `--ca-cert` at that CA's root certificate PEM (for Let's Encrypt,
+  the ISRG Root X1 certificate; for an internal PKI, your organization's
+  root CA cert) — not the server's own leaf certificate.
+
+The gateway has no daemonization of its own (no `fork`/`setsid`) — it runs
+in the foreground and logs to stdout/stderr, matching systemd's expectations
+for `Type=simple` (§11.5 below); it is not meant to be run detached by hand
+in production.
+
+### 11.4 nginx site configuration
+
+An example nginx site config already exists at `web/nginx.conf.example`
+(`TASK-136`) — this section explains how it fits together rather than
+duplicating it. Copy it into place and adjust the domain/cert paths:
+
+```bash
+sudo cp web/nginx.conf.example /etc/nginx/sites-available/vapourwault
+sudo ln -s /etc/nginx/sites-available/vapourwault /etc/nginx/sites-enabled/
+```
+
+What it does:
+
+- Terminates browser-facing TLS itself (`listen 443 ssl` — its own
+  `ssl_certificate`/`ssl_certificate_key`, unrelated to the VaporWault
+  server's own TLS cert or the gateway's `--ca-cert`; get one the same way
+  as any other public web server, e.g. via `certbot`, or reuse this
+  project's own ACME support if you'd rather not run a second ACME client).
+- Serves `web/index.html`/`web/style.css`/`web/dist/` as static files
+  (`root` + `try_files`) for every path that isn't `/api/*`.
+- Reverse-proxies `/api/*` to the gateway's loopback listener
+  (`proxy_pass http://127.0.0.1:8080`, matching the gateway's own
+  `--listen-host`/`--listen-port` defaults from §11.3 — update this if you
+  changed either flag) with `proxy_http_version 1.1` and an emptied
+  `Connection` header, since `vw_http.c` always closes the connection after
+  one response (no keep-alive) and expects a clean HTTP/1.1 request per
+  call.
+- Redirects plain HTTP (port 80) to HTTPS.
+
+Reload nginx after installing or changing the site config:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 11.5 systemd unit for the gateway
+
+A systemd unit, `packaging/linux/vapourwault-web-gateway.service`, follows
+the same conventions as `vapourwaultd.service` (`Type=simple`,
+`Restart=on-failure`, a dedicated non-privileged user, the same sandboxing
+directives — `NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`,
+`ProtectSystem=strict`). Unlike the server, the gateway has no config file
+to point at — its ExecStart line *is* its configuration (§11.3's flags),
+so **edit that line directly** for your deployment before installing it.
+
+There is currently no install-script integration for the gateway
+(`packaging/linux/install.sh` only handles the server; the gateway has no
+CPack installer component yet either — see `CMakeLists.txt`'s comment above
+its `install()` rules). Install it directly, either via CMake's own install
+step or by hand:
+
+```bash
+# Build with the gateway enabled (§11.2), then either:
+
+# Option A: let CMake install the binary + unit file together
+sudo cmake --install build --prefix /usr/local
+
+# Option B: copy them by hand
+sudo install -m 755 build/bin/vapourwault-web-gateway /usr/local/bin/
+sudo install -m 644 packaging/linux/vapourwault-web-gateway.service \
+    /lib/systemd/system/vapourwault-web-gateway.service
+```
+
+Either way, the `vapourwault` system user must already exist (created by
+`packaging/linux/install.sh` when you installed the server, §2 — if the
+gateway runs on a host without the server installed, create the user
+yourself: `useradd --system --no-create-home --shell /usr/sbin/nologin
+vapourwault`), and the CA cert path in the unit's `ExecStart` (§11.3) must be
+readable by that user.
+
+Edit the `ExecStart` line in `/lib/systemd/system/vapourwault-web-gateway.service`
+for your `--server-host`/`--server-port`/`--ca-cert`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now vapourwault-web-gateway
+
+# Verify
+sudo systemctl status vapourwault-web-gateway
+sudo journalctl -u vapourwault-web-gateway -n 50
+```
+
+### 11.6 Fresh host walkthrough
+
+A concrete, ordered path from a fresh Linux host to a working
+server + gateway + nginx + frontend deployment, all on one host (split
+across hosts by adjusting `--server-host`/`--ca-cert` and the nginx
+`proxy_pass` target accordingly):
+
+1. **Install build prerequisites**: a C compiler, CMake, and (new for this
+   section) Node.js + npm for the frontend build. See `VENDOR_SETUP.md` for
+   the C/CMake toolchain list — it does not yet cover Node.js/npm, so make
+   sure both are installed via your distribution's package manager or
+   [nodejs.org](https://nodejs.org) before continuing.
+2. **Build everything**, gateway included:
+   ```bash
+   cmake -B build -DCMAKE_BUILD_TYPE=Release -DVW_BUILD_WEB_GATEWAY=ON
+   cmake --build build -j$(nproc)
+   ```
+3. **Install and start the VaporWault server** — follow Sections 2 (Linux
+   install), 3 (`server.conf`), 4 (TLS certificate — a self-signed cert is
+   fine to start with), and 5 (first-run setup, including creating an admin
+   user) above in full before continuing. Confirm it's up:
+   `systemctl status vapourwaultd`.
+4. **Install and start the gateway** — §11.5 above. Point `--server-host`/
+   `--server-port` at the server from step 3 (`127.0.0.1`/`4430` if it's the
+   same host) and `--ca-cert` at the `server.crt` from step 3's TLS setup
+   (self-signed case — see §11.3 for the CA-signed case). Confirm it's up:
+   `curl -i http://127.0.0.1:8080/api/login` (no real request body — a bare
+   `GET` against a `POST`-only route) should get *some* HTTP error response
+   back rather than "connection refused," which is enough to confirm the
+   listener itself is alive; the full `/api/*` route surface is defined by
+   `TASK-132`–`TASK-135`'s endpoint handlers
+   (`src/gateway/vw_gateway_api.c`).
+5. **Build the frontend** — §11.2's `npm install && npm run build` in
+   `web/`.
+6. **Install and configure nginx** — install nginx via your distribution's
+   package manager, then §11.4 above: copy `web/nginx.conf.example` into
+   `/etc/nginx/sites-available/`, point its `root` at wherever you've put
+   `web/index.html`/`web/style.css`/`web/dist/` (copy the whole `web/`
+   output tree to e.g. `/usr/share/vapourwault/web/` if you don't want to
+   serve directly out of the checkout), set `server_name` and the
+   `ssl_certificate`/`ssl_certificate_key` paths for nginx's own
+   browser-facing TLS (a separate cert from the server's — see §11.4),
+   enable the site, and reload nginx.
+7. **Verify end-to-end**: open `https://<your-domain>/` in a browser, log
+   in with the admin user created in step 3, and confirm the file browser
+   loads. If it doesn't, check (in this order) `journalctl -u
+   vapourwault-web-gateway`, then nginx's error log
+   (`/var/log/nginx/error.log`), then `journalctl -u vapourwaultd`.
+8. **Firewall**: confirm only port 443 (and 80, for the HTTP→HTTPS
+   redirect) need to be open to the internet on this host. Port 8080 (the
+   gateway) and port 4430 (the server, if colocated) should **not** be
+   reachable from outside this host at all — re-read §11.1's warning if
+   you're tempted to open either for convenience.
