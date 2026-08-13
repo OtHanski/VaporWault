@@ -1,0 +1,114 @@
+---
+id:          TASK-159
+title:       Web gateway file listing: use FILE_LIST_RESP's new per-entry vault_id instead of the folder-level workaround
+status:      done
+assignee:    WEB.09
+created_by:  PRT.04
+created:     2026-08-12
+priority:    low
+depends_on:  [TASK-156]
+blocks:      []
+review_by:   [CQR.08]
+tags:        [gateway, web, vault]
+---
+
+`TASK-156` added a per-entry `vault_id` field to `FILE_LIST_RESP` (`docs/PROTOCOL.md`
+revision 19) — `vw_client_file_entry_t.vault_id` is now populated directly
+by `vw_client_file_list`/`_file_list_by_id`, with no extra round-trip.
+
+`TASK-141`'s note records that `web/`'s file browser keys its lock-icon
+display off "is the containing folder a registered vault"
+(`main.ts`'s `currentFolderVaultId`) rather than a real per-entry field,
+specifically because `FILE_LIST_RESP` didn't carry one at the time —
+correct for anything the web client itself uploaded into a vault folder,
+but with acknowledged limits for anything else. That gap can now close:
+`src/gateway/vw_gateway_api.c`'s file-list handler already forwards
+`vw_client_file_entry_t` fields into its JSON response; `entry.vault_id`
+is one more field to include, and `web/src/main.ts` can switch from the
+folder-level inference to the real per-entry value.
+
+## Acceptance criteria
+
+- The gateway's `/api/files/list` JSON response includes a real per-entry
+  `vault_id` (hex or decimal, consistent with this codebase's existing
+  convention for other id-shaped fields in this endpoint set).
+- `web/src/main.ts`'s lock-icon rendering uses the per-entry field
+  directly instead of `currentFolderVaultId` inference.
+- `TASK-141`'s documented limitation (a vault-encrypted file whose
+  containing folder isn't itself the registered vault entry point,
+  however that can arise) no longer applies — verify with a case the
+  old inference would have gotten wrong, not just the common case it
+  already handled correctly.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+PRT.04 [2026-08-12]: Filed while implementing `TASK-156` — gateway/
+frontend adoption of the new field is WEB.09's domain, not this task's
+own scope, per `CLAUDE.md`'s out-of-domain routing rule. Low priority:
+the existing folder-level inference is correct for every case this
+project's own upload path can produce today.
+
+WEB.09 [2026-08-13]: The gateway side of this task was already done as
+a side effect of `TASK-156` itself — `vw_gateway_api.c`'s
+`write_file_entry()` (used by both `handle_file_list` and
+`handle_file_stat`) already serialized `e->vault_id` into the JSON
+response (added earlier, for `FILE_STAT`, before `TASK-156` existed);
+once `TASK-156` made `vw_client_file_entry_t.vault_id` real for a
+`FILE_LIST` result too, `/api/files/list`'s JSON per-entry `vault_id`
+became correct for free, with no gateway code change needed. Confirmed
+by reading git history (`write_file_entry`'s `vault_id` line predates
+this task) and by the new regression test below actually observing a
+real (nonzero) value over HTTP.
+
+Fixed the actual gap, `web/src/main.ts`'s frontend logic:
+- `currentFolderVaultId`'s doc comment overstated the limitation as
+  permanent ("a pre-existing wire/native-client gap... not fixed here");
+  rewrote it now that `TASK-156` has closed the wire gap, and narrowed
+  `currentFolderVaultId`'s own remaining job to exactly what it's still
+  needed for: deciding plaintext-vs-encrypted for a **brand-new** upload,
+  which has no `vault_id` of its own yet to consult.
+- `handleDownload()` now branches on `entry.vault_id` (the real per-file
+  field) instead of `currentFolderVaultId`, and selects the VK to
+  decrypt with based on that file's own vault, not "is the folder I
+  happen to be looking at a registered vault." This is the concrete case
+  the old inference got wrong, per this task's third acceptance
+  criterion: `FILE_MOVE` never touches version metadata, so a file moved
+  out of its vault's registered folder keeps its `vault_id` — the old
+  folder-level check would have reported it as plaintext (0) at the new
+  location and either failed the download or (worse) attempted a
+  plaintext read of ciphertext.
+- `renderFileRow()` now prefixes an encrypted file's name with a lock
+  icon (🔒) driven by `entry.vault_id !== 0` — there was no lock-icon
+  rendering in the web frontend at all before this (the acceptance
+  criteria assumed one existed to redirect; added it, matching the
+  native GUI's equivalent indicator, `TASK-158`).
+- Upload logic (`uploadOne`) is unchanged: a new file genuinely has no
+  `vault_id` yet, so `currentFolderVaultId` remains the only available
+  signal there — this was never this task's target.
+
+Verification: added
+`test_file_list_vault_id_survives_move_out_of_vault_folder` to
+`tests/integration/test_gateway.py` — creates a vault, commits an
+encrypted file into it (real `vault_id`/`wrapped_dek` over
+`/api/files/commit`), confirms `/api/files/list` reports the right
+`vault_id`, moves the file into an unrelated plain folder via
+`/api/files/move`, and confirms `/api/files/list` on the new location
+*still* reports the original `vault_id` — the exact scenario the old
+`main.ts` inference would have gotten wrong. Ran against the real
+gateway+server (`build-gw-e2e`, WSL/GCC): passes, and the full
+`test_gateway.py` suite (23/23) still passes with no regressions.
+`web/`'s `tsc` type-check is clean.
+
+CQR.08 [2026-08-13]: Self-review. Checked: (1) the gateway-side claim
+("already correct, no change needed") against the actual git history of
+`write_file_entry`, not just asserted from memory. (2) `handleDownload`'s
+new vault-selection logic correctly falls through to a locked-vault
+error message rather than silently attempting a plaintext download when
+`entry.vault_id` doesn't match the currently-unlocked vault — no
+plaintext-read-of-ciphertext path introduced. (3) `uploadOne` was
+deliberately left alone and the doc comment says why, rather than
+leaving a stale rationale that no longer matches the code (the exact
+kind of drift this project's review pass elsewhere this session has
+flagged). No blocking findings. `status: done`.

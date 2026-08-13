@@ -150,7 +150,7 @@ bool VwGuiIpc::file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
         uint16_t vplen = 0, lplen = 0;
         if (vw_ipc_read_str(resp.data(), rlen, &off, &vpath, &vplen) != VW_OK) break;
         if (vw_ipc_read_str(resp.data(), rlen, &off, &lpath, &lplen) != VW_OK) break;
-        if (off + 4u + 1u + 8u + 8u + 8u + 8u > rlen) break;
+        if (off + 4u + 1u + 8u + 8u + 8u + 8u + 8u > rlen) break;
 
         VwGuiFileEntry e;
         e.virtual_path.assign(vpath, vplen);
@@ -161,6 +161,7 @@ bool VwGuiIpc::file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
         e.local_mtime  = read_i64_le(resp.data() + off); off += 8;
         e.server_size  = (uint64_t)read_i64_le(resp.data() + off); off += 8;
         e.file_id      = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.vault_id     = (uint64_t)read_i64_le(resp.data() + off); off += 8;
         entries.push_back(std::move(e));
     }
 
@@ -427,14 +428,3 @@ int VwGuiIpc::vault_download(uint64_t vault_id, uint64_t file_id, const char *lo
     return (int)read_u32_le(resp);
 }
 
-int VwGuiIpc::file_vault_id(uint64_t file_id, uint64_t *out_vault_id) {
-    uint8_t req[8]; vw_write_u64le(req, file_id);
-    uint8_t resp[12]; uint32_t rlen;
-    vw_err_t err = one_shot(VW_IPC_FILE_VAULT_ID_REQ, req, sizeof(req), VW_IPC_FILE_VAULT_ID_RESP,
-                             resp, sizeof(resp), &rlen);
-    if (err != VW_OK) return (int)err;
-    if (rlen < 12) return (int)VW_ERR_IO;
-    uint32_t ec = read_u32_le(resp);
-    if (ec == 0 && out_vault_id) *out_vault_id = (uint64_t)read_i64_le(resp + 4);
-    return (int)ec;
-}

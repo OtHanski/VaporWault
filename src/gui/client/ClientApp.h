@@ -70,7 +70,6 @@ public:
                            const char *leaf_name, const char *local_path,
                            uint64_t *out_file_id, uint64_t *out_version_id);
     int  ipc_vault_download(uint64_t vault_id, uint64_t file_id, const char *local_path);
-    int  ipc_file_vault_id(uint64_t file_id, uint64_t *out_vault_id);
 
     uint16_t ipc_port = VW_IPC_DEFAULT_PORT;
 

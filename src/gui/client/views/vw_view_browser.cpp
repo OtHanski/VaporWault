@@ -200,24 +200,16 @@ static void refresh_shared_badges(ClientApp &app) {
         for (auto &l : links) if (!l.revoked) s_shared_file_ids.insert(l.file_id);
 }
 
-/* TASK-100: FILE_LIST_RESP doesn't carry per-entry vault_id (see
- * docs/PROTOCOL.md §7.2's note on why), so the encrypted-item indicator
- * needs one VW_IPC_FILE_VAULT_ID round trip per uploaded file. Capped at
- * kMaxVaultLookups to bound refresh cost for very large listings — files
- * beyond the cap simply show no lock indicator until a future refresh
- * budget/streaming approach exists (a known, documented limitation, not
- * silently wrong: those files just look unencrypted rather than blocking
- * or slowing the whole browser). */
-static void refresh_vault_badges(ClientApp &app) {
-    static const size_t kMaxVaultLookups = 200;
+/* TASK-158: VW_IPC_FILE_LIST_RESP now carries each entry's vault_id
+ * directly (vw_cache_entry_t.vault_id, populated from FILE_LIST_RESP's own
+ * per-entry vault_id — TASK-156). This just reshapes s_entries' already-
+ * fetched field into the file_id -> vault_id map the row-render code
+ * looks up by; no extra IPC round trip and no cap on listing size. */
+static void refresh_vault_badges() {
     s_vault_ids.clear();
-    size_t n = 0;
     for (auto &e : s_entries) {
         if (e.entry_type != 0 || e.file_id == 0) continue; /* dirs / not-yet-uploaded */
-        if (n++ >= kMaxVaultLookups) break;
-        uint64_t vault_id = 0;
-        if (app.ipc_file_vault_id(e.file_id, &vault_id) == 0 && vault_id != 0)
-            s_vault_ids[e.file_id] = vault_id;
+        if (e.vault_id != 0) s_vault_ids[e.file_id] = e.vault_id;
     }
 }
 
@@ -228,7 +220,7 @@ static void refresh(ClientApp &app) {
         snprintf(s_error_msg, sizeof(s_error_msg), "Failed to fetch file list from daemon.");
     }
     refresh_shared_badges(app);
-    refresh_vault_badges(app);
+    refresh_vault_badges();
     s_needs_refresh = false;
 }
 

@@ -666,6 +666,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_write_u64le(rbuf + roff, (uint64_t)e->local_mtime);  roff += 8;
             vw_write_u64le(rbuf + roff, e->server_size);             roff += 8;
             vw_write_u64le(rbuf + roff, e->file_id);                 roff += 8;
+            vw_write_u64le(rbuf + roff, e->vault_id);                roff += 8;
             written++;
         }
         /* Patch the real count now — cannot have been known up front since
@@ -1058,23 +1059,6 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             rc = vw_vault_download_file(vault, dc->sess, file_id, lpath_buf, NULL, NULL);
         }
         ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP, (uint32_t)rc);
-        break;
-    }
-
-    case VW_IPC_FILE_VAULT_ID_REQ: {
-        if (plen < 8u || !dc->sess) {
-            uint8_t rbuf[12] = {0};
-            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
-            vw_ipc_send(conn, VW_IPC_FILE_VAULT_ID_RESP, rbuf, sizeof(rbuf));
-            break;
-        }
-        uint64_t file_id = vw_read_u64le(buf);
-        vw_file_entry_t entry;
-        vw_err_t rc = vw_client_file_stat_by_id(dc->sess, file_id, &entry);
-        uint8_t rbuf[12];
-        vw_write_u32le(rbuf, (uint32_t)rc);
-        vw_write_u64le(rbuf + 4u, rc == VW_OK ? entry.vault_id : 0u);
-        vw_ipc_send(conn, VW_IPC_FILE_VAULT_ID_RESP, rbuf, sizeof(rbuf));
         break;
     }
 

@@ -241,21 +241,20 @@ async function resolveCurrentFolderId(): Promise<void> {
 }
 
 /*
- * currentFolderVaultId (0 = not a vault folder) is the sole signal this
- * UI uses to decide plaintext vs. encrypted upload/download - NOT
- * FileEntry.vault_id from a file listing. That field is real in the wire
- * protocol (docs/PROTOCOL.md, TASK-100) but FILE_LIST_RESP never actually
- * populates it (only FILE_STAT_RESP and VERSION_CHUNKS_RESP do — confirmed
- * by reading vw_client_core.c's recv_file_list_resp, which never sets
- * entries[i].vault_id at all). This is a pre-existing wire/native-client
- * gap, not something introduced here — the native GUI has the identical
- * limitation and can't show a per-file lock icon from a listing either
- * without an extra FILE_STAT per entry. Worth a follow-up task for
- * whoever owns the wire protocol; not fixed here. Since every file this
- * UI ever commits into a vault folder carries that folder's vault_id
- * (uploadFileEncrypted always does), treating "is the CONTAINING folder a
- * registered vault" as the per-file signal is correct for anything this
- * UI itself created, without needing the missing field at all.
+ * currentFolderVaultId (0 = not a vault folder) decides plaintext vs.
+ * encrypted for a brand-new upload, which has no vault_id of its own yet
+ * to consult — this remains the only signal available at upload time.
+ *
+ * It is deliberately NOT used for any *existing* entry's plaintext-vs-
+ * encrypted decision (download, lock-icon rendering) — TASK-156 closed
+ * the wire-protocol gap that used to force that folder-level inference
+ * (FILE_LIST_RESP now carries a real per-entry vault_id, and
+ * vw_client_file_list populates FileEntry.vault_id from it). An entry's
+ * own vault_id is the correct signal there and handles cases the
+ * folder-level inference got wrong: a file keeps its vault_id when moved
+ * out of the vault's registered folder (FILE_MOVE never touches version
+ * metadata), so a plain "is the containing folder a registered vault"
+ * check would wrongly treat it as plaintext post-move.
  */
 let currentFolderVaultId = 0;
 
@@ -447,7 +446,8 @@ function renderFileRow(entry: FileEntry): HTMLTableRowElement {
   // textContent, never innerHTML - a shared folder can contain files
   // named by someone else; this is what keeps arbitrary filenames from
   // ever being interpreted as markup (TASK-138's flagged XSS concern).
-  nameLink.textContent = (isDir ? "\u{1F4C1} " : "\u{1F4C4} ") + entry.name;
+  const lockPrefix = !isDir && entry.vault_id !== 0 ? "\u{1F512} " : "";
+  nameLink.textContent = lockPrefix + (isDir ? "\u{1F4C1} " : "\u{1F4C4} ") + entry.name;
   if (isDir) {
     nameLink.addEventListener("click", (ev) => {
       ev.preventDefault();
@@ -685,15 +685,15 @@ async function uploadOne(file: File): Promise<void> {
 
 async function handleDownload(entry: FileEntry): Promise<void> {
   const handle = createTransferItem(`Downloading ${entry.name}`);
-  // See currentFolderVaultId's own doc comment: FILE_LIST never actually
-  // populates entry.vault_id (a pre-existing wire/native-client gap), so
-  // "is the CONTAINING folder a registered vault" is the real signal,
-  // not the per-entry field.
-  if (currentFolderVaultId !== 0 && !(unlockedVault?.vaultId === currentFolderVaultId)) {
-    handle.setFailed("This folder is a locked vault - unlock it before downloading.");
+  // The entry's own vault_id (TASK-156/TASK-159), not currentFolderVaultId -
+  // an encrypted file keeps its vault_id after being moved out of the
+  // vault's registered folder, and the folder-level signal would wrongly
+  // call it plaintext there.
+  if (entry.vault_id !== 0 && !(unlockedVault?.vaultId === entry.vault_id)) {
+    handle.setFailed("This file's vault is locked - unlock it before downloading.");
     return;
   }
-  const vault = currentFolderVaultId !== 0 ? unlockedVault : null;
+  const vault = entry.vault_id !== 0 ? unlockedVault : null;
   try {
     const blob = vault
       ? await downloadFileEncrypted(entry.version_id, entry.size_bytes, vault.vk, (done, total) =>

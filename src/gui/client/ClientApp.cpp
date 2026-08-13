@@ -197,7 +197,3 @@ int ClientApp::ipc_vault_download(uint64_t vault_id, uint64_t file_id, const cha
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.vault_download(vault_id, file_id, local_path);
 }
-int ClientApp::ipc_file_vault_id(uint64_t file_id, uint64_t *out_vault_id) {
-    std::lock_guard<std::mutex> lk(status_mutex_);
-    return ipc_.file_vault_id(file_id, out_vault_id);
-}

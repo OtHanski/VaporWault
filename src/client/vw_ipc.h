@@ -113,12 +113,6 @@ typedef enum {
     VW_IPC_VAULT_DOWNLOAD_REQ = 0x802B, /* C→D: download+decrypt to a local path  */
     VW_IPC_VAULT_DOWNLOAD_RESP = 0x802C, /* D→C: error_code                       */
 
-    /* Narrow lookup for the file browser's encrypted-item indicator: just
-     * the vault_id, not a full FILE_STAT passthrough (which doesn't exist
-     * over this IPC and isn't otherwise needed by any GUI view today). */
-    VW_IPC_FILE_VAULT_ID_REQ  = 0x802D, /* C→D: look up one file's vault_id       */
-    VW_IPC_FILE_VAULT_ID_RESP = 0x802E, /* D→C: error_code + vault_id             */
-
     /* TASK-106: add a sync folder rooted at a SHARED item (by file_id)
      * rather than an owned virtual path — a separate message pair rather
      * than an optional trailing field on FOLDER_ADD_REQ, since the two
@@ -188,6 +182,12 @@ typedef enum {
  *                        LINK_LIST entries against browser rows). Internal
  *                        daemon↔client IPC only, not the wire protocol to
  *                        the server — no version negotiation needed.
+ *   u64    vault_id      TASK-158: vw_cache_entry_t.vault_id (0 = unencrypted
+ *                        or unknown). Lets the GUI browser show a per-file
+ *                        encrypted-item indicator straight from the listing
+ *                        it already fetched, replacing the removed
+ *                        VW_IPC_FILE_VAULT_ID_REQ/_RESP one-round-trip-per-
+ *                        file lookup this superseded.
  *
  * VW_IPC_FOLDER_ADD_RESP / VW_IPC_FOLDER_REMOVE_RESP / VW_IPC_SYNC_NOW_RESP /
  * VW_IPC_PAUSE_RESP / VW_IPC_RESUME_RESP / VW_IPC_SHUTDOWN_RESP:
@@ -319,12 +319,6 @@ typedef enum {
  *   string local_path      destination path for the decrypted plaintext
  * VW_IPC_VAULT_DOWNLOAD_RESP:
  *   u32 error_code
- *
- * VW_IPC_FILE_VAULT_ID_REQ:
- *   u64 file_id
- * VW_IPC_FILE_VAULT_ID_RESP:
- *   u32 error_code
- *   u64 vault_id           0 = unencrypted; only meaningful if error_code == 0
  *
  * VW_IPC_FOLDER_ADD_SHARED_REQ:
  *   string local_root      local filesystem directory to sync into

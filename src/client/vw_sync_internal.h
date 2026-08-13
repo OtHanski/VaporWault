@@ -81,6 +81,7 @@ typedef struct {
     uint64_t size_bytes;
     int64_t  mtime_unix;
     uint64_t version_id;
+    uint64_t vault_id;   /* TASK-158: 0 = unencrypted */
     uint8_t  entry_type;
 } srv_entry_t;
 

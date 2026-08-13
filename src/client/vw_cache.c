@@ -261,6 +261,26 @@ vw_err_t vw_cache_open(const char *state_dir, vw_cache_t **out)
     err = vw_fs_read_file(c->cache_path, &buf, &buf_len);
     if (err != VW_OK) goto fail;
 
+    if (buf_len != 0 &&
+        buf_len % sizeof(vw_cache_entry_t) != 0 &&
+        buf_len % VW_CACHE_ENTRY_SIZE_PRE_TASK158 == 0) {
+        /* TASK-158 migration: this cache.db was written by a pre-vault_id
+         * build (1088-byte records) — reinterpreting its bytes at the new
+         * 1096-byte record size would misalign virtual_path/local_path and
+         * corrupt the decode. The cache is a disposable, fully rebuildable
+         * local index — every sync cycle reconciles it against a fresh
+         * local walk + server listing (vw_sync.c's compute_actions treats
+         * a missing cache entry exactly like a brand-new file/version), so
+         * the correct and safe fix is to start it over rather than guess
+         * at an in-place migration of the old byte layout. */
+        free(buf); buf = NULL; buf_len = 0;
+        memset(&guard_e, 0, sizeof(guard_e));
+        err = vw_fs_atomic_write(c->cache_path, &guard_e, sizeof(guard_e));
+        if (err != VW_OK) goto fail;
+        err = vw_fs_read_file(c->cache_path, &buf, &buf_len);
+        if (err != VW_OK) goto fail;
+    }
+
     c->nslots = buf_len / sizeof(vw_cache_entry_t);
     c->entries = (vw_cache_entry_t *)calloc(c->nslots ? c->nslots : 1,
                                               sizeof(vw_cache_entry_t));

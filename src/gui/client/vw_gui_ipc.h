@@ -49,6 +49,7 @@ struct VwGuiFileEntry {
     int64_t     local_mtime  = 0;
     uint64_t    server_size  = 0;
     uint64_t    file_id      = 0; /* 0 = not yet uploaded */
+    uint64_t    vault_id     = 0; /* TASK-158: 0 = unencrypted or unknown */
 };
 
 /* Sharing (TASK-096; library: TASK-095, docs/PROTOCOL.md §7.5). Mirrors
@@ -194,13 +195,6 @@ public:
 
     /* Download and decrypt file_id's current version to local_path. */
     int vault_download(uint64_t vault_id, uint64_t file_id, const char *local_path);
-
-    /*
-     * Look up one file's current-version vault_id (0 = unencrypted) for
-     * the browser's encrypted-item indicator. Returns the error_code as
-     * int; *out_vault_id is only meaningful when the return is 0.
-     */
-    int file_vault_id(uint64_t file_id, uint64_t *out_vault_id);
 
 private:
     uint16_t port_      = VW_IPC_DEFAULT_PORT;

@@ -226,6 +226,7 @@ VW_SYNC_TESTABLE vw_err_t srv_push(srv_list_t *sl, const char *vpath, const vw_f
     s->size_bytes = e->size_bytes;
     s->mtime_unix = e->mtime_unix;
     s->version_id = e->version_id;
+    s->vault_id   = e->vault_id;
     s->entry_type = e->entry_type;
     return VW_OK;
 }
@@ -696,6 +697,7 @@ static void update_cache_after_upload(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
         ce.server_version_id = stat_entry.version_id;
         ce.server_mtime      = stat_entry.mtime_unix;
         ce.server_size       = stat_entry.size_bytes;
+        ce.vault_id          = stat_entry.vault_id;
     }
 
     (void)vw_cache_upsert(ctx->cache, &ce);
@@ -1070,6 +1072,7 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
                 ce.server_version_id = se->version_id;
                 ce.server_mtime      = se->mtime_unix;
                 ce.server_size       = se->size_bytes;
+                ce.vault_id          = se->vault_id;
                 (void)vw_cache_upsert(ctx->cache, &ce);
             } else if (cerr == VW_OK) {
                 /* TASK-109: FILE_LIST_RESP now carries a real version_id
@@ -1104,6 +1107,7 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
                     ce.server_mtime      = se->mtime_unix;
                     ce.server_size       = se->size_bytes;
                     ce.file_id           = se->file_id;
+                    ce.vault_id          = se->vault_id;
                     (void)vw_cache_upsert(ctx->cache, &ce);
                 }
                 /* else: no change from server side */

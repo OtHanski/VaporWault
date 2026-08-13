@@ -591,6 +591,68 @@ def test_vault_passphrase_never_sent_to_gateway(server, clients, unique_username
     assert vault_shaped_bodies_checked >= 2  # vault_create + vault_key_fetch, at least
 
 
+def test_file_list_vault_id_survives_move_out_of_vault_folder(server, clients, unique_username):
+    """
+    TASK-159 regression. `web/src/main.ts` used to infer a listed file's
+    encrypted-vs-plaintext status from whether its *containing folder*
+    was a registered vault (`currentFolderVaultId`), because
+    `FILE_LIST_RESP` didn't carry a per-entry `vault_id` yet (TASK-141's
+    documented limitation). `TASK-156` closed that wire gap by adding one;
+    the gateway's `write_file_entry()` already forwards
+    `vw_client_file_entry_t.vault_id` into `/api/files/list` JSON
+    unchanged, so this exercises that it actually arrives correctly, not
+    just that the field exists.
+
+    This is the concrete case the old folder-level inference gets wrong:
+    `FILE_MOVE` never touches version metadata, so a file's `vault_id`
+    must survive being moved out of the vault's own registered folder -
+    a plain "is the containing folder a registered vault" check would
+    wrongly report it as plaintext (0) at the new location.
+    """
+    client = clients.login(unique_username, server=server)
+
+    r = client.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    vault_folder_id = r.json()["dir_id"]
+    r = client.mkdir("plain_elsewhere")
+    assert r.status_code == 200, r.text
+    plain_folder_id = r.json()["dir_id"]
+
+    wrapped_vk = os.urandom(60).hex()
+    kdf_salt = os.urandom(16).hex()
+    kdf_params = (19456).to_bytes(4, "little") + (2).to_bytes(4, "little") + (1).to_bytes(4, "little")
+    r = client.vault_create(vault_folder_id, wrapped_vk, kdf_salt, kdf_params.hex())
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    data = b"opaque ciphertext-shaped payload, content is irrelevant here"
+    h = hashlib.sha256(data).hexdigest()
+    r = client.upload_chunk(h, data)
+    assert r.status_code == 200, r.text
+    wrapped_dek_hex = os.urandom(48).hex()
+    r = client.commit_file("/vault_home/secret.bin", len(data), [h],
+                            vault_id=vault_id, wrapped_dek_hex=wrapped_dek_hex)
+    assert r.status_code == 200, r.text
+    file_id = r.json()["file_id"]
+
+    r = client.list_files("/vault_home")
+    assert r.status_code == 200, r.text
+    entry = next(e for e in r.json() if e["name"] == "secret.bin")
+    assert entry["vault_id"] == vault_id
+
+    # Move it OUT of the vault's own registered folder.
+    r = client.move(file_id, new_parent_dir_id=plain_folder_id)
+    assert r.status_code == 200, r.text
+
+    r = client.list_files("/plain_elsewhere")
+    assert r.status_code == 200, r.text
+    entry = next(e for e in r.json() if e["name"] == "secret.bin")
+    assert entry["vault_id"] == vault_id, (
+        "a moved file's vault_id must survive the move - the old "
+        "containing-folder inference would have reported 0 here"
+    )
+
+
 # ── 3. Multi-session concurrency / isolation ─────────────────────────────────
 
 def test_multi_session_isolation(server, clients, unique_username):

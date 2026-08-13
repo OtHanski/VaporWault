@@ -571,4 +571,64 @@ VW_TEST_CASE("resolve_or_create_dir: root-path-normalization fallback branch") {
     stack_close(&s);
 }
 
+VW_TEST_CASE("vw_cache_open: pre-TASK-158 (1088-byte record) cache.db is safely reset, not misread") {
+    char tmpdir[512];
+    make_tmpdir(tmpdir, sizeof(tmpdir), "cache_migrate");
+    char cache_path[600];
+    path_join(cache_path, sizeof(cache_path), tmpdir, "cache.db");
+
+    /* Simulate a pre-TASK-158 cache.db: 3 old-sized (1088-byte) records,
+     * the middle one carrying a fake but well-formed virtual_path at the
+     * byte offset that used to be its start (64) in the old layout. If
+     * vw_cache_open ever went back to naively dividing buf_len by the
+     * current (1096-byte) record size, every field past this record
+     * would misalign and this path string would corrupt on decode
+     * instead of being cleanly discarded. */
+    size_t old_total = 3u * VW_CACHE_ENTRY_SIZE_PRE_TASK158;
+    uint8_t *old_buf = (uint8_t *)calloc(1, old_total);
+    VW_ASSERT(old_buf != NULL);
+    snprintf((char *)(old_buf + VW_CACHE_ENTRY_SIZE_PRE_TASK158 + 64), 64, "/old/format/file.txt");
+    FILE *f = fopen(cache_path, "wb");
+    VW_ASSERT(f != NULL);
+    size_t written = fwrite(old_buf, 1, old_total, f);
+    fclose(f);
+    free(old_buf);
+    VW_ASSERT_EQ(written, old_total);
+
+    vw_cache_t *cache = NULL;
+    VW_ASSERT_OK(vw_cache_open(tmpdir, &cache));
+
+    vw_cache_entry_t *entries = NULL; uint32_t n = 0;
+    VW_ASSERT_OK(vw_cache_list(cache, -1, &entries, &n));
+    VW_ASSERT_EQ(n, 0u); /* migrated to fresh — no garbage/misread entries surfaced */
+    free(entries);
+
+    /* A real record inserted after migration must round-trip cleanly. */
+    vw_cache_entry_t ce;
+    memset(&ce, 0, sizeof(ce));
+    snprintf(ce.virtual_path, sizeof(ce.virtual_path), "%s", "/after/migration.txt");
+    ce.entry_type = VW_ENTRY_FILE;
+    ce.vault_id = 424242;
+    VW_ASSERT_OK(vw_cache_upsert(cache, &ce));
+    vw_cache_entry_t got;
+    VW_ASSERT_OK(vw_cache_get(cache, "/after/migration.txt", &got));
+    VW_ASSERT_EQ(got.vault_id, 424242u);
+
+    vw_cache_close(cache);
+
+    /* The on-disk file itself must also have been rewritten to the
+     * current record size at migration time — not just the in-memory
+     * view — so a later reopen (e.g. after a daemon restart) doesn't
+     * re-trigger this same migration path against stale trailing bytes. */
+    FILE *check = fopen(cache_path, "rb");
+    VW_ASSERT(check != NULL);
+    fseek(check, 0, SEEK_END);
+    long sz = ftell(check);
+    fclose(check);
+    uint64_t remainder = (uint64_t)sz % sizeof(vw_cache_entry_t);
+    VW_ASSERT_EQ(remainder, 0u);
+
+    rm_rf(tmpdir);
+}
+
 VW_TEST_SUITE_END()

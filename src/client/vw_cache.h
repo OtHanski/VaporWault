@@ -39,8 +39,10 @@ typedef enum {
 /* ── Cache entry record ──────────────────────────────────────────────────── */
 
 /*
- * One cache entry per known file / directory. 1088 bytes on disk:
- *   64 bytes of scalar fields (including 11-byte alignment pad)
+ * One cache entry per known file / directory. 1096 bytes on disk (grew from
+ * 1088 in TASK-158, which added vault_id — see vw_cache.c's cache.db load
+ * path for the resulting old-format migration):
+ *   72 bytes of scalar fields (including a 3-byte alignment pad)
  *   512 bytes for virtual_path
  *   512 bytes for local_path
  *
@@ -53,14 +55,24 @@ typedef struct {
     uint64_t        server_size;       /* size of last known server version       */
     int64_t         local_mtime;       /* mtime of local file at last sync        */
     uint64_t        local_size;        /* size of local file at last sync         */
+    uint64_t        vault_id;          /* TASK-158: last known server version's vault,
+                                         * 0 if unencrypted — mirrors vw_file_entry_t.
+                                         * vault_id, populated from the same FILE_LIST/
+                                         * FILE_STAT calls that already set the other
+                                         * server_* fields below. */
     vw_sync_state_t sync_state;        /* u32 on disk                             */
     uint8_t         entry_type;        /* VW_ENTRY_FILE or VW_ENTRY_DIR           */
-    uint8_t         _pad[11];          /* pad to align paths at offset 64         */
+    uint8_t         _pad[11];          /* pad to align paths at offset 72         */
     char            virtual_path[512]; /* NUL-terminated absolute virtual path    */
     char            local_path[512];   /* NUL-terminated absolute local path      */
 } vw_cache_entry_t;
-_Static_assert(sizeof(vw_cache_entry_t) == 1088,
-               "vw_cache_entry_t must be 1088 bytes");
+_Static_assert(sizeof(vw_cache_entry_t) == 1096,
+               "vw_cache_entry_t must be 1096 bytes");
+
+/* Size of a cache.db record before TASK-158 added vault_id — needed only to
+ * recognize (and migrate away from) a pre-existing cache.db written by an
+ * older build; see vw_cache.c. */
+#define VW_CACHE_ENTRY_SIZE_PRE_TASK158 1088u
 
 /* Reasons a sync folder can be found paused (vw_sync_folder_t.pause_reason).
  * Only meaningful when paused == 1; VW_PAUSE_REASON_NONE covers both "never

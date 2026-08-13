@@ -353,7 +353,8 @@ static int cmd_list_folders(vw_ipc_conn_t *conn) {
  * FILE_LIST_RESP layout per entry:
  *   string virtual_path, string local_path,
  *   u32 sync_state, u8 entry_type,
- *   i64 server_mtime, i64 local_mtime, u64 server_size
+ *   i64 server_mtime, i64 local_mtime, u64 server_size, u64 file_id,
+ *   u64 vault_id (TASK-158)
  */
 static int cmd_ls(vw_ipc_conn_t *conn, const char *prefix, uint8_t filter) {
     uint8_t req[518];
@@ -387,16 +388,18 @@ static int cmd_ls(vw_ipc_conn_t *conn, const char *prefix, uint8_t filter) {
 
         if (vw_ipc_read_str(resp, rlen, &roff, &vpath, &vplen) != VW_OK) break;
         if (vw_ipc_read_str(resp, rlen, &roff, &lpath_unused, &lplen) != VW_OK) break;
-        if (roff + 4u + 1u + 8u + 8u + 8u + 8u > rlen) break;
+        if (roff + 4u + 1u + 8u + 8u + 8u + 8u + 8u > rlen) break;
 
         uint32_t sync_state  = vw_read_u32le(resp + roff); roff += 4;
         uint8_t  entry_type  = resp[roff++];
         int64_t  server_mt   = (int64_t)vw_read_u64le(resp + roff); roff += 8;
         int64_t  local_mt    = (int64_t)vw_read_u64le(resp + roff); roff += 8;
         uint64_t server_size = vw_read_u64le(resp + roff);           roff += 8;
-        /* file_id: not printed by `ls` today; consumed to stay aligned
-         * with the next entry (TASK-096 added it to the wire format). */
-        roff += 8;
+        /* file_id, vault_id: not printed by `ls` today; consumed to stay
+         * aligned with the next entry (TASK-096 added file_id, TASK-158
+         * added vault_id, to the wire format). */
+        roff += 8; /* file_id */
+        roff += 8; /* vault_id */
 
         int64_t mtime = server_mt ? server_mt : local_mt;
         char ts_buf[24]; format_ts(mtime, ts_buf, sizeof(ts_buf), 0);
