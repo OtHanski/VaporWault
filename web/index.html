@@ -10,19 +10,25 @@
   <div id="app">
     <section id="login-view">
       <form id="login-form">
-        <h1>VaporWault</h1>
+        <h1 id="login-heading">VaporWault</h1>
         <input id="login-username" type="text" placeholder="Username" autocomplete="username" required>
         <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" required>
         <div id="otp-field" hidden>
           <input id="login-otp" type="text" placeholder="2FA code" autocomplete="one-time-code">
         </div>
+        <label id="remember-me-field" class="checkbox-field">
+          <input id="login-remember" type="checkbox">
+          Remember me on this device
+        </label>
         <button type="submit">Log in</button>
+        <button type="button" id="login-cancel-btn" hidden>Cancel</button>
         <p id="login-error" class="error" hidden></p>
       </form>
     </section>
 
     <section id="browser-view" hidden>
       <header>
+        <div id="account-switcher"></div>
         <span id="current-path" title="Click to go up one level">/</span>
         <button id="logout-btn">Log out</button>
       </header>

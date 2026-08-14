@@ -1,0 +1,89 @@
+---
+id:          TASK-160
+title:       Design multi-account support (local clients + web gateway remember-me/multi-session)
+status:      done
+assignee:    ARCH.00
+created_by:  ARCH.00
+created:     2026-08-13
+priority:    high
+depends_on:  []
+blocks:      [TASK-161, TASK-164]
+review_by:   [CQR.08]
+tags:        [design]
+---
+
+User request: persistent "remember me" login for the web client, plus
+multiple *simultaneously logged-in* accounts — all still syncing/reachable
+in the background regardless of which one is currently displayed — for both
+the web client and the local (GUI/CLI/daemon) clients, with a way to switch
+which one is "active" in the UI. Confirmed with the user: background sync
+must continue for every logged-in account, not just the active one (not a
+lighter "single active + remembered list" model).
+
+Full design is recorded in `ARCHITECTURE.md`'s Architectural Decisions table
+(four new rows: "Multi-account daemon model", "Daemon↔GUI/CLI IPC account
+scoping", "Gateway multi-account browser sessions", "Gateway remember-me
+persistence"), the new Phase 12 row under Implementation Phases, and an
+updated Risks-table mitigation for the pre-existing "session-token file
+storage precedent" risk. This task file is the pointer into that design and
+the root of the implementation task graph below.
+
+Key decisions (see `ARCHITECTURE.md` for full rationale):
+
+- **One daemon process, N account contexts** (`vw_account_ctx_t`), not N
+  daemon processes. Round-robin-scheduled on the existing single-threaded
+  sync loop — delivers "every account keeps syncing" without a real
+  multi-threading rewrite of `vw_sync.c`/`vw_cache.c`.
+- **IPC account scoping**: a leading `u32 account_id` on every existing
+  per-file/vault/share/folder IPC request (assigned by a new
+  `ACCOUNT_ADD_RESP`), not a stateful "select active account" connection —
+  matches `VwGuiIpc`'s existing one-shot-per-call design.
+- **Gateway**: per-slot cookie names (`vw_session_0`..`vw_session_<N-1>`)
+  instead of one fixed name, selected per-request via a new `X-Vw-Slot`
+  header. Persistent remember-me reuses `vw_client_resume()`/
+  `vw_client_get_token()` — the same primitive the daemon's own
+  single-account remember-me already uses — backed by a new on-disk store
+  under a new gateway `--state-dir`.
+- **No `docs/PROTOCOL.md` changes**: everything here is internal daemon↔GUI/
+  CLI IPC or gateway-internal/frontend work. The gateway and daemon each
+  still call `vw_client_connect`/`vw_client_resume` once per account, same
+  as any single-account client.
+
+## Acceptance criteria
+
+- [x] `ARCHITECTURE.md` decision rows, Phase 12 row, and Risks-table update
+  committed.
+- [x] `TASK-161`–`TASK-168` filed with dependencies matching the graph
+  below.
+
+Dependency graph:
+
+```
+TASK-160 (this task)
+  ├─> TASK-161 (daemon core + IPC)
+  │     ├─> TASK-162 (CLI account subcommands)
+  │     └─> TASK-163 (GUI account switcher)
+  └─> TASK-164 (gateway multi-slot sessions)
+        └─> TASK-165 (gateway remember-me persistence)
+              └─> TASK-166 (frontend switcher + remember-me UI)
+TASK-167 (packaging/deployment docs) depends_on [TASK-161, TASK-165]
+TASK-168 (integration tests) depends_on [TASK-161..166]
+```
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-08-13]: Design complete, `ARCHITECTURE.md` updated,
+implementation tasks filed. This task's own deliverable (the design + task
+graph) is complete; implementation happens in the tasks it spawned.
+
+CQR.08 [2026-08-13]: Self-review. Checked the design against the actual
+codebase (not just described from memory): confirmed `vw_client_resume`/
+`vw_client_get_token`/`tok_load`/`tok_save` exist and are exactly what
+`TASK-165` will reuse; confirmed `ACCOUNT_ADD_RESP`-assigned `account_id` is
+consistent with `VwGuiIpc`'s documented one-shot-per-call design (no
+persistent-connection state to hang an "active account" off of); confirmed
+no `docs/PROTOCOL.md` change is implied anywhere in this design (verified
+against §7.1's session-resume single-use rule, which this design relies on
+unchanged). No blocking findings. `status: done`.

@@ -13,6 +13,7 @@
  */
 
 #include "vw_gateway_session.h"
+#include "vw_gateway_remember.h"
 #include "vw_http.h"
 #include "../client/vw_client_core.h"
 #include "../core/vw_proto.h"
@@ -42,6 +43,20 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
                           const vw_gateway_server_cfg_t *cfg,
                           const vw_http_request_t *req,
                           vw_http_conn_t *conn);
+
+/*
+ * Enables "remember me" persistence (TASK-165): a `remember: true` login
+ * writes to store, and a cookie-miss in require_session() consults it
+ * before failing. Pass NULL (the default - main.c never calls this
+ * without --state-dir) to leave the feature entirely disabled: a
+ * `remember: true` login is then silently treated as a normal
+ * session-only login rather than erroring, matching this feature's own
+ * "opt-in" framing at both the operator (--state-dir) and user
+ * (remember: true) level. Not thread-safe to call after dispatch begins
+ * handling requests - call once, at startup, before the accept loop
+ * (matches this whole module's single-threaded-only calling convention).
+ */
+void vw_gateway_api_set_remember_store(vw_gateway_remember_store_t *store);
 
 #ifdef __cplusplus
 }

@@ -5,10 +5,24 @@
  * vw_daemon — VaporWault client daemon.
  *
  * Owns the sync engine, filesystem watcher, IPC server, and server connection
- * lifecycle. Runs as a single-threaded event loop on the main thread.
+ * lifecycle for every configured account. Runs as a single-threaded event
+ * loop on the main thread — one process, N concurrently-connected accounts,
+ * each with its own server session/cache/vault registry, round-robin
+ * scheduled on this one thread (TASK-161; see ARCHITECTURE.md's "Multi-
+ * account daemon model" decision for why this is one process with N account
+ * contexts rather than N daemon processes).
+ *
+ * On-disk layout under {state_dir}:
+ *   daemon.conf              global settings (ipc_port, sync_interval_ms)
+ *   daemon.log, daemon.pid
+ *   accounts/<account_id>/
+ *     account.conf           label, server_host, server_port,
+ *                             ca_cert_pem_path, username
+ *     cache.db, sync_folders.db, session.tok, offline_queue.db
  *
  * Security:
- *   - session.tok is checked for mode 0600 before loading (POSIX).
+ *   - Each account's session.tok is checked for mode 0600 before loading
+ *     (POSIX).
  *   - PID file is created with O_EXCL to prevent TOCTOU races.
  *   - No session tokens are written to the log (SEC.07).
  */
@@ -21,11 +35,9 @@ extern "C" {
 #endif
 
 typedef struct {
-    char     state_dir[512];        /* cache.db, offline_queue.db, session.tok */
-    char     server_host[256];      /* server hostname                          */
-    uint16_t server_port;           /* server TLS port (default 4430)          */
-    char     ca_cert_pem_path[512]; /* CA cert PEM; empty = system store       */
-    char     username[64];          /* server username                         */
+    char     state_dir[512];        /* daemon-global root — see this file's
+                                      * header comment for the on-disk layout
+                                      * underneath it */
     uint16_t ipc_port;              /* IPC listen port (default 47832)         */
     uint32_t sync_interval_ms;      /* periodic sync interval (default 30 000) */
 } vw_daemon_cfg_t;
@@ -33,6 +45,9 @@ typedef struct {
 /*
  * Load config from {state_dir}/daemon.conf (simple INI; missing keys get
  * defaults). Returns VW_OK even if the file does not exist (all defaults).
+ * Per-account settings (server_host, username, etc.) are no longer part of
+ * this file — see accounts/<account_id>/account.conf, managed internally by
+ * vw_daemon.c via VW_IPC_ACCOUNT_ADD_REQ, not hand-edited.
  */
 vw_err_t vw_daemon_cfg_load(const char *state_dir, vw_daemon_cfg_t *out);
 

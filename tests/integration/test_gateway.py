@@ -43,6 +43,7 @@ import time
 import pytest
 import requests
 
+from conftest import GatewayInstance, ServerInstance
 from vw_client import VW_PERM_VIEW
 
 PASSWORD = "GatewayTestP@ss1"
@@ -76,33 +77,60 @@ class GatewayClient:
     def __init__(self, gateway):
         self.base_url = gateway.base_url
         self.session = requests.Session()
+        # Which slot this client last logged into (default 0, matching the
+        # gateway's own default) — logout()'s own default must track this,
+        # not always 0, or logging out a non-default-slot client would
+        # clear the wrong (empty) slot server-side and leave its real
+        # session leaked. See this module's docstring on why a leaked
+        # session is a real problem here (only 2 test-server workers).
+        self.last_login_slot = 0
 
     def _strip_secure_flag(self):
         for cookie in self.session.cookies:
             cookie.secure = False
 
-    def post(self, path, json_body=None, **kwargs):
-        return self.session.post(self.base_url + path, json=json_body, timeout=10, **kwargs)
+    def post(self, path, json_body=None, slot=None, **kwargs):
+        # TASK-164: X-Vw-Slot tells the gateway which of this browser's
+        # several slot cookies backs this one request. slot=None (the
+        # default everywhere below) omits the header entirely, which is
+        # exactly the "not yet updated to use it" case TASK-164's own
+        # acceptance criteria requires to keep behaving as slot 0 —
+        # every pre-existing call site in this file relies on that.
+        headers = kwargs.pop("headers", {}) or {}
+        if slot is not None:
+            headers["X-Vw-Slot"] = str(slot)
+        return self.session.post(self.base_url + path, json=json_body, timeout=10,
+                                  headers=headers, **kwargs)
 
-    def login(self, username, password, otp=None):
+    def login(self, username, password, otp=None, slot=None, remember=None):
         body = {"username": username, "password": password}
         if otp is not None:
             body["otp"] = otp
+        if slot is not None:
+            body["slot"] = slot
+        if remember is not None:
+            body["remember"] = remember
         r = self.post("/api/login", body)
         self._strip_secure_flag()
+        if r.status_code == 200 and r.json().get("status") == "ok":
+            self.last_login_slot = slot if slot is not None else 0
         return r
 
-    def logout(self):
-        return self.post("/api/logout", {})
+    def logout(self, slot=None):
+        target = slot if slot is not None else self.last_login_slot
+        return self.post("/api/logout", {"slot": target})
 
-    def list_files(self, path="/", recursive=False):
-        return self.post("/api/files/list", {"path": path, "recursive": recursive})
+    def accounts(self):
+        return self.post("/api/accounts", {})
+
+    def list_files(self, path="/", recursive=False, slot=None):
+        return self.post("/api/files/list", {"path": path, "recursive": recursive}, slot=slot)
 
     def stat(self, path):
         return self.post("/api/files/stat", {"path": path})
 
-    def mkdir(self, name, parent_dir_id=0):
-        return self.post("/api/files/mkdir", {"name": name, "parent_dir_id": parent_dir_id})
+    def mkdir(self, name, parent_dir_id=0, slot=None):
+        return self.post("/api/files/mkdir", {"name": name, "parent_dir_id": parent_dir_id}, slot=slot)
 
     def delete(self, path):
         return self.post("/api/files/delete", {"path": path})
@@ -161,9 +189,14 @@ class GatewayClient:
     def link_list(self, file_id_filter=0):
         return self.post("/api/links/list", {"file_id_filter": file_id_filter})
 
-    def link_access(self, link_token_hex):
-        r = self.post("/api/links/access", {"link_token": link_token_hex})
+    def link_access(self, link_token_hex, slot=None):
+        body = {"link_token": link_token_hex}
+        if slot is not None:
+            body["slot"] = slot
+        r = self.post("/api/links/access", body)
         self._strip_secure_flag()
+        if r.status_code == 200 and r.json().get("status") == "ok":
+            self.last_login_slot = slot if slot is not None else 0
         return r
 
     def vault_create(self, folder_file_id, wrapped_vk_hex, kdf_salt_hex, kdf_params_hex):
@@ -190,12 +223,12 @@ class ClientFactory:
         self.gateway = gateway
         self._clients = []
 
-    def login(self, username, password=PASSWORD, create_user=True, server=None):
+    def login(self, username, password=PASSWORD, create_user=True, server=None, slot=None, remember=None):
         if create_user:
             assert server is not None, "create_user=True requires passing server="
             server.create_user(username, password)
         client = GatewayClient(self.gateway)
-        r = client.login(username, password)
+        r = client.login(username, password, slot=slot, remember=remember)
         assert r.status_code == 200 and r.json()["status"] == "ok", r.text
         self._clients.append(client)
         return client
@@ -683,6 +716,246 @@ def test_multi_session_isolation(server, clients, unique_username):
     assert r.status_code == 401
 
 
+def test_multi_slot_same_browser(server, clients, unique_username):
+    """
+    TASK-164 acceptance criterion: one requests.Session (one simulated
+    browser) logs in as two different accounts into two different slots
+    and makes authenticated calls against both concurrently, without
+    either affecting the other's session — the multi-*slot* case, as
+    opposed to test_multi_session_isolation's multi-*browser* case above
+    (two entirely separate cookie jars, which was already possible before
+    this task; this test is what's actually new).
+    """
+    user_a = f"{unique_username}_a"
+    user_b = f"{unique_username}_b"
+    client = clients.bare()
+
+    server.create_user(user_a, PASSWORD)
+    server.create_user(user_b, PASSWORD)
+
+    # Explicit slot 0, then an unspecified ("next free") slot for the
+    # second login — both through the SAME cookie jar, so "next free"
+    # must see slot 0 as already occupied and land on slot 1.
+    r = client.login(user_a, PASSWORD, slot=0)
+    assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+    r = client.login(user_b, PASSWORD)
+    assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+
+    slot_names = {c.name for c in client.session.cookies}
+    assert "vw_session_0" in slot_names and "vw_session_1" in slot_names
+
+    # No X-Vw-Slot header at all must behave exactly like slot 0 (the
+    # acceptance criterion's own "non-breaking for anything not yet
+    # updated" case) - every call below that omits slot= relies on this.
+    r = client.mkdir("a_only_dir")  # slot=None -> slot 0 (user_a)
+    assert r.status_code == 200
+    r = client.mkdir("b_only_dir", slot=1)
+    assert r.status_code == 200
+
+    names_0 = {e["name"] for e in client.list_files("/").json()}
+    names_1 = {e["name"] for e in client.list_files("/", slot=1).json()}
+    assert "a_only_dir" in names_0 and "b_only_dir" not in names_0
+    assert "b_only_dir" in names_1 and "a_only_dir" not in names_1
+
+    # /api/accounts reports exactly these two occupied slots + usernames,
+    # read from this same browser's own cookies only.
+    accounts = {s["slot"]: s["username"] for s in client.accounts().json()["slots"]}
+    assert accounts == {0: user_a, 1: user_b}
+
+    # Logging out slot 1 must not affect slot 0's still-live session.
+    r = client.logout(slot=1)
+    assert r.status_code == 200
+    assert client.list_files("/", slot=1).status_code == 401
+    assert client.list_files("/").status_code == 200
+
+    r = client.logout(slot=0)
+    assert r.status_code == 200
+    assert client.list_files("/").status_code == 401
+
+
+def test_login_no_free_slot_is_rejected(binaries, tmp_path_factory, unique_username):
+    """Filling every one of VW_GATEWAY_MAX_SLOTS (6) slots in one browser,
+    then trying a 7th unspecified-slot login, must fail cleanly rather
+    than silently overwrite an existing slot.
+
+    Uses its own dedicated server+gateway (not the module-scoped
+    server/gateway fixtures used by every other test in this file) with a
+    higher max_workers: holding 6 simultaneously-live sessions open at
+    once against the shared fixtures' max_workers=2 test server would
+    itself hang (the 3rd login's vw_client_connect blocking forever
+    waiting for a server worker that only frees up once an earlier
+    session logs out) — a test-server capacity limit, unrelated to the
+    gateway's own 6-slot cap this test actually means to exercise.
+    """
+    binaries.require_server()
+    binaries.require_tls()
+    binaries.require_gateway()
+
+    srv = ServerInstance(binaries, str(tmp_path_factory.mktemp("vw_gw_slots_srv")), max_workers=8)
+    srv.start()
+    gw = GatewayInstance(binaries, srv)
+    gw.start()
+    try:
+        client = GatewayClient(gw)
+        for i in range(6):
+            username = f"{unique_username}_slot{i}"
+            srv.create_user(username, PASSWORD)
+            r = client.login(username, PASSWORD, slot=i)
+            assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+
+        overflow_username = f"{unique_username}_overflow"
+        srv.create_user(overflow_username, PASSWORD)
+        r = client.login(overflow_username, PASSWORD)  # no explicit slot -> "next free"
+        assert r.status_code == 507
+        assert r.json()["status"] == "no_free_slot"
+
+        for i in range(6):
+            assert client.logout(slot=i).status_code == 200
+    finally:
+        gw.stop()
+        srv.stop()
+
+
+# ── 3b. TASK-165: persistent "remember me" ───────────────────────────────────
+#
+# All four tests here need a gateway launched with --state-dir (the shared
+# module-scoped `gateway` fixture never sets one, so `remember: true` is a
+# no-op against it - see main.c's own opt-in framing), and need to kill +
+# relaunch that exact gateway process, so each spins up its own dedicated
+# GatewayInstance against the shared module `server` fixture (cheap to
+# reuse - only the gateway process, not the Argon2id-backed server, gets
+# restarted) rather than the shared `gateway` fixture.
+
+def test_remember_me_survives_gateway_restart(binaries, server, tmp_path_factory, unique_username):
+    binaries.require_gateway()
+    server.create_user(unique_username, PASSWORD)
+
+    state_dir = str(tmp_path_factory.mktemp("vw_gw_remember"))
+    gw = GatewayInstance(binaries, server, state_dir=state_dir)
+    gw.start()
+    try:
+        client = GatewayClient(gw)
+        r = client.login(unique_username, PASSWORD, remember=True)
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+        assert client.list_files("/").status_code == 200
+
+        gw.restart()
+
+        # Same cookie, same browser, no re-authentication - the whole
+        # point of this feature (acceptance criterion #1).
+        r = client.list_files("/")
+        assert r.status_code == 200
+
+        assert client.logout().status_code == 200
+    finally:
+        gw.stop()
+
+
+def test_non_remember_login_does_not_survive_restart(binaries, server, tmp_path_factory, unique_username):
+    """Opt-in only (acceptance criterion #2): a plain login, even with a
+    --state-dir-enabled gateway, creates no on-disk entry."""
+    binaries.require_gateway()
+    server.create_user(unique_username, PASSWORD)
+
+    state_dir = str(tmp_path_factory.mktemp("vw_gw_no_remember"))
+    gw = GatewayInstance(binaries, server, state_dir=state_dir)
+    gw.start()
+    try:
+        client = GatewayClient(gw)
+        r = client.login(unique_username, PASSWORD)  # remember omitted -> False
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+        assert client.list_files("/").status_code == 200
+
+        gw.restart()
+
+        r = client.list_files("/")
+        assert r.status_code == 401
+    finally:
+        gw.stop()
+
+
+def test_logout_removes_remembered_entry(binaries, server, tmp_path_factory, unique_username):
+    """Acceptance criterion #3: logging out a remembered slot removes both
+    the in-memory pool entry AND the on-disk one - a restart afterward
+    must not resurrect it."""
+    binaries.require_gateway()
+    server.create_user(unique_username, PASSWORD)
+
+    state_dir = str(tmp_path_factory.mktemp("vw_gw_remember_logout"))
+    gw = GatewayInstance(binaries, server, state_dir=state_dir)
+    gw.start()
+    try:
+        client = GatewayClient(gw)
+        r = client.login(unique_username, PASSWORD, remember=True)
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+
+        assert client.logout().status_code == 200
+
+        gw.restart()
+
+        r = client.list_files("/")
+        assert r.status_code == 401
+    finally:
+        gw.stop()
+
+
+def test_remember_resume_then_immediate_second_request_both_succeed(
+        binaries, server, tmp_path_factory, unique_username):
+    """
+    SEC.07's own required check for the "resume-rotation race": two
+    requests presenting the same remembered cookie right after a restart.
+    vw_gateway_dispatch() is only ever driven by main.c's single-threaded,
+    one-request-at-a-time accept loop, so these two requests from one
+    `requests.Session` are handled strictly sequentially by construction -
+    there is no way for both to reach vw_client_resume() with the same
+    single-use token. The first resumes and rotates the token, re-inserting
+    a live pool entry; the second must succeed too, but via that ordinary
+    live-session path, not a second resume. Both succeeding (rather than
+    the second one failing, or the gateway crashing/hanging) is exactly
+    what "handled cleanly" means here.
+
+    TASK-168's own stronger version of this check: read the on-disk store
+    "back" afterward - not by parsing vw_gateway_remember.c's private
+    192-byte record format directly (that's the kind of test-to-
+    implementation coupling this project avoids elsewhere - test_vw_
+    gateway_remember.c's own unit tests already exercise that layer
+    directly), but behaviorally: restart the gateway a SECOND time and
+    confirm the SAME cookie still resumes cleanly. That is only possible
+    if the race left the store with exactly one coherent, genuinely
+    resumable entry for this cookie - a corrupted write, a lost update, or
+    two conflicting entries from the earlier race would all show up here
+    as this second resume failing (a 401) instead of succeeding.
+    """
+    binaries.require_gateway()
+    server.create_user(unique_username, PASSWORD)
+
+    state_dir = str(tmp_path_factory.mktemp("vw_gw_remember_race"))
+    gw = GatewayInstance(binaries, server, state_dir=state_dir)
+    gw.start()
+    try:
+        client = GatewayClient(gw)
+        r = client.login(unique_username, PASSWORD, remember=True)
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+
+        gw.restart()
+
+        r1 = client.list_files("/")
+        r2 = client.list_files("/")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+        # Second restart: proves the store still holds exactly one valid,
+        # resumable entry for this cookie after the race above, not a
+        # corrupted or duplicated one.
+        gw.restart()
+        r3 = client.list_files("/")
+        assert r3.status_code == 200
+
+        assert client.logout().status_code == 200
+    finally:
+        gw.stop()
+
+
 # ── 4. Regression tests for TASK-144's blocking findings ────────────────────
 
 @pytest.mark.slow
@@ -721,9 +994,16 @@ def test_invalid_cookie_is_rejected(gateway):
     rejected, not just a malformed one. (The timing-safety property
     itself isn't meaningfully assertable in a portable, non-flaky CI
     test; this covers the functional contract the fix must not break.)
+
+    Uses "vw_session_0" (TASK-164's slot-0 cookie name, what a request
+    with no X-Vw-Slot header resolves to) rather than the pre-TASK-164
+    bare "vw_session" — the latter no longer names any real cookie at
+    all post-TASK-164, so setting it would make this a "missing cookie"
+    test in disguise, not the "wrong but well-formed cookie" case this
+    test is actually meant to cover.
     """
     client = GatewayClient(gateway)
-    client.session.cookies.set("vw_session", "0" * 64)
+    client.session.cookies.set("vw_session_0", "0" * 64)
     r = client.list_files("/")
     assert r.status_code == 401
     assert r.json()["status"] == "auth_required"

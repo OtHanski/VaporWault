@@ -10,6 +10,7 @@ add_executable(vapourwault-web-gateway
     vw_http.c
     vw_json.c
     vw_gateway_session.c
+    vw_gateway_remember.c
     vw_gateway_api.c
     ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
 )

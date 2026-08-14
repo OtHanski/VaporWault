@@ -210,6 +210,33 @@ if(WIN32)
     target_link_libraries(test_shared_sync PRIVATE ws2_32)
 endif()
 
+# test_daemon_multi_account: TASK-161 daemon multi-account core. Replicates
+# vw_daemon_run()'s new round-robin loop (one vw_sync_run() per account per
+# tick) directly against a real already-running server with two real users,
+# rather than spawning the actual vapourwault-daemon binary and speaking
+# real IPC (TASK-168's job, for the fuller multi-account IPC surface) — same
+# "drive the real sync engine directly" rationale as test_shared_sync above.
+
+add_executable(test_daemon_multi_account
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_daemon_multi_account.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_cache.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_sync.c
+)
+
+target_include_directories(test_daemon_multi_account PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_link_libraries(test_daemon_multi_account PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_daemon_multi_account PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_daemon_multi_account PRIVATE ws2_32)
+endif()
+
 # test_shared_sync_hardening: TASK-111 regression tests for the two advisory
 # findings from TASK-106's independent review (revocation-detection too
 # coarse; unbounded shared-tree BFS). Built with VW_SYNC_TEST_HOOKS so its

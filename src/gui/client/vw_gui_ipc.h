@@ -86,6 +86,17 @@ struct VwGuiVaultEntry {
     int64_t  created_at = 0;
 };
 
+/* Multi-account (TASK-161/163). Mirrors VW_IPC_ACCOUNT_LIST_RESP's
+ * per-entry fields exactly, same shape vapourwault-cli's `account list`
+ * decodes (vw_client_cli.c's account_list_entry_t). */
+struct VwGuiAccountEntry {
+    uint32_t    account_id = 0;
+    std::string label;
+    std::string username;
+    std::string server_host;
+    uint8_t     connected = 0;
+};
+
 class VwGuiIpc {
 public:
     VwGuiIpc() = default;
@@ -106,80 +117,102 @@ public:
     /* Send STATUS_REQ and decode STATUS_RESP into *out. Returns false on error. */
     bool fetch_status(VwIpcStatus *out);
 
-    /* Simple fire-and-forget requests that return an error_code response. */
+    /* Simple fire-and-forget requests that return an error_code response.
+     * send_pause/send_resume are account-scoped (TASK-161); send_sync_now/
+     * send_shutdown act on the whole daemon (every configured account). */
     bool send_sync_now();
-    bool send_pause(const char *folder_root);   /* nullptr = all folders */
-    bool send_resume(const char *folder_root);
+    bool send_pause(uint32_t account_id, const char *folder_root);   /* nullptr = all folders */
+    bool send_resume(uint32_t account_id, const char *folder_root);
     bool send_shutdown();
 
-    /* Send FOLDER_ADD_REQ; returns vw_err_t encoded as int. */
-    int send_folder_add(const char *local_root, const char *virtual_root);
+    /* Send FOLDER_ADD_REQ; returns vw_err_t encoded as int. Account-scoped
+     * (TASK-161) — same wire payload vapourwault-cli's add-folder sends. */
+    int send_folder_add(uint32_t account_id, const char *local_root, const char *virtual_root);
 
-    /* Send FOLDER_REMOVE_REQ. */
-    int send_folder_remove(const char *local_root);
+    /* Send FOLDER_REMOVE_REQ. Account-scoped (TASK-161). */
+    int send_folder_remove(uint32_t account_id, const char *local_root);
 
     /*
-     * Authenticate with the server, via the daemon (TASK-107). password is
-     * zeroed by this call before returning, regardless of outcome — same
-     * raw-password-handling convention as vw_client_cli.c's cmd_login.
-     * otp may be nullptr/empty on the first attempt; returns
-     * VW_ERR_AUTH_2FA_REQUIRED (encoded as int) if the account needs one.
+     * Multi-account (TASK-161/163).
      */
-    int login(char *password, const char *otp);
+    /* List configured accounts. Returns true on success (out is cleared
+     * and repopulated); false on IPC failure (out is left unchanged). */
+    bool account_list(std::vector<VwGuiAccountEntry> *out);
+
+    /*
+     * Add a new account (account_id_hint == 0) or re-authenticate an
+     * existing one (account_id_hint != 0) — same ACCOUNT_ADD_REQ semantics
+     * as vapourwault-cli's `account add` (vw_client_cli.c's
+     * cmd_account_add). label may be nullptr/empty (defaults to username,
+     * decided daemon-side). password is zeroed by this call before
+     * returning, regardless of outcome — same raw-password-handling
+     * convention as the old login(). otp may be nullptr/empty on the
+     * first attempt; returns VW_ERR_AUTH_2FA_REQUIRED (encoded as int) if
+     * the account needs one. *out_account_id is only meaningful on success
+     * (0 return).
+     */
+    int account_add(uint32_t account_id_hint, const char *label,
+                     const char *server_host, uint16_t server_port, const char *ca_cert_path,
+                     const char *username, char *password, const char *otp,
+                     uint32_t *out_account_id);
+
+    /* Log out and forget an account (ACCOUNT_REMOVE_REQ). Already-synced
+     * local files are untouched — see vw_ipc.h's own payload doc. */
+    int account_remove(uint32_t account_id);
 
     /*
      * List synced-cache entries under virtual path prefix (TASK-108) —
      * same VW_IPC_FILE_LIST_REQ/_RESP exchange vapourwault-cli's `ls` uses.
-     * Returns true on success (out is cleared and repopulated); false on
-     * IPC failure (out is left unchanged).
+     * Account-scoped (TASK-161). Returns true on success (out is cleared
+     * and repopulated); false on IPC failure (out is left unchanged).
      */
-    bool file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
+    bool file_list(uint32_t account_id, const char *prefix, std::vector<VwGuiFileEntry> *out);
 
     /*
      * Sharing (TASK-096). All take a virtual_path — the daemon resolves it
      * to a file_id via vw_client_file_stat before calling through (same
-     * as vapourwault-cli's share/create-link commands). Return an int
-     * error_code (0 = VW_OK) unless noted.
+     * as vapourwault-cli's share/create-link commands). Account-scoped
+     * (TASK-161). Return an int error_code (0 = VW_OK) unless noted.
      */
-    int share_grant(const char *virtual_path, const char *target_username,
+    int share_grant(uint32_t account_id, const char *virtual_path, const char *target_username,
                      uint8_t permission, int64_t expires_at, uint64_t *out_share_id);
-    int share_revoke(uint64_t share_id);
-    bool share_list(uint8_t mode, std::vector<VwGuiShareEntry> *out, int *out_error_code);
+    int share_revoke(uint32_t account_id, uint64_t share_id);
+    bool share_list(uint32_t account_id, uint8_t mode, std::vector<VwGuiShareEntry> *out, int *out_error_code);
 
     /* out_token receives the raw 32-byte link token — meaningful only when
      * the return value is 0; never re-fetchable afterward (server never
      * re-discloses it), matching the CLI's own one-time-display handling. */
-    int link_create(const char *virtual_path, uint8_t permission, int64_t expires_at,
+    int link_create(uint32_t account_id, const char *virtual_path, uint8_t permission, int64_t expires_at,
                      uint64_t *out_share_id, uint8_t out_token[32]);
-    int link_revoke(uint64_t share_id);
-    bool link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code);
+    int link_revoke(uint32_t account_id, uint64_t share_id);
+    bool link_list(uint32_t account_id, std::vector<VwGuiLinkEntry> *out, int *out_error_code);
 
     /*
      * Vault / E2EE (TASK-100). Create a real server-side directory — a
      * vault's folder_file_id must already be one (see docs/PROTOCOL.md
      * §7.2's FILE_STAT_RESP note). new_parent_dir_id == 0 means the
-     * caller's own root.
+     * caller's own root. Account-scoped (TASK-161).
      */
-    int file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id);
+    int file_mkdir(uint32_t account_id, uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id);
 
     /*
      * Create a new vault under folder_file_id, deriving its KEK from
      * passphrase. passphrase is zeroed by this call before returning,
-     * regardless of outcome — same convention as login(). On success the
-     * new vault is unlocked in the daemon's registry immediately (no
-     * separate vault_unlock() call needed right after).
+     * regardless of outcome — same convention as account_add(). On
+     * success the new vault is unlocked in the daemon's registry
+     * immediately (no separate vault_unlock() call needed right after).
      */
-    int vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id);
+    int vault_create(uint32_t account_id, uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id);
 
     /*
      * Unlock an existing vault (new-device case). passphrase is zeroed
      * before returning. Returns VW_ERR_AUTH_BAD_CREDS (encoded as int) for
      * a wrong passphrase.
      */
-    int vault_unlock(uint64_t vault_id, char *passphrase);
+    int vault_unlock(uint32_t account_id, uint64_t vault_id, char *passphrase);
 
     /* List vaults owned by the caller. Never includes key material. */
-    bool vault_list(std::vector<VwGuiVaultEntry> *out, int *out_error_code);
+    bool vault_list(uint32_t account_id, std::vector<VwGuiVaultEntry> *out, int *out_error_code);
 
     /*
      * Encrypt local_path and upload it into vault_id (which must already
@@ -189,12 +222,12 @@ public:
      * ignored). Returns VW_ERR_AUTH_REQUIRED (encoded as int) if vault_id
      * is not currently unlocked in the daemon.
      */
-    int vault_upload(uint64_t vault_id, uint64_t file_id,
+    int vault_upload(uint32_t account_id, uint64_t vault_id, uint64_t file_id,
                       const char *leaf_name, const char *local_path,
                       uint64_t *out_file_id, uint64_t *out_version_id);
 
     /* Download and decrypt file_id's current version to local_path. */
-    int vault_download(uint64_t vault_id, uint64_t file_id, const char *local_path);
+    int vault_download(uint32_t account_id, uint64_t vault_id, uint64_t file_id, const char *local_path);
 
 private:
     uint16_t port_      = VW_IPC_DEFAULT_PORT;

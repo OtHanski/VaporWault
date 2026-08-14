@@ -6,8 +6,74 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/*
+ * Remember-me (TASK-165) global state. cfg/store are process-lifetime
+ * configuration set once at startup (cfg by every vw_gateway_dispatch()
+ * call — it's the same pointer/values every time, main.c never rebuilds
+ * it — store by main.c calling vw_gateway_api_set_remember_store() once
+ * before the accept loop starts), not per-request state, so a static
+ * here avoids threading a `cfg` parameter through all twenty-odd
+ * per-endpoint handlers that never otherwise needed it. Safe precisely
+ * because this whole module is documented single-threaded-only (see
+ * vw_gateway_session.h's own threading note, which applies equally
+ * here) — there is no concurrent dispatch() call this could race with.
+ */
+static const vw_gateway_server_cfg_t *g_server_cfg = NULL;
+static vw_gateway_remember_store_t   *g_remember_store = NULL;
+
+void vw_gateway_api_set_remember_store(vw_gateway_remember_store_t *store) {
+    g_remember_store = store;
+}
+
 #define VW_GATEWAY_COOKIE_NAME "vw_session"
 #define VW_GATEWAY_MAX_PASSWORD_BYTES 256u
+
+/*
+ * Multi-slot sessions (TASK-164). One browser can hold up to
+ * VW_GATEWAY_MAX_SLOTS simultaneously logged-in accounts, each under its
+ * own cookie name "vw_session_<slot>" (slot 0 == today's plain
+ * "vw_session", so an unmodified browser/frontend that never sends
+ * X-Vw-Slot keeps behaving exactly as before this task). A small hard cap
+ * — same "mandatory hard cap" philosophy as VW_GATEWAY_MAX_SESSIONS
+ * (vw_gateway_session.h's own doc: an unbounded per-browser slot count
+ * would let one browser claim an unbounded share of the pool's 256-session
+ * hard cap). This is a purely gateway-local, per-request routing concept —
+ * the session pool itself stays keyed by cookie VALUE only, with no notion
+ * of "slot" (see vw_gateway_session.h).
+ *
+ * Deliberately still one-process-one-server (ARCHITECTURE.md's "Gateway
+ * stays one-process-one-server" decision) — every slot is an account on
+ * the *same* server this gateway is configured for. A second, unrelated
+ * server gets its own separate gateway deployment/URL; there is no
+ * per-slot host/CA-cert field anywhere in this file.
+ */
+#define VW_GATEWAY_MAX_SLOTS 6u
+#define VW_GATEWAY_SLOT_HEADER "X-Vw-Slot"
+
+/* "vw_session_" + up to 1 digit (VW_GATEWAY_MAX_SLOTS - 1 <= 9) + NUL. */
+static void slot_cookie_name(unsigned slot, char *out, size_t out_size) {
+    snprintf(out, out_size, VW_GATEWAY_COOKIE_NAME "_%u", slot);
+}
+
+/*
+ * Reads X-Vw-Slot off the request and returns a slot index in
+ * [0, VW_GATEWAY_MAX_SLOTS). Absent, non-numeric, or out-of-range values
+ * all fall back to slot 0 rather than rejecting the request outright —
+ * this header is a routing hint from a trusted-shape browser/frontend,
+ * not a security boundary (the cookie value itself, checked in
+ * constant time by vw_gateway_session_get, is what actually
+ * authenticates), so failing open to "acts like today's single-slot
+ * behavior" is the safe default per this task's own acceptance criterion
+ * that an absent header must be a complete no-op.
+ */
+static unsigned resolve_slot(const vw_http_request_t *req) {
+    const char *hdr = vw_http_header_get(req, VW_GATEWAY_SLOT_HEADER);
+    if (hdr == NULL || hdr[0] < '0' || hdr[0] > '9') return 0;
+    char *end = NULL;
+    long v = strtol(hdr, &end, 10);
+    if (end == hdr || *end != '\0' || v < 0 || (unsigned long)v >= VW_GATEWAY_MAX_SLOTS) return 0;
+    return (unsigned)v;
+}
 
 /* ── Small shared helpers ─────────────────────────────────────────────────── */
 
@@ -69,17 +135,95 @@ static int get_cookie_value(const vw_http_request_t *req, const char *name,
  * pass NULL if the caller doesn't need it (e.g. login/logout, which don't
  * call this at all).
  */
+/*
+ * Attempts to resume a session for cookie (TASK-165's remember-me) when
+ * it's absent from the live in-memory pool — a gateway restart, or an
+ * idle/capacity eviction of a session whose cookie the browser still
+ * has. Returns VW_OK with *out_sess set (and the pool now holding a live
+ * entry under this exact cookie again) on success; any other return
+ * means "no dice," and the caller should fall through to its own 401.
+ *
+ * No lock/retry logic needed for the "resume-rotation race" this task's
+ * own security note calls out: vw_gateway_dispatch() is only ever called
+ * from main.c's single-threaded, one-request-at-a-time accept loop
+ * (vw_gateway_session.h's own threading note), so two requests
+ * presenting the same stale cookie can never both reach this function
+ * concurrently — whichever is handled first either resumes and
+ * re-inserts (so a second one takes the ordinary live-session path in
+ * require_session() below, never reaching here at all) or fails and
+ * evicts the stale on-disk entry (so a second one gets a clean 401 here,
+ * not a second resume attempt on an already-consumed single-use token).
+ */
+static vw_err_t try_resume_and_reinsert(vw_gateway_session_pool_t *pool, const char *cookie,
+                                         vw_client_sess_t **out_sess) {
+    if (g_remember_store == NULL || g_server_cfg == NULL) return VW_ERR_AUTH_REQUIRED;
+
+    uint8_t token[32];
+    char username[VW_MAX_USERNAME_BYTES + 1];
+    if (vw_gateway_remember_get(g_remember_store, cookie, token, username, sizeof(username)) != VW_OK) {
+        return VW_ERR_AUTH_REQUIRED;
+    }
+
+    vw_client_cfg_t client_cfg;
+    memset(&client_cfg, 0, sizeof(client_cfg));
+    client_cfg.host = g_server_cfg->server_host;
+    client_cfg.port = g_server_cfg->server_port;
+    client_cfg.cert_verify = VW_CERT_VERIFY_REQUIRED;
+    client_cfg.ca_cert_pem_path = g_server_cfg->ca_cert_pem_path;
+
+    vw_client_sess_t *sess = NULL;
+    if (vw_client_resume(&client_cfg, token, &sess) != VW_OK) {
+        /* Expired/revoked/already-consumed - simple lazy GC, no separate
+         * sweep needed (this task's own design note). */
+        vw_gateway_remember_remove(g_remember_store, cookie);
+        return VW_ERR_AUTH_REQUIRED;
+    }
+
+    if (vw_gateway_session_reinsert(pool, cookie, sess, username) != VW_OK) {
+        /* Removing the store entry here is correct even though the
+         * failure (almost certainly VW_ERR_QUOTA_EXCEEDED - the pool at
+         * its 256-session hard cap) has nothing to do with the token's
+         * own validity: vw_client_resume() above already succeeded,
+         * which per its own doc means the server already rotated past
+         * the OLD token we looked up (single-use resumption,
+         * docs/PROTOCOL.md §7.1) - so the on-disk copy is dead the
+         * instant that call returns VW_OK, regardless of what happens
+         * next locally. There is no "keep the old entry for a retry"
+         * option; the user just has to log in again, same as any other
+         * too_many_sessions case. */
+        vw_client_close(sess);
+        vw_gateway_remember_remove(g_remember_store, cookie);
+        return VW_ERR_AUTH_REQUIRED;
+    }
+
+    /* Persist the rotated token immediately - vw_client_resume's own doc:
+     * single-use per resume (docs/PROTOCOL.md §7.1), same convention
+     * vw_daemon.c's try_connect() already follows ("persist fresh token"
+     * right after vw_client_get_token). */
+    uint8_t new_token[32];
+    vw_client_get_token(sess, new_token);
+    vw_gateway_remember_put(g_remember_store, cookie, new_token, username);
+    *out_sess = sess;
+    return VW_OK;
+}
+
 static vw_err_t require_session(vw_gateway_session_pool_t *pool,
                                  const vw_http_request_t *req,
                                  vw_http_conn_t *conn,
                                  vw_client_sess_t **out_sess,
                                  char *out_cookie) {
+    char slot_cookie_hdr_name[16];
+    slot_cookie_name(resolve_slot(req), slot_cookie_hdr_name, sizeof(slot_cookie_hdr_name));
+
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
-    if (!get_cookie_value(req, VW_GATEWAY_COOKIE_NAME, cookie, sizeof(cookie))) {
+    if (!get_cookie_value(req, slot_cookie_hdr_name, cookie, sizeof(cookie))) {
         send_error(conn, 401, "auth_required");
         return VW_ERR_AUTH_REQUIRED;
     }
     vw_err_t err = vw_gateway_session_get(pool, cookie, out_sess);
+    if (err != VW_OK) {
+        err = try_resume_and_reinsert(pool, cookie, out_sess);
+    }
     if (err != VW_OK) {
         send_error(conn, 401, "auth_required");
         return VW_ERR_AUTH_REQUIRED;
@@ -87,6 +231,36 @@ static vw_err_t require_session(vw_gateway_session_pool_t *pool,
     if (out_cookie != NULL) {
         memcpy(out_cookie, cookie, sizeof(cookie));
     }
+    return VW_OK;
+}
+
+/*
+ * Shared JSON-body field readers. Defined here (ahead of every endpoint
+ * that uses them, including handle_login/handle_logout/handle_link_access
+ * below, which is why this pair moved up from where the rest of this
+ * file's endpoint-specific helpers live, right before handle_file_list) —
+ * a plain forward declaration would work too, but a single definition
+ * point is simpler to keep in sync.
+ */
+static vw_err_t get_json_string_field(const vw_http_request_t *req, const char *key,
+                                       char *out, size_t out_size) {
+    vw_json_value_t v;
+    size_t out_len = 0;
+    if (vw_json_object_get((const char *)req->body, req->body_len, key, &v) != VW_OK ||
+        v.kind != VW_JSON_STRING) {
+        return VW_ERR_PROTO_INVALID;
+    }
+    return vw_json_string_decode(v.start, v.len, out, out_size, &out_len);
+}
+
+static vw_err_t get_json_uint_field(const vw_http_request_t *req, const char *key,
+                                     uint64_t *out) {
+    vw_json_value_t v;
+    if (vw_json_object_get((const char *)req->body, req->body_len, key, &v) != VW_OK ||
+        v.kind != VW_JSON_NUMBER) {
+        return VW_ERR_PROTO_INVALID;
+    }
+    *out = (uint64_t)v.number_val;
     return VW_OK;
 }
 
@@ -115,6 +289,70 @@ static vw_err_t login_otp_cb(void *userdata, char *otp_buf, uint16_t *otp_len) {
     memcpy(otp_buf, ctx->otp, ctx->otp_len);
     *otp_len = ctx->otp_len;
     return VW_OK;
+}
+
+/*
+ * Determines which slot a fresh login/link-access session should occupy.
+ * explicit_slot_valid/explicit_slot come from the request's own JSON body
+ * "slot" field (present and, per this function's own check, in range) —
+ * an explicit, out-of-range value is a caller error (unlike the
+ * X-Vw-Slot *header* used by require_session, which fails open to slot 0;
+ * here the caller is asserting a specific target, so a bad one should be
+ * rejected, not silently reinterpreted). Absent -> "next free slot" for
+ * THIS browser: the lowest slot whose cookie is either absent or doesn't
+ * map to a currently-live session. Scoped entirely to the calling
+ * browser's own Cookie header, so it can never observe (or affect)
+ * another browser's sessions. Returns VW_ERR_QUOTA_EXCEEDED if every slot
+ * is occupied and none was explicitly requested (a real cap, not a
+ * suggestion — see VW_GATEWAY_MAX_SLOTS's own doc above), or
+ * VW_ERR_INVALID_ARG for an out-of-range explicit slot.
+ */
+static vw_err_t resolve_login_slot(vw_gateway_session_pool_t *pool,
+                                    const vw_http_request_t *req,
+                                    int explicit_slot_valid, unsigned explicit_slot,
+                                    unsigned *out_slot) {
+    if (explicit_slot_valid) {
+        if (explicit_slot >= VW_GATEWAY_MAX_SLOTS) return VW_ERR_INVALID_ARG;
+        *out_slot = explicit_slot;
+        return VW_OK;
+    }
+    for (unsigned i = 0; i < VW_GATEWAY_MAX_SLOTS; i++) {
+        char name[16];
+        slot_cookie_name(i, name, sizeof(name));
+        char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+        vw_client_sess_t *dummy;
+        if (!get_cookie_value(req, name, cookie, sizeof(cookie)) ||
+            vw_gateway_session_get(pool, cookie, &dummy) != VW_OK) {
+            *out_slot = i;
+            return VW_OK;
+        }
+    }
+    return VW_ERR_QUOTA_EXCEEDED;
+}
+
+/*
+ * If target_slot's cookie is currently present, removes it from the live
+ * pool AND the remember-me store (TASK-165) — otherwise re-authenticating
+ * an already-occupied slot (this function's whole reason to exist:
+ * resolve_login_slot's explicit-slot path allows exactly that) would
+ * orphan the old entries: the pool one until idle-reap, the on-disk one
+ * forever (nothing else ever revisits a remember-store entry except a
+ * cookie-miss on that exact cookie value, which can't happen again once
+ * a NEW cookie takes over the slot). Safe to call unconditionally on
+ * both — vw_gateway_session_remove/vw_gateway_remember_remove are both
+ * no-ops on an absent/unknown cookie.
+ */
+static void evict_slot_if_present(vw_gateway_session_pool_t *pool,
+                                   const vw_http_request_t *req, unsigned slot) {
+    char name[16];
+    slot_cookie_name(slot, name, sizeof(name));
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (get_cookie_value(req, name, cookie, sizeof(cookie))) {
+        vw_gateway_session_remove(pool, cookie);
+        if (g_remember_store != NULL) {
+            vw_gateway_remember_remove(g_remember_store, cookie);
+        }
+    }
 }
 
 static void handle_login(vw_gateway_session_pool_t *pool,
@@ -159,6 +397,32 @@ static void handle_login(vw_gateway_session_pool_t *pool,
         otp_ctx.otp_len = (uint16_t)out_len;
     }
 
+    /* Multi-slot (TASK-164): resolve BEFORE the network round-trip below,
+     * so a full slot set or an invalid explicit slot fails fast without
+     * ever contacting the server. */
+    uint64_t slot_raw = 0;
+    int slot_present = (get_json_uint_field(req, "slot", &slot_raw) == VW_OK);
+    unsigned target_slot = 0;
+    vw_err_t slot_err = resolve_login_slot(pool, req, slot_present, (unsigned)slot_raw, &target_slot);
+    if (slot_err != VW_OK) {
+        vw_crypto_secure_zero(password, sizeof(password));
+        vw_crypto_secure_zero(otp, sizeof(otp));
+        send_error(conn, slot_err == VW_ERR_QUOTA_EXCEEDED ? 507 : 400,
+                   slot_err == VW_ERR_QUOTA_EXCEEDED ? "no_free_slot" : "bad_request");
+        return;
+    }
+
+    /* Remember-me (TASK-165): opt-in at both the operator level
+     * (g_remember_store == NULL unless main.c was given --state-dir) and
+     * the user level (this field) - absent/false/store-disabled all mean
+     * "session-only cookie," never an error. */
+    int remember = 0;
+    if (vw_json_object_get((const char *)req->body, req->body_len, "remember", &v) == VW_OK &&
+        v.kind == VW_JSON_BOOL) {
+        remember = v.bool_val ? 1 : 0;
+    }
+    remember = remember && (g_remember_store != NULL);
+
     vw_client_cfg_t client_cfg;
     memset(&client_cfg, 0, sizeof(client_cfg));
     client_cfg.host = cfg->server_host;
@@ -175,16 +439,37 @@ static void handle_login(vw_gateway_session_pool_t *pool,
     vw_crypto_secure_zero(otp, sizeof(otp));
 
     if (err == VW_OK) {
+        evict_slot_if_present(pool, req, target_slot);
         char cookie_hex[VW_GATEWAY_COOKIE_HEX_LEN + 1];
-        if (vw_gateway_session_create(pool, sess, cookie_hex) != VW_OK) {
+        if (vw_gateway_session_create(pool, sess, username, cookie_hex) != VW_OK) {
             vw_client_close(sess);
             send_error(conn, 503, "too_many_sessions");
             return;
         }
+        if (remember) {
+            uint8_t token[32];
+            vw_client_get_token(sess, token);
+            /* Best-effort: a failed persist here just means this login
+             * won't survive a restart, not that the login itself fails -
+             * the live in-memory session created above is unaffected. */
+            (void)vw_gateway_remember_put(g_remember_store, cookie_hex, token, username);
+        }
+        char slot_name[16];
+        slot_cookie_name(target_slot, slot_name, sizeof(slot_name));
         char cookie_header[VW_GATEWAY_COOKIE_HEX_LEN + 96];
-        snprintf(cookie_header, sizeof(cookie_header),
-                 VW_GATEWAY_COOKIE_NAME "=%s; Path=/; HttpOnly; Secure; SameSite=Strict",
-                 cookie_hex);
+        /* Max-Age=2592000 (30 days, matching the server's own
+         * DEFAULT_SESSION_TTL_SECS, src/server/vw_auth.c) only when
+         * remember was actually honored - a session-only cookie for
+         * every other case, unchanged from before this task. */
+        if (remember) {
+            snprintf(cookie_header, sizeof(cookie_header),
+                     "%s=%s; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000",
+                     slot_name, cookie_hex);
+        } else {
+            snprintf(cookie_header, sizeof(cookie_header),
+                     "%s=%s; Path=/; HttpOnly; Secure; SameSite=Strict",
+                     slot_name, cookie_hex);
+        }
         send_json_status(conn, 200, "ok", cookie_header);
         return;
     }
@@ -214,13 +499,36 @@ static void handle_login(vw_gateway_session_pool_t *pool,
 static void handle_logout(vw_gateway_session_pool_t *pool,
                            const vw_http_request_t *req,
                            vw_http_conn_t *conn) {
+    /* Multi-slot (TASK-164): an explicit body "slot" field says which one
+     * to clear; absent (including no body at all — logout never required
+     * one before this task) defaults to slot 0, preserving today's
+     * behavior for a frontend that hasn't been updated yet. An
+     * out-of-range value here just can't match any real slot's cookie
+     * name below, so it's harmless to fail open to 0 rather than reject
+     * the request — logout has nothing left to protect by being strict. */
+    uint64_t slot_raw = 0;
+    unsigned slot = 0;
+    if (get_json_uint_field(req, "slot", &slot_raw) == VW_OK && slot_raw < VW_GATEWAY_MAX_SLOTS) {
+        slot = (unsigned)slot_raw;
+    }
+    char slot_name[16];
+    slot_cookie_name(slot, slot_name, sizeof(slot_name));
+
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
-    if (get_cookie_value(req, VW_GATEWAY_COOKIE_NAME, cookie, sizeof(cookie))) {
+    if (get_cookie_value(req, slot_name, cookie, sizeof(cookie))) {
         vw_gateway_session_remove(pool, cookie);
+        /* TASK-165: a remembered slot's on-disk entry must go too, or a
+         * "logged out" browser would silently resume itself on its very
+         * next request (this task's own acceptance criterion). */
+        if (g_remember_store != NULL) {
+            vw_gateway_remember_remove(g_remember_store, cookie);
+        }
     }
     /* Idempotent either way - an unknown/absent cookie is not an error. */
-    send_json_status(conn, 200, "ok",
-                      VW_GATEWAY_COOKIE_NAME "=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
+    char clear_header[96];
+    snprintf(clear_header, sizeof(clear_header),
+             "%s=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0", slot_name);
+    send_json_status(conn, 200, "ok", clear_header);
 }
 
 /* ── File endpoints (TASK-133) ────────────────────────────────────────────
@@ -326,28 +634,6 @@ static void write_file_entry(vw_json_writer_t *w, const vw_file_entry_t *e) {
     vw_json_write_key(w, "vault_id");
     vw_json_write_uint(w, e->vault_id);
     vw_json_write_object_end(w);
-}
-
-static vw_err_t get_json_string_field(const vw_http_request_t *req, const char *key,
-                                       char *out, size_t out_size) {
-    vw_json_value_t v;
-    size_t out_len = 0;
-    if (vw_json_object_get((const char *)req->body, req->body_len, key, &v) != VW_OK ||
-        v.kind != VW_JSON_STRING) {
-        return VW_ERR_PROTO_INVALID;
-    }
-    return vw_json_string_decode(v.start, v.len, out, out_size, &out_len);
-}
-
-static vw_err_t get_json_uint_field(const vw_http_request_t *req, const char *key,
-                                     uint64_t *out) {
-    vw_json_value_t v;
-    if (vw_json_object_get((const char *)req->body, req->body_len, key, &v) != VW_OK ||
-        v.kind != VW_JSON_NUMBER) {
-        return VW_ERR_PROTO_INVALID;
-    }
-    *out = (uint64_t)v.number_val;
-    return VW_OK;
 }
 
 static void handle_file_list(vw_gateway_session_pool_t *pool,
@@ -1221,6 +1507,20 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
         return;
     }
 
+    /* Multi-slot (TASK-164): same resolution as handle_login, before the
+     * network round-trip. A redeemed link is a login-like action from the
+     * browser's own perspective (it can coexist with other already-open
+     * account slots), so it gets the same "explicit or next free" choice. */
+    uint64_t slot_raw = 0;
+    int slot_present = (get_json_uint_field(req, "slot", &slot_raw) == VW_OK);
+    unsigned target_slot = 0;
+    vw_err_t slot_err = resolve_login_slot(pool, req, slot_present, (unsigned)slot_raw, &target_slot);
+    if (slot_err != VW_OK) {
+        send_error(conn, slot_err == VW_ERR_QUOTA_EXCEEDED ? 507 : 400,
+                   slot_err == VW_ERR_QUOTA_EXCEEDED ? "no_free_slot" : "bad_request");
+        return;
+    }
+
     vw_client_cfg_t client_cfg;
     memset(&client_cfg, 0, sizeof(client_cfg));
     client_cfg.host = cfg->server_host;
@@ -1237,16 +1537,21 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
         return;
     }
 
+    evict_slot_if_present(pool, req, target_slot);
     char cookie_hex[VW_GATEWAY_COOKIE_HEX_LEN + 1];
-    if (vw_gateway_session_create(pool, sess, cookie_hex) != VW_OK) {
+    /* No real logged-in username for a link session - see
+     * vw_gateway_session_create's own doc on the NULL convention. */
+    if (vw_gateway_session_create(pool, sess, NULL, cookie_hex) != VW_OK) {
         vw_client_close(sess);
         send_error(conn, 503, "too_many_sessions");
         return;
     }
+    char slot_name[16];
+    slot_cookie_name(target_slot, slot_name, sizeof(slot_name));
     char cookie_header[VW_GATEWAY_COOKIE_HEX_LEN + 96];
     snprintf(cookie_header, sizeof(cookie_header),
-             VW_GATEWAY_COOKIE_NAME "=%s; Path=/; HttpOnly; Secure; SameSite=Strict",
-             cookie_hex);
+             "%s=%s; Path=/; HttpOnly; Secure; SameSite=Strict",
+             slot_name, cookie_hex);
     send_json_status(conn, 200, "ok", cookie_header);
 }
 
@@ -1419,18 +1724,74 @@ static void handle_vault_list(vw_gateway_session_pool_t *pool,
     free(buf);
 }
 
+/*
+ * /api/accounts (TASK-164): which slots THIS browser currently has a live
+ * session in, and each one's display username. Read entirely off the
+ * calling request's own Cookie header (get_cookie_value/
+ * vw_gateway_session_get_username below never look at anything but the
+ * slot cookie names derived here), so this can never leak another
+ * browser's sessions. No require_session() call - by design, an empty
+ * result (no slots occupied) is a normal, successful response here, not
+ * a 401 - this is exactly how the frontend's "does the browser already
+ * have anything to resume" check on page load is meant to work, per this
+ * task's own note that the frontend previously always showed the login
+ * form even when a still-valid cookie was already present.
+ */
+static void handle_accounts(vw_gateway_session_pool_t *pool,
+                             const vw_http_request_t *req, vw_http_conn_t *conn) {
+    char *buf = malloc(2048);
+    if (buf == NULL) { send_error(conn, 500, "error"); return; }
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, 2048);
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "slots");
+    vw_json_write_array_start(&w);
+
+    for (unsigned i = 0; i < VW_GATEWAY_MAX_SLOTS; i++) {
+        char name[16];
+        slot_cookie_name(i, name, sizeof(name));
+        char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+        char username[VW_MAX_USERNAME_BYTES + 1];
+        if (!get_cookie_value(req, name, cookie, sizeof(cookie)) ||
+            vw_gateway_session_get_username(pool, cookie, username, sizeof(username)) != VW_OK) {
+            continue;
+        }
+        vw_json_write_object_start(&w);
+        vw_json_write_key(&w, "slot");
+        vw_json_write_uint(&w, i);
+        vw_json_write_key(&w, "username");
+        /* Empty for a redeemed-public-link session - see
+         * vw_gateway_session_create's own doc on the NULL convention. */
+        vw_json_write_string(&w, username, strlen(username));
+        vw_json_write_object_end(&w);
+    }
+
+    vw_json_write_array_end(&w);
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+    free(buf);
+}
+
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
                           const vw_gateway_server_cfg_t *cfg,
                           const vw_http_request_t *req,
                           vw_http_conn_t *conn) {
+    g_server_cfg = cfg;
+
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/login") == 0) {
         handle_login(pool, cfg, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/logout") == 0) {
         handle_logout(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/accounts") == 0) {
+        handle_accounts(pool, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/list") == 0) {

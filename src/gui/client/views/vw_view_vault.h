@@ -16,3 +16,11 @@ void vw_view_vault_render(const VwIpcStatus &status, ClientApp &app);
  * Vault tab first.
  */
 bool vw_view_vault_is_unlocked(uint64_t vault_id);
+
+/* Multi-account (TASK-163): see vw_view_browser.h's invalidate doc comment
+ * — same render-thread-only caveat applies here. Also clears the
+ * unlocked-vault hint set above, since vault_id numbering is server-
+ * assigned per-server and a different account may be on a different
+ * server entirely — a stale hint here could wrongly claim a same-numbered
+ * vault on the new account's server is already unlocked. */
+void vw_view_vault_invalidate();

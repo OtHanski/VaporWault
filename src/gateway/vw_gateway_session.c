@@ -10,6 +10,9 @@ typedef struct {
     char               cookie_hex[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     vw_client_sess_t  *sess;
     time_t             last_active;
+    /* Display-only (TASK-164) — empty for a redeemed-public-link session
+     * (no real logged-in user). Never used for authorization. */
+    char               username[VW_MAX_USERNAME_BYTES + 1];
 } gateway_session_slot_t;
 
 struct vw_gateway_session_pool {
@@ -60,6 +63,7 @@ static int find_by_cookie(vw_gateway_session_pool_t *pool, const char *cookie_he
 
 vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
                                     vw_client_sess_t *sess,
+                                    const char *username,
                                     char *out_cookie_hex) {
     if (pool == NULL || sess == NULL || out_cookie_hex == NULL) {
         return VW_ERR_INVALID_ARG;
@@ -86,6 +90,14 @@ vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
     slot->sess = sess;
     slot->last_active = time(NULL);
     slot->in_use = 1;
+    if (username != NULL && username[0] != '\0') {
+        size_t n = strlen(username);
+        if (n > VW_MAX_USERNAME_BYTES) n = VW_MAX_USERNAME_BYTES;
+        memcpy(slot->username, username, n);
+        slot->username[n] = '\0';
+    } else {
+        slot->username[0] = '\0';
+    }
     pool->count++;
 
     memcpy(out_cookie_hex, slot->cookie_hex, VW_GATEWAY_COOKIE_HEX_LEN + 1);
@@ -103,6 +115,54 @@ vw_err_t vw_gateway_session_get(vw_gateway_session_pool_t *pool,
 
     pool->slots[idx].last_active = time(NULL);
     *out_sess = pool->slots[idx].sess;
+    return VW_OK;
+}
+
+vw_err_t vw_gateway_session_reinsert(vw_gateway_session_pool_t *pool,
+                                      const char *cookie_hex,
+                                      vw_client_sess_t *sess,
+                                      const char *username) {
+    if (pool == NULL || cookie_hex == NULL || sess == NULL) return VW_ERR_INVALID_ARG;
+    if (strlen(cookie_hex) != VW_GATEWAY_COOKIE_HEX_LEN) return VW_ERR_INVALID_ARG;
+    if (find_by_cookie(pool, cookie_hex) >= 0) return VW_ERR_ALREADY_EXISTS;
+    if (pool->count >= VW_GATEWAY_MAX_SESSIONS) return VW_ERR_QUOTA_EXCEEDED;
+
+    int slot_idx = -1;
+    for (uint32_t i = 0; i < VW_GATEWAY_MAX_SESSIONS; i++) {
+        if (!pool->slots[i].in_use) { slot_idx = (int)i; break; }
+    }
+    if (slot_idx < 0) return VW_ERR_QUOTA_EXCEEDED;
+
+    gateway_session_slot_t *slot = &pool->slots[slot_idx];
+    memcpy(slot->cookie_hex, cookie_hex, VW_GATEWAY_COOKIE_HEX_LEN + 1);
+    slot->sess = sess;
+    slot->last_active = time(NULL);
+    slot->in_use = 1;
+    if (username != NULL && username[0] != '\0') {
+        size_t n = strlen(username);
+        if (n > VW_MAX_USERNAME_BYTES) n = VW_MAX_USERNAME_BYTES;
+        memcpy(slot->username, username, n);
+        slot->username[n] = '\0';
+    } else {
+        slot->username[0] = '\0';
+    }
+    pool->count++;
+    return VW_OK;
+}
+
+vw_err_t vw_gateway_session_get_username(vw_gateway_session_pool_t *pool,
+                                          const char *cookie_hex,
+                                          char *out_buf, size_t out_buf_size) {
+    if (pool == NULL || cookie_hex == NULL || out_buf == NULL || out_buf_size == 0) {
+        return VW_ERR_INVALID_ARG;
+    }
+    int idx = find_by_cookie(pool, cookie_hex);
+    if (idx < 0) return VW_ERR_AUTH_REQUIRED;
+
+    size_t n = strlen(pool->slots[idx].username);
+    if (n >= out_buf_size) n = out_buf_size - 1;
+    memcpy(out_buf, pool->slots[idx].username, n);
+    out_buf[n] = '\0';
     return VW_OK;
 }
 

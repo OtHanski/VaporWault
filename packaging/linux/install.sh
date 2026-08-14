@@ -25,12 +25,21 @@ CONF_DIR="/etc/vapourwault"
 DATA_DIR="/var/lib/vapourwault"
 RUN_DIR="/run/vapourwault"
 SERVICE_USER="vapourwault"
+# TASK-165/167: the gateway's own state (remember.db, when --state-dir is
+# used) - separate directory from the server's DATA_DIR above, since the
+# gateway and server are frequently on different hosts and are always
+# separate services even when colocated (vapourwault-web-gateway.service's
+# own comment: "Deliberately NOT After=/Wants=vapourwaultd.service").
+GATEWAY_DATA_DIR="/var/lib/vapourwault-gateway"
 
 # ── Locate binaries ───────────────────────────────────────────────────────────
 
 SERVER_BIN="${BUILD_DIR}/bin/vapourwaultd"
 ADMIN_BIN="${BUILD_DIR}/bin/vapourwault-server-cli"
 GUI_BIN="${BUILD_DIR}/bin/vapourwault-server-gui"
+# Optional, like GUI_BIN above - VW_BUILD_WEB_GATEWAY defaults OFF
+# (docs/DEPLOYMENT.md §11.2), so most server-only builds won't have this.
+GATEWAY_BIN="${BUILD_DIR}/bin/vapourwault-web-gateway"
 
 if [[ ! -f "${SERVER_BIN}" ]]; then
     echo "ERROR: server binary not found at ${SERVER_BIN}" >&2
@@ -65,6 +74,9 @@ install -m 755 "${ADMIN_BIN}"  "${BIN_DIR}/vapourwault-server-cli"
 if [[ -f "${GUI_BIN}" ]]; then
     install -m 755 "${GUI_BIN}" "${BIN_DIR}/vapourwault-server-gui"
 fi
+if [[ -f "${GATEWAY_BIN}" ]]; then
+    install -m 755 "${GATEWAY_BIN}" "${BIN_DIR}/vapourwault-web-gateway"
+fi
 echo "Installed binaries to ${BIN_DIR}"
 
 # ── Create directories ────────────────────────────────────────────────────────
@@ -72,6 +84,19 @@ echo "Installed binaries to ${BIN_DIR}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${DATA_DIR}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${CONF_DIR}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${RUN_DIR}"
+
+# TASK-165/167: only created when the gateway is actually being installed -
+# an unused directory for a feature/binary this install doesn't ship would
+# just be clutter. 0700 (not the server DATA_DIR's 0750): the gateway's own
+# remember.db file inside it is a bearer-credential store as sensitive as a
+# password (see vw_gateway_remember.h's own doc), so even group-read on the
+# containing directory is one more thing that could go wrong - narrower than
+# strictly required (the file itself is already 0600) but cheap insurance,
+# and there's no legitimate reason for anyone but SERVICE_USER to read this
+# directory's contents at all.
+if [[ -f "${GATEWAY_BIN}" ]]; then
+    install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 700 "${GATEWAY_DATA_DIR}"
+fi
 
 # ── Install config template (do not overwrite existing config) ─────────────────
 
@@ -91,6 +116,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -m 644 "${SCRIPT_DIR}/vapourwaultd.service" \
     "${SYSTEMD_DIR}/vapourwaultd.service"
+if [[ -f "${GATEWAY_BIN}" ]]; then
+    install -m 644 "${SCRIPT_DIR}/vapourwault-web-gateway.service" \
+        "${SYSTEMD_DIR}/vapourwault-web-gateway.service"
+    echo "Installed systemd unit: vapourwault-web-gateway.service"
+    echo "  --> Edit its ExecStart line for your --server-host/--server-port/--ca-cert"
+    echo "      before starting it (it has no separate config file - see"
+    echo "      docs/DEPLOYMENT.md §11.3)."
+fi
 systemctl daemon-reload
 echo "Installed systemd unit: vapourwaultd.service"
 

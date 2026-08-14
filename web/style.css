@@ -80,6 +80,61 @@ button:hover {
   margin: 0;
 }
 
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.checkbox-field input[type="checkbox"] {
+  width: auto;
+  padding: 0;
+}
+
+#login-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+#login-cancel-btn:hover {
+  border-color: var(--muted);
+  color: var(--text);
+}
+
+#account-switcher {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.account-pill {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.account-pill:hover {
+  border-color: var(--accent);
+}
+
+.account-pill.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.account-pill.add-account {
+  background: transparent;
+  border-style: dashed;
+}
+
 #browser-view header, #history-view header, #share-view header {
   display: flex;
   justify-content: space-between;

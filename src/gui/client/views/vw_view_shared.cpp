@@ -46,6 +46,13 @@ static void refresh(ClientApp &app) {
     s_needs_refresh = false;
 }
 
+void vw_view_shared_invalidate() {
+    s_needs_refresh = true;
+    s_shared_by_me.clear();
+    s_my_links.clear();
+    s_shared_with_me.clear();
+}
+
 void vw_view_shared_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     ImGuiIO &io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 28));

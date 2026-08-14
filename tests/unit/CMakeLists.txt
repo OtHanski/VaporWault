@@ -302,3 +302,26 @@ if(WIN32)
     target_link_libraries(test_vw_file_handlers PRIVATE ws2_32)
 endif()
 add_test(NAME unit_vw_file_handlers COMMAND test_vw_file_handlers)
+
+# ── vw_gateway_remember (TASK-165) ────────────────────────────────────────
+#
+# vw_gateway_remember.c lives in src/gateway and is not part of vw_core.
+# Compiled directly into the test binary (same pattern as test_vw_ipc/
+# test_vw_smtp). Its Windows ACL code links advapi32 via its own
+# #pragma comment (mirrors src/client/vw_ipc.c's precedent), so no
+# target_link_libraries entry for it is needed here.
+add_executable(test_vw_gateway_remember
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_gateway_remember.c
+    ${CMAKE_SOURCE_DIR}/src/gateway/vw_gateway_remember.c
+)
+target_include_directories(test_vw_gateway_remember PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/src/gateway
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_vw_gateway_remember PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_gateway_remember PRIVATE pthread)
+endif()
+add_test(NAME unit_vw_gateway_remember COMMAND test_vw_gateway_remember)

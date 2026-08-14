@@ -68,7 +68,10 @@ sudo packaging/linux/install.sh --prefix /usr/local --build-dir build
 
 The script creates the `vapourwault` system user, installs binaries to
 `/usr/local/bin`, creates `/var/lib/vapourwault` and `/etc/vapourwault`, and
-installs the systemd unit.
+installs the systemd unit. If the build also produced
+`vapourwault-web-gateway` (§11.2's `-DVW_BUILD_WEB_GATEWAY=ON`), the script
+installs that too, along with its own state directory and systemd unit —
+see §11.7.
 
 ### Windows (manual, from source)
 
@@ -440,6 +443,11 @@ If the server crashed mid-write, it recovers automatically on next start: the op
 - [ ] Use ACME or a CA-signed certificate — not a self-signed cert — in production.
 - [ ] Enable GC (`gc_interval_secs = 1800`, the default) so expired sessions are cleaned up.
 - [ ] On Linux: verify the systemd sandbox is active (`systemctl status vapourwaultd` should show `ProtectSystem=strict`).
+- [ ] **If running the web gateway with `--state-dir`** (§11.7): confirm its
+      state directory is owned by the gateway's service user at mode `0700`
+      (`stat -c "%U %a" /var/lib/vapourwault-gateway` if installed via
+      `install.sh`) — this holds resumable session tokens for every
+      "remember me" login, as sensitive as a password store.
 - [ ] **Client daemon hosts**: `vapourwault-daemon`'s IPC port (loopback TCP,
       default 47832) binds to `127.0.0.1` only. **On Linux**, connections are
       also verified against `/proc/net/tcp` to confirm the connecting
@@ -561,6 +569,7 @@ flags (`vapourwault-web-gateway --help`, `src/gateway/main.c`):
 | `--ca-cert PATH` | Yes | — | CA certificate (PEM) to verify the server's TLS certificate against. See below — this is **mandatory**, there is no "trust the system store" fallback like the client daemon's `ca_cert_pem_path` has. |
 | `--listen-host HOST` | No | `127.0.0.1` | Address the gateway's own HTTP listener binds to. See the loopback-only warning in §11.1 before changing this. |
 | `--listen-port PORT` | No | `8080` | Port the gateway's own HTTP listener binds to. |
+| `--state-dir DIR` | No | *(unset — feature disabled)* | Enables persistent "remember me" logins (`TASK-165`). See §11.7 for the directory it creates, required permissions, and systemd wiring. |
 
 **On `--ca-cert`**: the gateway is itself a `vw/1` client of the VaporWault
 server, and — per `ARCHITECTURE.md`'s Gateway↔server TLS verification
@@ -629,33 +638,37 @@ directives — `NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`,
 to point at — its ExecStart line *is* its configuration (§11.3's flags),
 so **edit that line directly** for your deployment before installing it.
 
-There is currently no install-script integration for the gateway
-(`packaging/linux/install.sh` only handles the server; the gateway has no
-CPack installer component yet either — see `CMakeLists.txt`'s comment above
-its `install()` rules). Install it directly, either via CMake's own install
-step or by hand:
+`packaging/linux/install.sh` (`TASK-167`) installs the gateway automatically
+whenever the build produced it — no separate install step needed. There is
+still no CPack installer component for it (see `CMakeLists.txt`'s comment
+above its `install()` rules), so a package-based install (§12) does not
+include the gateway yet; use the manual/from-source path below for it:
 
 ```bash
-# Build with the gateway enabled (§11.2), then either:
-
-# Option A: let CMake install the binary + unit file together
-sudo cmake --install build --prefix /usr/local
-
-# Option B: copy them by hand
-sudo install -m 755 build/bin/vapourwault-web-gateway /usr/local/bin/
-sudo install -m 644 packaging/linux/vapourwault-web-gateway.service \
-    /lib/systemd/system/vapourwault-web-gateway.service
+# Build with the gateway enabled (§11.2), then:
+sudo packaging/linux/install.sh --build-dir build
 ```
 
-Either way, the `vapourwault` system user must already exist (created by
-`packaging/linux/install.sh` when you installed the server, §2 — if the
-gateway runs on a host without the server installed, create the user
-yourself: `useradd --system --no-create-home --shell /usr/sbin/nologin
-vapourwault`), and the CA cert path in the unit's `ExecStart` (§11.3) must be
-readable by that user.
+This installs `vapourwault-web-gateway` alongside the server binaries,
+creates its state directory (`/var/lib/vapourwault-gateway`, owned by the
+`vapourwault` system user, mode `0700` — see §11.7), and installs the
+systemd unit — the same single script, not a second parallel path (`TASK-167`
+verified this end-to-end in a disposable container: fresh install creates
+the directory with exactly this ownership/mode, and re-running the script is
+a no-op on an already-correct installation). If the gateway runs on a host
+without the server installed, run the same script there too — it creates
+the `vapourwault` system user itself if it doesn't already exist, same as a
+server-only install.
+
+Either way, the CA cert path in the unit's `ExecStart` (§11.3) must be
+readable by the `vapourwault` user.
 
 Edit the `ExecStart` line in `/lib/systemd/system/vapourwault-web-gateway.service`
-for your `--server-host`/`--server-port`/`--ca-cert`, then:
+for your `--server-host`/`--server-port`/`--ca-cert` (the installed unit
+already points `--state-dir` at the directory the install script just
+created — leave that as-is unless you have a reason to move it, and if you
+do, update `ReadWritePaths=` in the same unit to match, or "remember me"
+logins will fail with a permissions error), then:
 
 ```bash
 sudo systemctl daemon-reload
@@ -719,6 +732,56 @@ across hosts by adjusting `--server-host`/`--ca-cert` and the nginx
    gateway) and port 4430 (the server, if colocated) should **not** be
    reachable from outside this host at all — re-read §11.1's warning if
    you're tempted to open either for convenience.
+
+### 11.7 Multi-account storage layout (client daemon and gateway)
+
+Both the client daemon and the gateway can now hold more than one logged-in
+account at once (`TASK-161`/`TASK-164`). Neither of their on-disk layouts is
+something an admin edits by hand — both are entirely managed by the
+software itself — but knowing their shape is useful for backup, cleanup, or
+just recognizing what a given file/directory is for.
+
+**Client daemon** (`vapourwault-daemon`'s own `--state-dir`, not covered
+elsewhere in this server-focused document since the daemon isn't something
+this guide otherwise installs — see `CLIENT_GETTING_STARTED.md` for the
+end-user setup path): each configured account gets its own subtree,
+`{state_dir}/accounts/<account_id>/`, containing that account's
+`cache.db`/`sync_folders.db` (sync metadata), `session.tok` (resumable
+session token), and `account.conf` (label, server host/port, CA cert path,
+username — `ARCHITECTURE.md`'s "Accounts are per-server, not just per-user"
+decision: two accounts on one daemon may point at two entirely unrelated
+VaporWault servers). `account_id` is a small daemon-assigned integer, not
+anything meaningful outside that one daemon instance. Created automatically
+by `vapourwault-cli account add` (or the GUI's "Add account" dialog);
+removed automatically, subtree and all, by `account remove` — never delete
+one of these subtrees by hand while its daemon is running, and if you ever
+find one that doesn't correspond to a `vapourwault-cli account list` entry
+(e.g. after a crash mid-`account remove`), it's safe to delete once the
+daemon is stopped.
+
+**Gateway** (`--state-dir`, `TASK-165`): a single small file,
+`{state_dir}/remember.db`, holding one entry per browser that logged in with
+"remember me" checked — a resumable session token and display username per
+remembered browser, keyed by that browser's own gateway-issued cookie value.
+This is a bearer-credential store exactly as sensitive as a password:
+anyone who can read it can impersonate every remembered account. The
+gateway hardens its permissions itself the moment it creates the file
+(POSIX `chmod 0600`; on Windows, a real ACL restricting access to the
+account the gateway process runs as, not just default inheritance — see
+`vw_gateway_remember.c`'s `harden_file_perms()`) — this is not something the
+install step or an admin needs to additionally lock down on the file
+itself. The **containing directory** is a different matter: §11.5's
+`packaging/linux/install.sh` path creates `/var/lib/vapourwault-gateway`
+owned by the `vapourwault` service user at mode `0700` (deliberately
+narrower than the server's own `/var/lib/vapourwault` at `0750` — there's no
+legitimate reason for any group member to read this directory's contents at
+all). If you create this directory by hand instead (a manual/non-systemd
+deployment), match that: owned by whichever user the gateway process runs
+as, `0700`, with no other user or group given any access.
+
+There is currently no Windows deployment path for the gateway at all (it's
+Linux/systemd-only today, matching this whole Section 11's scope) — nothing
+above applies to a Windows host.
 
 ---
 

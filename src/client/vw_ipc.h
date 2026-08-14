@@ -67,8 +67,12 @@ typedef enum {
     VW_IPC_FILE_LIST_RESP     = 0x8010, /* D→C: count + array of file entries     */
     VW_IPC_SHUTDOWN_REQ       = 0x8011, /* C→D: ask daemon to shut down           */
     VW_IPC_SHUTDOWN_RESP      = 0x8012, /* D→C: acknowledged                      */
-    VW_IPC_LOGIN_REQ          = 0x8013, /* C→D: authenticate with password (+OTP) */
-    VW_IPC_LOGIN_RESP         = 0x8014, /* D→C: error_code                        */
+    /* 0x8013/0x8014 were VW_IPC_LOGIN_REQ/_RESP (single-account login) —
+     * removed in TASK-161, superseded by VW_IPC_ACCOUNT_ADD_REQ/_RESP
+     * below. Codes deliberately left unused rather than recycled (both IPC
+     * ends always ship from the same build, so there's no compatibility
+     * reason to recycle them — recycling would just make future git-log
+     * archaeology on this range more confusing for no benefit). */
 
     /* Sharing (TASK-095; server side: TASK-094, docs/PROTOCOL.md §7.5).
      * Every _REQ below requires an active daemon session (dc->sess) — the
@@ -121,20 +125,44 @@ typedef enum {
      * exist and be a directory the caller has at least VIEW access to). */
     VW_IPC_FOLDER_ADD_SHARED_REQ  = 0x802F, /* C→D: add shared-folder sync target */
     VW_IPC_FOLDER_ADD_SHARED_RESP = 0x8030, /* D→C: error_code                    */
+
+    /* Multi-account (TASK-161). The daemon holds N concurrently-connected
+     * accounts, each with its own server session, cache, and vault
+     * registry under {state_dir}/accounts/<account_id>/ — see vw_daemon.c.
+     * ACCOUNT_ADD_REQ replaces the old LOGIN_REQ/_RESP pair (removed
+     * above): logging in IS adding (or re-authenticating) an account. */
+    VW_IPC_ACCOUNT_LIST_REQ    = 0x8031, /* C→D: list configured accounts      */
+    VW_IPC_ACCOUNT_LIST_RESP   = 0x8032, /* D→C: count + array of accounts     */
+    VW_IPC_ACCOUNT_ADD_REQ     = 0x8033, /* C→D: add a new account, or re-authenticate an existing one */
+    VW_IPC_ACCOUNT_ADD_RESP    = 0x8034, /* D→C: error_code + account_id       */
+    VW_IPC_ACCOUNT_REMOVE_REQ  = 0x8035, /* C→D: log out and forget an account */
+    VW_IPC_ACCOUNT_REMOVE_RESP = 0x8036, /* D→C: error_code                    */
 } vw_ipc_msg_t;
 
 /*
  * Payload layouts (all integers little-endian; strings = u16 len + UTF-8):
  *
+ * Multi-account scoping (TASK-161): every request below that operates on a
+ * specific account's data — folder/file/vault/share/link operations — now
+ * carries a leading `u32 account_id`, assigned by ACCOUNT_ADD_RESP and
+ * reused thereafter exactly like `file_id` is already used instead of
+ * repeating paths. An unknown `account_id` gets VW_ERR_INVALID_ARG; a known
+ * one with no live session gets VW_ERR_AUTH_REQUIRED (same error used for
+ * "no session at all" before this task). STATUS_REQ/_RESP, SYNC_NOW_REQ/
+ * _RESP, and SHUTDOWN_REQ/_RESP remain account-agnostic — they report on or
+ * act on the daemon as a whole, aggregating across every configured
+ * account.
+ *
  * VW_IPC_STATUS_RESP:
- *   u8  connected        1 = live server connection
- *   u8  syncing          1 = sync cycle in progress
- *   u8  paused           1 = all sync paused
+ *   u8  connected        1 = at least one account has a live server connection
+ *   u8  syncing          1 = a sync cycle is in progress for at least one account
+ *   u8  paused           1 = all sync paused (every account, every folder)
  *   u8  _pad
- *   i64 last_sync_at     Unix timestamp of last completed sync; 0 = never
- *   u32 pending_uploads
- *   u32 pending_downloads
- *   u32 error_count           non-fatal errors since last sync
+ *   i64 last_sync_at     Unix timestamp of the most recent completed sync
+ *                        cycle across all accounts; 0 = never
+ *   u32 pending_uploads      summed across all accounts
+ *   u32 pending_downloads    summed across all accounts
+ *   u32 error_count           non-fatal errors since last sync, summed across all accounts
  *   u32 permission_denied_count  TASK-113: permission-denied shared-folder
  *                                auto-mkdir attempts since last sync — kept
  *                                distinct from error_count above rather than
@@ -143,16 +171,73 @@ typedef enum {
  *                                after every existing field; client and
  *                                daemon ship from the same build (see the
  *                                FOLDER_LIST_RESP pause_reason field for the
- *                                same precedent).
+ *                                same precedent). Summed across all accounts
+ *                                (TASK-161) — see VW_IPC_ACCOUNT_LIST_RESP
+ *                                for the per-account breakdown of every
+ *                                field on this message.
+ *
+ * VW_IPC_ACCOUNT_LIST_REQ: (no payload)
+ * VW_IPC_ACCOUNT_LIST_RESP:
+ *   u32 count
+ *   count * {
+ *     u32    account_id
+ *     string label
+ *     string username
+ *     string server_host
+ *     u8     connected         1 = live server session right now
+ *     u32    pending_uploads
+ *     u32    pending_downloads
+ *   }
+ *
+ * VW_IPC_ACCOUNT_ADD_REQ:
+ *   u32    account_id     0 = create a new account; nonzero = re-authenticate
+ *                         an existing one (e.g. after a password change) —
+ *                         its accounts/<id>/ subtree and cache are kept,
+ *                         only the session/token/account.conf fields below
+ *                         are refreshed.
+ *   string label          display name; free-form, not sent to the server
+ *   string server_host
+ *   u16    server_port
+ *   string ca_cert_pem_path   empty = system store
+ *   string username
+ *   string password       RAW — the daemon derives SHA-256(password) itself
+ *                         via vw_client_connect(), same loopback-only trust
+ *                         rationale the old LOGIN_REQ used (this socket is
+ *                         127.0.0.1-only — see this file's header comment
+ *                         for the peer-UID check's per-platform coverage).
+ *   string otp            TOTP/OTP code, if the caller already has one;
+ *                         empty if not (first attempt on a 2FA-enabled
+ *                         account).
+ * VW_IPC_ACCOUNT_ADD_RESP:
+ *   u32 error_code        vw_err_t; 0 = VW_OK. VW_ERR_AUTH_2FA_REQUIRED means
+ *                         retry with `otp` set (and the same account_id, if
+ *                         this was a re-authentication) — server requires
+ *                         2FA and none was supplied.
+ *   u32 account_id        only meaningful if error_code == 0 — the id to use
+ *                         on every subsequent account-scoped request; equal
+ *                         to the request's account_id if it was nonzero.
+ *
+ * VW_IPC_ACCOUNT_REMOVE_REQ:
+ *   u32 account_id
+ * VW_IPC_ACCOUNT_REMOVE_RESP:
+ *   u32 error_code        vw_err_t; 0 = VW_OK. Logs out the account's server
+ *                         session and deletes its accounts/<id>/ subtree
+ *                         (cache + session token). Files already synced to
+ *                         local disk are never touched by this call.
  *
  * VW_IPC_FOLDER_ADD_REQ:
+ *   u32    account_id
  *   string local_root
  *   string virtual_root
  *
  * VW_IPC_FOLDER_REMOVE_REQ / VW_IPC_FILE_LIST_REQ:
+ *   u32    account_id
  *   string path          local_root (folder remove) or virtual prefix (file list)
  *   u8     filter        sync_state filter; VW_IPC_FILTER_ALL (0xFF) = all
+ *                        (FOLDER_REMOVE_REQ ignores this field)
  *
+ * VW_IPC_FOLDER_LIST_REQ:
+ *   u32 account_id
  * VW_IPC_FOLDER_LIST_RESP per-entry:
  *   string local_root
  *   string virtual_root
@@ -193,25 +278,12 @@ typedef enum {
  * VW_IPC_PAUSE_RESP / VW_IPC_RESUME_RESP / VW_IPC_SHUTDOWN_RESP:
  *   u32 error_code       vw_err_t; 0 = VW_OK
  *
- * VW_IPC_LOGIN_REQ:
- *   string password      RAW password — the daemon derives SHA-256(password)
- *                        itself via vw_client_connect(), same rationale as
- *                        the server admin IPC's USER_CREATE_REQ: this socket
- *                        is loopback-only (127.0.0.1), so sending the raw
- *                        password here is not a new exposure — see this
- *                        file's header comment for the peer-UID check's
- *                        per-platform coverage. The username comes from the daemon's own
- *                        already-configured daemon.conf, not from this
- *                        payload.
- *   string otp           TOTP/OTP code, if the caller already has one; empty
- *                        if not (first attempt on a 2FA-enabled account).
- * VW_IPC_LOGIN_RESP:
- *   u32 error_code       vw_err_t; 0 = VW_OK. VW_ERR_AUTH_2FA_REQUIRED means
- *                        retry with `otp` set (server requires 2FA and none
- *                        was supplied). On success the daemon persists the
- *                        new session token to state_dir/session.tok.
+ * VW_IPC_PAUSE_REQ / VW_IPC_RESUME_REQ:
+ *   u32    account_id
+ *   string local_root     empty = every folder under this account
  *
  * VW_IPC_SHARE_GRANT_REQ:
+ *   u32    account_id
  *   string virtual_path
  *   string target_username
  *   u8     permission     vw_perm_t: VW_PERM_VIEW (1) or VW_PERM_EDIT (2)
@@ -221,11 +293,13 @@ typedef enum {
  *   u64 share_id          only meaningful if error_code == 0
  *
  * VW_IPC_SHARE_REVOKE_REQ / VW_IPC_LINK_REVOKE_REQ:
+ *   u32 account_id
  *   u64 share_id
  * VW_IPC_SHARE_REVOKE_RESP / VW_IPC_LINK_REVOKE_RESP:
  *   u32 error_code
  *
  * VW_IPC_SHARE_LIST_REQ:
+ *   u32 account_id
  *   u8  mode              0 = grants I created, 1 = grants granted to me
  * VW_IPC_SHARE_LIST_RESP:
  *   u32 error_code
@@ -243,6 +317,7 @@ typedef enum {
  *   }
  *
  * VW_IPC_LINK_CREATE_REQ:
+ *   u32    account_id
  *   string virtual_path
  *   u8     permission
  *   i64    expires_at
@@ -253,6 +328,7 @@ typedef enum {
  *                            meaningful if error_code == 0
  *
  * VW_IPC_LINK_LIST_REQ:
+ *   u32 account_id
  *   u64 file_id_filter    0 = all of my links
  * VW_IPC_LINK_LIST_RESP:
  *   u32 error_code
@@ -268,42 +344,47 @@ typedef enum {
  *   }                       never includes the raw link_token
  *
  * VW_IPC_FILE_MKDIR_REQ:
- *   u64 new_parent_dir_id  0 = caller's own root
+ *   u32    account_id
+ *   u64    new_parent_dir_id  0 = caller's own root
  *   string name            bare leaf name, no '/'
  * VW_IPC_FILE_MKDIR_RESP:
  *   u32 error_code
  *   u64 dir_id             only meaningful if error_code == 0
  *
  * VW_IPC_VAULT_CREATE_REQ:
+ *   u32    account_id
  *   u64    folder_file_id  must already be a real directory (FILE_MKDIR
  *                          first) — see docs/PROTOCOL.md §7.2's FILE_STAT_RESP
  *                          note and TASK-099's own discovery of this
  *                          entry_type requirement.
  *   string passphrase      RAW encryption passphrase — same loopback-only
- *                          trust rationale as VW_IPC_LOGIN_REQ's password.
+ *                          trust rationale as ACCOUNT_ADD_REQ's password.
  *                          Uses the SEC.07-pinned Argon2id floor; no
  *                          custom-KDF-params path is exposed over IPC.
  * VW_IPC_VAULT_CREATE_RESP:
  *   u32 error_code
  *   u64 vault_id           only meaningful if error_code == 0. On success
- *                          the new vault is also added to the daemon's
+ *                          the new vault is also added to that account's
  *                          unlocked-vault registry (no separate UNLOCK
  *                          call needed right after creating it).
  *
  * VW_IPC_VAULT_UNLOCK_REQ:
+ *   u32    account_id
  *   u64    vault_id
  *   string passphrase      RAW; same rationale as above. Wrong passphrase
  *                          → error_code == VW_ERR_AUTH_BAD_CREDS.
  * VW_IPC_VAULT_UNLOCK_RESP:
  *   u32 error_code
  *
- * VW_IPC_VAULT_LIST_REQ: (no payload)
+ * VW_IPC_VAULT_LIST_REQ:
+ *   u32 account_id
  * VW_IPC_VAULT_LIST_RESP:
  *   u32 error_code
  *   u32 count              0 if error_code != 0
  *   count * { u64 vault_id, u64 folder_file_id, i64 created_at }
  *
  * VW_IPC_VAULT_UPLOAD_REQ:
+ *   u32    account_id
  *   u64    vault_id        must already be unlocked (VAULT_CREATE/_UNLOCK)
  *   u64    file_id         0 = create a new file named leaf_name
  *   string leaf_name       used only when file_id == 0; bare leaf, no '/'
@@ -314,6 +395,7 @@ typedef enum {
  *   u64 version_id         only meaningful if error_code == 0
  *
  * VW_IPC_VAULT_DOWNLOAD_REQ:
+ *   u32    account_id
  *   u64    vault_id        must already be unlocked
  *   u64    file_id
  *   string local_path      destination path for the decrypted plaintext
@@ -321,6 +403,7 @@ typedef enum {
  *   u32 error_code
  *
  * VW_IPC_FOLDER_ADD_SHARED_REQ:
+ *   u32    account_id
  *   string local_root      local filesystem directory to sync into
  *   string virtual_root    local display/bookkeeping name only (TASK-106
  *                          design: never sent to the server for a shared
@@ -334,8 +417,9 @@ typedef enum {
  *                          a directory).
  * VW_IPC_FOLDER_ADD_SHARED_RESP:
  *   u32 error_code       vw_err_t; 0 = VW_OK. Requires an active daemon
- *                        session (VW_ERR_AUTH_REQUIRED if none), same as
- *                        every other server-touching IPC request.
+ *                        session for that account (VW_ERR_AUTH_REQUIRED if
+ *                        none), same as every other server-touching IPC
+ *                        request.
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

@@ -1,0 +1,137 @@
+---
+id:          TASK-166
+title:       Web frontend: remember-me checkbox, account switcher, session-check-on-load
+status:      done
+assignee:    WEB.09
+created_by:  ARCH.00
+created:     2026-08-13
+priority:    normal
+depends_on:  [TASK-164, TASK-165]
+review_by:   [CQR.08]
+tags:        [web]
+---
+
+Depends on `TASK-164`/`TASK-165`'s gateway multi-slot + remember-me
+endpoints. Today `web/src/main.ts` has zero client-side session state
+(confirmed: no `localStorage`/`sessionStorage` usage anywhere under
+`web/src/`) and, notably, never checks whether an existing session cookie
+is still valid on page load — `index.html`'s login view has no `hidden`
+attribute, so the login form always renders first regardless of cookie
+state, even mid-session on a simple page reload.
+
+## Work
+
+- "Remember me" checkbox on the login form; when checked, `login()`/
+  `loginWithOtp()` (`web/src/api.ts`) send `remember: true`.
+- Account-switcher UI: a small username row (one per occupied slot) plus
+  "+ Add account", backed by the new `/api/accounts` endpoint.
+- On page load, call `/api/accounts` *before* deciding which view to show.
+  If any slot is live/resumable, enter the browser view directly for the
+  last-active (or first-occupied) slot instead of always showing the login
+  form — this fixes the pre-existing gap noted above as a natural side
+  effect, not just adds new UI.
+- Switching the active slot in the switcher re-fetches the file
+  list/vault state/etc. for that slot, sending `X-Vw-Slot` on subsequent
+  requests (thread the active slot through `web/src/api.ts`'s request
+  helper, e.g. an extra parameter or a module-level "current slot"
+  variable set by the switcher).
+- "Add account" flow reuses the existing login form, targeting the next
+  free slot rather than replacing the current one.
+
+## Acceptance criteria
+
+- Reloading the page after a `remember`-flagged login (same browser,
+  gateway not restarted) goes straight to the browser view — no login form
+  shown.
+- Two accounts logged in (two slots) can both be switched to and used for
+  file operations in the same tab without re-authenticating.
+- `web/`'s `tsc` type-check is clean; existing gateway integration tests
+  (`tests/integration/test_gateway.py`) still pass.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+**WEB.09 [2026-08-13]:** Implemented per the task's own design.
+
+- `web/src/api.ts`: module-level `activeSlot` + `setActiveSlot`/
+  `getActiveSlot`, sent as `X-Vw-Slot` on every request through the
+  shared `apiPost` helper AND the two raw-`fetch` chunk-transfer calls
+  (`uploadChunk`/`downloadChunk`, which bypass `apiPost`) — easy to miss
+  since they're the only two endpoints in this file that don't already
+  go through the shared helper. `login`/`loginWithOtp` gained an
+  `opts: {slot?, remember?}` parameter; `logout` gained an optional
+  `slot` (defaulting to `activeSlot`, NOT always 0 — logging out must
+  never silently act on the wrong account). New `getAccounts()` wraps
+  `/api/accounts` — deliberately does NOT go through `apiPost` (it
+  doesn't send `X-Vw-Slot` at all), since that endpoint reports every
+  occupied slot regardless of slot, not one slot's own data.
+- `web/index.html`/`style.css`: "Remember me" checkbox on the login
+  form; a Cancel button on that same form (hidden unless at least one
+  account is already open — nothing to cancel back to on the very first
+  login); an `#account-switcher` div in the browser view's header,
+  populated at runtime (pills, one per occupied slot, plus "+ Add
+  account").
+- `web/src/main.ts`:
+  - `refreshAccounts()`/`renderAccountSwitcher()`: fetch `/api/accounts`,
+    cache the result in module state (`accounts`), render pills
+    (highlighting the active slot).
+  - `switchToSlot()`: sets the active slot, persists it to
+    `localStorage` (`vw_active_slot` — only the slot NUMBER, never a
+    username or anything else), and re-enters the browser view fresh
+    (path reset to `/`, file list/vault banner refetched for the newly
+    active slot) — satisfies "switching re-fetches file list/vault state
+    for that slot."
+  - `handleLoginSubmit()`: never passes an explicit `slot` (the gateway
+    always picks "next free," which is what both real callers — first
+    login and "+ Add account" — want); after success, diffs the
+    account list against a pre-request snapshot to find which slot the
+    login just landed in (the gateway's response never says directly —
+    only visible as a `Set-Cookie` name, which is `HttpOnly` and
+    unreadable from JS), sets that as active, and enters the browser
+    view for it. Passes `remember: <checkbox>` through unconditionally;
+    a false/unchecked value or a gateway with remember-me disabled are
+    both silently harmless no-ops, matching the backend's own opt-in
+    framing (nothing here needs to know which).
+  - `handleLogout()`: logs out only the active slot (other open accounts
+    in this browser are unaffected — TASK-164's isolation guarantee,
+    now honored at the UI layer too), then switches to another still-open
+    slot if one remains, or falls back to the login view if none do.
+  - `init()` (new, called once at module load): calls `/api/accounts`
+    *before* deciding what to show — this is the actual fix for the
+    pre-existing gap this task's design note flagged (the login form
+    used to always render first, even with a still-valid session cookie
+    already present, because nothing ever checked). Restores the last-
+    active slot from `localStorage` if it's still among the occupied
+    ones, else falls back to the first occupied slot.
+  - `enterBrowserView()` hardened to also hide the history/share views
+    (previously only ever entered from the login form, where those two
+    were already guaranteed hidden; now also reachable via
+    `switchToSlot()`/`handleLogout()`, which could otherwise leave two
+    sections visible at once if triggered while looking at either).
+- Fixed while self-reviewing, before any test run: the Cancel button's
+  handler didn't call `forgetPendingCredentials()` — canceling out of an
+  "add account" attempt mid-2FA would leave that attempt's username/
+  password sitting in module state (in-memory only, never persisted or
+  sent anywhere, but a real state leak nonetheless) until the next login
+  attempt happened to overwrite or clear it.
+- Verification: `tsc --noEmit` (this task's own acceptance criterion)
+  clean, and a real `npm run build` also succeeds. Full
+  `tests/integration/test_gateway.py` (29/29) still green — expected,
+  since nothing here touches the gateway itself, but confirmed rather
+  than assumed.
+- **Explicit limitation, not silently skipped**: this project has no
+  browser-automation test tooling (no Playwright/Puppeteer devDependency,
+  no `web/*.spec.ts` files anywhere, and `test_gateway.py`'s own
+  docstring already frames nginx/the frontend as deliberately untested
+  by that suite — "a dumb reverse proxy with no logic of its own to
+  test"). Adding one would be a real new external dependency, out of
+  scope for what was asked and against this project's minimal-
+  dependencies stance. This means the actual DOM behavior here — does
+  the switcher visually render/highlight correctly, does clicking a pill
+  really swap the file list, does the Cancel button really return to the
+  right view — is verified by type-checking and code review, not by
+  driving a real or headless browser. A human should click through the
+  two-accounts-in-one-tab flow at least once before fully trusting this
+  beyond what's proven here (mirrors the same caveat given for TASK-163's
+  GUI switcher).

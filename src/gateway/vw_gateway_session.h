@@ -57,9 +57,19 @@ void vw_gateway_session_pool_destroy(vw_gateway_session_pool_t *pool);
  * Returns VW_ERR_QUOTA_EXCEEDED if the pool is already at its hard cap —
  * caller must not free/logout sess itself in that case; the caller is
  * still responsible for it since the pool never took ownership.
+ *
+ * username (TASK-164) is a display-only label for /api/accounts — never
+ * used for authorization (the server remains the sole authority on that,
+ * per this module's own doc). Pass NULL/empty for a session that has no
+ * real logged-in user (a redeemed public link, vw_gateway_api.c's
+ * handle_link_access) — vw_gateway_session_get_username() below then
+ * reports an empty string for it, which handle_accounts's own JSON
+ * response leaves for the frontend to render distinctly (e.g. "(shared
+ * link)") rather than encoding that meaning in this module itself.
  */
 vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
                                     vw_client_sess_t *sess,
+                                    const char *username,
                                     char *out_cookie_hex);
 
 /*
@@ -70,6 +80,38 @@ vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
 vw_err_t vw_gateway_session_get(vw_gateway_session_pool_t *pool,
                                  const char *cookie_hex,
                                  vw_client_sess_t **out_sess);
+
+/*
+ * Insert sess into the pool under a SPECIFIC, pre-existing cookie value
+ * (TASK-165's remember-me resume path) rather than generating a fresh one
+ * — a resumed session must stay transparent to the browser (same cookie,
+ * no new Set-Cookie needed). cookie_hex must be exactly
+ * VW_GATEWAY_COOKIE_HEX_LEN hex chars. username follows
+ * vw_gateway_session_create()'s own NULL/empty convention.
+ * Returns VW_ERR_ALREADY_EXISTS if the pool already has a live entry
+ * under this exact cookie — defensive only; vw_gateway_api.c's
+ * require_session() only ever calls this after its own
+ * vw_gateway_session_get() lookup for the same cookie already missed, so
+ * this should never actually trigger. Returns VW_ERR_QUOTA_EXCEEDED at
+ * the pool's hard cap, same as vw_gateway_session_create().
+ */
+vw_err_t vw_gateway_session_reinsert(vw_gateway_session_pool_t *pool,
+                                      const char *cookie_hex,
+                                      vw_client_sess_t *sess,
+                                      const char *username);
+
+/*
+ * Fetch the display username stored for this cookie at
+ * vw_gateway_session_create() time (TASK-164's /api/accounts). Does NOT
+ * touch last_active (unlike vw_gateway_session_get() above) — a status
+ * check should never itself reset a session's idle-eviction countdown.
+ * Returns VW_ERR_AUTH_REQUIRED if the cookie is unknown/malformed.
+ * out_buf receives a NUL-terminated string, empty ("") if this session
+ * was created with a NULL/empty username (a redeemed public link).
+ */
+vw_err_t vw_gateway_session_get_username(vw_gateway_session_pool_t *pool,
+                                          const char *cookie_hex,
+                                          char *out_buf, size_t out_buf_size);
 
 /*
  * Remove and log out (vw_client_logout) the session for this cookie.

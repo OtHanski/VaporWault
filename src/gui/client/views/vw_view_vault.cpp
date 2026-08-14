@@ -71,6 +71,12 @@ static void refresh(ClientApp &app) {
     s_needs_refresh = false;
 }
 
+void vw_view_vault_invalidate() {
+    s_needs_refresh = true;
+    s_vaults.clear();
+    s_unlocked_vaults.clear();
+}
+
 /* ── Warnings block — shared verbatim by the setup wizard; do not soften
  * or shorten any of these three, per TASK-100's explicit instruction. ── */
 static void render_vault_warnings() {

@@ -9,7 +9,30 @@
  * "same-origin"` is what makes the browser attach it automatically on
  * every request, matching nginx serving this page and proxying /api/*
  * from the same origin (docs/DEPLOYMENT.md).
+ *
+ * Multi-slot sessions (TASK-164/166): the browser can hold several
+ * concurrently-logged-in accounts, each under its own gateway-issued
+ * cookie (vw_session_0..vw_session_5) - all of them get attached to
+ * every request automatically (they're all just cookies matching the
+ * same path), so the ONLY thing this module needs to track client-side
+ * is which slot a given request is FOR, sent as the X-Vw-Slot header
+ * (vw_gateway_api.c's require_session). setActiveSlot()/getActiveSlot()
+ * hold that as simple module state, exactly like currentPath is
+ * main.ts's own module state - no per-call parameter threaded through
+ * every one of this file's exported functions, since main.ts only ever
+ * has one slot "on screen" at a time (switching slots re-fetches
+ * everything for the newly active one, see main.ts's switchToSlot).
  */
+
+let activeSlot = 0;
+
+export function setActiveSlot(slot: number): void {
+  activeSlot = slot;
+}
+
+export function getActiveSlot(): number {
+  return activeSlot;
+}
 
 export interface FileEntry {
   name: string;
@@ -68,7 +91,7 @@ export type ApiResult<T> =
 async function apiPost<T>(path: string, body: unknown): Promise<ApiResult<T>> {
   const res = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Vw-Slot": String(activeSlot) },
     credentials: "same-origin",
     body: JSON.stringify(body),
   });
@@ -80,20 +103,69 @@ async function apiPost<T>(path: string, body: unknown): Promise<ApiResult<T>> {
   return { ok: false, status: res.status, data };
 }
 
-export function login(username: string, password: string): Promise<ApiResult<StatusResponse>> {
-  return apiPost("/api/login", { username, password });
+/*
+ * login/loginWithOtp/link access (TASK-164/165): `slot` targets a
+ * specific slot (re-authenticate) - omit to let the gateway pick the
+ * next free one ("add account"), the only mode main.ts actually uses.
+ * `remember` opts into surviving a gateway restart (TASK-165) - omit or
+ * false for today's session-only behavior; silently a no-op if the
+ * gateway wasn't started with --state-dir (vw_gateway_api.c's own
+ * opt-in framing, this module doesn't need to know which).
+ */
+export interface LoginOpts {
+  slot?: number;
+  remember?: boolean;
+}
+
+export function login(
+  username: string,
+  password: string,
+  opts: LoginOpts = {},
+): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/login", { username, password, ...opts });
 }
 
 export function loginWithOtp(
   username: string,
   password: string,
   otp: string,
+  opts: LoginOpts = {},
 ): Promise<ApiResult<StatusResponse>> {
-  return apiPost("/api/login", { username, password, otp });
+  return apiPost("/api/login", { username, password, otp, ...opts });
 }
 
-export function logout(): Promise<ApiResult<StatusResponse>> {
-  return apiPost("/api/logout", {});
+// slot: which slot to log out (defaults to the currently active one, NOT
+// always 0 - logging out must never silently act on the wrong account).
+export function logout(slot: number = activeSlot): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/logout", { slot });
+}
+
+export interface AccountSlot {
+  slot: number;
+  username: string; // "" for a redeemed public-link session (no real user)
+}
+
+export interface AccountsResponse {
+  slots: AccountSlot[];
+}
+
+// Deliberately does not go through apiPost: /api/accounts reports every
+// occupied slot for THIS browser regardless of X-Vw-Slot (it isn't
+// scoped to one slot the way every other endpoint is), so sending that
+// header would be misleading about what this call actually means.
+export async function getAccounts(): Promise<ApiResult<AccountsResponse>> {
+  const res = await fetch("/api/accounts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({}),
+  });
+  if (res.ok) {
+    const data = (await res.json()) as AccountsResponse;
+    return { ok: true, status: res.status, data };
+  }
+  const data = (await res.json()) as StatusResponse;
+  return { ok: false, status: res.status, data };
 }
 
 export function listFiles(path: string, recursive = false): Promise<ApiResult<FileEntry[]>> {
@@ -160,7 +232,7 @@ async function sha256Hex(data: ArrayBuffer): Promise<string> {
 async function uploadChunk(hash: string, data: ArrayBuffer): Promise<ApiResult<StatusResponse>> {
   const res = await fetch("/api/chunks/upload", {
     method: "POST",
-    headers: { "X-Vw-Chunk-Hash": hash },
+    headers: { "X-Vw-Chunk-Hash": hash, "X-Vw-Slot": String(activeSlot) },
     credentials: "same-origin",
     body: data,
   });
@@ -173,7 +245,7 @@ async function uploadChunk(hash: string, data: ArrayBuffer): Promise<ApiResult<S
 async function downloadChunk(hash: string): Promise<ArrayBuffer> {
   const res = await fetch("/api/chunks/download", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Vw-Slot": String(activeSlot) },
     credentials: "same-origin",
     body: JSON.stringify({ hash }),
   });

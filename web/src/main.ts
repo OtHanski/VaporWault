@@ -8,6 +8,9 @@ import {
   login,
   loginWithOtp,
   logout,
+  getAccounts,
+  setActiveSlot,
+  getActiveSlot,
   listFiles,
   mkdir,
   deleteFile,
@@ -32,6 +35,7 @@ import {
   type VersionEntry,
   type ShareEntry,
   type LinkEntry,
+  type AccountSlot,
 } from "./api.js";
 
 // ── Element lookups ─────────────────────────────────────────────────────────
@@ -49,7 +53,10 @@ const usernameInput = el<HTMLInputElement>("login-username");
 const passwordInput = el<HTMLInputElement>("login-password");
 const otpField = el<HTMLElement>("otp-field");
 const otpInput = el<HTMLInputElement>("login-otp");
+const rememberCheckbox = el<HTMLInputElement>("login-remember");
+const loginCancelBtn = el<HTMLButtonElement>("login-cancel-btn");
 const loginError = el<HTMLElement>("login-error");
+const accountSwitcher = el<HTMLElement>("account-switcher");
 const logoutBtn = el<HTMLButtonElement>("logout-btn");
 const mkdirBtn = el<HTMLButtonElement>("mkdir-btn");
 const currentPathLabel = el<HTMLElement>("current-path");
@@ -103,6 +110,109 @@ let currentFolderId = 0;
 // is ever sent to the gateway.
 let unlockedVault: { vaultId: number; folderFileId: number; vk: Uint8Array } | null = null;
 
+// ── Multi-account state (TASK-166) ──────────────────────────────────────
+//
+// `accounts` mirrors the gateway's own per-slot state (GET-like
+// /api/accounts, scoped to this browser's own cookies) — refreshed after
+// every login/logout so the switcher never shows stale slots. Only the
+// ACTIVE slot number itself (never anything sensitive - not a username,
+// not a token) is persisted, in localStorage, purely so a page reload
+// restores the same slot the user was last looking at rather than always
+// falling back to "the first occupied one" (TASK-166's own "last-active"
+// acceptance wording).
+
+let accounts: AccountSlot[] = [];
+const LAST_SLOT_STORAGE_KEY = "vw_active_slot";
+
+function saveLastSlot(slot: number): void {
+  try {
+    localStorage.setItem(LAST_SLOT_STORAGE_KEY, String(slot));
+  } catch {
+    // Private-browsing/storage-disabled: losing the "remembered" active
+    // slot across reloads is a minor UX papercut, not a functional
+    // failure worth surfacing to the user.
+  }
+}
+
+function loadLastSlot(): number | null {
+  try {
+    const raw = localStorage.getItem(LAST_SLOT_STORAGE_KEY);
+    return raw === null ? null : Number(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function refreshAccounts(): Promise<void> {
+  const result = await getAccounts();
+  accounts = result.ok ? result.data.slots : [];
+  renderAccountSwitcher();
+}
+
+function renderAccountSwitcher(): void {
+  accountSwitcher.replaceChildren();
+  const active = getActiveSlot();
+
+  for (const acct of accounts) {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "account-pill" + (acct.slot === active ? " active" : "");
+    // Empty username = a redeemed public-link session (vw_gateway_
+    // session_create's NULL-username convention) - this UI never
+    // actually reaches that case today (link redemption has its own
+    // flow, not this switcher), but label it sensibly rather than
+    // showing a blank pill if it ever does.
+    pill.textContent = acct.username || "(shared link)";
+    pill.addEventListener("click", () => {
+      if (acct.slot !== getActiveSlot()) void switchToSlot(acct.slot);
+    });
+    accountSwitcher.appendChild(pill);
+  }
+
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = "account-pill add-account";
+  addBtn.textContent = "+ Add account";
+  addBtn.addEventListener("click", () => {
+    showLoginView({ cancelable: accounts.length > 0 });
+  });
+  accountSwitcher.appendChild(addBtn);
+}
+
+async function switchToSlot(slot: number): Promise<void> {
+  setActiveSlot(slot);
+  saveLastSlot(slot);
+  await enterBrowserView();
+}
+
+// Shows the login form. `cancelable` controls the Cancel button: adding
+// a second account (already-open browser view behind it) can back out
+// without submitting; the very first login (no accounts open yet) has
+// nothing to cancel back to.
+function showLoginView(opts: { cancelable: boolean }): void {
+  forgetPendingCredentials();
+  usernameInput.value = "";
+  passwordInput.value = "";
+  rememberCheckbox.checked = false;
+  clearError(loginError);
+  loginCancelBtn.hidden = !opts.cancelable;
+  browserView.hidden = true;
+  historyView.hidden = true;
+  shareView.hidden = true;
+  loginView.hidden = false;
+  usernameInput.focus();
+}
+
+loginCancelBtn.addEventListener("click", () => {
+  // Fully abandon whatever was in progress - including a mid-2FA
+  // attempt's pending username/password sitting in module state, which
+  // would otherwise survive until the next login attempt overwrites or
+  // clears it.
+  forgetPendingCredentials();
+  passwordInput.value = "";
+  void enterBrowserView();
+});
+
 function showError(target: HTMLElement, message: string): void {
   target.textContent = message;
   target.hidden = false;
@@ -132,14 +242,30 @@ async function handleLoginSubmit(): Promise<void> {
   const otpVisible = !otpField.hidden;
   const username = otpVisible && pendingUsername !== null ? pendingUsername : usernameInput.value;
   const password = otpVisible && pendingPassword !== null ? pendingPassword : passwordInput.value;
+  // No explicit `slot` here - the gateway always picks the next free one
+  // (vw_gateway_api.c's resolve_login_slot), matching this form's only
+  // two real callers: the very first login (slot 0, trivially "next
+  // free") and "+ Add account" (this task's own note that it "targets
+  // the next free slot rather than replacing the current one").
+  const opts = { remember: rememberCheckbox.checked };
+
+  // Snapshot BEFORE the request - used below to find which slot this
+  // login just landed in, since the gateway's own response never says
+  // (the slot is only visible as a Set-Cookie name, which JS can't read -
+  // it's HttpOnly).
+  const previousSlots = new Set(accounts.map((a) => a.slot));
 
   const result = otpVisible
-    ? await loginWithOtp(username, password, otpInput.value)
-    : await login(username, password);
+    ? await loginWithOtp(username, password, otpInput.value, opts)
+    : await login(username, password, opts);
 
   if (result.ok) {
     forgetPendingCredentials();
     passwordInput.value = "";
+    await refreshAccounts();
+    const newAccount = accounts.find((a) => !previousSlots.has(a.slot));
+    setActiveSlot(newAccount?.slot ?? accounts[0]?.slot ?? 0);
+    saveLastSlot(getActiveSlot());
     await enterBrowserView();
     return;
   }
@@ -173,12 +299,19 @@ logoutBtn.addEventListener("click", () => {
 });
 
 async function handleLogout(): Promise<void> {
+  // Logs out only the currently-active slot (api.ts's logout() defaults
+  // to getActiveSlot()) - other open accounts in this same browser must
+  // be unaffected, matching TASK-164's own multi-slot isolation
+  // guarantee at the UI layer too.
   await logout();
-  browserView.hidden = true;
-  loginView.hidden = false;
-  usernameInput.value = "";
-  passwordInput.value = "";
-  loginForm.reset();
+  await refreshAccounts();
+  if (accounts.length > 0) {
+    setActiveSlot(accounts[0].slot);
+    saveLastSlot(getActiveSlot());
+    await enterBrowserView();
+    return;
+  }
+  showLoginView({ cancelable: false });
 }
 
 // ── File browser view (TASK-138) ────────────────────────────────────────
@@ -186,6 +319,16 @@ async function handleLogout(): Promise<void> {
 async function enterBrowserView(): Promise<void> {
   loginView.hidden = true;
   browserView.hidden = false;
+  // Defensive, not just for the login path: switchToSlot() can be
+  // triggered from the history/share views too (the switcher pills are
+  // only rendered inside browser-view's header today, but nothing stops
+  // that from changing later) - without this, switching slots while
+  // looking at either would leave TWO sections visible at once, since
+  // neither of those views' own "Back" buttons run here to hide
+  // themselves.
+  historyView.hidden = true;
+  shareView.hidden = true;
+  renderAccountSwitcher();
   currentPath = "/";
   await refreshFileList();
 }
@@ -989,3 +1132,28 @@ currentPathLabel.addEventListener("click", () => {
   currentPath = lastSlash <= 0 ? "/" : trimmed.slice(0, lastSlash);
   void refreshFileList();
 });
+
+// ── Bootstrap (TASK-166) ─────────────────────────────────────────────────
+//
+// index.html's own default markup shows login-view and hides
+// browser-view - correct for "no session at all" and left as-is here.
+// This is what actually fixes the pre-existing gap this task's own
+// design note flagged: previously the login form always rendered first
+// on every page load, even with a still-valid remembered/live session
+// cookie already present, because nothing ever checked. /api/accounts
+// works here as a plain "does this browser have anything to resume"
+// probe - it needs no request body and returns an empty list rather
+// than a 401 when nothing is live, so this is safe to call
+// unconditionally before the user has done anything.
+async function init(): Promise<void> {
+  await refreshAccounts();
+  if (accounts.length === 0) return;
+
+  const lastSlot = loadLastSlot();
+  const target = accounts.find((a) => a.slot === lastSlot) ?? accounts[0];
+  setActiveSlot(target.slot);
+  saveLastSlot(target.slot);
+  await enterBrowserView();
+}
+
+void init();

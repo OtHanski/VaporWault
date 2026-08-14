@@ -109,7 +109,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _write_server_conf(path, data_dir, cert, key, admin_socket, port):
+def _write_server_conf(path, data_dir, cert, key, admin_socket, port, max_workers=2):
     with open(path, "w") as f:
         f.write(f"""\
 listen_host      = 127.0.0.1
@@ -119,7 +119,7 @@ cert_pem_path    = {cert}
 key_pem_path     = {key}
 log_level        = DEBUG
 max_connections  = 16
-max_workers      = 2
+max_workers      = {max_workers}
 admin_socket     = {admin_socket}
 smtp_host        =
 """)
@@ -128,7 +128,7 @@ smtp_host        =
 class ServerInstance:
     """A running vapourwaultd process with its admin socket and TLS port."""
 
-    def __init__(self, binaries: Binaries, tmpdir: str):
+    def __init__(self, binaries: Binaries, tmpdir: str, max_workers: int = 2):
         self.binaries = binaries
         self.tmpdir = tmpdir
         self.data_dir     = os.path.join(tmpdir, "data")
@@ -143,7 +143,7 @@ class ServerInstance:
         _write_server_conf(
             self.conf_path, self.data_dir,
             self.cert, binaries.test_key,
-            self.admin_socket, self.port
+            self.admin_socket, self.port, max_workers=max_workers
         )
 
     def start(self, timeout=20):
@@ -228,11 +228,15 @@ def default_user(server):
 class GatewayInstance:
     """A running vapourwault-web-gateway process pointed at a ServerInstance."""
 
-    def __init__(self, binaries: Binaries, server: ServerInstance):
+    def __init__(self, binaries: Binaries, server: ServerInstance, state_dir: str = None):
         self.binaries = binaries
         self.server = server
         self.host = "127.0.0.1"
         self.port = _free_port()
+        # TASK-165: passing state_dir enables "remember me" - omit (the
+        # default, used by every test that doesn't care about it) to
+        # match this feature's own opt-in-at-the-operator-level framing.
+        self.state_dir = state_dir
         self._proc = None
 
     @property
@@ -240,15 +244,18 @@ class GatewayInstance:
         return f"http://{self.host}:{self.port}"
 
     def start(self, timeout=10):
+        args = [
+            self.binaries.gateway_bin,
+            "--server-host", self.server.host,
+            "--server-port", str(self.server.port),
+            "--ca-cert", self.server.cert,
+            "--listen-host", self.host,
+            "--listen-port", str(self.port),
+        ]
+        if self.state_dir is not None:
+            args += ["--state-dir", self.state_dir]
         self._proc = subprocess.Popen(
-            [
-                self.binaries.gateway_bin,
-                "--server-host", self.server.host,
-                "--server-port", str(self.server.port),
-                "--ca-cert", self.server.cert,
-                "--listen-host", self.host,
-                "--listen-port", str(self.port),
-            ],
+            args,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         # No admin socket/readiness signal of its own (unlike vapourwaultd) -
@@ -278,8 +285,12 @@ class GatewayInstance:
             self._proc = None
 
     def restart(self, timeout=10):
-        """Kill and relaunch the gateway process - used to simulate the
-        in-memory session pool being wiped (TASK-131: no persistence)."""
+        """Kill and relaunch the gateway process - always wipes the
+        in-memory session pool (TASK-131: no persistence there), but a
+        remembered login (this instance's own state_dir set, TASK-165)
+        should transparently resume on the next request rather than
+        needing to re-authenticate - that's exactly what this helper
+        exists to let a test exercise."""
         self.stop()
         self.start(timeout=timeout)
 
@@ -337,3 +348,104 @@ def admin_client(server):
     ac = AdminClient(server.admin_socket)
     yield ac
     ac.close()
+
+
+# ── TASK-161/162 fixtures: vapourwault-daemon + vapourwault-cli ─────────────
+#
+# Shared by test_daemon_ipc_accounts.py and test_cli_account_commands.py —
+# both need a real running multi-account daemon, not the module-scoped
+# `server` fixture above (which is the VaporWault *server*, a different
+# binary entirely).
+
+def _find_client_bin(name):
+    # build-gw-e2e/bin first and deliberately: build-wsl-werror/bin and
+    # build-wsl/bin can (and, discovered while first writing these fixtures,
+    # did) contain a stale pre-TASK-161 vapourwault-daemon left over from
+    # before the ACCOUNT_* IPC changes — silently falling back to it
+    # produces no error, just a request the old binary's switch statement
+    # doesn't know about (falls into `default: break`, connection just
+    # closes with zero response bytes). Search this session's own known-
+    # current tree first so a stale binary elsewhere never wins silently.
+    exe = f"{name}.exe" if os.name == "nt" else name
+    for d in ("build-gw-e2e/bin", "build/bin", "build-release/bin", "../build/bin",
+              "build-wsl-werror/bin", "build-wsl/bin"):
+        p = os.path.join(d, exe)
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    return None
+
+
+@pytest.fixture
+def daemon_bin():
+    path = _find_client_bin("vapourwault-daemon")
+    if not path:
+        pytest.skip("vapourwault-daemon binary not found (build it first)")
+    return path
+
+
+@pytest.fixture
+def cli_bin():
+    path = _find_client_bin("vapourwault-cli")
+    if not path:
+        pytest.skip("vapourwault-cli binary not found (build it first)")
+    return path
+
+
+@pytest.fixture
+def running_daemon(daemon_bin, tmp_path):
+    """Spawns a real vapourwault-daemon against a fresh state_dir, waits for
+    its IPC port, and guarantees process cleanup even on test failure — same
+    "never leak a running process" discipline this file's server/gateway
+    fixtures already apply. Yields the daemon's IPC port.
+
+    Cleanup uses terminate() (SIGTERM/CTRL_CLOSE), not an IPC SHUTDOWN_REQ —
+    the daemon already installs a signal handler that sets the same
+    shutdown flag (vw_daemon.c's install_signal_handlers/sig_handler), so
+    this is equally clean and doesn't require this fixture to speak the
+    daemon's IPC wire format itself.
+    """
+    state_dir = tmp_path / "daemon_state"
+    state_dir.mkdir()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        ipc_port = s.getsockname()[1]
+
+    # sync_interval_ms gates how often vw_daemon_run's main loop even checks
+    # for pending IPC connections (vw_watcher_wait blocks for up to this long
+    # first, every iteration — see vw_daemon.c) - kept short so tests using
+    # this fixture don't have to wait out a long poll interval per call.
+    # Mirrors run_integration.py's own 5000ms choice, made even shorter
+    # since these tests issue several calls back-to-back.
+    (state_dir / "daemon.conf").write_text(
+        f"ipc_port = {ipc_port}\nsync_interval_ms = 200\n"
+    )
+
+    env = dict(os.environ)
+    env["VW_LOG_LEVEL"] = "DEBUG"
+    proc = subprocess.Popen(
+        [daemon_bin, "--state-dir", str(state_dir)], env=env,
+    )
+
+    deadline = time.time() + 10
+    connected = False
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", ipc_port), timeout=0.5):
+                connected = True
+                break
+        except OSError:
+            time.sleep(0.1)
+
+    if not connected:
+        proc.kill()
+        pytest.fail("daemon did not open its IPC port in time")
+
+    try:
+        yield ipc_port
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)

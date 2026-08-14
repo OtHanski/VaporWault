@@ -38,6 +38,13 @@
 #define CONFIG_FILE          "daemon.conf"
 #define LOG_ROTATE_BYTES     (10 * 1024 * 1024L)
 
+/* Multi-account (TASK-161): {state_dir}/accounts/<account_id>/, each
+ * holding its own account.conf/cache.db/sync_folders.db/session.tok/
+ * offline_queue.db — see vw_daemon.h's header comment for the full layout. */
+#define ACCOUNTS_DIR         "accounts"
+#define ACCOUNT_CONFIG_FILE  "account.conf"
+#define MAX_ACCOUNTS         32u
+
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 
 typedef enum { LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3 } log_lvl_t;
@@ -258,25 +265,22 @@ static vw_err_t tok_save(const char *state_dir, const uint8_t tok[VW_TOKEN_BYTES
 /* ── Config parser ───────────────────────────────────────────────────────── */
 
 static void cfg_defaults(vw_daemon_cfg_t *c) {
-    c->server_port     = (uint16_t)DEFAULT_PORT;
     c->ipc_port        = (uint16_t)DEFAULT_IPC_PORT;
     c->sync_interval_ms = DEFAULT_SYNC_MS;
 }
 
 static void cfg_apply_kv(vw_daemon_cfg_t *c, const char *key, const char *val) {
-    if (strcmp(key, "server_host")      == 0)
-        snprintf(c->server_host, sizeof(c->server_host), "%s", val);
-    else if (strcmp(key, "server_port") == 0)
-        c->server_port = (uint16_t)strtoul(val, NULL, 10);
-    else if (strcmp(key, "ca_cert_pem_path") == 0)
-        snprintf(c->ca_cert_pem_path, sizeof(c->ca_cert_pem_path), "%s", val);
-    else if (strcmp(key, "username")    == 0)
-        snprintf(c->username, sizeof(c->username), "%s", val);
-    else if (strcmp(key, "ipc_port")   == 0)
+    if (strcmp(key, "ipc_port")   == 0)
         c->ipc_port = (uint16_t)strtoul(val, NULL, 10);
     else if (strcmp(key, "sync_interval_ms") == 0)
         c->sync_interval_ms = (uint32_t)strtoul(val, NULL, 10);
-    /* Unknown keys are silently ignored (forward-compat). */
+    /* Unknown keys are silently ignored (forward-compat) — this also
+     * quietly absorbs a pre-TASK-161 daemon.conf's now-relocated
+     * server_host/server_port/ca_cert_pem_path/username keys without
+     * needing an explicit migration: they're simply dropped, and the
+     * daemon starts with zero configured accounts until `account add`
+     * (vapourwault-cli) or the GUI's "Add account" flow is used. This
+     * project is pre-1.0 with no real migration story needed yet. */
 }
 
 vw_err_t vw_daemon_cfg_load(const char *state_dir, vw_daemon_cfg_t *out) {
@@ -326,12 +330,79 @@ vw_err_t vw_daemon_cfg_write_defaults(const char *state_dir,
     fp = fopen(path, "w");
     if (!fp) return VW_ERR_IO;
     fprintf(fp, "# VaporWault daemon configuration\n");
-    fprintf(fp, "server_host     = %s\n", cfg->server_host[0] ? cfg->server_host : "localhost");
-    fprintf(fp, "server_port     = %u\n", (unsigned)cfg->server_port);
-    fprintf(fp, "ca_cert_pem_path = %s\n", cfg->ca_cert_pem_path);
-    fprintf(fp, "username        = %s\n", cfg->username);
     fprintf(fp, "ipc_port        = %u\n", (unsigned)cfg->ipc_port);
     fprintf(fp, "sync_interval_ms = %u\n", (unsigned)cfg->sync_interval_ms);
+    fclose(fp);
+    return VW_OK;
+}
+
+/* ── Per-account config (TASK-161) ────────────────────────────────────────
+ * {state_dir}/accounts/<account_id>/account.conf — same simple INI format
+ * as daemon.conf above, one file per account. Not meant to be hand-edited;
+ * written by account_ctx_create() below in response to
+ * VW_IPC_ACCOUNT_ADD_REQ. */
+
+typedef struct {
+    uint32_t account_id;
+    char     label[64];
+    char     server_host[256];
+    uint16_t server_port;
+    char     ca_cert_pem_path[512];
+    char     username[64];
+} vw_account_cfg_t;
+
+static void account_cfg_apply_kv(vw_account_cfg_t *c, const char *key, const char *val) {
+    if (strcmp(key, "label") == 0)
+        snprintf(c->label, sizeof(c->label), "%s", val);
+    else if (strcmp(key, "server_host") == 0)
+        snprintf(c->server_host, sizeof(c->server_host), "%s", val);
+    else if (strcmp(key, "server_port") == 0)
+        c->server_port = (uint16_t)strtoul(val, NULL, 10);
+    else if (strcmp(key, "ca_cert_pem_path") == 0)
+        snprintf(c->ca_cert_pem_path, sizeof(c->ca_cert_pem_path), "%s", val);
+    else if (strcmp(key, "username") == 0)
+        snprintf(c->username, sizeof(c->username), "%s", val);
+}
+
+/* accounts_dir is {state_dir}/accounts/<account_id> (no trailing slash). */
+static vw_err_t account_cfg_load(const char *account_dir, vw_account_cfg_t *out) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", account_dir, ACCOUNT_CONFIG_FILE);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return VW_ERR_NOT_FOUND;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t ln = strlen(line);
+        while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r'))
+            line[--ln] = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p; char *val = eq + 1;
+        size_t kl = strlen(key);
+        while (kl > 0 && (key[kl-1] == ' ' || key[kl-1] == '\t')) key[--kl] = '\0';
+        while (*val == ' ' || *val == '\t') val++;
+        account_cfg_apply_kv(out, key, val);
+    }
+    fclose(fp);
+    return VW_OK;
+}
+
+static vw_err_t account_cfg_save(const char *account_dir, const vw_account_cfg_t *cfg) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", account_dir, ACCOUNT_CONFIG_FILE);
+    FILE *fp = fopen(path, "w");
+    if (!fp) return VW_ERR_IO;
+    fprintf(fp, "# VaporWault account configuration — managed by the daemon, do not hand-edit\n");
+    fprintf(fp, "label            = %s\n", cfg->label);
+    fprintf(fp, "server_host      = %s\n", cfg->server_host);
+    fprintf(fp, "server_port      = %u\n", (unsigned)cfg->server_port);
+    fprintf(fp, "ca_cert_pem_path = %s\n", cfg->ca_cert_pem_path);
+    fprintf(fp, "username         = %s\n", cfg->username);
     fclose(fp);
     return VW_OK;
 }
@@ -411,30 +482,101 @@ static void vault_registry_close_all(daemon_vault_registry_t *reg) {
     reg->count = reg->cap = 0;
 }
 
+/* ── Account contexts (TASK-161) ──────────────────────────────────────────
+ * One per configured account. The daemon's IPC loop and sync loop are both
+ * single-threaded (handle_ipc_client and the round-robin sync pass in
+ * vw_daemon_run are called synchronously from the same main loop — see that
+ * function), so this array needs no locking, same reasoning as the vault
+ * registry above (now one of this struct's own fields, no longer global).
+ */
+typedef struct {
+    uint32_t   account_id;
+    char       account_dir[600];  /* {state_dir}/accounts/<account_id> */
+    vw_account_cfg_t         cfg;
+    vw_cache_t              *cache;
+    vw_sync_ctx_t           *sync_ctx;
+    vw_client_sess_t        *sess;      /* NULL if currently offline */
+    daemon_vault_registry_t  vaults;    /* TASK-100: unlocked vw_vault_t handles */
+    int64_t    last_sync_at;
+    uint32_t   error_count;
+} vw_account_ctx_t;
+
+typedef struct {
+    vw_account_ctx_t *accounts;
+    size_t            count;
+    size_t            cap;
+    uint32_t          next_account_id;  /* monotonic; never reused */
+} account_registry_t;
+
+static vw_account_ctx_t *account_find(account_registry_t *reg, uint32_t account_id) {
+    for (size_t i = 0; i < reg->count; i++)
+        if (reg->accounts[i].account_id == account_id) return &reg->accounts[i];
+    return NULL;
+}
+
+/* Appends a zero-initialized slot and returns a pointer to it, or NULL on
+ * OOM. The returned pointer is only valid until the next account_add_slot
+ * call (the backing array may realloc) — callers must re-look-up via
+ * account_find after that, never hold this pointer across one. */
+static vw_account_ctx_t *account_add_slot(account_registry_t *reg) {
+    if (reg->count >= reg->cap) {
+        size_t new_cap = reg->cap ? reg->cap * 2 : 4;
+        vw_account_ctx_t *ne = realloc(reg->accounts, new_cap * sizeof(*ne));
+        if (!ne) return NULL;
+        reg->accounts = ne;
+        reg->cap = new_cap;
+    }
+    vw_account_ctx_t *a = &reg->accounts[reg->count++];
+    memset(a, 0, sizeof(*a));
+    return a;
+}
+
+/* {state_dir}/accounts/<account_id> — no trailing slash. */
+static void account_dir_path(const char *state_dir, uint32_t account_id,
+                              char *out, size_t out_size) {
+    snprintf(out, out_size, "%s/%s/%u", state_dir, ACCOUNTS_DIR, (unsigned)account_id);
+}
+
+/* Deletes every file directly inside dir, then the (now-empty) directory
+ * itself. accounts/<id>/ is deliberately kept flat (account.conf, cache.db,
+ * sync_folders.db, session.tok, offline_queue.db — see vw_daemon.h's header
+ * comment) specifically so this doesn't need general recursive-delete
+ * logic; vw_fs.h has no directory-removal primitive at all today (only
+ * vw_fs_delete for files), so the final rmdir/RemoveDirectory step is done
+ * here directly rather than adding one for this single call site. */
+static int delete_dir_entry_cb(const char *name, void *userdata) {
+    const char *dir = (const char *)userdata;
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    (void)vw_fs_delete(path);
+    return 0;
+}
+
+static void delete_account_dir(const char *account_dir) {
+    (void)vw_fs_list_dir(account_dir, delete_dir_entry_cb, (void *)account_dir);
+#ifdef _WIN32
+    RemoveDirectoryA(account_dir);
+#else
+    rmdir(account_dir);
+#endif
+}
+
 /* ── IPC dispatch ────────────────────────────────────────────────────────── */
 
 typedef struct {
-    vw_cache_t       *cache;
-    vw_sync_ctx_t    *sync_ctx;
-    vw_watcher_t     *watcher;
-    vw_client_sess_t *sess;
-    int               paused_all;
-    int64_t           last_sync_at;
-    uint32_t          error_count;
-    int              *sync_now_flag;
-    int              *shutdown_flag;
-    const vw_daemon_cfg_t *cfg;       /* for LOGIN_REQ: server_host/port/username */
-    vw_client_sess_t     **sess_out;  /* points at vw_daemon_run's own `sess` var —
-                                        * LOGIN_REQ writes the new session here so
-                                        * it survives past this dispatch call      */
-    daemon_vault_registry_t *vaults;  /* TASK-100: unlocked vw_vault_t handles */
+    account_registry_t *accounts;
+    vw_watcher_t        *watcher;
+    int                 *sync_now_flag;
+    int                 *shutdown_flag;
+    const char          *state_dir;   /* daemon-global root, for account_dir_path */
 } ipc_dispatch_ctx_t;
 
-/* otp_cb userdata for VW_IPC_LOGIN_REQ: hands a pre-supplied OTP code (if any)
- * to vw_client_connect() synchronously, since the whole login round-trip
- * (including 2FA) happens within a single LOGIN_REQ/RESP exchange — the CLI
- * re-issues LOGIN_REQ with the OTP filled in if the first attempt reports
- * VW_ERR_AUTH_2FA_REQUIRED. */
+/* otp_cb userdata for VW_IPC_ACCOUNT_ADD_REQ: hands a pre-supplied OTP code
+ * (if any) to vw_client_connect() synchronously, since the whole login
+ * round-trip (including 2FA) happens within a single ACCOUNT_ADD_REQ/RESP
+ * exchange — the caller re-issues ACCOUNT_ADD_REQ with the OTP filled in
+ * (and the same account_id, if this was a re-authentication) if the first
+ * attempt reports VW_ERR_AUTH_2FA_REQUIRED. */
 typedef struct { const char *otp; uint16_t otp_len; } login_otp_ctx_t;
 
 static vw_err_t login_otp_cb(void *userdata, char *otp_buf, uint16_t *otp_len) {
@@ -465,22 +607,46 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     switch (type) {
 
     case VW_IPC_STATUS_REQ: {
-        uint64_t bd = 0, bt = 0;
-        vw_sync_get_progress(dc->sync_ctx, &bd, &bt);
+        /* Daemon-global aggregate across every configured account
+         * (TASK-161) — see VW_IPC_ACCOUNT_LIST_RESP for the per-account
+         * breakdown of every field here. */
+        uint8_t any_connected = 0, any_syncing = 0;
+        int64_t max_last_sync = 0;
+        uint32_t total_pending = 0, total_errors = 0, total_perm_denied = 0;
+        uint32_t total_folders = 0, paused_folders = 0;
+        for (size_t i = 0; i < dc->accounts->count; i++) {
+            vw_account_ctx_t *a = &dc->accounts->accounts[i];
+            if (a->sess) any_connected = 1;
+            uint64_t bd = 0, bt = 0;
+            vw_sync_get_progress(a->sync_ctx, &bd, &bt);
+            if (bd < bt) any_syncing = 1;
+            if (a->last_sync_at > max_last_sync) max_last_sync = a->last_sync_at;
+            total_pending += vw_sync_pending_count(a->sync_ctx);
+            total_errors  += a->error_count;
+            total_perm_denied += vw_sync_permission_denied_count(a->sync_ctx);
+            /* "all sync paused" (below) is now computed straight from every
+             * account's own folder-level paused bits (TASK-161) rather than
+             * a separate tracked flag — PAUSE_REQ/RESUME_REQ are per-account
+             * now, so there is no single daemon-global toggle left to set. */
+            vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
+            vw_cache_folder_list(a->cache, &folders, &nf);
+            total_folders += nf;
+            for (uint32_t j = 0; j < nf; j++) if (folders[j].paused) paused_folders++;
+            free(folders);
+        }
         uint8_t resp[28]; uint32_t off = 0;
-        resp[off++] = dc->sess ? 1 : 0;        /* connected */
-        resp[off++] = (bd < bt) ? 1 : 0;       /* syncing */
-        resp[off++] = (uint8_t)dc->paused_all;
+        resp[off++] = any_connected;
+        resp[off++] = any_syncing;
+        resp[off++] = (total_folders > 0 && paused_folders == total_folders) ? 1 : 0;
         resp[off++] = 0;                        /* _pad */
-        vw_write_u64le(resp + off, (uint64_t)dc->last_sync_at); off += 8;
-        uint32_t pending = vw_sync_pending_count(dc->sync_ctx);
-        vw_write_u32le(resp + off, pending); off += 4; /* pending_uploads */
+        vw_write_u64le(resp + off, (uint64_t)max_last_sync); off += 8;
+        vw_write_u32le(resp + off, total_pending); off += 4; /* pending_uploads */
         vw_write_u32le(resp + off, 0);       off += 4; /* pending_downloads */
-        vw_write_u32le(resp + off, dc->error_count); off += 4;
+        vw_write_u32le(resp + off, total_errors); off += 4;
         /* TASK-113: distinct from error_count above — a permission-denied
          * shared-folder auto-mkdir is its own specific signal, not lumped
          * in with every other kind of action failure. */
-        vw_write_u32le(resp + off, vw_sync_permission_denied_count(dc->sync_ctx)); off += 4;
+        vw_write_u32le(resp + off, total_perm_denied); off += 4;
         vw_ipc_send(conn, VW_IPC_STATUS_RESP, resp, off);
         break;
     }
@@ -490,24 +656,202 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         ipc_send_u32(conn, VW_IPC_SYNC_NOW_RESP, 0);
         break;
 
+    case VW_IPC_ACCOUNT_LIST_REQ: {
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { vw_ipc_send(conn, VW_IPC_ACCOUNT_LIST_RESP, NULL, 0); break; }
+        uint32_t roff = 4;
+        uint32_t written = 0;
+        for (size_t i = 0; i < dc->accounts->count && roff + 900 < 65536; i++) {
+            vw_account_ctx_t *a = &dc->accounts->accounts[i];
+            vw_write_u32le(rbuf + roff, a->account_id); roff += 4;
+            uint16_t llen = (uint16_t)strnlen(a->cfg.label, sizeof(a->cfg.label));
+            vw_ipc_write_str(rbuf, 65536, &roff, a->cfg.label, llen);
+            uint16_t ulen = (uint16_t)strnlen(a->cfg.username, sizeof(a->cfg.username));
+            vw_ipc_write_str(rbuf, 65536, &roff, a->cfg.username, ulen);
+            uint16_t hlen = (uint16_t)strnlen(a->cfg.server_host, sizeof(a->cfg.server_host));
+            vw_ipc_write_str(rbuf, 65536, &roff, a->cfg.server_host, hlen);
+            rbuf[roff++] = a->sess ? 1 : 0;
+            vw_write_u32le(rbuf + roff, vw_sync_pending_count(a->sync_ctx)); roff += 4;
+            vw_write_u32le(rbuf + roff, 0); roff += 4; /* pending_downloads */
+            written++;
+        }
+        vw_write_u32le(rbuf, written);
+        vw_ipc_send(conn, VW_IPC_ACCOUNT_LIST_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
+    case VW_IPC_ACCOUNT_ADD_REQ: {
+        uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_ACCOUNT_ADD_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t req_account_id = vw_read_u32le(buf + off); off += 4u;
+        const char *label = NULL, *host = NULL, *ca_path = NULL, *username = NULL, *pw = NULL, *otp = NULL;
+        uint16_t label_len = 0, host_len = 0, ca_len = 0, user_len = 0, pw_len = 0, otp_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &label, &label_len);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &host, &host_len);
+        uint16_t server_port = 0;
+        if (err == VW_OK && off + 2u <= plen) { server_port = vw_read_u16le(buf + off); off += 2u; }
+        else if (err == VW_OK) err = VW_ERR_PROTO_TRUNCATED;
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &ca_path, &ca_len);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &username, &user_len);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &pw, &pw_len);
+        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &otp, &otp_len);
+        if (err != VW_OK || pw_len == 0 || host_len == 0 || user_len == 0) {
+            ipc_send_u32(conn, VW_IPC_ACCOUNT_ADD_RESP,
+                         (uint32_t)(err != VW_OK ? err : VW_ERR_INVALID_ARG));
+            break;
+        }
+
+        vw_account_ctx_t *existing = req_account_id != 0
+            ? account_find(dc->accounts, req_account_id) : NULL;
+        if (req_account_id != 0 && !existing) {
+            ipc_send_u32(conn, VW_IPC_ACCOUNT_ADD_RESP, (uint32_t)VW_ERR_NOT_FOUND);
+            break;
+        }
+
+        vw_account_cfg_t acfg;
+        memset(&acfg, 0, sizeof(acfg));
+        size_t cpy;
+        cpy = label_len < sizeof(acfg.label)-1u ? label_len : sizeof(acfg.label)-1u;
+        memcpy(acfg.label, label, cpy);
+        cpy = host_len < sizeof(acfg.server_host)-1u ? host_len : sizeof(acfg.server_host)-1u;
+        memcpy(acfg.server_host, host, cpy);
+        acfg.server_port = server_port;
+        cpy = ca_len < sizeof(acfg.ca_cert_pem_path)-1u ? ca_len : sizeof(acfg.ca_cert_pem_path)-1u;
+        memcpy(acfg.ca_cert_pem_path, ca_path, cpy);
+        cpy = user_len < sizeof(acfg.username)-1u ? user_len : sizeof(acfg.username)-1u;
+        memcpy(acfg.username, username, cpy);
+
+        char pw_buf[256]; char otp_buf_local[16];
+        cpy = pw_len < sizeof(pw_buf)-1u ? pw_len : sizeof(pw_buf)-1u;
+        memcpy(pw_buf, pw, cpy); pw_buf[cpy] = '\0';
+        cpy = otp_len < sizeof(otp_buf_local)-1u ? otp_len : sizeof(otp_buf_local)-1u;
+        memcpy(otp_buf_local, otp, cpy); otp_buf_local[cpy] = '\0';
+
+        vw_client_cfg_t cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.host             = acfg.server_host;
+        cc.port             = acfg.server_port;
+        cc.cert_verify      = VW_CERT_VERIFY_REQUIRED;
+        cc.ca_cert_pem_path = acfg.ca_cert_pem_path[0] ? acfg.ca_cert_pem_path : NULL;
+
+        login_otp_ctx_t octx;
+        octx.otp     = (otp_len > 0) ? otp_buf_local : NULL;
+        octx.otp_len = (uint16_t)strlen(otp_buf_local);
+
+        vw_client_sess_t *new_sess = NULL;
+        vw_err_t rc = vw_client_connect(&cc, acfg.username, (uint16_t)strlen(acfg.username),
+                                         pw_buf, strlen(pw_buf), login_otp_cb, &octx, &new_sess);
+        memset(pw_buf, 0, sizeof(pw_buf));
+        memset(otp_buf_local, 0, sizeof(otp_buf_local));
+
+        uint32_t out_account_id = req_account_id;
+        if (rc == VW_OK) {
+            char account_dir[600];
+            if (existing) {
+                snprintf(account_dir, sizeof(account_dir), "%s", existing->account_dir);
+            } else {
+                out_account_id = dc->accounts->next_account_id++;
+                account_dir_path(dc->state_dir, out_account_id, account_dir, sizeof(account_dir));
+            }
+            rc = vw_fs_ensure_dir(account_dir);
+            if (rc == VW_OK) rc = account_cfg_save(account_dir, &acfg);
+            uint8_t tok[VW_TOKEN_BYTES];
+            if (rc == VW_OK) {
+                vw_client_get_token(new_sess, tok);
+                rc = tok_save(account_dir, tok);
+                memset(tok, 0, sizeof(tok));
+            }
+
+            if (rc == VW_OK && existing) {
+                vw_client_close(existing->sess); /* old token already superseded */
+                existing->sess = new_sess;
+                existing->cfg  = acfg;
+                vw_sync_set_session(existing->sync_ctx, new_sess);
+            } else if (rc == VW_OK) {
+                vw_cache_t *cache = NULL;
+                rc = vw_cache_open(account_dir, &cache);
+                vw_sync_ctx_t *sync_ctx = NULL;
+                if (rc == VW_OK) {
+                    vw_sync_cfg_t sc;
+                    sc.sess = new_sess; sc.cache = cache; sc.state_dir = account_dir;
+                    rc = vw_sync_open(&sc, &sync_ctx);
+                    if (rc != VW_OK) vw_cache_close(cache);
+                }
+                if (rc == VW_OK) {
+                    vw_account_ctx_t *a = account_add_slot(dc->accounts);
+                    if (!a) { rc = VW_ERR_OOM; vw_sync_close(sync_ctx); vw_cache_close(cache); }
+                    else {
+                        a->account_id = out_account_id;
+                        snprintf(a->account_dir, sizeof(a->account_dir), "%s", account_dir);
+                        a->cfg = acfg;
+                        a->cache = cache;
+                        a->sync_ctx = sync_ctx;
+                        a->sess = new_sess;
+                    }
+                }
+            }
+            if (rc != VW_OK) vw_client_close(new_sess);
+            else vw_log(LOG_INFO, "account '%s' (id=%u) authenticated", acfg.username, (unsigned)out_account_id);
+        }
+
+        uint8_t resp[8];
+        vw_write_u32le(resp, (uint32_t)rc);
+        vw_write_u32le(resp + 4u, rc == VW_OK ? out_account_id : 0u);
+        vw_ipc_send(conn, VW_IPC_ACCOUNT_ADD_RESP, resp, sizeof(resp));
+        break;
+    }
+
+    case VW_IPC_ACCOUNT_REMOVE_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_ACCOUNT_REMOVE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        size_t idx = SIZE_MAX;
+        for (size_t i = 0; i < dc->accounts->count; i++)
+            if (dc->accounts->accounts[i].account_id == account_id) { idx = i; break; }
+        if (idx == SIZE_MAX) {
+            ipc_send_u32(conn, VW_IPC_ACCOUNT_REMOVE_RESP, (uint32_t)VW_ERR_NOT_FOUND);
+            break;
+        }
+        vw_account_ctx_t *a = &dc->accounts->accounts[idx];
+        vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
+        vw_cache_folder_list(a->cache, &folders, &nf);
+        for (uint32_t i = 0; i < nf; i++) vw_watcher_remove(dc->watcher, folders[i].local_root);
+        free(folders);
+        vault_registry_close_all(&a->vaults);
+        vw_sync_close(a->sync_ctx);
+        if (a->sess) vw_client_logout(a->sess);
+        vw_cache_close(a->cache);
+        delete_account_dir(a->account_dir);
+        /* Shift the tail down over the removed slot — order doesn't matter,
+         * this array is only ever iterated in full, never indexed by
+         * position. */
+        memmove(a, a + 1, (dc->accounts->count - idx - 1) * sizeof(*a));
+        dc->accounts->count--;
+        ipc_send_u32(conn, VW_IPC_ACCOUNT_REMOVE_RESP, 0);
+        break;
+    }
+
     case VW_IPC_PAUSE_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_PAUSE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { ipc_send_u32(conn, VW_IPC_PAUSE_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
         const char *lroot = NULL; uint16_t lroot_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &lroot, &lroot_len);
         if (err != VW_OK) { ipc_send_u32(conn, VW_IPC_PAUSE_RESP, (uint32_t)err); break; }
         if (lroot_len == 0) {
-            /* Pause all */
+            /* Pause all (within this account) */
             vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
-            vw_cache_folder_list(dc->cache, &folders, &nf);
+            vw_cache_folder_list(a->cache, &folders, &nf);
             for (uint32_t i = 0; i < nf; i++)
-                vw_cache_folder_set_paused(dc->cache, folders[i].local_root, 1);
+                vw_cache_folder_set_paused(a->cache, folders[i].local_root, 1);
             free(folders);
-            dc->paused_all = 1;
         } else {
             char path[512];
             size_t cl = lroot_len < sizeof(path) - 1 ? lroot_len : sizeof(path) - 1;
             memcpy(path, lroot, cl); path[cl] = '\0';
-            vw_cache_folder_set_paused(dc->cache, path, 1);
+            vw_cache_folder_set_paused(a->cache, path, 1);
         }
         ipc_send_u32(conn, VW_IPC_PAUSE_RESP, 0);
         break;
@@ -515,21 +859,24 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
 
     case VW_IPC_RESUME_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_RESUME_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { ipc_send_u32(conn, VW_IPC_RESUME_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
         const char *lroot = NULL; uint16_t lroot_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &lroot, &lroot_len);
         if (err != VW_OK) { ipc_send_u32(conn, VW_IPC_RESUME_RESP, (uint32_t)err); break; }
         if (lroot_len == 0) {
             vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
-            vw_cache_folder_list(dc->cache, &folders, &nf);
+            vw_cache_folder_list(a->cache, &folders, &nf);
             for (uint32_t i = 0; i < nf; i++)
-                vw_cache_folder_set_paused(dc->cache, folders[i].local_root, 0);
+                vw_cache_folder_set_paused(a->cache, folders[i].local_root, 0);
             free(folders);
-            dc->paused_all = 0;
         } else {
             char path[512];
             size_t cl = lroot_len < sizeof(path) - 1 ? lroot_len : sizeof(path) - 1;
             memcpy(path, lroot, cl); path[cl] = '\0';
-            vw_cache_folder_set_paused(dc->cache, path, 0);
+            vw_cache_folder_set_paused(a->cache, path, 0);
         }
         ipc_send_u32(conn, VW_IPC_RESUME_RESP, 0);
         break;
@@ -537,6 +884,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
 
     case VW_IPC_FOLDER_ADD_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_FOLDER_ADD_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { ipc_send_u32(conn, VW_IPC_FOLDER_ADD_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
         const char *lroot = NULL, *vroot = NULL;
         uint16_t ll = 0, vl = 0;
         err = vw_ipc_read_str(buf, plen, &off, &lroot, &ll);
@@ -548,7 +899,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         memcpy(f.local_root, lroot, al); f.local_root[al] = '\0';
         al = vl < sizeof(f.virtual_root)-1 ? vl : sizeof(f.virtual_root)-1;
         memcpy(f.virtual_root, vroot, al); f.virtual_root[al] = '\0';
-        err = vw_cache_folder_add(dc->cache, &f);
+        err = vw_cache_folder_add(a->cache, &f);
         if (err == VW_OK)
             vw_watcher_add(dc->watcher, f.local_root);
         ipc_send_u32(conn, VW_IPC_FOLDER_ADD_RESP, (uint32_t)err);
@@ -556,11 +907,15 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_FOLDER_ADD_SHARED_REQ: {
-        if (!dc->sess) {
+        uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_FOLDER_ADD_SHARED_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { ipc_send_u32(conn, VW_IPC_FOLDER_ADD_SHARED_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
+        if (!a->sess) {
             ipc_send_u32(conn, VW_IPC_FOLDER_ADD_SHARED_RESP, (uint32_t)VW_ERR_AUTH_REQUIRED);
             break;
         }
-        uint32_t off = 0;
         const char *lroot = NULL, *vroot = NULL;
         uint16_t ll = 0, vl = 0;
         err = vw_ipc_read_str(buf, plen, &off, &lroot, &ll);
@@ -576,7 +931,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
          * has at least VIEW access to — checked up front so a bad id fails
          * immediately with a clear error instead of silently never syncing. */
         vw_file_entry_t dir_entry;
-        vw_err_t rc = vw_client_file_stat_by_id(dc->sess, remote_dir_id, &dir_entry);
+        vw_err_t rc = vw_client_file_stat_by_id(a->sess, remote_dir_id, &dir_entry);
         if (rc == VW_OK && dir_entry.entry_type != VW_ENTRY_DIR)
             rc = VW_ERR_INVALID_ARG;
         if (rc == VW_OK) {
@@ -587,7 +942,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             al = vl < sizeof(f.virtual_root)-1 ? vl : sizeof(f.virtual_root)-1;
             memcpy(f.virtual_root, vroot, al); f.virtual_root[al] = '\0';
             f.remote_dir_id = remote_dir_id;
-            rc = vw_cache_folder_add(dc->cache, &f);
+            rc = vw_cache_folder_add(a->cache, &f);
             if (rc == VW_OK)
                 vw_watcher_add(dc->watcher, f.local_root);
         }
@@ -597,6 +952,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
 
     case VW_IPC_FOLDER_REMOVE_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_FOLDER_REMOVE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { ipc_send_u32(conn, VW_IPC_FOLDER_REMOVE_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
         const char *lroot = NULL; uint16_t ll = 0;
         err = vw_ipc_read_str(buf, plen, &off, &lroot, &ll);
         if (err != VW_OK) { ipc_send_u32(conn, VW_IPC_FOLDER_REMOVE_RESP, (uint32_t)err); break; }
@@ -604,14 +963,18 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         size_t cl = ll < sizeof(path)-1 ? ll : sizeof(path)-1;
         memcpy(path, lroot, cl); path[cl] = '\0';
         vw_watcher_remove(dc->watcher, path);
-        err = vw_cache_folder_remove(dc->cache, path);
+        err = vw_cache_folder_remove(a->cache, path);
         ipc_send_u32(conn, VW_IPC_FOLDER_REMOVE_RESP, (uint32_t)err);
         break;
     }
 
     case VW_IPC_FOLDER_LIST_REQ: {
+        if (plen < 4u) { vw_ipc_send(conn, VW_IPC_FOLDER_LIST_RESP, NULL, 0); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { vw_ipc_send(conn, VW_IPC_FOLDER_LIST_RESP, NULL, 0); break; }
         vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
-        (void)vw_cache_folder_list(dc->cache, &folders, &nf);
+        (void)vw_cache_folder_list(a->cache, &folders, &nf);
         /* Encode: u32 count + per-entry (str local_root, str virtual_root,
          * u8 paused, u8 pause_reason [TASK-111], u64 remote_dir_id [TASK-106]) */
         uint8_t rbuf[65536]; uint32_t roff = 0;
@@ -636,13 +999,17 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
 
     case VW_IPC_FILE_LIST_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { vw_ipc_send(conn, VW_IPC_FILE_LIST_RESP, NULL, 0); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { vw_ipc_send(conn, VW_IPC_FILE_LIST_RESP, NULL, 0); break; }
         const char *prefix = NULL; uint16_t pl = 0;
         uint8_t filter = VW_IPC_FILTER_ALL;
         err = vw_ipc_read_str(buf, plen, &off, &prefix, &pl);
         if (err == VW_OK && off < plen) filter = buf[off];
         int state_filter = (filter == VW_IPC_FILTER_ALL) ? -1 : (int)filter;
         vw_cache_entry_t *entries = NULL; uint32_t ne = 0;
-        (void)vw_cache_list(dc->cache, state_filter, &entries, &ne);
+        (void)vw_cache_list(a->cache, state_filter, &entries, &ne);
         uint8_t *rbuf = malloc(65536);
         if (!rbuf) { free(entries); vw_ipc_send(conn, VW_IPC_FILE_LIST_RESP, NULL, 0); break; }
         uint32_t roff = 4; /* count patched in below once the real written count is known */
@@ -687,56 +1054,11 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         *dc->shutdown_flag = 1;
         break;
 
-    case VW_IPC_LOGIN_REQ: {
-        uint32_t off = 0;
-        const char *pw = NULL; uint16_t pw_len = 0;
-        err = vw_ipc_read_str(buf, plen, &off, &pw, &pw_len);
-        const char *otp = NULL; uint16_t otp_len = 0;
-        if (err == VW_OK) err = vw_ipc_read_str(buf, plen, &off, &otp, &otp_len);
-        if (err != VW_OK || pw_len == 0) {
-            ipc_send_u32(conn, VW_IPC_LOGIN_RESP,
-                         (uint32_t)(err != VW_OK ? err : VW_ERR_INVALID_ARG));
-            break;
-        }
-        if (!dc->cfg->server_host[0] || !dc->cfg->username[0]) {
-            ipc_send_u32(conn, VW_IPC_LOGIN_RESP, (uint32_t)VW_ERR_INVALID_ARG);
-            break;
-        }
-
-        vw_client_cfg_t cc;
-        memset(&cc, 0, sizeof(cc));
-        cc.host             = dc->cfg->server_host;
-        cc.port             = dc->cfg->server_port;
-        cc.cert_verify      = VW_CERT_VERIFY_REQUIRED;
-        cc.ca_cert_pem_path = dc->cfg->ca_cert_pem_path[0] ? dc->cfg->ca_cert_pem_path : NULL;
-
-        login_otp_ctx_t octx;
-        octx.otp     = (otp_len > 0) ? otp : NULL;
-        octx.otp_len = otp_len;
-
-        vw_client_sess_t *new_sess = NULL;
-        vw_err_t rc = vw_client_connect(&cc, dc->cfg->username,
-                                         (uint16_t)strlen(dc->cfg->username),
-                                         pw, pw_len,
-                                         login_otp_cb, &octx, &new_sess);
-        if (rc == VW_OK) {
-            if (*dc->sess_out) vw_client_close(*dc->sess_out);
-            *dc->sess_out = new_sess;
-            vw_sync_set_session(dc->sync_ctx, new_sess);
-            uint8_t tok[VW_TOKEN_BYTES];
-            vw_client_get_token(new_sess, tok);
-            /* Best-effort persist; a failed save just means the next daemon
-             * restart falls back to offline mode until login is retried. */
-            (void)tok_save(dc->cfg->state_dir, tok);
-            memset(tok, 0, sizeof(tok));
-            vw_log(LOG_INFO, "login succeeded for user '%s'", dc->cfg->username);
-        }
-        ipc_send_u32(conn, VW_IPC_LOGIN_RESP, (uint32_t)rc);
-        break;
-    }
-
     case VW_IPC_SHARE_GRANT_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_SHARE_GRANT_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *account = account_find(dc->accounts, account_id);
         const char *path = NULL; uint16_t path_len = 0;
         const char *tgt = NULL; uint16_t tgt_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &path, &path_len);
@@ -748,9 +1070,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         } else if (err == VW_OK) {
             err = VW_ERR_PROTO_TRUNCATED;
         }
-        if (err != VW_OK || !dc->sess) {
+        if (err != VW_OK || !account || !account->sess) {
             uint8_t rbuf[12] = {0};
-            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? err : VW_ERR_AUTH_REQUIRED));
+            vw_write_u32le(rbuf, (uint32_t)(!account ? VW_ERR_INVALID_ARG :
+                                             !account->sess ? VW_ERR_AUTH_REQUIRED : err));
             vw_ipc_send(conn, VW_IPC_SHARE_GRANT_RESP, rbuf, sizeof(rbuf));
             break;
         }
@@ -762,10 +1085,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         memcpy(tgt_buf, tgt, tcopy); tgt_buf[tcopy] = '\0';
 
         vw_file_entry_t entry;
-        vw_err_t rc = vw_client_file_stat(dc->sess, path_buf, &entry);
+        vw_err_t rc = vw_client_file_stat(account->sess, path_buf, &entry);
         uint64_t share_id = 0;
         if (rc == VW_OK)
-            rc = vw_client_share_grant(dc->sess, entry.file_id, tgt_buf,
+            rc = vw_client_share_grant(account->sess, entry.file_id, tgt_buf,
                                         (vw_perm_t)permission, expires_at, &share_id);
         uint8_t rbuf[12];
         vw_write_u32le(rbuf, (uint32_t)rc);
@@ -778,29 +1101,34 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     case VW_IPC_LINK_REVOKE_REQ: {
         vw_ipc_msg_t resp_type = (type == VW_IPC_SHARE_REVOKE_REQ)
                                   ? VW_IPC_SHARE_REVOKE_RESP : VW_IPC_LINK_REVOKE_RESP;
-        if (plen < 8u || !dc->sess) {
-            ipc_send_u32(conn, resp_type,
-                         (uint32_t)(!dc->sess ? VW_ERR_AUTH_REQUIRED : VW_ERR_PROTO_TRUNCATED));
+        if (plen < 12u) { ipc_send_u32(conn, resp_type, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            ipc_send_u32(conn, resp_type, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
             break;
         }
-        uint64_t share_id = vw_read_u64le(buf);
+        uint64_t share_id = vw_read_u64le(buf + 4u);
         vw_err_t rc = (type == VW_IPC_SHARE_REVOKE_REQ)
-                      ? vw_client_share_revoke(dc->sess, share_id)
-                      : vw_client_link_revoke(dc->sess, share_id);
+                      ? vw_client_share_revoke(a->sess, share_id)
+                      : vw_client_link_revoke(a->sess, share_id);
         ipc_send_u32(conn, resp_type, (uint32_t)rc);
         break;
     }
 
     case VW_IPC_SHARE_LIST_REQ: {
-        uint8_t mode = (plen >= 1u) ? buf[0] : 0;
-        if (!dc->sess) {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_SHARE_LIST_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        uint8_t mode = (plen >= 5u) ? buf[4] : 0;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
             uint8_t rbuf[8] = {0};
-            vw_write_u32le(rbuf, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
             vw_ipc_send(conn, VW_IPC_SHARE_LIST_RESP, rbuf, sizeof(rbuf));
             break;
         }
         vw_share_entry_t *entries = NULL; uint32_t count = 0;
-        vw_err_t rc = vw_client_share_list(dc->sess, mode, &entries, &count);
+        vw_err_t rc = vw_client_share_list(a->sess, mode, &entries, &count);
         uint8_t *rbuf = malloc(65536);
         if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_SHARE_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
         uint32_t roff = 0;
@@ -829,6 +1157,9 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
 
     case VW_IPC_LINK_CREATE_REQ: {
         uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_LINK_CREATE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
         const char *path = NULL; uint16_t path_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &path, &path_len);
         uint8_t permission = 0; int64_t expires_at = 0;
@@ -838,9 +1169,9 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         } else if (err == VW_OK) {
             err = VW_ERR_PROTO_TRUNCATED;
         }
-        if (err != VW_OK || !dc->sess) {
+        if (err != VW_OK || !a || !a->sess) {
             uint8_t rbuf[44] = {0};
-            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? err : VW_ERR_AUTH_REQUIRED));
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : !a->sess ? VW_ERR_AUTH_REQUIRED : err));
             vw_ipc_send(conn, VW_IPC_LINK_CREATE_RESP, rbuf, sizeof(rbuf));
             break;
         }
@@ -849,11 +1180,11 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         memcpy(path_buf, path, pcopy); path_buf[pcopy] = '\0';
 
         vw_file_entry_t entry;
-        vw_err_t rc = vw_client_file_stat(dc->sess, path_buf, &entry);
+        vw_err_t rc = vw_client_file_stat(a->sess, path_buf, &entry);
         uint64_t share_id = 0;
         uint8_t link_token[32] = {0};
         if (rc == VW_OK)
-            rc = vw_client_link_create(dc->sess, entry.file_id, (vw_perm_t)permission,
+            rc = vw_client_link_create(a->sess, entry.file_id, (vw_perm_t)permission,
                                         expires_at, &share_id, link_token);
         uint8_t rbuf[4u + 8u + 32u];
         vw_write_u32le(rbuf, (uint32_t)rc);
@@ -866,15 +1197,18 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_LINK_LIST_REQ: {
-        uint64_t file_id_filter = (plen >= 8u) ? vw_read_u64le(buf) : 0u;
-        if (!dc->sess) {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_LINK_LIST_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        uint64_t file_id_filter = (plen >= 12u) ? vw_read_u64le(buf + 4u) : 0u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
             uint8_t rbuf[8] = {0};
-            vw_write_u32le(rbuf, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
             vw_ipc_send(conn, VW_IPC_LINK_LIST_RESP, rbuf, sizeof(rbuf));
             break;
         }
         vw_link_entry_t *entries = NULL; uint32_t count = 0;
-        vw_err_t rc = vw_client_link_list(dc->sess, file_id_filter, &entries, &count);
+        vw_err_t rc = vw_client_link_list(a->sess, file_id_filter, &entries, &count);
         uint8_t *rbuf = malloc(65536);
         if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_LINK_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
         uint32_t roff = 0;
@@ -899,14 +1233,20 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_FILE_MKDIR_REQ: {
-        if (plen < 8u || !dc->sess) {
+        if (plen < 12u) {
+            ipc_send_u32(conn, VW_IPC_FILE_MKDIR_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED);
+            break;
+        }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
             uint8_t rbuf[12] = {0};
-            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
             vw_ipc_send(conn, VW_IPC_FILE_MKDIR_RESP, rbuf, sizeof(rbuf));
             break;
         }
-        uint64_t new_parent_dir_id = vw_read_u64le(buf);
-        uint32_t off = 8u;
+        uint64_t new_parent_dir_id = vw_read_u64le(buf + 4u);
+        uint32_t off = 12u;
         const char *name = NULL; uint16_t name_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &name, &name_len);
         char name_buf[256];
@@ -916,7 +1256,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             if (name_len >= sizeof(name_buf)) rc = VW_ERR_INVALID_ARG;
             else {
                 memcpy(name_buf, name, name_len); name_buf[name_len] = '\0';
-                rc = vw_client_file_mkdir(dc->sess, new_parent_dir_id, name_buf, &dir_id);
+                rc = vw_client_file_mkdir(a->sess, new_parent_dir_id, name_buf, &dir_id);
             }
         }
         uint8_t rbuf[12];
@@ -927,14 +1267,20 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_VAULT_CREATE_REQ: {
-        if (plen < 8u || !dc->sess) {
+        if (plen < 12u) {
+            ipc_send_u32(conn, VW_IPC_VAULT_CREATE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED);
+            break;
+        }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
             uint8_t rbuf[12] = {0};
-            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
             vw_ipc_send(conn, VW_IPC_VAULT_CREATE_RESP, rbuf, sizeof(rbuf));
             break;
         }
-        uint64_t folder_file_id = vw_read_u64le(buf);
-        uint32_t off = 8u;
+        uint64_t folder_file_id = vw_read_u64le(buf + 4u);
+        uint32_t off = 12u;
         const char *pass = NULL; uint16_t pass_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &pass, &pass_len);
 
@@ -942,8 +1288,8 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         uint64_t vault_id = 0;
         vw_err_t rc = err;
         if (rc == VW_OK)
-            rc = vw_vault_setup(dc->sess, folder_file_id, pass, pass_len, NULL, &vault, &vault_id);
-        if (rc == VW_OK) rc = vault_registry_put(dc->vaults, vault_id, vault);
+            rc = vw_vault_setup(a->sess, folder_file_id, pass, pass_len, NULL, &vault, &vault_id);
+        if (rc == VW_OK) rc = vault_registry_put(&a->vaults, vault_id, vault);
 
         uint8_t rbuf[12];
         vw_write_u32le(rbuf, (uint32_t)rc);
@@ -953,35 +1299,44 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_VAULT_UNLOCK_REQ: {
-        if (plen < 8u || !dc->sess) {
-            ipc_send_u32(conn, VW_IPC_VAULT_UNLOCK_RESP,
-                         (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+        if (plen < 12u) {
+            ipc_send_u32(conn, VW_IPC_VAULT_UNLOCK_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED);
             break;
         }
-        uint64_t vault_id = vw_read_u64le(buf);
-        uint32_t off = 8u;
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            ipc_send_u32(conn, VW_IPC_VAULT_UNLOCK_RESP,
+                         (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf + 4u);
+        uint32_t off = 12u;
         const char *pass = NULL; uint16_t pass_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &pass, &pass_len);
 
         vw_vault_t *vault = NULL;
         vw_err_t rc = err;
         if (rc == VW_OK)
-            rc = vw_vault_unlock(dc->sess, vault_id, pass, pass_len, &vault);
-        if (rc == VW_OK) rc = vault_registry_put(dc->vaults, vault_id, vault);
+            rc = vw_vault_unlock(a->sess, vault_id, pass, pass_len, &vault);
+        if (rc == VW_OK) rc = vault_registry_put(&a->vaults, vault_id, vault);
 
         ipc_send_u32(conn, VW_IPC_VAULT_UNLOCK_RESP, (uint32_t)rc);
         break;
     }
 
     case VW_IPC_VAULT_LIST_REQ: {
-        if (!dc->sess) {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_VAULT_LIST_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
             uint8_t rbuf[8] = {0};
-            vw_write_u32le(rbuf, (uint32_t)VW_ERR_AUTH_REQUIRED);
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
             vw_ipc_send(conn, VW_IPC_VAULT_LIST_RESP, rbuf, sizeof(rbuf));
             break;
         }
         vw_vault_entry_t *entries = NULL; uint32_t count = 0;
-        vw_err_t rc = vw_client_vault_list(dc->sess, &entries, &count);
+        vw_err_t rc = vw_client_vault_list(a->sess, &entries, &count);
         uint8_t *rbuf = malloc(8u + (size_t)count * 24u);
         if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_VAULT_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
         uint32_t roff = 0;
@@ -1001,15 +1356,23 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_VAULT_UPLOAD_REQ: {
-        if (plen < 16u || !dc->sess) {
+        if (plen < 20u) {
             uint8_t rbuf[20] = {0};
-            vw_write_u32le(rbuf, (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_PROTO_TRUNCATED);
             vw_ipc_send(conn, VW_IPC_VAULT_UPLOAD_RESP, rbuf, sizeof(rbuf));
             break;
         }
-        uint64_t vault_id = vw_read_u64le(buf);
-        uint64_t file_id  = vw_read_u64le(buf + 8u);
-        uint32_t off = 16u;
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            uint8_t rbuf[20] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_VAULT_UPLOAD_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf + 4u);
+        uint64_t file_id  = vw_read_u64le(buf + 12u);
+        uint32_t off = 20u;
         const char *leaf = NULL; uint16_t leaf_len = 0;
         const char *lpath = NULL; uint16_t lpath_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &leaf, &leaf_len);
@@ -1018,14 +1381,14 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         char leaf_buf[256], lpath_buf[1024];
         uint64_t out_file_id = 0, out_version_id = 0;
         vw_err_t rc = err;
-        vw_vault_t *vault = (rc == VW_OK) ? vault_registry_find(dc->vaults, vault_id) : NULL;
+        vw_vault_t *vault = (rc == VW_OK) ? vault_registry_find(&a->vaults, vault_id) : NULL;
         if (rc == VW_OK && !vault) rc = VW_ERR_AUTH_REQUIRED;
         if (rc == VW_OK && (leaf_len >= sizeof(leaf_buf) || lpath_len >= sizeof(lpath_buf)))
             rc = VW_ERR_INVALID_ARG;
         if (rc == VW_OK) {
             memcpy(leaf_buf, leaf, leaf_len); leaf_buf[leaf_len] = '\0';
             memcpy(lpath_buf, lpath, lpath_len); lpath_buf[lpath_len] = '\0';
-            rc = vw_vault_upload_file(vault, dc->sess, file_id,
+            rc = vw_vault_upload_file(vault, a->sess, file_id,
                                        file_id == 0 ? leaf_buf : NULL, lpath_buf,
                                        NULL, NULL, &out_file_id, &out_version_id);
         }
@@ -1038,25 +1401,31 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
     }
 
     case VW_IPC_VAULT_DOWNLOAD_REQ: {
-        if (plen < 16u || !dc->sess) {
-            ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP,
-                         (uint32_t)(dc->sess ? VW_ERR_PROTO_TRUNCATED : VW_ERR_AUTH_REQUIRED));
+        if (plen < 20u) {
+            ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED);
             break;
         }
-        uint64_t vault_id = vw_read_u64le(buf);
-        uint64_t file_id  = vw_read_u64le(buf + 8u);
-        uint32_t off = 16u;
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP,
+                         (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf + 4u);
+        uint64_t file_id  = vw_read_u64le(buf + 12u);
+        uint32_t off = 20u;
         const char *lpath = NULL; uint16_t lpath_len = 0;
         err = vw_ipc_read_str(buf, plen, &off, &lpath, &lpath_len);
 
         char lpath_buf[1024];
         vw_err_t rc = err;
-        vw_vault_t *vault = (rc == VW_OK) ? vault_registry_find(dc->vaults, vault_id) : NULL;
+        vw_vault_t *vault = (rc == VW_OK) ? vault_registry_find(&a->vaults, vault_id) : NULL;
         if (rc == VW_OK && !vault) rc = VW_ERR_AUTH_REQUIRED;
         if (rc == VW_OK && lpath_len >= sizeof(lpath_buf)) rc = VW_ERR_INVALID_ARG;
         if (rc == VW_OK) {
             memcpy(lpath_buf, lpath, lpath_len); lpath_buf[lpath_len] = '\0';
-            rc = vw_vault_download_file(vault, dc->sess, file_id, lpath_buf, NULL, NULL);
+            rc = vw_vault_download_file(vault, a->sess, file_id, lpath_buf, NULL, NULL);
         }
         ipc_send_u32(conn, VW_IPC_VAULT_DOWNLOAD_RESP, (uint32_t)rc);
         break;
@@ -1066,40 +1435,114 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break; /* unknown message: ignore */
     }
 
-    /* buf may have held a raw password (LOGIN_REQ) — zero it unconditionally,
-     * matching the admin IPC's payload-zeroing convention. */
+    /* buf may have held a raw password (ACCOUNT_ADD_REQ) — zero it
+     * unconditionally, matching the admin IPC's payload-zeroing convention. */
     memset(buf, 0, sizeof(buf));
 }
 
 /* ── Connection attempt ──────────────────────────────────────────────────── */
 
-static vw_client_sess_t *try_connect(const vw_daemon_cfg_t *cfg,
-                                      const char *state_dir) {
-    if (!cfg->server_host[0]) return NULL;
+static vw_client_sess_t *try_connect(const vw_account_cfg_t *acfg,
+                                      const char *account_dir) {
+    if (!acfg->server_host[0]) return NULL;
 
     vw_client_cfg_t cc;
     memset(&cc, 0, sizeof(cc));
-    cc.host         = cfg->server_host;
-    cc.port         = cfg->server_port;
+    cc.host         = acfg->server_host;
+    cc.port         = acfg->server_port;
     cc.cert_verify      = VW_CERT_VERIFY_REQUIRED;
-    cc.ca_cert_pem_path = cfg->ca_cert_pem_path[0] ? cfg->ca_cert_pem_path : NULL;
+    cc.ca_cert_pem_path = acfg->ca_cert_pem_path[0] ? acfg->ca_cert_pem_path : NULL;
 
     /* Try session token resume first */
     uint8_t tok[VW_TOKEN_BYTES];
-    if (tok_load(state_dir, tok) == VW_OK) {
+    if (tok_load(account_dir, tok) == VW_OK) {
         vw_client_sess_t *sess = NULL;
         if (vw_client_resume(&cc, tok, &sess) == VW_OK) {
-            vw_log(LOG_INFO, "session resumed");
+            vw_log(LOG_INFO, "session resumed for account '%s'", acfg->username);
             /* Persist fresh token */
             vw_client_get_token(sess, tok);
-            tok_save(state_dir, tok);
+            tok_save(account_dir, tok);
             return sess;
         }
-        vw_log(LOG_WARN, "session resume failed, continuing offline");
+        vw_log(LOG_WARN, "session resume failed for account '%s', continuing offline", acfg->username);
     }
 
     /* No valid token: offline mode */
     return NULL;
+}
+
+/* Opens (or reopens, at startup) one account's context from its already-
+ * existing accounts/<account_id>/ subtree: loads account.conf, opens its
+ * cache + sync context, and attempts a token resume. Returns VW_OK with
+ * *out populated (sess may be NULL — offline) on success. */
+static vw_err_t account_ctx_open_existing(const char *account_dir, uint32_t account_id,
+                                            vw_account_ctx_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->account_id = account_id;
+    snprintf(out->account_dir, sizeof(out->account_dir), "%s", account_dir);
+
+    vw_err_t err = account_cfg_load(account_dir, &out->cfg);
+    if (err != VW_OK) return err;
+
+    err = vw_cache_open(account_dir, &out->cache);
+    if (err != VW_OK) return err;
+
+    out->sess = try_connect(&out->cfg, account_dir);
+
+    vw_sync_cfg_t sc;
+    sc.sess = out->sess; sc.cache = out->cache; sc.state_dir = account_dir;
+    err = vw_sync_open(&sc, &out->sync_ctx);
+    if (err != VW_OK) {
+        if (out->sess) vw_client_close(out->sess);
+        vw_cache_close(out->cache);
+        return err;
+    }
+    return VW_OK;
+}
+
+/* Scans {state_dir}/accounts/ for existing account_id subdirectories and
+ * opens each one via account_ctx_open_existing, populating reg. A
+ * subdirectory whose name isn't a plain decimal number, or that fails to
+ * open (corrupt/incomplete — e.g. missing account.conf), is skipped with a
+ * warning rather than aborting the whole daemon startup: one bad account
+ * must not take every other configured account offline. */
+typedef struct { const char *state_dir; account_registry_t *reg; } scan_ud_t;
+
+static int scan_accounts_cb(const char *name, void *userdata) {
+    scan_ud_t *ud = (scan_ud_t *)userdata;
+    char *endp = NULL;
+    unsigned long id_ul = strtoul(name, &endp, 10);
+    if (!endp || *endp != '\0' || id_ul == 0) return 0; /* not a plain number, or 0 (invalid) */
+    uint32_t account_id = (uint32_t)id_ul;
+
+    char account_dir[600];
+    snprintf(account_dir, sizeof(account_dir), "%s/%s/%s", ud->state_dir, ACCOUNTS_DIR, name);
+
+    vw_account_ctx_t tmp;
+    vw_err_t err = account_ctx_open_existing(account_dir, account_id, &tmp);
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "skipping unreadable account dir '%s': %d", account_dir, (int)err);
+        return 0;
+    }
+    vw_account_ctx_t *slot = account_add_slot(ud->reg);
+    if (!slot) {
+        vw_log(LOG_ERROR, "OOM adding account slot for '%s'", account_dir);
+        if (tmp.sess) vw_client_close(tmp.sess);
+        vw_sync_close(tmp.sync_ctx);
+        vw_cache_close(tmp.cache);
+        return 0;
+    }
+    *slot = tmp;
+    if (account_id >= ud->reg->next_account_id) ud->reg->next_account_id = account_id + 1;
+    return 0;
+}
+
+static void account_registry_scan(const char *state_dir, account_registry_t *reg) {
+    char accounts_root[600];
+    snprintf(accounts_root, sizeof(accounts_root), "%s/%s", state_dir, ACCOUNTS_DIR);
+    vw_fs_ensure_dir(accounts_root);
+    scan_ud_t ud = { state_dir, reg };
+    (void)vw_fs_list_dir(accounts_root, scan_accounts_cb, &ud);
 }
 
 /* ── Main event loop ─────────────────────────────────────────────────────── */
@@ -1141,84 +1584,78 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
         return err;
     }
 
-    /* 1. Open cache */
-    vw_cache_t *cache = NULL;
-    err = vw_cache_open(cfg->state_dir, &cache);
-    if (err != VW_OK) { vw_log(LOG_ERROR, "vw_cache_open failed: %d", (int)err); return err; }
+    /* 1. Scan and open every already-configured account (TASK-161) */
+    account_registry_t accounts = {0};
+    accounts.next_account_id = 1; /* 0 is reserved for "create new" in ACCOUNT_ADD_REQ */
+    account_registry_scan(cfg->state_dir, &accounts);
+    vw_log(LOG_INFO, "loaded %zu configured account(s)", accounts.count);
 
     /* 2. Open IPC server */
     vw_ipc_server_t *ipc_srv = NULL;
     err = vw_ipc_server_open(cfg->ipc_port, &ipc_srv);
     if (err != VW_OK) {
         vw_log(LOG_ERROR, "cannot bind IPC port %u", (unsigned)cfg->ipc_port);
-        vw_cache_close(cache); return err;
+        for (size_t i = 0; i < accounts.count; i++) {
+            vw_account_ctx_t *a = &accounts.accounts[i];
+            vw_sync_close(a->sync_ctx);
+            if (a->sess) vw_client_close(a->sess);
+            vw_cache_close(a->cache);
+        }
+        free(accounts.accounts);
+        return err;
     }
 
     /* 3. Write PID file (after IPC bind confirms we're not a duplicate) */
     err = pid_file_create(cfg->state_dir);
     if (err != VW_OK) {
-        vw_ipc_server_close(ipc_srv); vw_cache_close(cache); return err;
+        vw_ipc_server_close(ipc_srv);
+        for (size_t i = 0; i < accounts.count; i++) {
+            vw_account_ctx_t *a = &accounts.accounts[i];
+            vw_sync_close(a->sync_ctx);
+            if (a->sess) vw_client_close(a->sess);
+            vw_cache_close(a->cache);
+        }
+        free(accounts.accounts);
+        return err;
     }
 
-    /* 4. Open watcher */
+    /* 4. Open one shared watcher and add every account's sync folders to it.
+     * A single watcher across all accounts is safe: vw_sync_mark_local_
+     * modified() (step 6 below) already self-scopes to whichever account's
+     * own registered folders a given path falls under (it walks that
+     * account's own vw_cache_folder_list and no-ops if nothing matches) —
+     * see vw_sync.c. There is no need to track which account owns which
+     * local_root at this layer. */
     vw_watcher_t *watcher = NULL;
     err = vw_watcher_open(1024, &watcher);
     if (err != VW_OK) {
         vw_log(LOG_WARN, "watcher init failed (%d), continuing without watch", (int)err);
         watcher = NULL;
     }
-
-    /* 5. Add configured sync folders to watcher */
     if (watcher) {
-        vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
-        vw_cache_folder_list(cache, &folders, &nf);
-        for (uint32_t i = 0; i < nf; i++)
-            vw_watcher_add(watcher, folders[i].local_root);
-        free(folders);
+        for (size_t i = 0; i < accounts.count; i++) {
+            vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
+            vw_cache_folder_list(accounts.accounts[i].cache, &folders, &nf);
+            for (uint32_t j = 0; j < nf; j++)
+                vw_watcher_add(watcher, folders[j].local_root);
+            free(folders);
+        }
     }
 
-    /* 6. Attempt server connection */
-    vw_client_sess_t *sess = try_connect(cfg, cfg->state_dir);
-    if (!sess) vw_log(LOG_INFO, "starting in offline mode");
-
-    /* 7. Open sync context */
-    vw_sync_ctx_t *sync_ctx = NULL;
-    vw_sync_cfg_t sc;
-    sc.sess      = sess;
-    sc.cache     = cache;
-    sc.state_dir = cfg->state_dir;
-    err = vw_sync_open(&sc, &sync_ctx);
-    if (err != VW_OK) {
-        vw_log(LOG_ERROR, "vw_sync_open failed: %d", (int)err);
-        if (sess) vw_client_logout(sess);
-        vw_watcher_close(watcher);
-        vw_ipc_server_close(ipc_srv);
-        vw_cache_close(cache);
-        pid_file_remove();
-        return err;
-    }
+    if (accounts.count == 0)
+        vw_log(LOG_INFO, "no accounts configured yet — waiting for VW_IPC_ACCOUNT_ADD_REQ");
 
     /* ── Main loop ──────────────────────────────────────────────────────── */
 
     int sync_now = 0;
     int shutdown  = 0;
-    int64_t last_sync_at = 0;
-    uint32_t error_count  = 0;
-    daemon_vault_registry_t vault_registry = {0};
 
     ipc_dispatch_ctx_t dc;
-    dc.cache         = cache;
-    dc.sync_ctx      = sync_ctx;
+    dc.accounts      = &accounts;
     dc.watcher       = watcher;
-    dc.sess          = sess;
-    dc.paused_all    = 0;
-    dc.last_sync_at  = 0;
-    dc.error_count   = 0;
     dc.sync_now_flag = &sync_now;
     dc.shutdown_flag = &shutdown;
-    dc.cfg           = cfg;
-    dc.sess_out      = &sess;
-    dc.vaults        = &vault_registry;
+    dc.state_dir     = cfg->state_dir;
 
     vw_log(LOG_INFO, "daemon ready (ipc_port=%u sync_interval=%ums)",
            (unsigned)cfg->ipc_port, (unsigned)cfg->sync_interval_ms);
@@ -1240,10 +1677,13 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
                 if (evts[i].type == VW_WATCH_CREATED ||
                     evts[i].type == VW_WATCH_MODIFIED ||
                     evts[i].type == VW_WATCH_MOVED) {
-                    vw_sync_mark_local_modified(sync_ctx, evts[i].path);
-                    if (evts[i].type == VW_WATCH_MOVED && evts[i].old_path[0]) {
-                        /* old_path was deleted */
-                        vw_sync_mark_local_modified(sync_ctx, evts[i].old_path);
+                    for (size_t j = 0; j < accounts.count; j++) {
+                        vw_sync_ctx_t *sc2 = accounts.accounts[j].sync_ctx;
+                        vw_sync_mark_local_modified(sc2, evts[i].path);
+                        if (evts[i].type == VW_WATCH_MOVED && evts[i].old_path[0]) {
+                            /* old_path was deleted */
+                            vw_sync_mark_local_modified(sc2, evts[i].old_path);
+                        }
                     }
                 }
                 /* DELETED events: next sync walk will detect the missing file */
@@ -1264,9 +1704,6 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
         {
             vw_ipc_conn_t *client = NULL;
             while (vw_ipc_server_try_accept(ipc_srv, &client) == VW_OK) {
-                dc.sess         = sess;
-                dc.last_sync_at = last_sync_at;
-                dc.error_count  = error_count;
                 handle_ipc_client(client, &dc);
                 vw_ipc_conn_close(client);
                 client = NULL;
@@ -1276,59 +1713,63 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
 
         if (shutdown || g_shutdown) break;
 
-        /* e. Reconnect if session is absent or expired */
-        if (!sess) {
-            sess = try_connect(cfg, cfg->state_dir);
-            if (sess) {
-                vw_sync_set_session(sync_ctx, sess);
-                vw_log(LOG_INFO, "reconnected to server");
-            }
-        } else {
-            /* Check if session has expired */
-            int64_t exp = vw_client_expires_at_of(sess);
-            if (exp > 0 && (int64_t)time(NULL) >= exp) {
-                vw_log(LOG_INFO, "session expired, re-connecting");
-                vw_client_close(sess); sess = NULL;
-                vw_sync_set_session(sync_ctx, NULL);
-                sess = try_connect(cfg, cfg->state_dir);
-                if (sess) vw_sync_set_session(sync_ctx, sess);
-            }
-        }
+        /* d. Round-robin one sync cycle per account (TASK-161) — every
+         * configured account keeps syncing every tick regardless of which
+         * one, if any, a connected GUI/CLI happens to be querying right
+         * now. Reconnect-if-needed is per account too. */
+        for (size_t i = 0; i < accounts.count; i++) {
+            vw_account_ctx_t *a = &accounts.accounts[i];
 
-        /* f. Sync cycle */
-        error_count = 0;
-        vw_err_t serr = vw_sync_run(sync_ctx);
-        if (serr == VW_OK) {
-            last_sync_at = (int64_t)time(NULL);
-            vw_log(LOG_DEBUG, "sync cycle complete (pending=%u)",
-                   (unsigned)vw_sync_pending_count(sync_ctx));
-        } else {
-            error_count++;
-            vw_log(LOG_WARN, "sync cycle error: %d", (int)serr);
-            if (serr == VW_ERR_NET_CLOSED || serr == VW_ERR_NET_TIMEOUT) {
-                /* Session may be dead */
-                if (sess) {
-                    vw_client_close(sess); sess = NULL;
-                    vw_sync_set_session(sync_ctx, NULL);
+            if (!a->sess) {
+                a->sess = try_connect(&a->cfg, a->account_dir);
+                if (a->sess) {
+                    vw_sync_set_session(a->sync_ctx, a->sess);
+                    vw_log(LOG_INFO, "reconnected account '%s'", a->cfg.username);
+                }
+            } else {
+                int64_t exp = vw_client_expires_at_of(a->sess);
+                if (exp > 0 && (int64_t)time(NULL) >= exp) {
+                    vw_log(LOG_INFO, "session expired for account '%s', re-connecting", a->cfg.username);
+                    vw_client_close(a->sess); a->sess = NULL;
+                    vw_sync_set_session(a->sync_ctx, NULL);
+                    a->sess = try_connect(&a->cfg, a->account_dir);
+                    if (a->sess) vw_sync_set_session(a->sync_ctx, a->sess);
                 }
             }
-        }
-        /* TASK-112: fold in per-action failures (e.g. quota rejections)
-         * that vw_sync_run itself treats as non-fatal for the cycle — these
-         * were previously invisible to status entirely. */
-        uint32_t action_errs = vw_sync_action_error_count(sync_ctx);
-        if (action_errs > 0)
-            vw_log(LOG_WARN, "sync cycle had %u action error(s)", (unsigned)action_errs);
-        error_count += action_errs;
 
-        /* TASK-113: logged distinctly, and NOT folded into error_count —
-         * status reports it as its own field so a permission problem
-         * doesn't look like every other kind of action failure. */
-        uint32_t perm_denied = vw_sync_permission_denied_count(sync_ctx);
-        if (perm_denied > 0)
-            vw_log(LOG_WARN,
-                   "sync cycle had %u permission-denied shared-folder mkdir attempt(s)",
-                   (unsigned)perm_denied);
+            a->error_count = 0;
+            vw_err_t serr = vw_sync_run(a->sync_ctx);
+            if (serr == VW_OK) {
+                a->last_sync_at = (int64_t)time(NULL);
+                vw_log(LOG_DEBUG, "sync cycle complete for '%s' (pending=%u)",
+                       a->cfg.username, (unsigned)vw_sync_pending_count(a->sync_ctx));
+            } else {
+                a->error_count++;
+                vw_log(LOG_WARN, "sync cycle error for '%s': %d", a->cfg.username, (int)serr);
+                if (serr == VW_ERR_NET_CLOSED || serr == VW_ERR_NET_TIMEOUT) {
+                    if (a->sess) {
+                        vw_client_close(a->sess); a->sess = NULL;
+                        vw_sync_set_session(a->sync_ctx, NULL);
+                    }
+                }
+            }
+            /* TASK-112: fold in per-action failures (e.g. quota rejections)
+             * that vw_sync_run itself treats as non-fatal for the cycle. */
+            uint32_t action_errs = vw_sync_action_error_count(a->sync_ctx);
+            if (action_errs > 0)
+                vw_log(LOG_WARN, "sync cycle for '%s' had %u action error(s)",
+                       a->cfg.username, (unsigned)action_errs);
+            a->error_count += action_errs;
+
+            /* TASK-113: logged distinctly, and NOT folded into error_count —
+             * status reports it as its own field so a permission problem
+             * doesn't look like every other kind of action failure. */
+            uint32_t perm_denied = vw_sync_permission_denied_count(a->sync_ctx);
+            if (perm_denied > 0)
+                vw_log(LOG_WARN,
+                       "sync cycle for '%s' had %u permission-denied shared-folder mkdir attempt(s)",
+                       a->cfg.username, (unsigned)perm_denied);
+        }
 
         sync_now = 0;
     }
@@ -1336,12 +1777,16 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     /* ── Shutdown ───────────────────────────────────────────────────────── */
     vw_log(LOG_INFO, "shutting down");
 
-    vault_registry_close_all(&vault_registry);
-    vw_sync_close(sync_ctx);
-    if (sess) vw_client_logout(sess);
+    for (size_t i = 0; i < accounts.count; i++) {
+        vw_account_ctx_t *a = &accounts.accounts[i];
+        vault_registry_close_all(&a->vaults);
+        vw_sync_close(a->sync_ctx);
+        if (a->sess) vw_client_logout(a->sess);
+        vw_cache_close(a->cache);
+    }
+    free(accounts.accounts);
     vw_watcher_close(watcher);
     vw_ipc_server_close(ipc_srv);
-    vw_cache_close(cache);
     pid_file_remove();
     vw_crypto_cleanup();
 

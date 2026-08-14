@@ -224,6 +224,14 @@ static void refresh(ClientApp &app) {
     s_needs_refresh = false;
 }
 
+void vw_view_browser_invalidate() {
+    s_needs_refresh = true;
+    s_current_path = "/";
+    s_entries.clear();
+    s_shared_file_ids.clear();
+    s_vault_ids.clear();
+}
+
 static void navigate_up() {
     if (s_current_path == "/") return;
     size_t pos = s_current_path.find_last_of('/');
