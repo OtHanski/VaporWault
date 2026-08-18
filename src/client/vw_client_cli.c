@@ -118,6 +118,7 @@ typedef struct {
     char     username[64];
     char     server_host[256];
     uint8_t  connected;
+    uint8_t  conn_mode; /* TASK-173/174: 0=offline, 1=primary, 2=fallback (read-only) */
 } account_list_entry_t;
 
 /*
@@ -153,6 +154,12 @@ static int fetch_account_list(vw_ipc_conn_t *conn, account_list_entry_t *out, in
         if (off + 1u + 8u > rlen) break;
         uint8_t connected = resp[off]; off += 1u;
         off += 8u; /* pending_uploads (u32) + pending_downloads (u32) */
+        /* TASK-173/174: trailing conn_mode byte (0=offline, 1=primary,
+         * 2=fallback) — must always be consumed, or every subsequent
+         * entry's offset desyncs by one byte per account already seen. */
+        uint8_t conn_mode = 0;
+        if (off + 1u > rlen) break;
+        conn_mode = resp[off]; off += 1u;
         if (written < cap) {
             account_list_entry_t *e = &out[written];
             e->account_id = acc_id;
@@ -164,6 +171,7 @@ static int fetch_account_list(vw_ipc_conn_t *conn, account_list_entry_t *out, in
             cl = host_len < sizeof(e->server_host)-1u ? host_len : sizeof(e->server_host)-1u;
             memcpy(e->server_host, host, cl); e->server_host[cl] = '\0';
             e->connected = connected;
+            e->conn_mode = conn_mode;
         }
         written++;
     }
@@ -171,11 +179,15 @@ static int fetch_account_list(vw_ipc_conn_t *conn, account_list_entry_t *out, in
     return written;
 }
 
+/* Defined below with cmd_account_list; forward-declared here since this
+ * hint function is used earlier in the file (resolve_account_id). */
+static const char *conn_mode_str(uint8_t conn_mode);
+
 static void print_account_list_hint(const account_list_entry_t *accts, int n) {
     for (int i = 0; i < n; i++) {
         fprintf(stderr, "    id=%u  label=%s  username=%s  server=%s  %s\n",
                 (unsigned)accts[i].account_id, accts[i].label, accts[i].username,
-                accts[i].server_host, accts[i].connected ? "connected" : "offline");
+                accts[i].server_host, conn_mode_str(accts[i].conn_mode));
     }
 }
 
@@ -273,6 +285,8 @@ static int cmd_status(vw_ipc_conn_t *conn) {
     uint32_t downloads  = vw_read_u32le(resp + 16);
     uint32_t errors     = vw_read_u32le(resp + 20);
     uint32_t perm_denied = (rlen >= 28) ? vw_read_u32le(resp + 24) : 0;
+    /* TASK-173: trailing byte, same append convention as perm_denied above. */
+    uint8_t  any_on_fallback = (rlen >= 29) ? resp[28] : 0;
 
     char ts_buf[32];
     format_ts(last_sync, ts_buf, sizeof(ts_buf), 1);
@@ -285,6 +299,9 @@ static int cmd_status(vw_ipc_conn_t *conn) {
     printf("  Pending:   %u uploads, %u downloads, %u errors\n",
            uploads, downloads, errors);
     printf("  Permission-denied (shared-folder auto-mkdir): %u\n", perm_denied);
+    if (any_on_fallback)
+        printf("  NOTE: at least one account is on its read-only fallback "
+               "right now — run `account list` for details.\n");
     return 0;
 }
 
@@ -580,15 +597,18 @@ static int cmd_ls(vw_ipc_conn_t *conn, uint32_t account_id, const char *prefix, 
  */
 static int cmd_account_add(vw_ipc_conn_t *conn, const char *server_host, uint16_t server_port,
                             const char *ca_cert_path, const char *label,
-                            const char *username, const char *password, const char *otp) {
+                            const char *username, const char *password, const char *otp,
+                            const char *fallback_host, uint16_t fallback_port,
+                            const char *fallback_ca_cert_path) {
     /* Worst case: 4 (account_id) + (2+63) label + (2+255) host + 2 (port) +
      * (2+511) ca_cert_path + (2+63) username + (2+255) password +
-     * (2+16) otp = 1181 bytes — sized with headroom, and every
-     * vw_ipc_write_str call below is still checked rather than trusted,
-     * since a silently-skipped write (VW_ERR_PROTO_TOO_LARGE) would
-     * desync every field after it into the wrong byte offset instead of
-     * just failing cleanly. */
-    uint8_t payload[1536];
+     * (2+16) otp + (2+255) fallback_host + 2 (fallback_port) +
+     * (2+511) fallback_ca_cert_path = 1954 bytes — sized with headroom, and
+     * every vw_ipc_write_str call below is still checked rather than
+     * trusted, since a silently-skipped write (VW_ERR_PROTO_TOO_LARGE)
+     * would desync every field after it into the wrong byte offset instead
+     * of just failing cleanly. */
+    uint8_t payload[2048];
     uint32_t off = 0;
     vw_write_u32le(payload + off, 0u); off += 4u; /* account_id: 0 = new account */
     const char *lbl = (label && label[0]) ? label : username;
@@ -610,6 +630,25 @@ static int cmd_account_add(vw_ipc_conn_t *conn, const char *server_host, uint16_
     const char *o = otp ? otp : "";
     if (werr == VW_OK)
         werr = vw_ipc_write_str(payload, sizeof(payload), &off, o, (uint16_t)strnlen(o, 16));
+
+    /* TASK-174: optional trailing fallback fields — omitted entirely (not
+     * sent as empty strings) when the caller supplied none, so a
+     * re-authentication that doesn't repeat --fallback-* leaves whatever
+     * fallback config already exists untouched (vw_daemon.c's own
+     * "absent means leave as-is" contract, see TASK-173). */
+    if (werr == VW_OK && fallback_host && fallback_host[0]) {
+        werr = vw_ipc_write_str(payload, sizeof(payload), &off,
+                                 fallback_host, (uint16_t)strnlen(fallback_host, 255));
+        if (werr == VW_OK && off + 2u <= sizeof(payload)) {
+            vw_write_u16le(payload + off, fallback_port); off += 2u;
+        } else if (werr == VW_OK) {
+            werr = VW_ERR_PROTO_TOO_LARGE;
+        }
+        const char *fca = fallback_ca_cert_path ? fallback_ca_cert_path : "";
+        if (werr == VW_OK)
+            werr = vw_ipc_write_str(payload, sizeof(payload), &off, fca,
+                                     (uint16_t)strnlen(fca, 511));
+    }
 
     if (werr != VW_OK) {
         memset(payload, 0, sizeof(payload));
@@ -637,12 +676,26 @@ static int cmd_account_add(vw_ipc_conn_t *conn, const char *server_host, uint16_
         return 1;
     }
     uint32_t account_id = vw_read_u32le(resp + 4u);
-    printf("account added: id=%u label=%s username=%s server=%s:%u\n",
-           (unsigned)account_id, lbl, username, server_host, (unsigned)server_port);
+    if (fallback_host && fallback_host[0])
+        printf("account added: id=%u label=%s username=%s server=%s:%u fallback=%s:%u\n",
+               (unsigned)account_id, lbl, username, server_host, (unsigned)server_port,
+               fallback_host, (unsigned)fallback_port);
+    else
+        printf("account added: id=%u label=%s username=%s server=%s:%u\n",
+               (unsigned)account_id, lbl, username, server_host, (unsigned)server_port);
     return 0;
 }
 
 /* ACCOUNT_LIST_REQ: no payload. Reuses fetch_account_list()'s decode. */
+/* TASK-173/174: matches vw_account_conn_mode_t in vw_daemon.c. */
+static const char *conn_mode_str(uint8_t conn_mode) {
+    switch (conn_mode) {
+    case 1:  return "primary";
+    case 2:  return "fallback (read-only)";
+    default: return "offline";
+    }
+}
+
 static int cmd_account_list(vw_ipc_conn_t *conn) {
     account_list_entry_t accts[64];
     int n = fetch_account_list(conn, accts, 64);
@@ -652,7 +705,7 @@ static int cmd_account_list(vw_ipc_conn_t *conn) {
     for (int i = 0; i < n && i < 64; i++) {
         printf("%-4u  %-16s  %-20s  %-24s  %s\n",
                (unsigned)accts[i].account_id, accts[i].label, accts[i].username,
-               accts[i].server_host, accts[i].connected ? "connected" : "offline");
+               accts[i].server_host, conn_mode_str(accts[i].conn_mode));
     }
     if (n > 64) fprintf(stderr, "(%d more accounts not shown)\n", n - 64);
     return 0;
@@ -882,14 +935,22 @@ static void print_usage(const char *prog) {
         "each independently configured against its own server; see \"account add\"):\n"
         "  account add <host> <port> <username> <password|-|--stdin-password>\n"
         "              [otp-code] [--label <name>] [--ca-cert <path>]\n"
+        "              [--fallback-host <host>] [--fallback-port <port>]\n"
+        "              [--fallback-ca-cert <path>]\n"
         "                                Add (or re-authenticate) an account. label\n"
         "                                defaults to <username>. Adding a second\n"
         "                                account against a different server is the\n"
         "                                normal way to use two unrelated self-hosted\n"
         "                                networks (e.g. family + friends) from one\n"
         "                                client — just give it a different host.\n"
+        "                                --fallback-host/--fallback-port (TASK-173)\n"
+        "                                configure an optional read-only replica the\n"
+        "                                daemon automatically connects to if the\n"
+        "                                primary becomes unreachable; both required\n"
+        "                                together, --fallback-ca-cert optional.\n"
         "  account list                  List configured accounts (id, label,\n"
-        "                                username, server, connected)\n"
+        "                                username, server, connection state:\n"
+        "                                primary / fallback (read-only) / offline)\n"
         "  account remove <label-or-id>  Log out and forget an account (local\n"
         "                                cache deleted; already-synced files on\n"
         "                                disk are untouched)\n"
@@ -1121,7 +1182,13 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
                     "Usage: %s account add <host> <port> <username> "
                     "<password|-|--stdin-password> [otp-code] "
                     "[--label <name>] [--ca-cert <path>]\n"
-                    "  Pass '-' or '--stdin-password' to read the password from stdin.\n",
+                    "  [--fallback-host <host>] [--fallback-port <port>] "
+                    "[--fallback-ca-cert <path>]\n"
+                    "  Pass '-' or '--stdin-password' to read the password from stdin.\n"
+                    "  --fallback-host and --fallback-port must be given together\n"
+                    "  (--fallback-ca-cert is optional, like --ca-cert for the primary).\n"
+                    "  Omit all fallback flags on a re-authentication to leave an\n"
+                    "  already-configured fallback untouched.\n",
                     argv[0]);
                 return 1;
             }
@@ -1132,6 +1199,9 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
             const char *otp      = NULL;
             const char *label    = NULL;
             const char *ca_cert  = NULL;
+            const char *fb_host  = NULL;
+            const char *fb_port_str = NULL;
+            const char *fb_ca    = NULL;
 
             /* otp is the next bare token, if any, before the --flags start. */
             if (argi < argc && strncmp(argv[argi], "--", 2) != 0) {
@@ -1142,11 +1212,30 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
                     label = argv[argi + 1]; argi += 2;
                 } else if (strcmp(argv[argi], "--ca-cert") == 0 && argi + 1 < argc) {
                     ca_cert = argv[argi + 1]; argi += 2;
+                } else if (strcmp(argv[argi], "--fallback-host") == 0 && argi + 1 < argc) {
+                    fb_host = argv[argi + 1]; argi += 2;
+                } else if (strcmp(argv[argi], "--fallback-port") == 0 && argi + 1 < argc) {
+                    fb_port_str = argv[argi + 1]; argi += 2;
+                } else if (strcmp(argv[argi], "--fallback-ca-cert") == 0 && argi + 1 < argc) {
+                    fb_ca = argv[argi + 1]; argi += 2;
                 } else {
                     fprintf(stderr, "error: unrecognized argument: %s\n", argv[argi]);
                     return 1;
                 }
             }
+            /* TASK-174: --fallback-host and --fallback-port must be given
+             * together — a partial set is a user error, never silently
+             * treated as "no fallback" (this task's own acceptance
+             * criterion). --fallback-ca-cert on its own without the other
+             * two is equally nonsensical and rejected the same way. */
+            if ((fb_host != NULL) != (fb_port_str != NULL) ||
+                (fb_ca != NULL && fb_host == NULL)) {
+                fprintf(stderr,
+                    "error: --fallback-host and --fallback-port must be given "
+                    "together (--fallback-ca-cert requires both too)\n");
+                return 1;
+            }
+            uint16_t fb_port = fb_port_str ? (uint16_t)strtoul(fb_port_str, NULL, 10) : 0;
 
             /* Read password from stdin when '-' or '--stdin-password' is
              * specified, to avoid exposing it in /proc/<pid>/cmdline and ps
@@ -1167,7 +1256,8 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
             }
             vw_ipc_conn_t *c = cli_connect(ipc_port);
             if (!c) { memset(stdin_pw, 0, sizeof(stdin_pw)); return 1; }
-            int rc = cmd_account_add(c, host, port, ca_cert, label, username, pw, otp);
+            int rc = cmd_account_add(c, host, port, ca_cert, label, username, pw, otp,
+                                      fb_host, fb_port, fb_ca);
             vw_ipc_conn_close(c);
             memset(stdin_pw, 0, sizeof(stdin_pw));
             return rc;

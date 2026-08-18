@@ -336,22 +336,72 @@ void vw_storage_close(vw_storage_t *st)
 
 /* ── vw_storage_chunk_put ────────────────────────────────────────────────── */
 
-vw_err_t vw_storage_chunk_put(vw_storage_t *st,
-                               const uint8_t hash[VW_HASH_BYTES],
-                               const uint8_t *data, uint32_t len,
-                               uint64_t owner_user_id)
+/*
+ * Shared implementation of vw_storage_chunk_put/vw_storage_chunk_put_replicated
+ * (TASK-172) — identical hash-verify + atomic-write logic; charge_quota
+ * controls whether a new/reused chunk debits owner_user_id's quota.
+ * Replicated chunk writes (a replica applying content the primary already
+ * accepted and charged) must never fail on the replica's own, possibly
+ * not-yet-synced quota state — see vw_storage_chunk_put_replicated's own
+ * doc comment.
+ *
+ * Ref-count semantics differ by caller (TASK-180 fix — see that task for
+ * the full incident writeup):
+ *
+ *   - Real client uploads (vw_storage_chunk_put, charge_quota=1): this
+ *     call establishes presence only. It must NOT itself add a reference
+ *     — handle_file_commit's own vw_storage_chunk_addref (called exactly
+ *     once per chunk hash in every FILE_COMMIT, whether the chunk was
+ *     just uploaded or already present via dedup) is the sole source of
+ *     real references for this path. Before this fix, chunk_put_impl
+ *     ALSO added a reference here, so a chunk uploaded and committed in
+ *     the same request permanently carried one extra, never-decremented
+ *     reference — no chunk was ever fully garbage-collected via normal
+ *     file deletion. A side effect worth knowing: a chunk sitting between
+ *     CHUNK_UPLOAD and its FILE_COMMIT is now genuinely ref_count==0 and
+ *     therefore GC-eligible — intentional (an uploaded-but-abandoned
+ *     chunk must eventually be collectible, the flip side of this same
+ *     fix), and bounded by gc_interval_secs (1800s default): a real
+ *     client's FILE_COMMIT normally follows CHUNK_UPLOAD within the same
+ *     round trip, well inside any reasonable interval.
+ *   - Replicated writes (vw_storage_chunk_put_replicated, charge_quota=0):
+ *     UNCHANGED by this fix. A replica has no FILE_COMMIT/addref call of
+ *     its own — replicated content only ever arrives through this
+ *     function — so it must keep establishing its own reference here.
+ *     (This path's refcount accounting has a separate, pre-existing
+ *     under-count for a chunk referenced by more than one synced version,
+ *     since a hash already present locally is never re-passed through
+ *     here on a later sync pass — flagged in TASK-180 as follow-up
+ *     investigation, deliberately not touched by this fix to avoid
+ *     changing replica behavior without its own dedicated review.)
+ */
+static vw_err_t chunk_put_impl(vw_storage_t *st,
+                                const uint8_t hash[VW_HASH_BYTES],
+                                const uint8_t *data, uint32_t len,
+                                uint64_t owner_user_id, int charge_quota)
 {
     vw_err_t rc;
 
     if (!st || !hash || !data) return VW_ERR_INVALID_ARG;
     if (len == 0 || len > (uint32_t)VW_CHUNK_SIZE_DEFAULT) return VW_ERR_INVALID_ARG;
 
+    /* See the function-level comment above: only the replicated path
+     * establishes its own reference here; the real-upload path leaves
+     * ref-counting entirely to handle_file_commit's addref. */
+    int establish_own_ref = !charge_quota;
+
     rwlock_wrlock(&st->lock);
 
     rc_ht_entry_t *entry = ht_find(st->ht, st->ht_cap, hash);
 
     if (entry && entry->ref_count > 0) {
-        /* Dedup hit: increment ref_count; owner_user_id unchanged (charged to first uploader). */
+        /* Dedup hit: content already has at least one real reference.
+         * Only bump it for the replicated path (see above) — the real
+         * upload path is a pure presence-check here, no-op on ref_count. */
+        if (!establish_own_ref) {
+            rwlock_wrunlock(&st->lock);
+            return VW_OK;
+        }
         entry->ref_count++;
         refcount_record_t rec;
         memcpy(rec.hash, hash, VW_HASH_BYTES);
@@ -396,7 +446,12 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
 
     entry = ht_find(st->ht, st->ht_cap, hash);
     if (entry && entry->ref_count > 0) {
-        /* Race: another thread already inserted this chunk. Just increment. */
+        /* Race: another thread already inserted this chunk. Bump it only
+         * for the replicated path — see the function-level comment. */
+        if (!establish_own_ref) {
+            rwlock_wrunlock(&st->lock);
+            return VW_OK;
+        }
         entry->ref_count++;
         refcount_record_t rec;
         memcpy(rec.hash, hash, VW_HASH_BYTES);
@@ -411,7 +466,7 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
     if (entry && entry->ref_count == 0) {
         /* Previously GC'd entry — reuse its slot.  Chunk is new from quota perspective:
          * charge atomically under the write lock so no concurrent upload can double-charge. */
-        if (st->store) {
+        if (charge_quota && st->store) {
             vw_err_t qrc = vw_store_quota_add(st->store, owner_user_id, (int64_t)len);
             if (qrc != VW_OK) {
                 /* Quota exceeded — chunk stays on disk as a dark orphan; GC cleans it. */
@@ -419,22 +474,22 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
                 return qrc;
             }
         }
-        entry->ref_count = 1;
+        entry->ref_count = establish_own_ref ? 1u : 0u;
         entry->owner_user_id = owner_user_id;
         refcount_record_t rec;
         memcpy(rec.hash, hash, VW_HASH_BYTES);
-        rec.ref_count = 1;
+        rec.ref_count = entry->ref_count;
         rec._pad = 0;
         rec.owner_user_id = owner_user_id;
         rc = rcdb_write(st, entry->slot, &rec);
-        if (rc != VW_OK && st->store)
+        if (rc != VW_OK && charge_quota && st->store)
             (void)vw_store_quota_add(st->store, owner_user_id, -(int64_t)len);
         rwlock_wrunlock(&st->lock);
         return rc;
     }
 
     /* Truly new: charge quota then append to refcounts.db. */
-    if (st->store) {
+    if (charge_quota && st->store) {
         vw_err_t qrc = vw_store_quota_add(st->store, owner_user_id, (int64_t)len);
         if (qrc != VW_OK) {
             /* Quota exceeded — chunk stays on disk as a dark orphan; GC cleans it. */
@@ -446,7 +501,7 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
     uint64_t slot = st->rc_slots;
     refcount_record_t rec;
     memcpy(rec.hash, hash, VW_HASH_BYTES);
-    rec.ref_count = 1;
+    rec.ref_count = establish_own_ref ? 1u : 0u;
     rec._pad = 0;
     rec.owner_user_id = owner_user_id;
 
@@ -454,17 +509,17 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
     if (rc != VW_OK) {
         /* Chunk is on disk but no ref record — dark orphan; next GC handles it.
          * Roll back the quota we just charged. */
-        if (st->store)
+        if (charge_quota && st->store)
             (void)vw_store_quota_add(st->store, owner_user_id, -(int64_t)len);
         rwlock_wrunlock(&st->lock);
         return rc;
     }
     st->rc_slots++;
 
-    if (ht_insert(st, hash, 1, slot, owner_user_id) != 0) {
+    if (ht_insert(st, hash, rec.ref_count, slot, owner_user_id) != 0) {
         /* OOM in HT — data is on disk with ref recorded; next open rebuilds HT.
          * Roll back the quota charged above so usage stays accurate. */
-        if (st->store)
+        if (charge_quota && st->store)
             (void)vw_store_quota_add(st->store, owner_user_id, -(int64_t)len);
         rwlock_wrunlock(&st->lock);
         return VW_ERR_OOM;
@@ -472,6 +527,31 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
 
     rwlock_wrunlock(&st->lock);
     return VW_OK;
+}
+
+vw_err_t vw_storage_chunk_put(vw_storage_t *st,
+                               const uint8_t hash[VW_HASH_BYTES],
+                               const uint8_t *data, uint32_t len,
+                               uint64_t owner_user_id)
+{
+    return chunk_put_impl(st, hash, data, len, owner_user_id, 1);
+}
+
+/*
+ * TASK-172: apply a chunk fetched from a primary during replica hot-standby
+ * sync. Identical to vw_storage_chunk_put except it never charges quota —
+ * the primary already charged (and byte-accounted) this content when its
+ * own client uploaded it; re-charging it against whatever this replica's
+ * own (possibly not-yet-synced) quota record happens to say right now would
+ * be both double-counting and a real correctness bug: replication must
+ * never fail with VW_ERR_QUOTA_EXCEEDED. owner_user_id is not needed either
+ * for the same reason — nothing on the replica bills against it.
+ */
+vw_err_t vw_storage_chunk_put_replicated(vw_storage_t *st,
+                                          const uint8_t hash[VW_HASH_BYTES],
+                                          const uint8_t *data, uint32_t len)
+{
+    return chunk_put_impl(st, hash, data, len, 0, 0);
 }
 
 /* ── vw_storage_chunk_get ────────────────────────────────────────────────── */
@@ -484,7 +564,13 @@ vw_err_t vw_storage_chunk_get(vw_storage_t *st,
 
     rwlock_rdlock(&st->lock);
     rc_ht_entry_t *entry = ht_find(st->ht, st->ht_cap, hash);
-    int present = (entry && entry->ref_count > 0);
+    /* TASK-180: presence means "physically on disk," independent of
+     * ref_count — a chunk between CHUNK_UPLOAD and its FILE_COMMIT is
+     * legitimately ref_count==0 now (see chunk_put_impl's own comment)
+     * but its bytes are still there; ht_find already returns NULL for a
+     * genuinely absent/GC'd-and-zeroed hash, so entry's mere existence is
+     * the correct signal, not its ref_count. */
+    int present = (entry != NULL);
     rwlock_rdunlock(&st->lock);
 
     if (!present) return VW_ERR_NOT_FOUND;
@@ -513,7 +599,14 @@ vw_err_t vw_storage_chunk_addref(vw_storage_t *st,
     rwlock_wrlock(&st->lock);
 
     rc_ht_entry_t *entry = ht_find(st->ht, st->ht_cap, hash);
-    if (!entry || entry->ref_count == 0) {
+    /* TASK-180: entry->ref_count == 0 is now the NORMAL state for a chunk
+     * freshly uploaded and about to be committed for the first time
+     * (chunk_put_impl no longer pre-establishes a reference for a real
+     * client upload) — addref-ing it from 0 to 1 here is exactly the
+     * intended, sole source of that first real reference. Only a
+     * genuinely absent hash (never uploaded, or already fully GC'd and
+     * zeroed) is an error. */
+    if (!entry) {
         rwlock_wrunlock(&st->lock);
         return VW_ERR_NOT_FOUND;
     }
@@ -614,6 +707,44 @@ vw_err_t vw_storage_chunk_decref(vw_storage_t *st,
     return rc;
 }
 
+/* ── vw_storage_chunk_set_refcount (TASK-181) ────────────────────────────── */
+
+vw_err_t vw_storage_chunk_set_refcount(vw_storage_t *st,
+                                        const uint8_t hash[VW_HASH_BYTES],
+                                        uint32_t refcount)
+{
+    if (!st || !hash) return VW_ERR_INVALID_ARG;
+
+    rwlock_wrlock(&st->lock);
+
+    rc_ht_entry_t *entry = ht_find(st->ht, st->ht_cap, hash);
+    if (!entry) {
+        rwlock_wrunlock(&st->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+
+    /* CQR.08 (TASK-181 review): the replica's chunk-sync pass calls this
+     * once per referenced hash on every pass, most of which leave the
+     * count unchanged from the previous pass — skip the disk write (and
+     * rcdb_write's fsync) rather than re-persisting an identical value
+     * every few seconds for every live chunk a replica holds. */
+    if (entry->ref_count == refcount) {
+        rwlock_wrunlock(&st->lock);
+        return VW_OK;
+    }
+
+    entry->ref_count = refcount;
+    refcount_record_t rec;
+    memcpy(rec.hash, hash, VW_HASH_BYTES);
+    rec.ref_count = entry->ref_count;
+    rec._pad = 0;
+    rec.owner_user_id = entry->owner_user_id;
+    vw_err_t rc = rcdb_write(st, entry->slot, &rec);
+
+    rwlock_wrunlock(&st->lock);
+    return rc;
+}
+
 /* ── vw_storage_chunk_query ──────────────────────────────────────────────── */
 
 vw_err_t vw_storage_chunk_query(vw_storage_t *st,
@@ -631,7 +762,14 @@ vw_err_t vw_storage_chunk_query(vw_storage_t *st,
     uint16_t i;
     for (i = 0; i < count; i++) {
         rc_ht_entry_t *e = ht_find(st->ht, st->ht_cap, hashes[i]);
-        if (e && e->ref_count > 0)
+        /* TASK-180: presence is "physically on disk" (e != NULL), not
+         * "has a live reference" — see vw_storage_chunk_get's identical
+         * fix for why ref_count==0 no longer means absent. This function
+         * backs both the client-facing CHUNK_QUERY dedup check and
+         * handle_file_commit's own upfront "do all these chunks exist"
+         * validation, both of which must see a just-uploaded,
+         * not-yet-committed chunk as present. */
+        if (e != NULL)
             out_bitmask[i / 8u] |= (uint8_t)(1u << (7u - (i % 8u)));
     }
     rwlock_rdunlock(&st->lock);

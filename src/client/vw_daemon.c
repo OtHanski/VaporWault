@@ -33,6 +33,7 @@
 #define DEFAULT_IPC_PORT     VW_IPC_DEFAULT_PORT
 #define DEFAULT_SYNC_MS      30000u
 #define SESSION_TOKEN_FILE   "session.tok"
+#define LOGIN_TOKEN_FILE     "login_token.bin"
 #define PID_FILE             "daemon.pid"
 #define LOG_FILE             "daemon.log"
 #define CONFIG_FILE          "daemon.conf"
@@ -262,6 +263,57 @@ static vw_err_t tok_save(const char *state_dir, const uint8_t tok[VW_TOKEN_BYTES
 #endif
 }
 
+/* ── Login token (TASK-173) ───────────────────────────────────────────────
+ * SHA-256(password) — the exact 32 bytes AUTH_REQUEST sends on the wire,
+ * never the raw password — retained so an automatic, unattended fallback
+ * connect (vw_client_connect_with_hash) can authenticate fresh against a
+ * replica without a stored SESSION_RESUME token, which is meaningless on
+ * any server other than the one that issued it. Same sensitivity class
+ * and on-disk protection as session.tok (mode 0600, same "wrong
+ * permissions -> ignore" load-time check) — this is not a new class of
+ * persisted secret, just a second file of the same kind. Written whenever
+ * ACCOUNT_ADD_REQ supplies a password (new account or re-authentication);
+ * never written for a plain reconnect (which only ever has a session
+ * token, not a password, by then). */
+
+static vw_err_t login_token_load(const char *account_dir, uint8_t out_tok[VW_TOKEN_BYTES]) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", account_dir, LOGIN_TOKEN_FILE);
+
+#ifndef _WIN32
+    struct stat st;
+    if (stat(path, &st) != 0) return VW_ERR_NOT_FOUND;
+    if ((st.st_mode & 0777) != 0600) {
+        vw_log(LOG_WARN, "login_token.bin has wrong permissions (%03o) — ignoring",
+               (unsigned)(st.st_mode & 0777));
+        return VW_ERR_NOT_FOUND;
+    }
+#endif
+
+    void *data = NULL; size_t len = 0;
+    vw_err_t err = vw_fs_read_file(path, &data, &len);
+    if (err != VW_OK) return err;
+    if (len < VW_TOKEN_BYTES) { free(data); return VW_ERR_NOT_FOUND; }
+    memcpy(out_tok, data, VW_TOKEN_BYTES);
+    free(data);
+    return VW_OK;
+}
+
+static vw_err_t login_token_save(const char *account_dir, const uint8_t tok[VW_TOKEN_BYTES]) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", account_dir, LOGIN_TOKEN_FILE);
+#ifdef _WIN32
+    return vw_fs_atomic_write(path, tok, VW_TOKEN_BYTES);
+#else
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) return VW_ERR_IO;
+    vw_err_t err = VW_OK;
+    if ((size_t)write(fd, tok, VW_TOKEN_BYTES) != VW_TOKEN_BYTES) err = VW_ERR_IO;
+    close(fd);
+    return err;
+#endif
+}
+
 /* ── Config parser ───────────────────────────────────────────────────────── */
 
 static void cfg_defaults(vw_daemon_cfg_t *c) {
@@ -349,6 +401,13 @@ typedef struct {
     uint16_t server_port;
     char     ca_cert_pem_path[512];
     char     username[64];
+    /* TASK-173: optional read-only fallback server — a vw_cluster replica
+     * of this same account's primary. Unset (fallback_host[0] == '\0') =
+     * today's behavior, fully unchanged; this is opt-in per account, never
+     * implicitly derived from the primary's own settings. */
+    char     fallback_host[256];
+    uint16_t fallback_port;
+    char     fallback_ca_cert_pem_path[512];
 } vw_account_cfg_t;
 
 static void account_cfg_apply_kv(vw_account_cfg_t *c, const char *key, const char *val) {
@@ -362,6 +421,12 @@ static void account_cfg_apply_kv(vw_account_cfg_t *c, const char *key, const cha
         snprintf(c->ca_cert_pem_path, sizeof(c->ca_cert_pem_path), "%s", val);
     else if (strcmp(key, "username") == 0)
         snprintf(c->username, sizeof(c->username), "%s", val);
+    else if (strcmp(key, "fallback_host") == 0)
+        snprintf(c->fallback_host, sizeof(c->fallback_host), "%s", val);
+    else if (strcmp(key, "fallback_port") == 0)
+        c->fallback_port = (uint16_t)strtoul(val, NULL, 10);
+    else if (strcmp(key, "fallback_ca_cert_pem_path") == 0)
+        snprintf(c->fallback_ca_cert_pem_path, sizeof(c->fallback_ca_cert_pem_path), "%s", val);
 }
 
 /* accounts_dir is {state_dir}/accounts/<account_id> (no trailing slash). */
@@ -403,6 +468,9 @@ static vw_err_t account_cfg_save(const char *account_dir, const vw_account_cfg_t
     fprintf(fp, "server_port      = %u\n", (unsigned)cfg->server_port);
     fprintf(fp, "ca_cert_pem_path = %s\n", cfg->ca_cert_pem_path);
     fprintf(fp, "username         = %s\n", cfg->username);
+    fprintf(fp, "fallback_host              = %s\n", cfg->fallback_host);
+    fprintf(fp, "fallback_port              = %u\n", (unsigned)cfg->fallback_port);
+    fprintf(fp, "fallback_ca_cert_pem_path  = %s\n", cfg->fallback_ca_cert_pem_path);
     fclose(fp);
     return VW_OK;
 }
@@ -489,6 +557,13 @@ static void vault_registry_close_all(daemon_vault_registry_t *reg) {
  * function), so this array needs no locking, same reasoning as the vault
  * registry above (now one of this struct's own fields, no longer global).
  */
+/* TASK-173: which server `sess` is actually connected to right now. */
+typedef enum {
+    VW_ACCOUNT_CONN_OFFLINE  = 0,  /* sess == NULL */
+    VW_ACCOUNT_CONN_PRIMARY  = 1,
+    VW_ACCOUNT_CONN_FALLBACK = 2,  /* read-only — see vw_sync_set_read_only */
+} vw_account_conn_mode_t;
+
 typedef struct {
     uint32_t   account_id;
     char       account_dir[600];  /* {state_dir}/accounts/<account_id> */
@@ -496,9 +571,18 @@ typedef struct {
     vw_cache_t              *cache;
     vw_sync_ctx_t           *sync_ctx;
     vw_client_sess_t        *sess;      /* NULL if currently offline */
+    vw_account_conn_mode_t   conn_mode; /* meaningful only while sess != NULL */
     daemon_vault_registry_t  vaults;    /* TASK-100: unlocked vw_vault_t handles */
     int64_t    last_sync_at;
     uint32_t   error_count;
+    /* TASK-173: SHA-256(password), retained only in memory + login_token.bin
+     * (never the raw password) so an automatic fallback connect can
+     * authenticate without user interaction. have_login_token == 0 means no
+     * password has been supplied this process (or on disk) yet — a fallback
+     * is configured but simply can't be used automatically until the next
+     * ACCOUNT_ADD_REQ (re-authentication) supplies one. */
+    uint8_t    login_token[VW_TOKEN_BYTES];
+    int        have_login_token;
 } vw_account_ctx_t;
 
 typedef struct {
@@ -512,6 +596,22 @@ static vw_account_ctx_t *account_find(account_registry_t *reg, uint32_t account_
     for (size_t i = 0; i < reg->count; i++)
         if (reg->accounts[i].account_id == account_id) return &reg->accounts[i];
     return NULL;
+}
+
+/*
+ * TASK-173: true while this account is connected to its read-only
+ * fallback rather than the primary. Callers use this to reject
+ * write-shaped IPC requests (SHARE_GRANT/REVOKE, LINK_CREATE/REVOKE,
+ * FILE_MKDIR, VAULT_CREATE, VAULT_UPLOAD) with VW_ERR_READ_ONLY_FALLBACK
+ * rather than actually attempting them against the fallback session —
+ * these are synchronous, user-initiated requests with no offline-queue
+ * equivalent (unlike the automatic sync engine's own file actions, which
+ * vw_sync_set_read_only already handles). Only meaningful while a->sess
+ * is non-NULL; callers must still check that separately (a fully offline
+ * account is VW_ERR_AUTH_REQUIRED, not this).
+ */
+static int account_is_read_only(const vw_account_ctx_t *a) {
+    return a->conn_mode == VW_ACCOUNT_CONN_FALLBACK;
 }
 
 /* Appends a zero-initialized slot and returns a pointer to it, or NULL on
@@ -610,13 +710,14 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         /* Daemon-global aggregate across every configured account
          * (TASK-161) — see VW_IPC_ACCOUNT_LIST_RESP for the per-account
          * breakdown of every field here. */
-        uint8_t any_connected = 0, any_syncing = 0;
+        uint8_t any_connected = 0, any_syncing = 0, any_on_fallback = 0;
         int64_t max_last_sync = 0;
         uint32_t total_pending = 0, total_errors = 0, total_perm_denied = 0;
         uint32_t total_folders = 0, paused_folders = 0;
         for (size_t i = 0; i < dc->accounts->count; i++) {
             vw_account_ctx_t *a = &dc->accounts->accounts[i];
             if (a->sess) any_connected = 1;
+            if (a->conn_mode == VW_ACCOUNT_CONN_FALLBACK) any_on_fallback = 1;
             uint64_t bd = 0, bt = 0;
             vw_sync_get_progress(a->sync_ctx, &bd, &bt);
             if (bd < bt) any_syncing = 1;
@@ -634,7 +735,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             for (uint32_t j = 0; j < nf; j++) if (folders[j].paused) paused_folders++;
             free(folders);
         }
-        uint8_t resp[28]; uint32_t off = 0;
+        uint8_t resp[29]; uint32_t off = 0;
         resp[off++] = any_connected;
         resp[off++] = any_syncing;
         resp[off++] = (total_folders > 0 && paused_folders == total_folders) ? 1 : 0;
@@ -647,6 +748,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
          * shared-folder auto-mkdir is its own specific signal, not lumped
          * in with every other kind of action failure. */
         vw_write_u32le(resp + off, total_perm_denied); off += 4;
+        /* TASK-173: trailing field, same pattern as permission_denied_count
+         * above — 1 if at least one account is currently on its read-only
+         * fallback rather than the primary. */
+        resp[off++] = any_on_fallback;
         vw_ipc_send(conn, VW_IPC_STATUS_RESP, resp, off);
         break;
     }
@@ -673,6 +778,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             rbuf[roff++] = a->sess ? 1 : 0;
             vw_write_u32le(rbuf + roff, vw_sync_pending_count(a->sync_ctx)); roff += 4;
             vw_write_u32le(rbuf + roff, 0); roff += 4; /* pending_downloads */
+            /* TASK-173: trailing field — vw_account_conn_mode_t (0=offline,
+             * 1=primary, 2=fallback/read-only). Meaningful even when
+             * `connected` above is 0 (always VW_ACCOUNT_CONN_OFFLINE then). */
+            rbuf[roff++] = (uint8_t)a->conn_mode;
             written++;
         }
         vw_write_u32le(rbuf, written);
@@ -702,6 +811,24 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             break;
         }
 
+        /* TASK-173: optional trailing fallback fields. Absent for any
+         * caller built before this task (or one simply not configuring a
+         * fallback) — malformed/short trailing bytes are treated as "not
+         * supplied" rather than failing the whole account add/re-auth over
+         * an optional field. */
+        const char *fb_host = NULL, *fb_ca = NULL;
+        uint16_t fb_host_len = 0, fb_ca_len = 0, fb_port = 0;
+        if (off < plen) {
+            vw_err_t ferr = vw_ipc_read_str(buf, plen, &off, &fb_host, &fb_host_len);
+            if (ferr == VW_OK && off + 2u <= plen) {
+                fb_port = vw_read_u16le(buf + off); off += 2u;
+                ferr = vw_ipc_read_str(buf, plen, &off, &fb_ca, &fb_ca_len);
+            } else if (ferr == VW_OK) {
+                ferr = VW_ERR_PROTO_TRUNCATED;
+            }
+            if (ferr != VW_OK) { fb_host = NULL; fb_host_len = 0; fb_port = 0; fb_ca = NULL; fb_ca_len = 0; }
+        }
+
         vw_account_ctx_t *existing = req_account_id != 0
             ? account_find(dc->accounts, req_account_id) : NULL;
         if (req_account_id != 0 && !existing) {
@@ -721,6 +848,23 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         memcpy(acfg.ca_cert_pem_path, ca_path, cpy);
         cpy = user_len < sizeof(acfg.username)-1u ? user_len : sizeof(acfg.username)-1u;
         memcpy(acfg.username, username, cpy);
+
+        if (fb_host_len > 0) {
+            cpy = fb_host_len < sizeof(acfg.fallback_host)-1u ? fb_host_len : sizeof(acfg.fallback_host)-1u;
+            memcpy(acfg.fallback_host, fb_host, cpy);
+            acfg.fallback_port = fb_port;
+            cpy = fb_ca_len < sizeof(acfg.fallback_ca_cert_pem_path)-1u ? fb_ca_len : sizeof(acfg.fallback_ca_cert_pem_path)-1u;
+            memcpy(acfg.fallback_ca_cert_pem_path, fb_ca, cpy);
+        } else if (existing) {
+            /* Re-authenticating (e.g. after a password change) without
+             * re-supplying fallback fields keeps whatever was already
+             * configured — this request's job is re-auth, not clearing an
+             * unrelated setting just because it wasn't repeated. */
+            memcpy(acfg.fallback_host, existing->cfg.fallback_host, sizeof(acfg.fallback_host));
+            acfg.fallback_port = existing->cfg.fallback_port;
+            memcpy(acfg.fallback_ca_cert_pem_path, existing->cfg.fallback_ca_cert_pem_path,
+                   sizeof(acfg.fallback_ca_cert_pem_path));
+        }
 
         char pw_buf[256]; char otp_buf_local[16];
         cpy = pw_len < sizeof(pw_buf)-1u ? pw_len : sizeof(pw_buf)-1u;
@@ -742,6 +886,16 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         vw_client_sess_t *new_sess = NULL;
         vw_err_t rc = vw_client_connect(&cc, acfg.username, (uint16_t)strlen(acfg.username),
                                          pw_buf, strlen(pw_buf), login_otp_cb, &octx, &new_sess);
+
+        /* TASK-173: retain SHA-256(password) — never the raw password
+         * itself — for an unattended fallback connect later. Computed
+         * before pw_buf is wiped below, regardless of rc: on 2FA-challenge
+         * failure this connect attempt fails, but the same token would be
+         * needed on the immediate retry-with-otp call the caller makes
+         * next, so there's no reason to gate this on rc == VW_OK. */
+        uint8_t login_tok[VW_TOKEN_BYTES];
+        int have_login_tok = (vw_crypto_sha256(pw_buf, strlen(pw_buf), login_tok) == VW_OK);
+
         memset(pw_buf, 0, sizeof(pw_buf));
         memset(otp_buf_local, 0, sizeof(otp_buf_local));
 
@@ -762,12 +916,20 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
                 rc = tok_save(account_dir, tok);
                 memset(tok, 0, sizeof(tok));
             }
+            if (rc == VW_OK && have_login_tok)
+                rc = login_token_save(account_dir, login_tok);
 
             if (rc == VW_OK && existing) {
                 vw_client_close(existing->sess); /* old token already superseded */
-                existing->sess = new_sess;
-                existing->cfg  = acfg;
+                existing->sess       = new_sess;
+                existing->conn_mode  = VW_ACCOUNT_CONN_PRIMARY;
+                existing->cfg        = acfg;
+                if (have_login_tok) {
+                    memcpy(existing->login_token, login_tok, VW_TOKEN_BYTES);
+                    existing->have_login_token = 1;
+                }
                 vw_sync_set_session(existing->sync_ctx, new_sess);
+                vw_sync_set_read_only(existing->sync_ctx, 0);
             } else if (rc == VW_OK) {
                 vw_cache_t *cache = NULL;
                 rc = vw_cache_open(account_dir, &cache);
@@ -788,12 +950,18 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
                         a->cache = cache;
                         a->sync_ctx = sync_ctx;
                         a->sess = new_sess;
+                        a->conn_mode = VW_ACCOUNT_CONN_PRIMARY;
+                        if (have_login_tok) {
+                            memcpy(a->login_token, login_tok, VW_TOKEN_BYTES);
+                            a->have_login_token = 1;
+                        }
                     }
                 }
             }
             if (rc != VW_OK) vw_client_close(new_sess);
             else vw_log(LOG_INFO, "account '%s' (id=%u) authenticated", acfg.username, (unsigned)out_account_id);
         }
+        memset(login_tok, 0, sizeof(login_tok)); /* wipe the local copy either way */
 
         uint8_t resp[8];
         vw_write_u32le(resp, (uint32_t)rc);
@@ -1077,6 +1245,12 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_ipc_send(conn, VW_IPC_SHARE_GRANT_RESP, rbuf, sizeof(rbuf));
             break;
         }
+        if (account_is_read_only(account)) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            vw_ipc_send(conn, VW_IPC_SHARE_GRANT_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
         char path_buf[VW_MAX_PATH_BYTES + 1];
         char tgt_buf[VW_MAX_USERNAME_BYTES + 1];
         size_t pcopy = path_len < sizeof(path_buf) - 1u ? path_len : sizeof(path_buf) - 1u;
@@ -1106,6 +1280,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         vw_account_ctx_t *a = account_find(dc->accounts, account_id);
         if (!a || !a->sess) {
             ipc_send_u32(conn, resp_type, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            ipc_send_u32(conn, resp_type, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
             break;
         }
         uint64_t share_id = vw_read_u64le(buf + 4u);
@@ -1172,6 +1350,12 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         if (err != VW_OK || !a || !a->sess) {
             uint8_t rbuf[44] = {0};
             vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : !a->sess ? VW_ERR_AUTH_REQUIRED : err));
+            vw_ipc_send(conn, VW_IPC_LINK_CREATE_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[44] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
             vw_ipc_send(conn, VW_IPC_LINK_CREATE_RESP, rbuf, sizeof(rbuf));
             break;
         }
@@ -1245,6 +1429,12 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_ipc_send(conn, VW_IPC_FILE_MKDIR_RESP, rbuf, sizeof(rbuf));
             break;
         }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            vw_ipc_send(conn, VW_IPC_FILE_MKDIR_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
         uint64_t new_parent_dir_id = vw_read_u64le(buf + 4u);
         uint32_t off = 12u;
         const char *name = NULL; uint16_t name_len = 0;
@@ -1276,6 +1466,12 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         if (!a || !a->sess) {
             uint8_t rbuf[12] = {0};
             vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_VAULT_CREATE_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[12] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
             vw_ipc_send(conn, VW_IPC_VAULT_CREATE_RESP, rbuf, sizeof(rbuf));
             break;
         }
@@ -1370,6 +1566,12 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             vw_ipc_send(conn, VW_IPC_VAULT_UPLOAD_RESP, rbuf, sizeof(rbuf));
             break;
         }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[20] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            vw_ipc_send(conn, VW_IPC_VAULT_UPLOAD_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
         uint64_t vault_id = vw_read_u64le(buf + 4u);
         uint64_t file_id  = vw_read_u64le(buf + 12u);
         uint32_t off = 20u;
@@ -1442,8 +1644,26 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
 
 /* ── Connection attempt ──────────────────────────────────────────────────── */
 
-static vw_client_sess_t *try_connect(const vw_account_cfg_t *acfg,
-                                      const char *account_dir) {
+/*
+ * TASK-173: the single place that ever assigns a->sess/a->conn_mode —
+ * keeps them, and the sync context's mirrored session/read_only flags,
+ * moving together so no call site can set one without the others. Pass
+ * sess = NULL to go offline (mode is ignored in that case).
+ */
+static void account_set_conn(vw_account_ctx_t *a, vw_client_sess_t *sess,
+                              vw_account_conn_mode_t mode) {
+    a->sess      = sess;
+    a->conn_mode = sess ? mode : VW_ACCOUNT_CONN_OFFLINE;
+    vw_sync_set_session(a->sync_ctx, a->sess);
+    vw_sync_set_read_only(a->sync_ctx, a->conn_mode == VW_ACCOUNT_CONN_FALLBACK);
+}
+
+/* Try a session-token resume against the primary. Returns NULL (offline)
+ * if no valid token is on disk or the resume itself fails — never attempts
+ * a fresh password login (the daemon has no password to use here; see
+ * try_connect_fallback for why the fallback path is different). */
+static vw_client_sess_t *try_connect_primary(const vw_account_cfg_t *acfg,
+                                               const char *account_dir) {
     if (!acfg->server_host[0]) return NULL;
 
     vw_client_cfg_t cc;
@@ -1471,10 +1691,68 @@ static vw_client_sess_t *try_connect(const vw_account_cfg_t *acfg,
     return NULL;
 }
 
+/*
+ * TASK-173: attempt an unattended fresh connect against this account's
+ * configured fallback server, using the retained login_token (SHA-256 of
+ * the last password this account authenticated with) instead of a saved
+ * SESSION_RESUME token — a primary-issued resume token is meaningless
+ * against a different server (§7.1). Returns NULL if no fallback is
+ * configured, no login_token is available yet (e.g. daemon just restarted
+ * and this account hasn't re-authenticated since), or the connect itself
+ * fails (including VW_ERR_AUTH_2FA_REQUIRED — no OTP callback is passed;
+ * this is a background, unattended attempt, so a 2FA-enabled account
+ * simply can't fail over automatically).
+ */
+static vw_client_sess_t *try_connect_fallback(vw_account_ctx_t *a) {
+    if (!a->cfg.fallback_host[0] || !a->have_login_token) return NULL;
+
+    vw_client_cfg_t cc;
+    memset(&cc, 0, sizeof(cc));
+    cc.host             = a->cfg.fallback_host;
+    cc.port             = a->cfg.fallback_port;
+    cc.cert_verify      = VW_CERT_VERIFY_REQUIRED;
+    cc.ca_cert_pem_path = a->cfg.fallback_ca_cert_pem_path[0]
+                          ? a->cfg.fallback_ca_cert_pem_path : NULL;
+
+    vw_client_sess_t *sess = NULL;
+    vw_err_t rc = vw_client_connect_with_hash(&cc, a->cfg.username,
+                                               (uint16_t)strlen(a->cfg.username),
+                                               a->login_token, NULL, NULL, &sess);
+    if (rc != VW_OK) {
+        vw_log(LOG_WARN, "fallback connect failed for account '%s': %d",
+               a->cfg.username, (int)rc);
+        return NULL;
+    }
+    vw_log(LOG_INFO, "account '%s' connected to its read-only fallback %s:%u",
+           a->cfg.username, a->cfg.fallback_host, (unsigned)a->cfg.fallback_port);
+    return sess;
+}
+
+/*
+ * TASK-173: assumes a->sess is already NULL (caller closed/logged out any
+ * prior session first). Tries primary, then — only if that fails — the
+ * fallback. Leaves the account offline (a->sess stays NULL) if neither
+ * works. Used both at startup and by the round-robin reconnect loop.
+ */
+static void account_reconnect(vw_account_ctx_t *a) {
+    vw_client_sess_t *sess = try_connect_primary(&a->cfg, a->account_dir);
+    if (sess) {
+        account_set_conn(a, sess, VW_ACCOUNT_CONN_PRIMARY);
+        vw_log(LOG_INFO, "reconnected account '%s' to primary", a->cfg.username);
+        return;
+    }
+    sess = try_connect_fallback(a);
+    if (sess) account_set_conn(a, sess, VW_ACCOUNT_CONN_FALLBACK);
+}
+
 /* Opens (or reopens, at startup) one account's context from its already-
  * existing accounts/<account_id>/ subtree: loads account.conf, opens its
- * cache + sync context, and attempts a token resume. Returns VW_OK with
- * *out populated (sess may be NULL — offline) on success. */
+ * cache + sync context, and attempts a token resume (primary) then, if
+ * that fails and a fallback is configured, a fresh fallback connect.
+ * Returns VW_OK with *out populated (sess may be NULL — offline) on
+ * success. login_token is loaded from disk (if present) regardless of
+ * whether it ends up being used this call — it's still needed later if
+ * the primary later goes down mid-session (see the round-robin loop). */
 static vw_err_t account_ctx_open_existing(const char *account_dir, uint32_t account_id,
                                             vw_account_ctx_t *out) {
     memset(out, 0, sizeof(*out));
@@ -1487,7 +1765,16 @@ static vw_err_t account_ctx_open_existing(const char *account_dir, uint32_t acco
     err = vw_cache_open(account_dir, &out->cache);
     if (err != VW_OK) return err;
 
-    out->sess = try_connect(&out->cfg, account_dir);
+    out->have_login_token =
+        (login_token_load(account_dir, out->login_token) == VW_OK);
+
+    out->sess = try_connect_primary(&out->cfg, account_dir);
+    if (out->sess) {
+        out->conn_mode = VW_ACCOUNT_CONN_PRIMARY;
+    } else {
+        out->sess = try_connect_fallback(out);
+        if (out->sess) out->conn_mode = VW_ACCOUNT_CONN_FALLBACK;
+    }
 
     vw_sync_cfg_t sc;
     sc.sess = out->sess; sc.cache = out->cache; sc.state_dir = account_dir;
@@ -1497,6 +1784,8 @@ static vw_err_t account_ctx_open_existing(const char *account_dir, uint32_t acco
         vw_cache_close(out->cache);
         return err;
     }
+    if (out->conn_mode == VW_ACCOUNT_CONN_FALLBACK)
+        vw_sync_set_read_only(out->sync_ctx, 1);
     return VW_OK;
 }
 
@@ -1721,19 +2010,38 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
             vw_account_ctx_t *a = &accounts.accounts[i];
 
             if (!a->sess) {
-                a->sess = try_connect(&a->cfg, a->account_dir);
-                if (a->sess) {
-                    vw_sync_set_session(a->sync_ctx, a->sess);
-                    vw_log(LOG_INFO, "reconnected account '%s'", a->cfg.username);
+                account_reconnect(a);
+            } else if (a->conn_mode == VW_ACCOUNT_CONN_FALLBACK) {
+                /* TASK-173 acceptance criterion: keep probing the primary
+                 * in the background while parked on the read-only
+                 * fallback, so the daemon transparently switches back
+                 * (and the next vw_sync_run drains the offline queue)
+                 * the moment the primary is reachable again — never just
+                 * stays on the fallback indefinitely. A failed probe
+                 * leaves the working fallback connection untouched. */
+                vw_client_sess_t *primary_sess = try_connect_primary(&a->cfg, a->account_dir);
+                if (primary_sess) {
+                    vw_client_logout(a->sess);  /* the fallback session */
+                    account_set_conn(a, primary_sess, VW_ACCOUNT_CONN_PRIMARY);
+                    vw_log(LOG_INFO, "account '%s' reconnected to primary; leaving fallback",
+                           a->cfg.username);
+                } else {
+                    int64_t exp = vw_client_expires_at_of(a->sess);
+                    if (exp > 0 && (int64_t)time(NULL) >= exp) {
+                        vw_log(LOG_INFO, "fallback session expired for account '%s', re-connecting",
+                               a->cfg.username);
+                        vw_client_close(a->sess);
+                        account_set_conn(a, NULL, VW_ACCOUNT_CONN_OFFLINE);
+                        account_reconnect(a);
+                    }
                 }
             } else {
                 int64_t exp = vw_client_expires_at_of(a->sess);
                 if (exp > 0 && (int64_t)time(NULL) >= exp) {
                     vw_log(LOG_INFO, "session expired for account '%s', re-connecting", a->cfg.username);
-                    vw_client_close(a->sess); a->sess = NULL;
-                    vw_sync_set_session(a->sync_ctx, NULL);
-                    a->sess = try_connect(&a->cfg, a->account_dir);
-                    if (a->sess) vw_sync_set_session(a->sync_ctx, a->sess);
+                    vw_client_close(a->sess);
+                    account_set_conn(a, NULL, VW_ACCOUNT_CONN_OFFLINE);
+                    account_reconnect(a);
                 }
             }
 
@@ -1748,8 +2056,8 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
                 vw_log(LOG_WARN, "sync cycle error for '%s': %d", a->cfg.username, (int)serr);
                 if (serr == VW_ERR_NET_CLOSED || serr == VW_ERR_NET_TIMEOUT) {
                     if (a->sess) {
-                        vw_client_close(a->sess); a->sess = NULL;
-                        vw_sync_set_session(a->sync_ctx, NULL);
+                        vw_client_close(a->sess);
+                        account_set_conn(a, NULL, VW_ACCOUNT_CONN_OFFLINE);
                     }
                 }
             }

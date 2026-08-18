@@ -58,6 +58,9 @@ bool VwGuiIpc::fetch_status(VwIpcStatus *out) {
     out->pending_uploads   = read_u32_le(buf + 12);
     out->pending_downloads = read_u32_le(buf + 16);
     out->error_count       = (plen >= 24) ? read_u32_le(buf + 20) : 0;
+    /* TASK-173/175: trailing byte, same append convention as error_count
+     * (which itself was appended after connected/syncing/paused). */
+    out->any_on_fallback   = (plen >= 29) ? buf[28] : 0;
     return true;
 }
 
@@ -139,6 +142,11 @@ bool VwGuiIpc::account_list(std::vector<VwGuiAccountEntry> *out) {
         e.server_host.assign(host, host_len);
         e.connected = resp[off]; off += 1u;
         off += 8u; /* pending_uploads (u32) + pending_downloads (u32) */
+        /* TASK-173/175: trailing conn_mode byte (0=offline, 1=primary,
+         * 2=fallback) — must always be consumed, or every subsequent
+         * entry's offset desyncs by one byte per account already seen. */
+        if (off + 1u > rlen) break;
+        e.conn_mode = resp[off]; off += 1u;
         entries.push_back(std::move(e));
     }
 
@@ -149,13 +157,17 @@ bool VwGuiIpc::account_list(std::vector<VwGuiAccountEntry> *out) {
 int VwGuiIpc::account_add(uint32_t account_id_hint, const char *label,
                            const char *server_host, uint16_t server_port, const char *ca_cert_path,
                            const char *username, char *password, const char *otp,
+                           const char *fallback_host, uint16_t fallback_port,
+                           const char *fallback_ca_cert_path,
                            uint32_t *out_account_id) {
     /* Worst case: 4 (account_id) + (2+63) label + (2+255) host + 2 (port) +
      * (2+511) ca_cert_path + (2+63) username + (2+255) password +
-     * (2+16) otp = 1181 bytes — sized with headroom. Every write is
-     * checked (TASK-162's CQR review found the CLI's equivalent function
-     * unchecked against this exact buffer's worst case — same fix here). */
-    uint8_t buf[1536]; uint32_t off = 0;
+     * (2+16) otp + (2+255) fallback_host + 2 (fallback_port) +
+     * (2+511) fallback_ca_cert_path = 1954 bytes — sized with headroom.
+     * Every write is checked (TASK-162's CQR review found the CLI's
+     * equivalent function unchecked against this exact buffer's worst
+     * case — same fix here). */
+    uint8_t buf[2048]; uint32_t off = 0;
     vw_write_u32le(buf + off, account_id_hint); off += 4u;
     const char *lbl = (label && label[0]) ? label : username;
     vw_err_t werr = vw_ipc_write_str(buf, sizeof(buf), &off, lbl, (uint16_t)strnlen(lbl, 63));
@@ -173,6 +185,24 @@ int VwGuiIpc::account_add(uint32_t account_id_hint, const char *label,
     const char *o = otp ? otp : "";
     if (werr == VW_OK)
         werr = vw_ipc_write_str(buf, sizeof(buf), &off, o, (uint16_t)strnlen(o, 16));
+
+    /* TASK-173/175: optional trailing fallback fields — omitted entirely
+     * (not sent as empty strings) when the caller passed no fallback_host,
+     * so a re-authentication that doesn't repeat it leaves an already-
+     * configured fallback untouched (vw_daemon.c's "absent means leave
+     * as-is" contract). */
+    if (werr == VW_OK && fallback_host && fallback_host[0]) {
+        werr = vw_ipc_write_str(buf, sizeof(buf), &off,
+                                 fallback_host, (uint16_t)strnlen(fallback_host, 255));
+        if (werr == VW_OK && off + 2u <= sizeof(buf)) {
+            vw_write_u16le(buf + off, fallback_port); off += 2u;
+        } else if (werr == VW_OK) {
+            werr = VW_ERR_PROTO_TOO_LARGE;
+        }
+        const char *fca = fallback_ca_cert_path ? fallback_ca_cert_path : "";
+        if (werr == VW_OK)
+            werr = vw_ipc_write_str(buf, sizeof(buf), &off, fca, (uint16_t)strnlen(fca, 511));
+    }
 
     if (werr != VW_OK) {
         memset(buf, 0, sizeof(buf));

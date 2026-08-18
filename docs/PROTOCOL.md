@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 19 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 21 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -1131,6 +1131,143 @@ Each node entry:
 
 `auth_token` is **never** included in CLUSTER_STATUS_RESP. Only fields required for the admin UI are present.
 
+**Hot-standby data replication (`TASK-169`/`170`, replaces "replica has an
+oplog backup only"):** the flow above (`OPLOG_PULL`/`_DATA`/`_ACK`) gives a
+replica an oplog *copy*, not a queryable copy of the primary's actual
+data — every `vw_oplog_op_t` payload is a bare id (e.g.
+`VW_OPLOG_FILE_CREATE`'s payload is `owner_id` alone, written before
+`file_id` is even assigned — see `vw_store_files.c`), never the full
+record, so a reader cannot reconstruct *what* changed from the entry
+alone. The eight messages below give a replica genuine, independently
+queryable data by syncing the small fixed-record metadata files
+wholesale (triggered by oplog activity as a doorbell, never read for
+their content) plus the actual chunk bytes those files reference
+(content-addressed, incrementally, by hash).
+
+| Code   | Name                     | Direction         | Description                       |
+|--------|--------------------------|--------------------|------------------------------------|
+| 0x0708 | CLUSTER_FILE_SYNC_LIST      | Replica → Primary | List syncable metadata files + hashes |
+| 0x0709 | CLUSTER_FILE_SYNC_LIST_RESP | Primary → Replica | Per-file size + content hash        |
+| 0x070A | CLUSTER_FILE_SYNC_FETCH     | Replica → Primary | Request one file's full content     |
+| 0x070B | CLUSTER_FILE_SYNC_DATA      | Primary → Replica | That file's full current bytes      |
+| 0x070C | CLUSTER_CHUNK_QUERY         | Replica → Primary | Which of these chunk hashes exist   |
+| 0x070D | CLUSTER_CHUNK_QUERY_RESP    | Primary → Replica | Bitmask (same shape as `CHUNK_QUERY_RESP`, §7.2) |
+| 0x070E | CLUSTER_CHUNK_FETCH         | Replica → Primary | Request one chunk's bytes           |
+| 0x070F | CLUSTER_CHUNK_DATA          | Primary → Replica | Chunk bytes (same shape as `CHUNK_DATA`, §7.2) |
+
+**Syncable metadata files** (`vw_cluster_file_tag_t`, one byte, a fixed
+enum — deliberately never a free-form path string, which would otherwise
+be a new path-traversal surface to review even though the replica is
+already admin-trusted per §7.9's existing trust model):
+
+| Tag | File | Holds |
+|-----|------|-------|
+| 1 | `store/users.dat` | User records (incl. password hash, 2FA secret) |
+| 2 | `store/quotas.db` | Per-user quota/usage |
+| 3 | `files/meta.dat` | File/directory records |
+| 4 | `files/versions.dat` | Version records (chunk_count, blob_offset, vault_id, wrapped-DEK offset/len) |
+| 5 | `files/versions.blob` | Chunk hash arrays + wrapped DEK bytes referenced by `versions.dat`'s `blob_offset` |
+| 6 | `shares.db` | User-to-user share grants |
+| 7 | `vaults.db` | Vault registry records |
+| 8 | `vaults.blob` | Vault registry blob storage (wrapped VKs, KDF params) |
+
+`files/versions.dat` and `files/versions.blob` are always synced as a
+pair — `versions.dat`'s `blob_offset` field is only meaningful relative
+to a `versions.blob` fetched at the same time, so the replica must apply
+both together (fetch tag 4, then tag 5, before running the chunk sweep
+below) rather than treating a mid-pair failure as "partially applied."
+
+**Deliberately never synced this way:**
+- `store/sessions.dat` — per-server; a client failing over to a replica
+  does a fresh `AUTH_REQUEST`/`vw_client_connect`, never
+  `vw_client_resume` (a primary-issued resume token is meaningless on a
+  different server).
+- `chunks/refcounts.db` — the replica computes its OWN refcounts from the
+  file/vault records it holds after each sync pass; it never copies the
+  primary's raw refcounts, which are transiently different during any
+  catch-up window and would be wrong to overwrite with anyway.
+- `invites.db`, `recovery.db` — not needed for this feature's read-only
+  surface (`FILE_LIST`/`FILE_STAT`/`CHUNK_DOWNLOAD_REQ`/`SHARE_LIST`/
+  `VERSION_LIST`/`VERSION_CHUNKS`/vault list+key-fetch); invite redemption
+  and password recovery are writes anyway, which stay primary-only
+  regardless of whether a client is currently failed over.
+
+**CLUSTER_FILE_SYNC_LIST payload:** none (request only; scoped to the
+already-authenticated connection).
+
+**CLUSTER_FILE_SYNC_LIST_RESP payload:**
+
+| Field       | Type   | Notes |
+|-------------|--------|-------|
+| file_count  | uint8  | Always 8 today (one per row in the table above); a future addition to the syncable set only ever grows this, both ends ship together so no negotiation needed |
+| files       | repeated file_count times (see below) | |
+
+Each file entry:
+
+| Field          | Type      | Notes |
+|----------------|-----------|-------|
+| file_tag       | uint8     | See table above |
+| size           | uint64    | Current size in bytes on the primary |
+| content_sha256 | bytes[32] | SHA-256 of the file's full current content |
+
+**CLUSTER_FILE_SYNC_FETCH payload:** `file_tag` (uint8).
+
+**CLUSTER_FILE_SYNC_DATA payload:**
+
+| Field    | Type      | Notes |
+|----------|-----------|-------|
+| file_tag | uint8     | Echoes the request |
+| size     | uint64    | Byte count that follows |
+| data     | bytes[size] | The file's entire current content |
+
+The replica replaces its own copy of that file atomically (write-temp,
+rename-over — the same crash-safe primitive `vw_fs_atomic_write` already
+provides for other metadata writes in this codebase), then re-opens/
+re-indexes whichever server module owns that file from the new content —
+it never patches that module's live in-memory state field-by-field to
+match. If the primary's copy was deleted or renamed since
+`CLUSTER_FILE_SYNC_LIST_RESP` was sent (a narrow race — these files are
+never deleted in normal operation, only rewritten), the primary responds
+with an ERROR (`VW_ERR_NOT_FOUND`) instead; the replica retries the whole
+`CLUSTER_FILE_SYNC_LIST` pass on its next sync trigger rather than
+treating this as fatal.
+
+**CLUSTER_CHUNK_QUERY / CLUSTER_CHUNK_QUERY_RESP payload:** byte-identical
+to `CHUNK_QUERY`/`CHUNK_QUERY_RESP` (§7.2) — `session_token` is replaced
+by nothing (this connection is already authenticated by `NODE_HELLO`'s
+`auth_token`, not a session token), everything else (`count`, `hashes`,
+response `bitmask`) is unchanged. Sent by the replica after refreshing
+`versions.dat` (tag 4) + `versions.blob` (tag 5), scanning its new content for every referenced chunk
+hash, in batches of up to 1024 per the existing `CHUNK_QUERY` cap.
+
+**CLUSTER_CHUNK_FETCH / CLUSTER_CHUNK_DATA payload:** byte-identical to
+`CHUNK_DOWNLOAD_REQ`/`CHUNK_DATA` (§7.2) minus the `session_token` field,
+same reasoning as above. The replica writes each fetched chunk into its
+own content-addressed store (`{chunks_dir}/{2-hex}/{64-hex}.chunk`, same
+layout the primary uses) and sets its own local refcount from its own
+now-current `versions.dat`/`versions.blob` content — never from any value the primary sends.
+
+**Sync trigger and ordering:** after appending a pulled `OPLOG_DATA` batch
+to its own oplog (unchanged — the oplog entries themselves are never read
+for content by this mechanism, only used as a "something changed, go
+check" signal), if `count > 0` the replica runs one
+`CLUSTER_FILE_SYNC_LIST` pass, fetches whatever changed, then the chunk
+sweep above if either `versions.dat` or `versions.blob` was among the changed files. The replica must
+NOT advance/persist its oplog watermark or send `OPLOG_ACK` until this
+entire sync pass (files, then any needed chunks) has completed
+successfully — a crash mid-sync simply re-detects the same file(s) as
+changed (hash mismatch against last-known) and redoes the fetch on
+reconnect; idempotent by construction, matching this protocol's existing
+preference (`FILE_COMMIT`, chunk dedup) for idempotent-by-content over
+bespoke resume logic.
+
+**GC interaction (`TASK-171`):** the primary's chunk garbage collection is
+gated on `vw_cluster_min_sync_watermark()` — the same primitive that
+already protects oplog segments from premature truncation now also
+protects chunk content from being deleted out from under a replica that
+hasn't caught up to the oplog position that existed when the current GC
+cycle started.
+
 ---
 
 ## 7.9 Cluster Channel Security Model
@@ -1158,10 +1295,17 @@ on the primary, and securely communicated to the replica out-of-band
 | Enumeration resistance | NODE_HELLO_FAIL is indistinguishable for unknown node_id vs wrong token |
 | Integrity of replicated log | CRC32 verified by replica per entry before application |
 | Token secrecy | auth_token never logged, never included in any response payload |
+| Integrity of synced files/chunks (`TASK-170`) | `CLUSTER_FILE_SYNC_DATA` has no separate checksum on the wire beyond TLS's own integrity guarantee — the replica trusts `CLUSTER_FILE_SYNC_LIST_RESP`'s `content_sha256` was for the bytes it then receives, both over the same authenticated TLS stream; `CLUSTER_CHUNK_DATA` bytes are additionally verified against the requested hash before being written (same rule as `CHUNK_DATA`, §7.2/7.8.3) |
+| Handler reachability (`TASK-170`) | `CLUSTER_FILE_SYNC_*`/`CLUSTER_CHUNK_*` (§7.7) are dispatched only on the `vw-cluster/1` ALPN listener, never the normal `vw/1` client listener, regardless of message-type value — there is no code path from a normal client-authenticated session into these handlers |
 
 **What the cluster channel does NOT protect against:**
 - A compromised replica node: once authenticated, a replica can pull the
-  entire oplog. Admin-level trust is implied by node registration.
+  entire oplog, and — as of `TASK-170` — every local user's password hash
+  and 2FA secret via `CLUSTER_FILE_SYNC_DATA` for the `USERS` file, plus
+  the full content of every file it can enumerate a chunk hash for.
+  Admin-level trust is implied by node registration; this task did not
+  change that trust boundary, it changed how much data crosses it once a
+  node is inside it.
 - Primary–replica relationship forgery: there is no mechanism for a replica
   to verify that the primary it connected to is the correct primary (no
   cluster membership certificate). A DNS or ARP spoofing attack could direct
@@ -1489,6 +1633,36 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 | 603  | `VW_ERR_VERSION_NOT_FOUND`   | File transfer  | Version ID absent or belongs to another file |
 | 604  | `VW_ERR_DIR_NOT_EMPTY`       | File transfer  | Directory delete: non-empty directory        |
 | 605  | `VW_ERR_RATE_LIMITED`        | File transfer  | Scoped-session write-count rate limit exceeded (§7.5, `TASK-094`) |
+| 606  | `VW_ERR_READ_ONLY_REPLICA`   | File transfer  | Write-shaped request rejected: this server is a cluster replica (`TASK-179`) |
+| 700  | `VW_ERR_IPC_NOT_RUNNING`     | IPC            | Daemon not listening on its IPC port (client-daemon transport only; never sent over `vw/1`) |
+| 800  | `VW_ERR_SYNC_TREE_TOO_LARGE` | Client-local   | Shared-folder BFS exceeded the client's resource ceiling for one sync cycle (`TASK-111`); never sent over the wire, daemon-internal/IPC only |
+| 801  | `VW_ERR_READ_ONLY_FALLBACK`  | Client-local   | Daemon rejected a write-shaped IPC request because this account is currently on its read-only fallback server (`TASK-173`); never sent over the wire, IPC-response only |
+
+**`VW_ERR_READ_ONLY_REPLICA` (`TASK-179`):** a server configured as a
+cluster replica (`cluster_is_replica = 1`, §6) runs its full normal
+client-facing `vw/1` listener unconditionally (§7.7's hot-standby
+replication note) — nothing about being a replica closes that listener or
+makes it reject connections. This code is the server-side backstop that
+actually enforces the read-only property `TASK-173`'s client-side fallback
+logic is named after: `vw_server_dispatch_file_op`'s single dispatch
+choke point (`vw_file_handlers.c`) rejects every write-shaped message
+(`FILE_COMMIT`, `CHUNK_UPLOAD`, `FILE_DELETE`, `FILE_MOVE`, `FILE_MKDIR`,
+`VERSION_RESTORE`, `SHARE_GRANT`/`REVOKE`, `LINK_CREATE`/`REVOKE`,
+`VAULT_CREATE`, `USER_SUSPEND`, `QUOTA_ADJUST`, `INVITE_CREATE`) with this
+code, before the corresponding handler runs — no on-disk state is
+mutated. Every read-shaped message (`FILE_LIST`/`STAT`,
+`CHUNK_DOWNLOAD_REQ`, `SHARE_LIST`, `LINK_LIST`, `VERSION_LIST`/`CHUNKS`,
+vault list/key-fetch, `CLUSTER_STATUS`) is unaffected, on a replica or
+not. This closes the gap the amended "Client-side automatic fallback"
+decision in `ARCHITECTURE.md` flagged as a known, bounded sharp edge:
+previously, only the daemon's own good behavior (queuing instead of
+sending) kept a write off a fallback session — a hand-rolled client, or
+`vapourwault-cli` pointed manually at a replica's `host:port`, had nothing
+stopping it. A client that gets this error while intentionally connected
+to a fallback (`TASK-173`) treats it exactly like a network error — queue
+the write locally, don't count it as an action failure — since from that
+client's perspective the effect (this write cannot reach the primary
+through this connection) is the same either way.
 
 **Wire encoding:** `error_code` is transmitted as a `uint32` (LE). Unknown codes must be treated as fatal errors by the receiver; the connection should be closed.
 
@@ -1498,6 +1672,8 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 21      | 2026-08-17 | SRV.01  | New error code `VW_ERR_READ_ONLY_REPLICA` (606, §10.1), resolving `TASK-179`: `vw_server_dispatch_file_op`'s single dispatch choke point now rejects every write-shaped message with this code when the server is configured as a cluster replica, before the corresponding handler runs — closes the gap `ARCHITECTURE.md`'s "Client-side automatic fallback" decision flagged, where read-only was previously enforced only by the daemon's own good behavior (`TASK-173`). Purely additive (a new error code, no existing message's byte layout changed); no protocol version bump required. Also backfills this table with two pre-existing but previously undocumented codes (`VW_ERR_IPC_NOT_RUNNING` = 700, `VW_ERR_READ_ONLY_FALLBACK` = 801) found missing while adding this row. |
+| 20      | 2026-08-14 | PRT.04  | Hot-standby data replication (§7.7) published, resolving `TASK-169`/`170`: eight new cluster-channel messages (`CLUSTER_FILE_SYNC_LIST`/`_LIST_RESP`/`_FETCH`/`_DATA`, `CLUSTER_CHUNK_QUERY`/`_QUERY_RESP`/`_FETCH`/`_DATA`, `0x0708`–`0x070F`) let a replica fetch and apply the actual record each oplog entry points to — previously a replica only replicated the bare-ID oplog notification stream itself (see §7.7's own note on `vw_oplog_op_t` payloads), giving it an audit trail but no independently queryable copy of the primary's data. §7.9 (cluster channel security model) extended with this exchange's integrity/reachability guarantees and an amended "what this does NOT protect against" entry (a compromised replica now also receives password hashes/2FA secrets and full file content, not just the oplog). Cluster-channel-only (`vw-cluster/1` ALPN, never the client-facing `vw/1` listener) — no existing client-facing message's byte layout changed, no protocol version bump required. Backfilled into this table by `SRV.01` (`TASK-179`, 2026-08-17) after being found missing — the §7.7/§7.9 prose was already present in this document, but this revision's own Version History row was not. |
 | 19      | 2026-08-12 | PRT.04  | `FILE_LIST_RESP` (§7.2) gains a second trailing `count * uint64 vault_id` parallel array, appended after revision 16's `version_id` array, resolving `TASK-156`. **Reverses revision 14's explicit decision** not to add this field, on the strength of concrete evidence that decision's own reasoning didn't hold up in practice: revision 14 argued populating per-entry `vault_id` for a whole listing "would mean one version lookup per entry" and that callers wanting this should `FILE_STAT` each entry of interest instead — but both real consumers that have since needed exactly this (the native GUI's `refresh_vault_badges`, capped at 200 lookups specifically *because* a real network round-trip per file is far more expensive than the in-process version lookup this array now does instead; the web gateway's folder-level-only workaround, `TASK-141`) prove the "just `FILE_STAT` it" alternative was actually costlier than the one-lookup-per-entry cost it was avoiding — doing that same lookup server-side, in-process, during the already-in-flight `FILE_LIST` call turns out to be cheaper than the escape hatch recommended instead of it. Same trailing-parallel-array technique as revision 16, for the same reason: an old client's decode loop stops after `version_id`'s array (or after the fixed-size entries, if even older) and never touches these new trailing bytes; a new client checks the payload is long enough before reading it, gated on `version_id`'s own array having been read successfully first. No protocol version bump required, matching every other purely-additive extension in this document. Directories and files with no current version encode `0` without any lookup; anything else costs exactly one `vw_store_version_get` call, the same cost `FILE_STAT` (revision 14) already pays for a single entry. |
 | 18      | 2026-08-05 | ARCH.00 | Doc-only clarification (`TASK-118`): split the header's single "Current version: 10" field — which matched neither `VW_PROTO_VERSION_CURRENT` (6) nor this table's own latest row (17) — into two separately labeled fields: the actual wire-negotiated version (`VW_PROTO_VERSION_CURRENT`, still 6, unchanged) and this table's revision counter (17 at the time, now 18). No wire behavior changed. Also corrected the header's **Status** line, which still said sharing's client/GUI support (`TASK-095`/`TASK-096`) and vault (§7.11, `TASK-089`) were pending — both finished and closed (`TASK-097`, `TASK-101`) well before this correction. Reviewed and confirmed by PRT.04 (document owner) per `CLAUDE.md`. |
 | 17      | 2026-08-04 | PRT.04  | **Breaking change** to the oplog entry format (§7.7), resolving `TASK-121` and `TASK-122` (both filed by GUI.03/CQR.08 out of `TASK-116`'s audit-log work): entry header gains an 8-byte `ts_unix_secs` append timestamp (advisory only — `entry_id` remains authoritative for ordering/replication), and the ambiguous `VW_OPLOG_FILE_WRITE` (0x02, meant `owner_id` on create but `file_id` on rename/update/version-write with no way to tell which) is retired in favor of explicit `VW_OPLOG_FILE_CREATE`/`VW_OPLOG_FILE_UPDATE`/`VW_OPLOG_FILE_VERSION` (0x08–0x0A). Total entry size grows from `17 + payload_len` to `25 + payload_len` bytes. This is a hard cutover, not an in-place migration — see §7.7's upgrade note; `AUDIT_RESP` (§7.6) and `OPLOG_DATA` (§7.7) both carry the new layout since they serialise raw entry bytes. Design-stage SEC.07 review (same day) found and closed a blocking gap in the initial draft: the text implied `vw_oplog_append_raw()` (replica applying a primary-sent entry) re-stamps the timestamp itself, and the draft's implementation notes missed that `src/server/vw_cluster.c`'s replica-side `OPLOG_DATA` batch-splitting loop independently hardcodes the pre-v17 17-byte header size (a third copy alongside `vw_oplog.c` and `vw_view_audit.cpp`) — left as-is, that loop would under-read every entry by 8 bytes and desync replication. Implemented as `TASK-123` (SRV.01) and `TASK-124` (GUI.03): the field shipped as `ts_unix_secs` rather than the originally-drafted `ts_unix_ms` (see §7.7's implementation note — no precedent in this codebase for ms-precision timestamps, and this field's filter-UI consumer doesn't need it), and implementation review found two *more* independent hardcoded-header-size copies beyond the three already caught (`handle_audit_query` in `vw_file_handlers.c`, and the primary-side `OPLOG_PULL` handler in `vw_cluster.c`) — all five now reference the single public `VW_OPLOG_ENTRY_HDR_BYTES` constant (`vw_oplog.h`). Full local build (MSVC, `/W4 /WX`) and unit test suite pass with no regressions. |

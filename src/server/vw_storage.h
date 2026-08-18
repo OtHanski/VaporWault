@@ -104,6 +104,19 @@ vw_err_t vw_storage_chunk_put(vw_storage_t *st,
                                uint64_t owner_user_id);
 
 /*
+ * TASK-172 (replica hot-standby data replication, docs/PROTOCOL.md §7.7):
+ * apply a chunk fetched via CLUSTER_CHUNK_FETCH. Same hash-verify +
+ * atomic-write + ref_count-set behavior as vw_storage_chunk_put, but never
+ * charges quota (the primary already charged this content when its own
+ * client uploaded it — replication must never fail with
+ * VW_ERR_QUOTA_EXCEEDED against this replica's own, possibly not-yet-synced
+ * quota state) and has no owner_user_id, for the same reason.
+ */
+vw_err_t vw_storage_chunk_put_replicated(vw_storage_t *st,
+                                          const uint8_t hash[VW_HASH_BYTES],
+                                          const uint8_t *data, uint32_t len);
+
+/*
  * Retrieve a chunk by its SHA-256 hash.
  * *out_data receives a malloc'd buffer; caller frees.
  * *out_len receives the byte count.
@@ -130,6 +143,25 @@ vw_err_t vw_storage_chunk_addref(vw_storage_t *st,
  */
 vw_err_t vw_storage_chunk_decref(vw_storage_t *st,
                                   const uint8_t hash[VW_HASH_BYTES]);
+
+/*
+ * TASK-181: authoritatively overwrite a chunk's ref_count to exactly
+ * `refcount`, unlike addref/decref's +1/-1 semantics. For a replica
+ * reconciling its own refcounts.db against the true occurrence count
+ * computed from its own current versions.dat/versions.blob (see
+ * vw_cluster.c's replica_run_chunk_sync_pass) — never for primary-side
+ * incremental tracking, which must keep using addref/decref/chunk_put's
+ * own increment-on-write.
+ *
+ * Does not create the chunk if absent: returns VW_ERR_NOT_FOUND if the
+ * hash has no entry at all (the caller must vw_storage_chunk_put_replicated
+ * it first so the content and its ref_count == 1 baseline both exist).
+ * Passing refcount == 0 is valid and marks the chunk GC-eligible, same as
+ * decref reaching 0.
+ */
+vw_err_t vw_storage_chunk_set_refcount(vw_storage_t *st,
+                                        const uint8_t hash[VW_HASH_BYTES],
+                                        uint32_t refcount);
 
 /*
  * TASK-094: move a chunk's quota attribution from from_user_id to

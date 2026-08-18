@@ -17,6 +17,17 @@
 
 enum class AppView { Login, Browser, Shared, Vault, Queue, Settings };
 
+/*
+ * TASK-173/175: format a write action's failure for display, giving
+ * VW_ERR_READ_ONLY_FALLBACK a specific, accurate explanation instead of a
+ * bare error code — this is a synchronous rejection (no offline-queue
+ * equivalent for share/link/vault actions, unlike automatic file sync),
+ * so the message says "blocked," not "queued." Writes into buf (must be
+ * at least 160 bytes); action is a short present-tense verb phrase, e.g.
+ * "Grant", "Vault creation", "Upload".
+ */
+void vw_gui_format_action_error(char *buf, size_t bufsz, const char *action, int rc);
+
 class ClientApp {
 public:
     ClientApp();
@@ -87,6 +98,8 @@ public:
     int  ipc_account_add(uint32_t account_id_hint, const char *label,
                           const char *server_host, uint16_t server_port, const char *ca_cert_path,
                           const char *username, char *password, const char *otp,
+                          const char *fallback_host, uint16_t fallback_port,
+                          const char *fallback_ca_cert_path,
                           uint32_t *out_account_id);
     int  ipc_account_remove(uint32_t account_id);
 

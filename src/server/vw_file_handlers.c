@@ -2750,6 +2750,39 @@ static vw_err_t handle_vault_list(vw_store_t *store, vw_vault_store_t *vs,
 
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
+/*
+ * TASK-179: message types that mutate on-disk server state, rejected
+ * outright when this server is running as a cluster replica
+ * (cfg.cluster.is_replica) — defense-in-depth alongside the daemon's own
+ * client-side enforcement (TASK-173's VW_ERR_READ_ONLY_FALLBACK), which
+ * only stops a *well-behaved* client from writing to a fallback session,
+ * not a client (or hand-rolled script) that connects to the replica's
+ * listen_port directly. Every branch of both switches below that calls
+ * into a handler which writes something to disk is listed here.
+ */
+static int is_write_shaped_msg(vw_msg_type_t type)
+{
+    switch (type) {
+    case VW_MSG_USER_SUSPEND:
+    case VW_MSG_QUOTA_ADJUST:
+    case VW_MSG_INVITE_CREATE:
+    case VW_MSG_CHUNK_UPLOAD:
+    case VW_MSG_FILE_COMMIT:
+    case VW_MSG_FILE_DELETE:
+    case VW_MSG_FILE_MOVE:
+    case VW_MSG_FILE_MKDIR:
+    case VW_MSG_VERSION_RESTORE:
+    case VW_MSG_SHARE_GRANT:
+    case VW_MSG_SHARE_REVOKE:
+    case VW_MSG_LINK_CREATE:
+    case VW_MSG_LINK_REVOKE:
+    case VW_MSG_VAULT_CREATE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
                                      vw_conn_t       *conn,
                                      vw_msg_type_t    type,
@@ -2757,6 +2790,12 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
                                      uint32_t         plen)
 {
     if (!ctx || !conn || !payload) return VW_ERR_INVALID_ARG;
+
+    if (is_write_shaped_msg(type) &&
+        vw_cluster_is_replica(vw_server_ctx_cluster(ctx))) {
+        (void)send_error(conn, VW_ERR_READ_ONLY_REPLICA);
+        return VW_ERR_READ_ONLY_REPLICA;
+    }
 
     vw_store_t        *store   = vw_server_ctx_store(ctx);
     vw_file_store_t   *fs      = vw_server_ctx_file_store(ctx);

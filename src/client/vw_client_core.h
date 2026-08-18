@@ -70,6 +70,26 @@ vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
                              vw_client_sess_t **out_sess);
 
 /*
+ * TASK-173: connect and authenticate with an already-derived auth_token
+ * (SHA-256(password), the exact 32 bytes AUTH_REQUEST sends — see this
+ * file's header comment) instead of a raw password. For a fallback
+ * connect: the daemon retains this value (not the raw password) from
+ * whichever ACCOUNT_ADD_REQ last supplied one, specifically so it can
+ * authenticate fresh against a differently-configured server (a
+ * SESSION_RESUME token from the primary is meaningless there — see
+ * vw_client_resume's own doc) without re-prompting the user. Same 2FA
+ * behavior as vw_client_connect: VW_ERR_AUTH_2FA_REQUIRED if the account
+ * has 2FA enabled and otp_cb is NULL (the expected case for an unattended
+ * background fallback attempt — the account then simply can't fail over
+ * automatically).
+ */
+vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
+                                       const char *username, uint16_t username_len,
+                                       const uint8_t auth_token[VW_TOKEN_BYTES],
+                                       vw_otp_callback_t otp_cb, void *otp_userdata,
+                                       vw_client_sess_t **out_sess);
+
+/*
  * Connect and resume a saved session using a stored token.  The server
  * validates the token and issues a fresh replacement (single-use resumption
  * per PROTOCOL.md §7.1).  After success the caller should update any

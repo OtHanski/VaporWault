@@ -8,6 +8,17 @@
 #include "imgui.h"
 #include <SDL.h>
 
+void vw_gui_format_action_error(char *buf, size_t bufsz, const char *action, int rc) {
+    if (rc == (int)VW_ERR_READ_ONLY_FALLBACK) {
+        snprintf(buf, bufsz,
+                 "%s blocked — this account is on its read-only fallback right now "
+                 "(primary unreachable). It will work again once the primary is back.",
+                 action);
+    } else {
+        snprintf(buf, bufsz, "%s failed (code %d).", action, rc);
+    }
+}
+
 ClientApp::ClientApp() = default;
 ClientApp::~ClientApp() { stop(); }
 
@@ -83,6 +94,22 @@ void ClientApp::render_frame() {
     /* Navigation menu bar */
     if (ImGui::BeginMainMenuBar()) {
         render_account_switcher();
+        /* TASK-173/175: an always-visible badge for the ACTIVE account's
+         * fallback state — distinct from render_account_switcher()'s
+         * per-item labels inside the dropdown, since a user shouldn't have
+         * to open the switcher menu just to notice they're on a read-only
+         * connection right now. */
+        {
+            std::vector<VwGuiAccountEntry> accounts = cached_accounts();
+            uint32_t active_id = active_account_id();
+            for (auto &a : accounts) {
+                if (a.account_id == active_id && a.conn_mode == 2) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.1f, 1.0f),
+                        "  ⚠ Read-only fallback — writes will be queued until the primary is back");
+                    break;
+                }
+            }
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Files",    nullptr, active_view_ == AppView::Browser))
             active_view_ = AppView::Browser;
@@ -152,7 +179,12 @@ void ClientApp::render_account_switcher() {
         for (auto &a : accounts) {
             bool selected = (a.account_id == active_id);
             std::string item = a.label.empty() ? a.username : a.label;
-            if (!a.connected) item += "  [offline]";
+            /* TASK-173/175: distinguish "connected to the read-only
+             * fallback" from plain offline — a user acting on this
+             * account needs to know uploads/mkdir/etc. will be queued,
+             * not that nothing works at all. */
+            if (a.conn_mode == 2) item += "  [fallback (read-only)]";
+            else if (!a.connected) item += "  [offline]";
             if (ImGui::MenuItem(item.c_str(), nullptr, selected) && !selected)
                 switch_active_account(a.account_id);
         }
@@ -211,10 +243,14 @@ bool ClientApp::ipc_account_list(std::vector<VwGuiAccountEntry> *out) {
 int ClientApp::ipc_account_add(uint32_t account_id_hint, const char *label,
                                 const char *server_host, uint16_t server_port, const char *ca_cert_path,
                                 const char *username, char *password, const char *otp,
+                                const char *fallback_host, uint16_t fallback_port,
+                                const char *fallback_ca_cert_path,
                                 uint32_t *out_account_id) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.account_add(account_id_hint, label, server_host, server_port, ca_cert_path,
-                             username, password, otp, out_account_id);
+                             username, password, otp,
+                             fallback_host, fallback_port, fallback_ca_cert_path,
+                             out_account_id);
 }
 int ClientApp::ipc_account_remove(uint32_t account_id) {
     bool need_invalidate = false;

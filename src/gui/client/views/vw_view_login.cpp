@@ -26,6 +26,17 @@ static char s_otp[16]       = "";
 static char s_status_msg[160] = "";
 static bool s_need_otp       = false;
 
+/* TASK-173/175: optional per-account read-only fallback — a second,
+ * already-cluster-paired replica the daemon automatically connects to
+ * (read-only) if this account's primary becomes unreachable. Collapsed
+ * behind a checkbox since most accounts won't set one; unchecking clears
+ * the fields so re-checking always starts from a known empty state rather
+ * than resubmitting stale values the user never meant to send. */
+static bool s_fallback_enabled = false;
+static char s_fallback_host[256]    = "";
+static char s_fallback_port[8]      = "";
+static char s_fallback_ca_cert[512] = "";
+
 void vw_view_login_render(const VwIpcStatus &status, ClientApp &app) {
     ImGuiIO &io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
@@ -53,13 +64,42 @@ void vw_view_login_render(const VwIpcStatus &status, ClientApp &app) {
         submit = ImGui::InputText("2FA code##login", s_otp, sizeof(s_otp),
                       ImGuiInputTextFlags_EnterReturnsTrue) || submit;
 
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (ImGui::Checkbox("Set up an automatic read-only fallback##login", &s_fallback_enabled)) {
+        if (!s_fallback_enabled) {
+            s_fallback_host[0] = '\0';
+            s_fallback_port[0] = '\0';
+            s_fallback_ca_cert[0] = '\0';
+        }
+    }
+    if (s_fallback_enabled) {
+        ImGui::TextWrapped(
+            "Must be an already cluster-paired replica of the server above. "
+            "Used automatically, read-only, if the primary becomes unreachable.");
+        ImGui::InputText("Fallback host##login", s_fallback_host, sizeof(s_fallback_host));
+        ImGui::InputText("Fallback port##login", s_fallback_port, sizeof(s_fallback_port),
+                          ImGuiInputTextFlags_CharsDecimal);
+        ImGui::InputText("Fallback CA cert path##login", s_fallback_ca_cert, sizeof(s_fallback_ca_cert));
+    }
+
     submit = ImGui::Button("Add account##login") || submit;
 
-    if (submit && s_password[0] && s_host[0] && s_username[0]) {
+    bool fallback_partial = s_fallback_enabled &&
+                             (s_fallback_host[0] == '\0' || s_fallback_port[0] == '\0');
+
+    if (submit && fallback_partial) {
+        snprintf(s_status_msg, sizeof(s_status_msg),
+                 "Fallback host and port are both required (or leave the checkbox unchecked).");
+    } else if (submit && s_password[0] && s_host[0] && s_username[0]) {
         uint16_t port = (uint16_t)strtoul(s_port, nullptr, 10);
+        const char *fb_host = s_fallback_enabled ? s_fallback_host : nullptr;
+        uint16_t fb_port = s_fallback_enabled ? (uint16_t)strtoul(s_fallback_port, nullptr, 10) : 0;
+        const char *fb_ca = s_fallback_enabled ? s_fallback_ca_cert : nullptr;
         uint32_t new_account_id = 0;
         int rc = app.ipc_account_add(0, s_label, s_host, port, s_ca_cert,
-                                      s_username, s_password, s_otp, &new_account_id);
+                                      s_username, s_password, s_otp,
+                                      fb_host, fb_port, fb_ca, &new_account_id);
         /* app.ipc_account_add() zeroes s_password in place regardless of
          * outcome (raw-password-handling convention, see vw_gui_ipc.cpp). */
         if (rc == 0) {
@@ -68,6 +108,10 @@ void vw_view_login_render(const VwIpcStatus &status, ClientApp &app) {
             s_otp[0] = '\0';
             s_label[0] = '\0';
             s_username[0] = '\0';
+            s_fallback_enabled = false;
+            s_fallback_host[0] = '\0';
+            s_fallback_port[0] = '\0';
+            s_fallback_ca_cert[0] = '\0';
             /* Render-thread-only — see ClientApp.h's doc comment. Safe
              * here: this render call and the switch happen on the same
              * (render) thread. */

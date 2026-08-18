@@ -164,8 +164,37 @@ vw_err_t vw_gc_run_once(vw_gc_ctx_t *ctx)
      *      preventing double-free of chunk data on GC retry after a crash.
      *   c. Only files with deleted == 1 are collected, which guarantees we
      *      never decrement ref-counts for the current_version_id of a live file.
-     */
-    if (ctx->file_store && ctx->chunk_store) {
+     *
+     * TASK-171 (replica-safety gate, found while designing TASK-169's
+     * client-fallback feature): before this task, this whole phase ran
+     * unconditionally, unlike phase 2's oplog-segment truncation above,
+     * which already refuses to reclaim anything a lagging replica might
+     * still need. That asymmetry was a real, silent data-loss race once a
+     * replica is expected to hold genuinely queryable data (TASK-172): a
+     * replica could take a snapshot of which chunks it needs (its own
+     * versions.blob sync), then have this server physically unlink one of
+     * those exact chunks from disk before the replica's own follow-up
+     * fetch for it arrives, if a write superseding that chunk's last
+     * reference and a GC cycle happen to race. Gated the same way phase 2
+     * already is (this project's own established pattern for this exact
+     * problem) — skip the whole phase, not just the final chunk-delete
+     * call, whenever any active replica hasn't yet caught up to this
+     * server's current oplog tail. Degrades to "always runs" (today's
+     * unconditional behavior) when there are no active replicas, so a
+     * single-node deployment sees zero change. */
+    int replica_lag_blocks_gc = 0;
+    if (ctx->cluster && vw_cluster_has_active_replicas(ctx->cluster)) {
+        uint64_t safe_eid    = vw_cluster_min_sync_watermark(ctx->cluster);
+        uint64_t current_eid = vw_oplog_last_entry_id(ctx->oplog);
+        if (safe_eid < current_eid) {
+            replica_lag_blocks_gc = 1;
+            GC_INFO("skipping file/chunk GC this cycle — a replica is at "
+                    "watermark %llu, behind current oplog tail %llu",
+                    (unsigned long long)safe_eid, (unsigned long long)current_eid);
+        }
+    }
+
+    if (ctx->file_store && ctx->chunk_store && !replica_lag_blocks_gc) {
         del_collect_t dc;
         memset(&dc, 0, sizeof(dc));
         dc.now            = (int64_t)now;

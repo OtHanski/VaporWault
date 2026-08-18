@@ -21,7 +21,9 @@
 
 static void print_usage(const char *prog) {
     printf("Usage: %s --server-host HOST --server-port PORT --ca-cert PATH "
-           "[--listen-host HOST] [--listen-port PORT] [--state-dir DIR]\n\n"
+           "[--listen-host HOST] [--listen-port PORT] [--state-dir DIR]\n"
+           "       [--fallback-server-host HOST --fallback-server-port PORT "
+           "--fallback-ca-cert PATH]\n\n"
            "  --server-host HOST   VaporWault server to connect to (required)\n"
            "  --server-port PORT   VaporWault server TLS port (required)\n"
            "  --ca-cert PATH       CA cert PEM to verify the server's certificate\n"
@@ -38,7 +40,17 @@ static void print_usage(const char *prog) {
            "                       hardened to this process's own user only. \n"
            "                       Omit to disable the feature entirely (a\n"
            "                       remember=true login is then silently\n"
-           "                       treated as session-only).\n",
+           "                       treated as session-only).\n"
+           "  --fallback-server-host HOST  Optional read-only fallback (TASK-176):\n"
+           "                       an already cluster-paired replica of the\n"
+           "                       primary above. Used automatically, read-only,\n"
+           "                       for new logins if the primary is unreachable.\n"
+           "                       All three --fallback-* flags are required\n"
+           "                       together, or omit all three (default).\n"
+           "  --fallback-server-port PORT  Fallback server TLS port\n"
+           "  --fallback-ca-cert PATH      CA cert PEM for the fallback - required\n"
+           "                       whenever a fallback is configured, never\n"
+           "                       optional or defaulted (same rule as --ca-cert)\n",
            prog);
 }
 
@@ -49,6 +61,9 @@ int main(int argc, char **argv) {
     const char *state_dir = NULL;
     uint16_t server_port = 0;
     uint16_t listen_port = 8080;
+    const char *fallback_host = NULL;
+    const char *fallback_ca_cert = NULL;
+    uint16_t fallback_port = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -66,6 +81,12 @@ int main(int argc, char **argv) {
             listen_port = (uint16_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {
             state_dir = argv[++i];
+        } else if (strcmp(argv[i], "--fallback-server-host") == 0 && i + 1 < argc) {
+            fallback_host = argv[++i];
+        } else if (strcmp(argv[i], "--fallback-server-port") == 0 && i + 1 < argc) {
+            fallback_port = (uint16_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--fallback-ca-cert") == 0 && i + 1 < argc) {
+            fallback_ca_cert = argv[++i];
         } else {
             fprintf(stderr, "Unknown argument: %s\n\n", argv[i]);
             print_usage(argv[0]);
@@ -75,6 +96,19 @@ int main(int argc, char **argv) {
 
     if (server_host == NULL || server_port == 0 || ca_cert == NULL) {
         fprintf(stderr, "--server-host, --server-port, and --ca-cert are all required.\n\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    /* TASK-176: all three fallback flags together, or none — a partial
+     * set is a configuration error, never silently treated as "no
+     * fallback" (same convention as TASK-174's CLI flags). */
+    int fallback_any = (fallback_host != NULL) || (fallback_port != 0) || (fallback_ca_cert != NULL);
+    int fallback_all = (fallback_host != NULL) && (fallback_port != 0) && (fallback_ca_cert != NULL);
+    if (fallback_any && !fallback_all) {
+        fprintf(stderr,
+                "--fallback-server-host, --fallback-server-port, and --fallback-ca-cert "
+                "must all be given together, or none of them.\n\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -119,12 +153,22 @@ int main(int argc, char **argv) {
     server_cfg.server_host = server_host;
     server_cfg.server_port = server_port;
     server_cfg.ca_cert_pem_path = ca_cert;
+    server_cfg.fallback_host = fallback_host;
+    server_cfg.fallback_port = fallback_port;
+    server_cfg.fallback_ca_cert_pem_path = fallback_ca_cert;
 
+    char fallback_desc[128];
+    fallback_desc[0] = '\0';
+    if (fallback_host != NULL) {
+        snprintf(fallback_desc, sizeof(fallback_desc),
+                 ", read-only fallback %s:%u", fallback_host, (unsigned)fallback_port);
+    }
     printf("vapourwault-web-gateway (protocol v%u) listening on %s:%u, "
-           "upstream server %s:%u%s\n",
+           "upstream server %s:%u%s%s\n",
            (unsigned)VW_PROTO_VERSION_CURRENT, listen_host, (unsigned)listen_port,
            server_host, (unsigned)server_port,
-           remember_store != NULL ? " (remember-me enabled)" : "");
+           remember_store != NULL ? " (remember-me enabled)" : "",
+           fallback_desc);
 
     time_t last_reap = time(NULL);
 

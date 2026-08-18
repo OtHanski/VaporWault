@@ -86,6 +86,12 @@ typedef enum {
     VW_ERR_VERSION_NOT_FOUND   = 603,  /* version_id absent or belongs to other file */
     VW_ERR_DIR_NOT_EMPTY       = 604,  /* directory delete: children still exist     */
     VW_ERR_RATE_LIMITED        = 605,  /* TASK-094: scoped-session write-count cap hit */
+    VW_ERR_READ_ONLY_REPLICA   = 606,  /* TASK-179: server rejected a write-shaped
+                                          request because it is running as a
+                                          cluster replica (cfg.cluster.is_replica);
+                                          sent over the wire, defense-in-depth
+                                          alongside the daemon's own client-side
+                                          VW_ERR_READ_ONLY_FALLBACK (800s, below) */
 
     /* IPC */
     VW_ERR_IPC_NOT_RUNNING     = 700,  /* daemon not listening on IPC port           */
@@ -93,6 +99,11 @@ typedef enum {
     /* Client-local sync engine (TASK-111; never sent over the wire) */
     VW_ERR_SYNC_TREE_TOO_LARGE = 800,  /* shared-folder BFS exceeded the client's
                                           resource ceiling for one sync cycle       */
+    VW_ERR_READ_ONLY_FALLBACK  = 801,  /* TASK-173: daemon rejected a write-shaped
+                                          IPC request because this account is
+                                          currently connected to its read-only
+                                          fallback server, not the primary; never
+                                          sent over the wire, IPC-response only  */
 } vw_err_t;
 
 /* ── Message types ───────────────────────────────────────────────────────── */
@@ -199,6 +210,22 @@ typedef enum {
     VW_MSG_OPLOG_ACK          = 0x0705,  /* replica confirms consumed up to entry_id */
     VW_MSG_CLUSTER_STATUS     = 0x0706,
     VW_MSG_CLUSTER_STATUS_RESP = 0x0707,
+
+    /* Hot-standby data replication (TASK-169/170/172; docs/PROTOCOL.md
+     * §7.7). Gives a replica genuinely queryable data — oplog entries
+     * above are bare-id notifications only, never a data source; see
+     * §7.7's own note. Cluster-connection-only (vw-cluster/1 ALPN),
+     * authenticated by NODE_HELLO's auth_token, never reachable from the
+     * normal vw/1 client listener. */
+    VW_MSG_CLUSTER_FILE_SYNC_LIST      = 0x0708,  /* replica → primary: list syncable files + hashes */
+    VW_MSG_CLUSTER_FILE_SYNC_LIST_RESP = 0x0709,  /* primary → replica: per-file size + sha256       */
+    VW_MSG_CLUSTER_FILE_SYNC_FETCH     = 0x070A,  /* replica → primary: request one file's content   */
+    VW_MSG_CLUSTER_FILE_SYNC_DATA      = 0x070B,  /* primary → replica: that file's full content      */
+    VW_MSG_CLUSTER_CHUNK_QUERY         = 0x070C,  /* replica → primary: which of these hashes exist   */
+    VW_MSG_CLUSTER_CHUNK_QUERY_RESP    = 0x070D,  /* primary → replica: bitmask (same shape as CHUNK_QUERY_RESP) */
+    VW_MSG_CLUSTER_CHUNK_FETCH         = 0x070E,  /* replica → primary: request one chunk's bytes     */
+    VW_MSG_CLUSTER_CHUNK_DATA          = 0x070F,  /* primary → replica: chunk bytes (same shape as CHUNK_DATA) */
+
     VW_MSG_NODE_HELLO_FAIL    = 0x07FF,  /* primary → replica: auth rejected */
 
     /* Vault / E2EE (TASK-098; docs/PROTOCOL.md §7.11). Server stores/returns

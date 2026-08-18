@@ -30,6 +30,19 @@ typedef struct {
      * VW_CERT_VERIFY_NONE. The gateway refuses to start without this set
      * (TASK-132's main() enforces it, not this struct itself). */
     const char *ca_cert_pem_path;
+    /*
+     * TASK-176: optional read-only fallback — an already cluster-paired
+     * replica of the primary above (same requirement as the daemon's own
+     * per-account fallback, TASK-172/173). fallback_host == NULL (or
+     * empty) means "not configured," this deployment's whole behavior is
+     * then unchanged from before this task. When fallback_host is set,
+     * fallback_ca_cert_pem_path must also be set — never optional, same
+     * "no disabled-verification path" rule as ca_cert_pem_path above
+     * (main.c enforces this pairing, not this struct itself).
+     */
+    const char *fallback_host;
+    uint16_t    fallback_port;
+    const char *fallback_ca_cert_pem_path;
 } vw_gateway_server_cfg_t;
 
 /*

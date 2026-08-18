@@ -701,6 +701,69 @@ fail:
     return err;
 }
 
+/* ── vw_store_reload_users_and_quotas (TASK-172) ─────────────────────────── */
+
+/*
+ * Rebuild `live`'s username_ht/email_ht/uid_to_slot/quotas/quota_free from
+ * the current on-disk users.dat/quotas.db under data_dir, in place —
+ * without ever closing/reopening `live` itself, since other threads
+ * already hold that exact pointer (this server's own client-facing
+ * request handlers, on a replica that's also serving normal reads while
+ * a sync pass is replacing these files). Reuses vw_store_open()'s own
+ * (already-reviewed) parsing/hash-table-building logic verbatim by
+ * building a completely separate scratch vw_store_t from it, then
+ * stealing only the users/quota fields out of it under `live`'s own
+ * users_lock/quota_lock, rather than duplicating that logic into a
+ * second, parallel code path that could silently drift from the
+ * original. sessions.dat is deliberately never touched here (see
+ * docs/PROTOCOL.md §7.7's own "deliberately never synced this way" note
+ * — scratch's freshly-built session fields are simply discarded along
+ * with the rest of scratch via vw_store_close()).
+ *
+ * Returns whatever vw_store_open() on the scratch instance returns; on
+ * failure `live` is left completely unchanged (scratch never opened
+ * successfully, so there is nothing to steal from).
+ */
+vw_err_t vw_store_reload_users_and_quotas(vw_store_t *live, const char *data_dir)
+{
+    if (!live || !data_dir) return VW_ERR_INVALID_ARG;
+
+    vw_store_t *scratch = NULL;
+    vw_err_t rc = vw_store_open(data_dir, live->oplog, &scratch);
+    if (rc != VW_OK) return rc;
+
+    rwlock_wrlock(&live->users_lock);
+    free(live->username_ht);
+    free(live->email_ht);
+    free(live->uid_to_slot);
+    live->username_ht     = scratch->username_ht;     scratch->username_ht     = NULL;
+    live->username_ht_cap = scratch->username_ht_cap;
+    live->username_ht_len = scratch->username_ht_len;
+    live->email_ht         = scratch->email_ht;        scratch->email_ht         = NULL;
+    live->email_ht_cap     = scratch->email_ht_cap;
+    live->email_ht_len     = scratch->email_ht_len;
+    live->uid_to_slot      = scratch->uid_to_slot;      scratch->uid_to_slot      = NULL;
+    live->uid_to_slot_cap  = scratch->uid_to_slot_cap;
+    live->next_user_id     = scratch->next_user_id;
+    live->user_slots       = scratch->user_slots;
+    rwlock_wrunlock(&live->users_lock);
+
+    rwlock_wrlock(&live->quota_lock);
+    free(live->quotas);
+    free(live->quota_free);
+    live->quotas          = scratch->quotas;          scratch->quotas          = NULL;
+    live->quota_nslots    = scratch->quota_nslots;
+    live->quota_free      = scratch->quota_free;      scratch->quota_free      = NULL;
+    live->quota_free_len  = scratch->quota_free_len;
+    live->quota_free_cap  = scratch->quota_free_cap;
+    rwlock_wrunlock(&live->quota_lock);
+
+    /* Frees scratch's own (unused, freshly-built, discarded) session
+     * fields and the now-NULL stolen fields harmlessly. */
+    vw_store_close(scratch);
+    return VW_OK;
+}
+
 /* ── vw_store_close ───────────────────────────────────────────────────────── */
 
 void vw_store_close(vw_store_t *ctx)

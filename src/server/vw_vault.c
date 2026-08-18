@@ -169,6 +169,27 @@ void vw_vault_store_close(vw_vault_store_t *s)
     free(s);
 }
 
+vw_err_t vw_vault_store_reload(vw_vault_store_t *live, const char *data_dir)
+{
+    if (!live || !data_dir) return VW_ERR_INVALID_ARG;
+
+    vw_vault_store_t *scratch = NULL;
+    vw_err_t rc = vw_vault_store_open(data_dir, live->oplog, &scratch);
+    if (rc != VW_OK) return rc;
+
+    vlt_rwlock_wlock(&live->lock);
+    free(live->vid_to_slot);
+    live->vid_to_slot     = scratch->vid_to_slot;     scratch->vid_to_slot     = NULL;
+    live->vid_to_slot_cap = scratch->vid_to_slot_cap;
+    live->nslots          = scratch->nslots;
+    live->next_vault_id   = scratch->next_vault_id;
+    live->blob_size       = scratch->blob_size;
+    vlt_rwlock_wunlock(&live->lock);
+
+    vw_vault_store_close(scratch);
+    return VW_OK;
+}
+
 /* ── CRUD ────────────────────────────────────────────────────────────────── */
 
 vw_err_t vw_vault_create(vw_vault_store_t *s,

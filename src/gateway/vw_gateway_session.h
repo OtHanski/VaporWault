@@ -67,9 +67,20 @@ void vw_gateway_session_pool_destroy(vw_gateway_session_pool_t *pool);
  * response leaves for the frontend to render distinctly (e.g. "(shared
  * link)") rather than encoding that meaning in this module itself.
  */
+/*
+ * read_only (TASK-176): 1 if `sess` is connected to this deployment's
+ * configured read-only fallback server rather than the primary (the
+ * gateway's own analogue of the daemon's per-account fallback,
+ * TASK-172/173) — every write endpoint checks
+ * vw_gateway_session_is_read_only() and rejects rather than attempting a
+ * write against the fallback. 0 for every session created before this
+ * task's fallback support existed, and for every ordinary primary-
+ * connected session today.
+ */
 vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
                                     vw_client_sess_t *sess,
                                     const char *username,
+                                    int read_only,
                                     char *out_cookie_hex);
 
 /*
@@ -112,6 +123,19 @@ vw_err_t vw_gateway_session_reinsert(vw_gateway_session_pool_t *pool,
 vw_err_t vw_gateway_session_get_username(vw_gateway_session_pool_t *pool,
                                           const char *cookie_hex,
                                           char *out_buf, size_t out_buf_size);
+
+/*
+ * TASK-176: report whether this session is connected to the configured
+ * read-only fallback rather than the primary (set at creation time —
+ * see vw_gateway_session_create's read_only parameter; never changes for
+ * the lifetime of a session, unlike the daemon's per-account state, since
+ * the gateway never migrates a live session between servers). Returns
+ * VW_ERR_AUTH_REQUIRED for an unknown/malformed cookie, same convention
+ * as vw_gateway_session_get_username.
+ */
+vw_err_t vw_gateway_session_is_read_only(vw_gateway_session_pool_t *pool,
+                                          const char *cookie_hex,
+                                          int *out_read_only);
 
 /*
  * Remove and log out (vw_client_logout) the session for this cookie.

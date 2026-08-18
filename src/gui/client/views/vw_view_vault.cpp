@@ -157,8 +157,8 @@ static void render_setup_wizard(ClientApp &app) {
             uint64_t dir_id = 0;
             int rc = app.ipc_file_mkdir(0, s_setup_dirname, &dir_id);
             if (rc != 0) {
-                snprintf(s_setup_status, sizeof(s_setup_status),
-                         "Could not create folder (code %d).", rc);
+                vw_gui_format_action_error(s_setup_status, sizeof(s_setup_status),
+                                            "Folder creation", rc);
             } else {
                 uint64_t vault_id = 0;
                 rc = app.ipc_vault_create(dir_id, s_setup_pass1, &vault_id);
@@ -172,8 +172,8 @@ static void render_setup_wizard(ClientApp &app) {
                     ImGui::CloseCurrentPopup();
                     refresh(app);
                 } else {
-                    snprintf(s_setup_status, sizeof(s_setup_status),
-                             "Vault creation failed (code %d).", rc);
+                    vw_gui_format_action_error(s_setup_status, sizeof(s_setup_status),
+                                                "Vault creation", rc);
                 }
             }
         }
@@ -280,8 +280,7 @@ static void render_upload_dialog(ClientApp &app) {
                 snprintf(s_upload_status, sizeof(s_upload_status),
                          "Uploaded as file #%llu.", (unsigned long long)out_file_id);
             } else {
-                snprintf(s_upload_status, sizeof(s_upload_status),
-                         "Upload failed (code %d).", rc);
+                vw_gui_format_action_error(s_upload_status, sizeof(s_upload_status), "Upload", rc);
             }
         }
     }

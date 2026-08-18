@@ -17,8 +17,16 @@
  *   daemon.log, daemon.pid
  *   accounts/<account_id>/
  *     account.conf           label, server_host, server_port,
- *                             ca_cert_pem_path, username
- *     cache.db, sync_folders.db, session.tok, offline_queue.db
+ *                             ca_cert_pem_path, username, and (TASK-173,
+ *                             optional) fallback_host/fallback_port/
+ *                             fallback_ca_cert_pem_path
+ *     cache.db, sync_folders.db, session.tok, offline_queue.db,
+ *     login_token.bin        TASK-173: SHA-256(password) — never the raw
+ *                             password — retained so an unattended fallback
+ *                             connect can authenticate fresh (a primary-
+ *                             issued session.tok is meaningless on a
+ *                             different server). Same 0600/"ignore on wrong
+ *                             permissions" protection as session.tok.
  *
  * Security:
  *   - Each account's session.tok is checked for mode 0600 before loading

@@ -118,7 +118,8 @@ def test_account_add_list_remove_over_real_ipc(server, running_daemon, unique_us
         host, off = _read_str(payload, off)
         connected = payload[off]; off += 1
         off += 8  # pending_uploads (u32) + pending_downloads (u32)
-        seen[acc_id] = (username.decode(), connected)
+        conn_mode = payload[off]; off += 1  # TASK-173: 0=offline, 1=primary, 2=fallback
+        seen[acc_id] = (username.decode(), connected, conn_mode)
     assert seen[account_id_a][0] == user_a
     assert seen[account_id_b][0] == user_b
     assert seen[account_id_a][1] == 1, "account A should be connected right after ACCOUNT_ADD_REQ"

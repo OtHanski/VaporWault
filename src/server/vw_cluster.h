@@ -29,6 +29,18 @@
 extern "C" {
 #endif
 
+/* Forward declarations — TASK-172 (replica hot-standby data replication):
+ * vw_cluster_open needs each store module's live handle so a replica can
+ * reload its in-memory state after CLUSTER_FILE_SYNC_DATA/CLUSTER_CHUNK_DATA
+ * writes new bytes to disk (see vw_*_reload() in each module's own header).
+ * Forward-declared rather than included so this header stays a thin
+ * dependency for callers that only need the node-record/handshake API. */
+struct vw_store;        typedef struct vw_store vw_store_t;
+struct vw_file_store;   typedef struct vw_file_store vw_file_store_t;
+struct vw_storage;      typedef struct vw_storage vw_storage_t;
+struct vw_share_store;  typedef struct vw_share_store vw_share_store_t;
+struct vw_vault_store;  typedef struct vw_vault_store vw_vault_store_t;
+
 /* ── On-disk node record ────────────────────────────────────────────────────── */
 
 /*
@@ -87,6 +99,22 @@ typedef struct {
  *
  * oplog must remain valid for the lifetime of the cluster context.
  *
+ * store, file_store, chunks, share_store, vault_store (TASK-172): this
+ * server's own already-opened live store handles. Used two ways:
+ *   - On either role, `chunks` backs CLUSTER_CHUNK_QUERY/CLUSTER_CHUNK_FETCH
+ *     (primary side, reusing vw_storage_chunk_query/vw_storage_chunk_get
+ *     exactly like the client-facing CHUNK_QUERY/CHUNK_DOWNLOAD_REQ
+ *     handlers) and vw_storage_chunk_put_replicated (replica side).
+ *   - On a replica, the other four back each module's vw_*_reload() call
+ *     after CLUSTER_FILE_SYNC_DATA writes fresh bytes for that module's
+ *     file(s) to disk (docs/PROTOCOL.md §7.7).
+ * share_store and vault_store may be NULL if the caller's own open call for
+ * that optional subsystem failed — the corresponding sync/reload is then
+ * skipped (that module stays whatever it already was, matching how the
+ * rest of the server already runs with sharing/vaults disabled). store,
+ * file_store, and chunks must be non-NULL — they are load-bearing for the
+ * base feature set on every server regardless of cluster role.
+ *
  * Returns VW_OK and sets *out on success; VW_ERR_IO on file errors;
  * VW_ERR_OOM on allocation failure.
  */
@@ -95,6 +123,11 @@ vw_err_t vw_cluster_open(const char *data_dir,
                           const char *cert_pem_path,
                           const char *key_pem_path,
                           vw_oplog_t *oplog,
+                          vw_store_t *store,
+                          vw_file_store_t *file_store,
+                          vw_storage_t *chunks,
+                          vw_share_store_t *share_store,
+                          vw_vault_store_t *vault_store,
                           vw_cluster_t **out);
 
 /*
@@ -199,6 +232,15 @@ uint64_t vw_cluster_min_sync_watermark(vw_cluster_t *ctx);
  * Return 1 if at least one node has is_active == 1 && role == 0.
  */
 int vw_cluster_has_active_replicas(vw_cluster_t *ctx);
+
+/*
+ * Return 1 if this server was configured with cluster_is_replica = 1
+ * (cfg.is_replica at vw_cluster_open time), 0 otherwise. ctx may be NULL
+ * (a non-clustered server) — returns 0 in that case. TASK-179: lets the
+ * client-facing dispatcher (vw_file_handlers.c) reject write-shaped
+ * requests on a replica without needing its own copy of the cluster cfg.
+ */
+int vw_cluster_is_replica(const vw_cluster_t *ctx);
 
 #ifdef __cplusplus
 }

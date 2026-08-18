@@ -78,41 +78,32 @@ static vw_err_t recv_auth_result(vw_conn_t *conn, vw_client_sess_t *sess)
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
-                             const char *username, uint16_t username_len,
-                             const void *password, size_t pw_len,
-                             vw_otp_callback_t otp_cb, void *otp_userdata,
-                             vw_client_sess_t **out_sess)
+/*
+ * Shared tail of vw_client_connect/vw_client_connect_with_hash: sess is
+ * already connected and version-negotiated; auth_token is the 32-byte
+ * value AUTH_REQUEST sends as-is (SHA-256(password) per PROTOCOL.md
+ * §8.1 Phase 1 — the caller has either just derived that or already had
+ * it). Takes ownership of sess on every path (destroys it on failure,
+ * hands it to *out_sess on success) and always wipes auth_token from the
+ * stack copies it makes, regardless of outcome.
+ */
+static vw_err_t do_auth_with_token(vw_client_sess_t *sess,
+                                    const char *username, uint16_t username_len,
+                                    const uint8_t auth_token[VW_TOKEN_BYTES],
+                                    vw_otp_callback_t otp_cb, void *otp_userdata,
+                                    vw_client_sess_t **out_sess)
 {
-    if (!cfg || !username || !password || !out_sess) return VW_ERR_INVALID_ARG;
-    if (!username_len || username_len > VW_MAX_USERNAME_BYTES)
-        return VW_ERR_INVALID_ARG;
-
-    vw_client_sess_t *sess = calloc(1, sizeof(*sess));
-    if (!sess) return VW_ERR_OOM;
-
-    vw_err_t err = do_connect(cfg, &sess->conn);
-    if (err != VW_OK) { free(sess); return err; }
-
-    uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
-    if (err != VW_OK) { sess_destroy(sess); return err; }
-
-    /* Derive auth_token = SHA-256(password) — PROTOCOL.md §8.1 Phase 1 */
-    uint8_t auth_token[VW_TOKEN_BYTES];
-    err = vw_crypto_sha256(password, pw_len, auth_token);
-    if (err != VW_OK) { sess_destroy(sess); return err; }
-
-    /* Encode AUTH_REQUEST */
+    /* Encode AUTH_REQUEST. auth_token is caller-owned (may be reused for a
+     * later fallback connect attempt, e.g. TASK-173) — this function never
+     * wipes it; only its own copies (req.auth_token, req_buf). */
     vw_payload_auth_request_t req;
     req.username     = username;
     req.username_len = username_len;
     memcpy(req.auth_token, auth_token, VW_TOKEN_BYTES);
-    secure_zero(auth_token, VW_TOKEN_BYTES);  /* wipe local copy after memcpy */
 
     uint8_t req_buf[2u + VW_MAX_USERNAME_BYTES + VW_TOKEN_BYTES];
     uint32_t req_len;
-    err = vw_proto_encode_auth_request(&req, req_buf, sizeof(req_buf), &req_len);
+    vw_err_t err = vw_proto_encode_auth_request(&req, req_buf, sizeof(req_buf), &req_len);
     if (err != VW_OK) {
         secure_zero(req.auth_token, VW_TOKEN_BYTES);
         secure_zero(req_buf, sizeof(req_buf));
@@ -194,6 +185,61 @@ vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
 
     sess_destroy(sess);
     return VW_ERR_PROTO_INVALID;
+}
+
+vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
+                             const char *username, uint16_t username_len,
+                             const void *password, size_t pw_len,
+                             vw_otp_callback_t otp_cb, void *otp_userdata,
+                             vw_client_sess_t **out_sess)
+{
+    if (!cfg || !username || !password || !out_sess) return VW_ERR_INVALID_ARG;
+    if (!username_len || username_len > VW_MAX_USERNAME_BYTES)
+        return VW_ERR_INVALID_ARG;
+
+    vw_client_sess_t *sess = calloc(1, sizeof(*sess));
+    if (!sess) return VW_ERR_OOM;
+
+    vw_err_t err = do_connect(cfg, &sess->conn);
+    if (err != VW_OK) { free(sess); return err; }
+
+    uint16_t version;
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
+    if (err != VW_OK) { sess_destroy(sess); return err; }
+
+    /* Derive auth_token = SHA-256(password) — PROTOCOL.md §8.1 Phase 1 */
+    uint8_t auth_token[VW_TOKEN_BYTES];
+    err = vw_crypto_sha256(password, pw_len, auth_token);
+    if (err != VW_OK) { sess_destroy(sess); return err; }
+
+    err = do_auth_with_token(sess, username, username_len, auth_token,
+                              otp_cb, otp_userdata, out_sess);
+    secure_zero(auth_token, VW_TOKEN_BYTES);  /* wipe local copy after use */
+    return err;
+}
+
+vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
+                                       const char *username, uint16_t username_len,
+                                       const uint8_t auth_token[VW_TOKEN_BYTES],
+                                       vw_otp_callback_t otp_cb, void *otp_userdata,
+                                       vw_client_sess_t **out_sess)
+{
+    if (!cfg || !username || !auth_token || !out_sess) return VW_ERR_INVALID_ARG;
+    if (!username_len || username_len > VW_MAX_USERNAME_BYTES)
+        return VW_ERR_INVALID_ARG;
+
+    vw_client_sess_t *sess = calloc(1, sizeof(*sess));
+    if (!sess) return VW_ERR_OOM;
+
+    vw_err_t err = do_connect(cfg, &sess->conn);
+    if (err != VW_OK) { free(sess); return err; }
+
+    uint16_t version;
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
+    if (err != VW_OK) { sess_destroy(sess); return err; }
+
+    return do_auth_with_token(sess, username, username_len, auth_token,
+                               otp_cb, otp_userdata, out_sess);
 }
 
 vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,

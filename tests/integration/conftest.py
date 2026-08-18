@@ -228,7 +228,8 @@ def default_user(server):
 class GatewayInstance:
     """A running vapourwault-web-gateway process pointed at a ServerInstance."""
 
-    def __init__(self, binaries: Binaries, server: ServerInstance, state_dir: str = None):
+    def __init__(self, binaries: Binaries, server: ServerInstance, state_dir: str = None,
+                 fallback=None):
         self.binaries = binaries
         self.server = server
         self.host = "127.0.0.1"
@@ -237,6 +238,11 @@ class GatewayInstance:
         # default, used by every test that doesn't care about it) to
         # match this feature's own opt-in-at-the-operator-level framing.
         self.state_dir = state_dir
+        # TASK-176: optional read-only fallback server — pass another
+        # ServerInstance/ClusterNode-like object with .host/.port/.cert
+        # attributes (an already cluster-paired replica of `server`).
+        # Omit (default) to match this feature's own opt-in framing.
+        self.fallback = fallback
         self._proc = None
 
     @property
@@ -254,6 +260,12 @@ class GatewayInstance:
         ]
         if self.state_dir is not None:
             args += ["--state-dir", self.state_dir]
+        if self.fallback is not None:
+            args += [
+                "--fallback-server-host", self.fallback.host,
+                "--fallback-server-port", str(self.fallback.port),
+                "--fallback-ca-cert", self.fallback.cert,
+            ]
         self._proc = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

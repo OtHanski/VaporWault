@@ -468,6 +468,7 @@ done:
 
 struct vw_sync_ctx {
     vw_client_sess_t *sess;
+    int               read_only; /* TASK-173: sess is a read-only fallback connection */
     vw_cache_t       *cache;
     vw__mutex_t       mu;
     char              offline_path[512];
@@ -517,8 +518,17 @@ static vw_err_t oq_push(vw_sync_ctx_t *ctx, int action,
 }
 
 VW_SYNC_TESTABLE int is_net_err(vw_err_t err) {
+    /* TASK-179: a write rejected by the server's own replica read-only
+     * guard is treated the same as a network error (queue, don't count as
+     * an action error) when it reaches here — this path shouldn't
+     * normally trigger, since ctx->read_only already stops the sync
+     * engine from sending writes to a fallback session in the first
+     * place, but a server-side rejection is the true backstop and must
+     * fail the same safe way if it's ever actually hit (e.g. a session
+     * that failed over mid-write, or a conn_mode/read_only desync bug). */
     return err == VW_ERR_NET_CONNECT || err == VW_ERR_NET_CLOSED ||
-           err == VW_ERR_NET_TIMEOUT || err == VW_ERR_NET_TLS;
+           err == VW_ERR_NET_TIMEOUT || err == VW_ERR_NET_TLS ||
+           err == VW_ERR_READ_ONLY_REPLICA;
 }
 
 /*
@@ -714,6 +724,18 @@ VW_SYNC_TESTABLE vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
     switch (a->action) {
 
     case ACT_UPLOAD:
+        if (ctx->read_only) {
+            /* TASK-173: never attempt a write against a read-only fallback
+             * session. Non-shared: queue exactly like the existing
+             * is_net_err() path below would. Shared: the offline queue is
+             * path-based only (see that path's own comment) — silently
+             * defer to next cycle, same as a would-be net error there. */
+            if (!a->shared) {
+                (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
+                queued = 1;
+            }
+            break;
+        }
         if (a->shared) {
             /* TASK-106: file-id-addressed upload for a shared folder. The
              * offline queue is deliberately NOT used here (it's path-based
@@ -797,6 +819,14 @@ VW_SYNC_TESTABLE vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
     }
 
     case ACT_DEL_REMOTE:
+        if (ctx->read_only) {
+            /* TASK-173: see ACT_UPLOAD above for the same reasoning. */
+            if (!a->shared) {
+                (void)oq_push(ctx, OQ_ACT_DELETE, a->virtual_path, a->local_path);
+                queued = 1;
+            }
+            break;
+        }
         err = a->shared
             ? vw_client_file_delete_by_id(sess, a->file_id)
             : vw_client_file_delete(sess, a->virtual_path);
@@ -831,6 +861,20 @@ VW_SYNC_TESTABLE vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
         /* Security: verify local_path is under the registered local_root */
         if (!under_root(a->local_path, a->local_root))
             return VW_ERR_INVALID_ARG;
+
+        if (ctx->read_only) {
+            /* TASK-173: resolving a conflict always ends in an upload of
+             * the local version — never safe against a read-only fallback.
+             * Defer the whole resolution (not just the upload half) rather
+             * than downloading a conflict-marker copy now that would need
+             * redoing anyway once actually resolved; same queue-or-defer
+             * split as ACT_UPLOAD above. */
+            if (!a->shared) {
+                (void)oq_push(ctx, OQ_ACT_UPLOAD, a->virtual_path, a->local_path);
+                queued = 1;
+            }
+            break;
+        }
         /*
          * Conflict resolution:
          *   1. Download server version to <stem>.conflict.<ts>.<ext>.
@@ -956,6 +1000,16 @@ VW_SYNC_TESTABLE vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_se
 
     const char *leaf = strrchr(vpath, '/');
     leaf = leaf ? leaf + 1 : vpath;
+
+    if (ctx->read_only) {
+        /* TASK-173: can't safely FILE_MKDIR against a read-only fallback
+         * connection. Defer exactly like "ancestor unresolved" above —
+         * this directory (and anything needing it) waits for next cycle,
+         * without aborting sync for any other folder (unlike propagating
+         * a real network error would). */
+        (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
+        return VW_OK;
+    }
 
     uint64_t new_id = 0;
     err = vw_client_file_mkdir(sess, parent_id, leaf, &new_id);
@@ -1350,6 +1404,12 @@ void vw_sync_set_session(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
     vw__mu_unlock(&ctx->mu);
 }
 
+void vw_sync_set_read_only(vw_sync_ctx_t *ctx, int read_only) {
+    vw__mu_lock(&ctx->mu);
+    ctx->read_only = read_only;
+    vw__mu_unlock(&ctx->mu);
+}
+
 vw_err_t vw_sync_run(vw_sync_ctx_t *ctx) {
     if (!ctx) return VW_ERR_INVALID_ARG;
 
@@ -1361,8 +1421,10 @@ vw_err_t vw_sync_run(vw_sync_ctx_t *ctx) {
     ctx->permission_denied_count = 0;
     vw__mu_unlock(&ctx->mu);
 
-    /* Drain offline queue first when online */
-    if (sess) oq_drain(ctx, sess);
+    /* Drain offline queue first when online — never against a read-only
+     * fallback session (TASK-173): draining would attempt real writes
+     * against `sess`, exactly what read_only exists to prevent. */
+    if (sess && !ctx->read_only) oq_drain(ctx, sess);
 
     /* Iterate sync folders */
     vw_sync_folder_t *folders = NULL; uint32_t nf = 0;

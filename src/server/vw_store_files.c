@@ -494,6 +494,53 @@ vw_err_t vw_file_store_open(const char *data_dir, vw_oplog_t *oplog,
     return VW_OK;
 }
 
+/* ── vw_file_store_reload_meta_and_versions (TASK-172) ────────────────────
+ *
+ * Same build-scratch/steal-fields/discard-scratch pattern as
+ * vw_store_reload_users_and_quotas (see that function's own doc comment
+ * for the full rationale — this module has the identical hazard: other
+ * threads already hold `live`, so it can never be closed and reopened).
+ * Rebuilds path_ht/fid_to_slot (meta.dat) and vid_to_slot/blob_size
+ * (versions.dat) together, since a replica sync pass always fetches and
+ * applies files/versions.dat and files/versions.blob as a pair
+ * (docs/PROTOCOL.md §7.7 — blob_offset is only meaningful relative to a
+ * versions.blob fetched at the same time as the versions.dat it came
+ * from).
+ */
+vw_err_t vw_file_store_reload_meta_and_versions(vw_file_store_t *live,
+                                                 const char *data_dir)
+{
+    if (!live || !data_dir) return VW_ERR_INVALID_ARG;
+
+    vw_file_store_t *scratch = NULL;
+    vw_err_t rc = vw_file_store_open(data_dir, live->oplog, &scratch);
+    if (rc != VW_OK) return rc;
+
+    rwlock_wrlock(&live->files_lock);
+    free(live->path_ht);
+    free(live->fid_to_slot);
+    live->path_ht         = scratch->path_ht;         scratch->path_ht         = NULL;
+    live->path_ht_cap     = scratch->path_ht_cap;
+    live->path_ht_len     = scratch->path_ht_len;
+    live->fid_to_slot     = scratch->fid_to_slot;     scratch->fid_to_slot     = NULL;
+    live->fid_to_slot_cap = scratch->fid_to_slot_cap;
+    live->next_file_id    = scratch->next_file_id;
+    live->file_slots      = scratch->file_slots;
+    rwlock_wrunlock(&live->files_lock);
+
+    rwlock_wrlock(&live->versions_lock);
+    free(live->vid_to_slot);
+    live->vid_to_slot     = scratch->vid_to_slot;     scratch->vid_to_slot     = NULL;
+    live->vid_to_slot_cap = scratch->vid_to_slot_cap;
+    live->next_version_id = scratch->next_version_id;
+    live->version_slots   = scratch->version_slots;
+    live->blob_size        = scratch->blob_size;
+    rwlock_wrunlock(&live->versions_lock);
+
+    vw_file_store_close(scratch);
+    return VW_OK;
+}
+
 void vw_file_store_close(vw_file_store_t *fs)
 {
     if (!fs) return;

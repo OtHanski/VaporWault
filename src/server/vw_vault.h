@@ -64,6 +64,17 @@ vw_err_t vw_vault_store_open(const char *data_dir, vw_oplog_t *oplog,
                               vw_vault_store_t **out);
 void vw_vault_store_close(vw_vault_store_t *vs);
 
+/*
+ * TASK-172 (replica hot-standby data replication, docs/PROTOCOL.md §7.7):
+ * atomically replace `live`'s in-memory vaults.db contents (vid_to_slot and
+ * every derived field) with a freshly-parsed read of data_dir's current
+ * on-disk vaults.db/vaults.blob, without invalidating any pointer already
+ * held by other threads. Builds a scratch vw_vault_store_t via
+ * vw_vault_store_open, steals its fields under live->lock, then discards
+ * the gutted scratch.
+ */
+vw_err_t vw_vault_store_reload(vw_vault_store_t *live, const char *data_dir);
+
 /* ── CRUD ────────────────────────────────────────────────────────────────── */
 
 /*

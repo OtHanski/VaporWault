@@ -311,6 +311,36 @@ vw_err_t vw_share_store_open(const char *data_dir, vw_oplog_t *oplog,
     return VW_OK;
 }
 
+/*
+ * TASK-172 (replica hot-standby data replication, docs/PROTOCOL.md §7.7):
+ * same build-scratch/steal-fields/discard-scratch pattern as
+ * vw_store_reload_users_and_quotas (see that function's doc comment for
+ * the full rationale). Rebuilds token_ht/nslots/next_share_id from the
+ * current on-disk shares.db, in place, under `live`'s own `lock` — never
+ * touches `rate_lock`/write_rate/ip_rate, which are purely local runtime
+ * state, not persisted, and must survive a reload untouched.
+ */
+vw_err_t vw_share_store_reload(vw_share_store_t *live, const char *data_dir)
+{
+    if (!live || !data_dir) return VW_ERR_INVALID_ARG;
+
+    vw_share_store_t *scratch = NULL;
+    vw_err_t rc = vw_share_store_open(data_dir, live->oplog, &scratch);
+    if (rc != VW_OK) return rc;
+
+    shr_rwlock_wlock(&live->lock);
+    free(live->token_ht);
+    live->token_ht      = scratch->token_ht;      scratch->token_ht      = NULL;
+    live->token_ht_cap  = scratch->token_ht_cap;
+    live->token_ht_len  = scratch->token_ht_len;
+    live->nslots        = scratch->nslots;
+    live->next_share_id = scratch->next_share_id;
+    shr_rwlock_wunlock(&live->lock);
+
+    vw_share_store_close(scratch);
+    return VW_OK;
+}
+
 void vw_share_store_close(vw_share_store_t *s)
 {
     if (!s) return;

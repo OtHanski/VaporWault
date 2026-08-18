@@ -272,6 +272,24 @@ Cluster mode is **on by default** (`cluster_port` defaults to `9010`) — set
 `cluster_port = 0` explicitly in `server.conf` if you don't intend to use it,
 to avoid leaving an unused TLS listener open.
 
+A paired replica is a genuine **hot standby**, not just an oplog backup: it
+runs the exact same server software, with its own client-facing `vw/1`
+listener always active, and continuously pulls both metadata (user
+accounts, quotas, file/version records, shares, vaults) and the actual file
+chunks those records reference from the primary. In practical terms this
+means a replica ends up holding a real, independently-usable copy of
+everything on the primary — the same users can log in with the same
+password, list the same files, and download byte-identical content,
+directly against the replica, with no involvement from the primary at all.
+This is what makes §6.1 below (automatic client-side fallback) possible: a
+client failing over to a replica gets a real server to talk to, not an
+empty shell. The traffic that keeps a replica current (new
+`CLUSTER_FILE_SYNC_*`/`CLUSTER_CHUNK_*` messages layered on top of the
+existing oplog pull loop) travels over the same authenticated,
+pre-shared-token cluster channel described below — see `docs/PROTOCOL.md`
+§7.7 if you need the wire-level detail; nothing about the pairing procedure
+in this section changes because of it.
+
 ### Primary node
 
 `server.conf` on the primary (this is the default — no change needed unless
@@ -333,6 +351,145 @@ The output shows each node's `NODE_ID`, `ROLE` (`replica` on the primary's own
 list, `self` on a replica's own list), `ACTV`, `HOSTNAME`, and
 `SYNC_WATERMARK` (the last oplog entry_id confirmed applied — 0 until the
 replica has pulled anything).
+
+### 6.1 Automatic fallback (client daemon and web gateway)
+
+Once you have a working primary + replica pair (above), clients can
+optionally be configured to fail over to the replica, **read-only**,
+whenever the primary is unreachable — continuing to serve reads
+transparently while queuing writes for the primary instead of losing them.
+This is opt-in and independently configured per client; pairing a replica
+by itself (§6 above) does not turn this on for anyone.
+
+**Why read-only, and why this doesn't reopen the split-brain problem** this
+whole feature area otherwise avoids on purpose: see `ARCHITECTURE.md`'s
+"Primary failover" and "Client-side automatic fallback (read-only)"
+decision-log rows. In short, a write always has exactly one possible
+destination — the primary — whether it's sent immediately or queued
+locally and flushed once the primary is reachable again; the replica never
+accepts a write it would have to reconcile later. As of `TASK-179`, this is
+enforced on the server itself (any write-shaped request sent directly to a
+replica's own listener is rejected with `VW_ERR_READ_ONLY_REPLICA`, `docs/
+PROTOCOL.md` §10.1), not just by well-behaved clients choosing not to send
+one.
+
+**Practical consequence you should tell your users about:** while a client
+is on the fallback, uploads, deletes, moves, new folders, share/link
+changes, and vault creation do not take effect until the primary comes
+back — they are queued (client daemon) or cleanly rejected so the caller
+can retry later (web gateway, which has no on-disk queue of its own).
+Don't let anyone assume "the app still works" during a primary outage means
+full read-write access; it means **read-only** access. See
+`ARCHITECTURE.md`'s decision row for the full rationale — it isn't
+re-derived here.
+
+#### Client daemon (`vapourwault-cli account add`)
+
+Each daemon account independently opts in via three flags on `account add`
+(`--fallback-host`/`--fallback-port` required together; the CLI accepts
+omitting `--fallback-ca-cert`, but don't — the daemon always verifies the
+fallback's certificate (`VW_CERT_VERIFY_REQUIRED`, same as the primary
+connection) and has no "trust the OS store" mode at all today (`vw_net.h`'s
+`vw_cert_verify_t` only has `REQUIRED` and a test-only `NONE`). Omit
+`--fallback-ca-cert` and every fallback connection attempt fails closed
+with an argument error before it even reaches the network — the account
+just silently behaves as if no fallback were configured at all the moment
+the primary actually goes down, which is a worse failure mode than an
+obvious startup error precisely because nothing tells you at setup time.
+Always pass it):
+
+```bash
+vapourwault-cli account add primary.example.com 4430 <username> <password> \
+    --ca-cert /path/to/primary-ca-or-server.crt \
+    --fallback-host replica1.example.com \
+    --fallback-port 4430 \
+    --fallback-ca-cert /path/to/replica-ca-or-server.crt
+```
+
+`account list` shows each account's live connection state — `primary`,
+`fallback (read-only)`, or `offline` — so `vapourwault-cli account list` (or
+the GUI's account switcher, or `vapourwault-cli status` for a one-line
+daemon-wide note) is how you or a user checks "am I currently degraded."
+The daemon keeps probing the primary in the background the whole time it's
+parked on the fallback, and switches back — flushing anything queued — the
+moment the primary is reachable again, with no user action required.
+
+#### Web gateway (`vapourwault-web-gateway`)
+
+The gateway has no per-account config (it's one process per deployment, per
+`ARCHITECTURE.md`'s "Gateway stays one-process-one-server" decision) — the
+fallback is a deployment-wide flag set, added to the invocation from §11.3:
+
+```bash
+vapourwault-web-gateway \
+    --server-host primary.example.com --server-port 4430 --ca-cert /path/to/primary-ca-or-server.crt \
+    --fallback-server-host replica1.example.com --fallback-server-port 4430 --fallback-ca-cert /path/to/replica-ca-or-server.crt \
+    --listen-host 127.0.0.1 --listen-port 8080
+```
+
+A browser session that logs in while the primary is down transparently
+lands on the replica; `/api/accounts`' `read_only` field tells the frontend
+to disable write actions and explain why. Unlike the daemon, the gateway
+has no offline queue of its own — a write attempt while read-only gets a
+clean `503 read_only_fallback` immediately, and it's the frontend/user's
+job to retry later.
+
+#### Verifying it actually works
+
+Don't just trust the config — prove the failover happens before you rely on
+it. With a paired primary + replica (§6) and a daemon account or gateway
+deployment configured as above:
+
+1. **Confirm normal operation first.** `account list` (daemon) should show
+   `primary`; a gateway login's `/api/accounts` should show `read_only:
+   false`. List/download something to confirm the primary path works
+   before you break anything.
+2. **Kill the primary.** Use whatever actually reflects the outage you're
+   defending against — `systemctl stop vapourwaultd`, or `kill -9 <pid>`
+   for a hard test. A **graceful** `SIGTERM`/`systemctl stop` can take a
+   little while to actually release the port if a client (like the
+   fallback-configured daemon itself) is holding a long-lived idle
+   connection open to it — worker threads only notice the shutdown signal
+   between requests, not while blocked waiting on one. Don't mistake "the
+   process is still in `ps` a couple of seconds after asking it to stop"
+   for "fallback isn't working"; either wait it out or use `kill -9` if you
+   want an instant, unambiguous outage for the test.
+3. **Confirm reads keep working.** Daemon: `account list` should flip to
+   `fallback (read-only)` and `vapourwault-cli ls` should keep returning
+   results. Gateway: a fresh login should still succeed and `read_only`
+   should now be `true`; `/api/files/list` should keep working on that
+   session.
+4. **Confirm writes are queued or rejected, not silently lost.** Daemon:
+   drop a new file into a synced folder — `vapourwault-cli ls` should show
+   it as `local_mod` (queued, not yet uploaded) rather than `synced` or an
+   error, and `vapourwault-cli status` should report it under `Pending:
+   N uploads` with a note that an account is on its fallback. Gateway: a
+   write endpoint (e.g. `/api/files/mkdir`) should return
+   `503`/`read_only_fallback` immediately — confirm it did **not** create
+   anything on the replica.
+5. **Bring the primary back.** Restart it the normal way. Within a few
+   reconnect cycles, the daemon's `account list` should return to `primary`
+   and the file you dropped in step 4 should show as `synced` — check its
+   content landed on the **primary** (e.g. via the primary's own admin
+   tools or a second client), not the replica. For the gateway, a fresh
+   login after the primary is back should show `read_only: false` again;
+   an already-established read-only session stays read-only for its own
+   lifetime (it doesn't silently get upgraded mid-session — log in again).
+
+If step 3 or 5 doesn't happen the way described, don't assume the feature
+is broken before checking the obvious things first: is the replica actually
+caught up (§6's "Verify replication" step) before you took the primary
+down, and does the fallback's own TLS certificate (`--fallback-ca-cert`)
+actually match what the replica is presenting?
+
+**Security note:** a configured fallback is a **second, independent TLS
+trust anchor** — the daemon's `--fallback-ca-cert` and the gateway's
+`--fallback-ca-cert` each get the same scrutiny you'd give the primary's
+own `--ca-cert`/`ca_cert_pem_path`. Unlike the daemon's fallback cert, the
+gateway's is never optional — `main.c` refuses to start at all if you set
+`--fallback-server-host`/`--fallback-server-port` without also setting
+`--fallback-ca-cert`, mirroring how it already treats its own required
+`--ca-cert`. See §10's checklist entry below.
 
 ---
 
@@ -443,6 +600,23 @@ If the server crashed mid-write, it recovers automatically on next start: the op
 - [ ] Use ACME or a CA-signed certificate — not a self-signed cert — in production.
 - [ ] Enable GC (`gc_interval_secs = 1800`, the default) so expired sessions are cleaned up.
 - [ ] On Linux: verify the systemd sandbox is active (`systemctl status vapourwaultd` should show `ProtectSystem=strict`).
+- [ ] **If a client daemon account or the web gateway is configured with an
+      automatic fallback** (§6.1): confirm `--fallback-ca-cert` is actually
+      set whenever `--fallback-host`/`--fallback-server-host` is. The
+      gateway refuses to start without it — that mistake is loud. The
+      daemon's `account add` is quieter and easy to get wrong: it accepts
+      omitting `--fallback-ca-cert`, but the daemon always requires
+      certificate verification for the fallback connection (same as the
+      primary) and has no "trust the OS store" mode at all — omit it and
+      every fallback connection attempt fails closed with an argument
+      error before touching the network, so the account just looks
+      `offline` instead of `fallback (read-only)` the moment you actually
+      need it, with nothing at setup time telling you it's misconfigured.
+      Verified (`2026-08-17`): `account list` never leaves `offline` and
+      the daemon log fills with `fallback connect failed ...: 3` for the
+      whole outage when this flag is left off. Treat `--fallback-ca-cert`
+      exactly like the primary's own `--ca-cert`/`ca_cert_pem_path` — a
+      required trust anchor, not a formality.
 - [ ] **If running the web gateway with `--state-dir`** (§11.7): confirm its
       state directory is owned by the gateway's service user at mode `0700`
       (`stat -c "%U %a" /var/lib/vapourwault-gateway` if installed via
@@ -570,6 +744,9 @@ flags (`vapourwault-web-gateway --help`, `src/gateway/main.c`):
 | `--listen-host HOST` | No | `127.0.0.1` | Address the gateway's own HTTP listener binds to. See the loopback-only warning in §11.1 before changing this. |
 | `--listen-port PORT` | No | `8080` | Port the gateway's own HTTP listener binds to. |
 | `--state-dir DIR` | No | *(unset — feature disabled)* | Enables persistent "remember me" logins (`TASK-165`). See §11.7 for the directory it creates, required permissions, and systemd wiring. |
+| `--fallback-server-host HOST` | No | *(unset — feature disabled)* | Optional read-only fallback (`TASK-176`): an already cluster-paired replica (§6) of the primary above. See §6.1 for the full setup and verification walkthrough. |
+| `--fallback-server-port PORT` | No\* | — | Fallback server's TLS port. \*Required together with `--fallback-server-host`. |
+| `--fallback-ca-cert PATH` | No\* | — | CA certificate (PEM) for the fallback. \*Required whenever a fallback is configured — never optional or defaulted, same rule as `--ca-cert` above. |
 
 **On `--ca-cert`**: the gateway is itself a `vw/1` client of the VaporWault
 server, and — per `ARCHITECTURE.md`'s Gateway↔server TLS verification

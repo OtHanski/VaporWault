@@ -351,7 +351,7 @@ static void render_share_dialog(ClientApp &app) {
                 refresh_dialog_lists(app);
                 refresh_shared_badges(app);
             } else {
-                snprintf(s_grant_status, sizeof(s_grant_status), "Grant failed (code %d).", rc);
+                vw_gui_format_action_error(s_grant_status, sizeof(s_grant_status), "Grant", rc);
             }
         }
     }
@@ -392,7 +392,7 @@ static void render_share_dialog(ClientApp &app) {
             refresh_dialog_lists(app);
             refresh_shared_badges(app);
         } else {
-            snprintf(s_link_status, sizeof(s_link_status), "Link creation failed (code %d).", rc);
+            vw_gui_format_action_error(s_link_status, sizeof(s_link_status), "Link creation", rc);
         }
     }
     if (s_link_token_valid) {

@@ -13,6 +13,15 @@ typedef struct {
     /* Display-only (TASK-164) — empty for a redeemed-public-link session
      * (no real logged-in user). Never used for authorization. */
     char               username[VW_MAX_USERNAME_BYTES + 1];
+    /* TASK-176: 1 if sess is connected to the configured read-only
+     * fallback rather than the primary. Every "free" slot is zeroed
+     * (calloc at pool creation; memset on remove/reap), so this is 0 by
+     * construction unless vw_gateway_session_create explicitly set it —
+     * vw_gateway_session_reinsert (remember-me resume) never does, since
+     * a resume token is only ever meaningful against the primary that
+     * issued it (docs/PROTOCOL.md §7.1) — resuming is never a fallback
+     * path, only a fresh login is. */
+    int                read_only;
 } gateway_session_slot_t;
 
 struct vw_gateway_session_pool {
@@ -64,6 +73,7 @@ static int find_by_cookie(vw_gateway_session_pool_t *pool, const char *cookie_he
 vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
                                     vw_client_sess_t *sess,
                                     const char *username,
+                                    int read_only,
                                     char *out_cookie_hex) {
     if (pool == NULL || sess == NULL || out_cookie_hex == NULL) {
         return VW_ERR_INVALID_ARG;
@@ -90,6 +100,7 @@ vw_err_t vw_gateway_session_create(vw_gateway_session_pool_t *pool,
     slot->sess = sess;
     slot->last_active = time(NULL);
     slot->in_use = 1;
+    slot->read_only = read_only ? 1 : 0;
     if (username != NULL && username[0] != '\0') {
         size_t n = strlen(username);
         if (n > VW_MAX_USERNAME_BYTES) n = VW_MAX_USERNAME_BYTES;
@@ -163,6 +174,19 @@ vw_err_t vw_gateway_session_get_username(vw_gateway_session_pool_t *pool,
     if (n >= out_buf_size) n = out_buf_size - 1;
     memcpy(out_buf, pool->slots[idx].username, n);
     out_buf[n] = '\0';
+    return VW_OK;
+}
+
+vw_err_t vw_gateway_session_is_read_only(vw_gateway_session_pool_t *pool,
+                                          const char *cookie_hex,
+                                          int *out_read_only) {
+    if (pool == NULL || cookie_hex == NULL || out_read_only == NULL) {
+        return VW_ERR_INVALID_ARG;
+    }
+    int idx = find_by_cookie(pool, cookie_hex);
+    if (idx < 0) return VW_ERR_AUTH_REQUIRED;
+
+    *out_read_only = pool->slots[idx].read_only;
     return VW_OK;
 }
 

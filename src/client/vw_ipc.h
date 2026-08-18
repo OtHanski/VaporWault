@@ -175,6 +175,11 @@ typedef enum {
  *                                (TASK-161) — see VW_IPC_ACCOUNT_LIST_RESP
  *                                for the per-account breakdown of every
  *                                field on this message.
+ *   u8  any_on_fallback          TASK-173: 1 = at least one account is
+ *                                currently connected to its read-only
+ *                                fallback server rather than its primary.
+ *                                Trailing field, same append convention as
+ *                                permission_denied_count above.
  *
  * VW_IPC_ACCOUNT_LIST_REQ: (no payload)
  * VW_IPC_ACCOUNT_LIST_RESP:
@@ -184,9 +189,14 @@ typedef enum {
  *     string label
  *     string username
  *     string server_host
- *     u8     connected         1 = live server session right now
+ *     u8     connected         1 = live server session right now (primary
+ *                               or fallback -- see conn_mode below to tell
+ *                               them apart)
  *     u32    pending_uploads
  *     u32    pending_downloads
+ *     u8     conn_mode         TASK-173, trailing field: 0 = offline,
+ *                               1 = primary, 2 = fallback (read-only).
+ *                               Always 0 when `connected` above is 0.
  *   }
  *
  * VW_IPC_ACCOUNT_ADD_REQ:
@@ -205,9 +215,21 @@ typedef enum {
  *                         rationale the old LOGIN_REQ used (this socket is
  *                         127.0.0.1-only — see this file's header comment
  *                         for the peer-UID check's per-platform coverage).
+ *                         The daemon also retains this derived value (never
+ *                         the raw password) as this account's login_token,
+ *                         for an unattended fallback connect later
+ *                         (TASK-173) — see vw_daemon.c's login_token_save.
  *   string otp            TOTP/OTP code, if the caller already has one;
  *                         empty if not (first attempt on a 2FA-enabled
  *                         account).
+ *   string fallback_host        TASK-173, optional trailing fields --
+ *                                absent entirely (payload ends after `otp`)
+ *                                means "leave fallback config as-is" on a
+ *                                re-authentication, or "no fallback" on a
+ *                                new account. Empty string explicitly
+ *                                clears a previously configured fallback.
+ *   u16    fallback_port
+ *   string fallback_ca_cert_pem_path   empty = system store
  * VW_IPC_ACCOUNT_ADD_RESP:
  *   u32 error_code        vw_err_t; 0 = VW_OK. VW_ERR_AUTH_2FA_REQUIRED means
  *                         retry with `otp` set (and the same account_id, if

@@ -227,6 +227,20 @@ vw_err_t vw_store_open(const char *data_dir, vw_oplog_t *oplog,
  */
 void vw_store_close(vw_store_t *ctx);
 
+/*
+ * TASK-172 (replica hot-standby data replication, docs/PROTOCOL.md §7.7):
+ * rebuild `live`'s users/quotas in-memory indexes from the CURRENT
+ * on-disk users.dat/quotas.db under data_dir, in place — for when a
+ * replica's sync pass has just atomically replaced those files out from
+ * under an already-open, already-in-use store context (never close/
+ * reopen `live` itself for this: other threads already hold that exact
+ * pointer). sessions.dat is never touched by this call (per §7.7's own
+ * "deliberately never synced this way" — this store's session table is
+ * always this node's own local sessions). On failure, `live` is left
+ * completely unchanged.
+ */
+vw_err_t vw_store_reload_users_and_quotas(vw_store_t *live, const char *data_dir);
+
 /* ── Users ───────────────────────────────────────────────────────────────── */
 
 /*
@@ -348,6 +362,19 @@ vw_err_t vw_file_store_open(const char *data_dir, vw_oplog_t *oplog,
 
 /* Close and free the file store. Safe to call with NULL. */
 void vw_file_store_close(vw_file_store_t *fs);
+
+/*
+ * TASK-172 (replica hot-standby data replication, docs/PROTOCOL.md §7.7):
+ * rebuild `live`'s in-memory indexes (path_ht/fid_to_slot from meta.dat;
+ * vid_to_slot/blob_size from versions.dat) from the CURRENT on-disk files
+ * under data_dir, in place — never close/reopen `live` itself (other
+ * threads already hold that exact pointer). Always covers both meta.dat
+ * and versions.dat together since a sync pass always fetches/applies
+ * versions.dat and versions.blob as a pair. On failure, `live` is left
+ * completely unchanged.
+ */
+vw_err_t vw_file_store_reload_meta_and_versions(vw_file_store_t *live,
+                                                 const char *data_dir);
 
 /* ── File CRUD ───────────────────────────────────────────────────────────── */
 

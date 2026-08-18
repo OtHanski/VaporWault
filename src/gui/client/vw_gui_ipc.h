@@ -35,6 +35,9 @@ struct VwIpcStatus {
     uint32_t pending_uploads  = 0;
     uint32_t pending_downloads = 0;
     uint32_t error_count      = 0;
+    /* TASK-173/175: 1 = at least one configured account is currently
+     * connected to its read-only fallback rather than its primary. */
+    uint8_t  any_on_fallback  = 0;
 };
 
 /* One VW_IPC_FILE_LIST_RESP entry (TASK-108) — mirrors vw_cache_entry_t's
@@ -95,6 +98,10 @@ struct VwGuiAccountEntry {
     std::string username;
     std::string server_host;
     uint8_t     connected = 0;
+    /* TASK-173/175: 0 = offline, 1 = primary, 2 = fallback (read-only) —
+     * mirrors vw_account_conn_mode_t in vw_daemon.c. Always 0 when
+     * `connected` above is 0. */
+    uint8_t     conn_mode = 0;
 };
 
 class VwGuiIpc {
@@ -151,9 +158,22 @@ public:
      * the account needs one. *out_account_id is only meaningful on success
      * (0 return).
      */
+    /*
+     * fallback_host/fallback_port/fallback_ca_cert_path (TASK-173/175):
+     * optional read-only fallback config — pass fallback_host = nullptr
+     * (or empty) to send none, which leaves an already-configured
+     * fallback untouched on a re-authentication (account_id_hint != 0),
+     * or means "no fallback" for a brand-new account. Caller must supply
+     * both fallback_host and a nonzero fallback_port together, or neither
+     * — same all-or-none validation as vapourwault-cli's --fallback-host/
+     * --fallback-port (TASK-174); this function does not itself validate
+     * that pairing, callers (the Add Account dialog) must.
+     */
     int account_add(uint32_t account_id_hint, const char *label,
                      const char *server_host, uint16_t server_port, const char *ca_cert_path,
                      const char *username, char *password, const char *otp,
+                     const char *fallback_host, uint16_t fallback_port,
+                     const char *fallback_ca_cert_path,
                      uint32_t *out_account_id);
 
     /* Log out and forget an account (ACCOUNT_REMOVE_REQ). Already-synced

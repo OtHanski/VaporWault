@@ -19,10 +19,10 @@
  *   VW_SYNC_REMOTE_DEL local deletions are verified to be under a registered
  *   sync folder's local_root before any call to vw_fs_delete (§SEC.07).
  *
- * Thread safety: vw_sync_set_session, vw_sync_get_progress,
- * vw_sync_action_error_count, and vw_sync_permission_denied_count are safe
- * to call concurrently with vw_sync_run. Other functions are not
- * concurrent-safe.
+ * Thread safety: vw_sync_set_session, vw_sync_set_read_only,
+ * vw_sync_get_progress, vw_sync_action_error_count, and
+ * vw_sync_permission_denied_count are safe to call concurrently with
+ * vw_sync_run. Other functions are not concurrent-safe.
  */
 
 #include "vw_client_core.h"
@@ -49,6 +49,20 @@ void     vw_sync_close(vw_sync_ctx_t *ctx);
  * Update the server session (e.g. after reconnect). Thread-safe.
  */
 void vw_sync_set_session(vw_sync_ctx_t *ctx, vw_client_sess_t *sess);
+
+/*
+ * TASK-173: mark the current session as a read-only fallback connection
+ * (or clear the mark once back on the primary). While set, vw_sync_run
+ * never attempts a write against `sess` — every upload/delete/mkdir/
+ * conflict-resolution action that would otherwise be attempted is instead
+ * queued into the existing offline queue (or, for shared-folder actions,
+ * silently deferred to next cycle — the queue is path-based only, same as
+ * its existing net-error handling) exactly as if the connection were down
+ * for writes specifically, while reads (file list, download) still go
+ * through normally. Does not itself change `sess` — call
+ * vw_sync_set_session separately. Thread-safe.
+ */
+void vw_sync_set_read_only(vw_sync_ctx_t *ctx, int read_only);
 
 /*
  * Run one complete sync cycle. Blocks until complete. See module header for

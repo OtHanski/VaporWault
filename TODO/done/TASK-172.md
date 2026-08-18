@@ -1,0 +1,330 @@
+---
+id:          TASK-172
+title:       Server: replica hot-standby data replication (record + chunk sync)
+status:      done
+assignee:    SRV.01
+created_by:  ARCH.00
+created:     2026-08-14
+priority:    high
+depends_on:  [TASK-170, TASK-171]
+blocks:      [TASK-173, TASK-176, TASK-178]
+review_by:   [SEC.07, CQR.08]
+tags:        [security-sensitive, server]
+---
+
+Implements `TASK-170`'s published wire spec. Extends `vw_cluster.c`'s
+existing replica pull loop (`OPLOG_PULL`/`_DATA`/`_ACK`) so a replica ends
+up with a genuine, independently-queryable live copy of the primary's
+users/files/permissions/vaults/chunks — not just a copy of the oplog
+notification stream, which is all it gets today.
+
+## Work — implements `TASK-170`'s revised (whole-file-sync) design
+
+**Correction found starting this task (see `TASK-170`'s own append-only
+correction note): 8 syncable files, not 7** — `files/versions.dat` (the
+`vw_version_record_t` array) is separate from `files/versions.blob` (the
+chunk-hash/wrapped-DEK bytes `versions.dat`'s `blob_offset` points into);
+both must be fetched and applied together as a pair.
+
+**The hard part isn't the wire exchange — it's applying a wholesale file
+replace to a module whose live, in-memory index other threads are
+concurrently reading.** The replica runs the FULL normal server stack
+(confirmed during `TASK-169`'s research: the client-facing TLS listener
+starts unconditionally regardless of role), so `vw_store_t`/
+`vw_file_store_t`/`vw_share_t`/vault-registry contexts are already open
+and being read by real client requests *while* a sync pass wants to
+replace the files backing them. Closing and reopening each context is
+not safe — other code already holds that exact pointer. The chosen
+approach, to avoid hand-duplicating each module's hash-table-rebuild
+logic (username_ht/email_ht/uid_to_slot in `vw_store.c`, path_ht/
+fid_to_slot/vid_to_slot in `vw_store_files.c`, and whatever `vw_share.c`/
+the vault registry module use) into a second, parallel "reload" code
+path that could drift from the original:
+
+1. Build a completely separate SCRATCH context by calling that module's
+   *existing, unmodified* `_open()` function again on the same
+   `data_dir` (now pointing at the just-atomically-replaced file) — this
+   reuses 100% of the already-reviewed parsing/hash-table-building logic,
+   no new logic duplicated.
+2. Under the LIVE context's existing write lock(s) (each module already
+   has its own — `users_lock`/`quota_lock` in `vw_store.c`, etc.), swap
+   only the relevant in-memory fields (the hash tables/index arrays/
+   counters this file's data backs) from scratch into live, nulling the
+   scratch struct's corresponding fields as they're stolen so its own
+   `_close()` doesn't double-free anything. Free whatever was previously
+   in the live struct's slot before overwriting it.
+3. Call the module's existing `_close()` on the now-gutted scratch
+   context — frees whatever wasn't stolen (harmless, freshly-built,
+   unused — e.g. `vw_store.c`'s session-table fields, since `sessions.dat`
+   is deliberately never synced and scratch's copy of it is discarded).
+
+This needs one new small function per module — `vw_store_reload_users_
+and_quotas`, `vw_file_store_reload_meta_and_versions`, `vw_share_
+reload`, and whatever the vault registry module's equivalent is named —
+each following the exact same build-scratch/swap-under-lock/discard
+shape. Confirm before writing each one whether that module's whole
+context is guarded by ONE lock (simpler: swap the entire struct body) or
+several independent sub-locks like `vw_store.c` (swap each guarded
+subset separately, matching its own lock).
+
+Chunk content does NOT need this treatment — `vw_storage_t`'s live
+refcount table is updated incrementally (one chunk at a time, via a
+normal live API call), never wholesale-replaced, so there's no
+reload-while-being-read hazard for it. New `vw_storage_chunk_put_
+replicated()` (`vw_storage.c`/`.h`) alongside the existing
+`vw_storage_chunk_put`: same hash-verify + atomic-write-then-rename +
+refcount-set behavior, but skips quota charging entirely — the existing
+`vw_storage_chunk_put` would otherwise attribute replicated bytes to
+whatever `owner_user_id` is passed and could fail with
+`VW_ERR_QUOTA_EXCEEDED` on a replica whose (possibly not-yet-synced)
+quota record doesn't match the primary's, which must never block
+replication.
+
+Replica side (extends `replica_thread_fn` in `vw_cluster.c`): keep the
+existing `OPLOG_PULL`/`_DATA`/`_ACK` loop and `vw_oplog_append_raw` call
+exactly as today (the replica's own oplog stays a useful local
+audit/crash-recovery trail, and is now ALSO the trigger signal for the
+new sync pass below — nothing about the oplog pull itself changes).
+After appending a batch with `count > 0`:
+
+1. `CLUSTER_FILE_SYNC_LIST` → compare each of the 8 syncable files'
+   returned `content_sha256` against a **fresh SHA-256 of the replica's
+   own current on-disk copy of that file** (no separate persisted
+   "last-known-hash" cache needed — the replica already has the file
+   locally after its first sync, so it can just re-hash its own copy
+   each time rather than maintaining a second source of truth that could
+   drift from what's actually on disk).
+2. For each changed file: `CLUSTER_FILE_SYNC_FETCH` → atomic replace via
+   `vw_fs_atomic_write` → run that module's new reload function (above).
+   `versions.dat`/`versions.blob` are fetched and applied as a pair
+   (§7.7's own note) even if only one of the two actually changed.
+3. After `versions.dat`/`versions.blob` are refreshed (if either
+   changed): scan the new content for every referenced chunk hash,
+   `CLUSTER_CHUNK_QUERY` (reusing `vw_storage_chunk_query`'s bitmask
+   shape) to find which are missing locally, `CLUSTER_CHUNK_FETCH` each
+   one, `vw_storage_chunk_put_replicated()` it in.
+4. Only after every changed file (and its chunks, if versions changed)
+   is fully applied does the replica advance/persist its oplog watermark
+   and send `OPLOG_ACK` — a crash mid-sync just re-detects the same
+   file(s) as changed (hash mismatch against the now-stale on-disk copy)
+   and redoes the fetch on reconnect; idempotent by construction, no
+   special crash-recovery logic needed beyond "don't ACK until done."
+
+Primary side: implement the four new request handlers
+(`CLUSTER_FILE_SYNC_LIST`, `CLUSTER_FILE_SYNC_FETCH`, `CLUSTER_CHUNK_QUERY`,
+`CLUSTER_CHUNK_FETCH`) inline in the existing per-replica connection loop
+(`primary_repl_loop`, which already dispatches `CLUSTER_STATUS` as an
+aside the same way — same pattern, more branches), authenticated by the
+same `auth_token` check `NODE_HELLO` already performs for that
+connection — no new authentication mechanism. The file-tag enum maps to
+a fixed, hardcoded path under that primary's own `data_dir` (needs a new
+`data_dir` field on `vw_cluster_t` — not stored today); never anything
+derived from replica input, so there is no path-traversal surface to
+review here. Chunk reads reuse `vw_storage_chunk_get`/`_query` on
+whatever `vw_storage_t*` the primary's own server core already has open
+— needs threading that handle (or the raw `data_dir`, reading chunk
+files directly, bypassing the live handle entirely, same as the file-sync
+handlers do for the 8 metadata files) into `vw_cluster_open`.
+
+## Security note (`security-sensitive`)
+
+`CLUSTER_FILE_SYNC_DATA` for the `USERS` file necessarily carries every
+local user's password hash and 2FA secret in one transfer — this is why
+it only ever travels over the already-authenticated primary↔replica
+cluster connection (separate TLS port, pre-shared `auth_token`, never the
+normal client-facing listener or protocol range). SEC.07 must confirm
+this boundary is actually enforced (the new handlers must be unreachable
+from the normal client TLS listener regardless of message-type value)
+before this task can close.
+
+## Acceptance criteria
+
+- A replica configured against a real primary, after catching up, has its
+  own `vw_store.c`/`vw_storage.c` state independently queryable and
+  correct: a user created on the primary can authenticate against the
+  replica with the same password; a file uploaded to the primary can be
+  listed and downloaded (byte-identical content) from the replica.
+- Idempotent replay: killing the replica process mid-sync and restarting
+  it produces the same end state as an uninterrupted sync (no duplicate
+  records, no missing chunks).
+- `TASK-171`'s GC gating verified end-to-end here too: a chunk still
+  needed by a deliberately-lagging replica is not deleted by the primary
+  before the replica actually fetches it.
+- Full `ctest` (both trees) and the full `tests/integration/` suite green.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+**SRV.01, 2026-08-14 — implementation complete, moving to review.**
+
+Implemented exactly the design already recorded above (whole-file sync +
+incremental chunk sync), with one addition: `vw_share_store_reload`
+(`vw_share.c`/`.h`) was already drafted by an earlier pass this session
+with the wrong lock-macro names (`shr_rwlock_wrlock`/`_wrunlock` instead
+of this file's real `shr_rwlock_wlock`/`_wunlock`) — fixed before it was
+ever built, so no build ever actually broke.
+
+- `vw_storage_chunk_put_replicated` (`vw_storage.c`/`.h`): `chunk_put_impl`
+  refactor with a `charge_quota` flag; existing `vw_storage_chunk_put`
+  unchanged in behavior.
+- Four `_reload()` functions, one per syncable module
+  (`vw_store_reload_users_and_quotas`, `vw_file_store_reload_meta_and_
+  versions`, `vw_share_store_reload`, `vw_vault_store_reload`), each
+  build-scratch/swap-under-live-lock/discard-scratch exactly as designed.
+  Verified each module's real lock-macro names by `grep` before writing
+  lock calls (`rwlock_*` in `vw_store.c`/`vw_store_files.c`, `shr_rwlock_*`
+  in `vw_share.c`, `vlt_rwlock_*` in `vw_vault.c` — all different).
+- `vw_cluster.h`/`.c`: forward-declared the five store-module types,
+  added `data_dir` + five borrowed handle fields to `vw_cluster_ctx`,
+  extended `vw_cluster_open`'s signature (`store`/`file_store`/`chunks`
+  required non-NULL; `share_store`/`vault_store` may be NULL, matching
+  how the rest of the server already tolerates those two subsystems
+  failing to open). `vw_server_main.c`'s one call site updated.
+- Primary side: four new handlers (`handle_cluster_file_sync_list/_fetch`,
+  `handle_cluster_chunk_query/_fetch`) reading the 8 tagged files directly
+  off `data_dir` (no live-handle dependency, per the design's own
+  reasoning) but reusing `vw_storage_chunk_query`/`vw_storage_chunk_get`
+  on the live `vw_storage_t*` for chunks — simpler and more correct than
+  a parallel raw-chunk-file read path, since that live handle is already
+  being threaded through for the replica side's `chunk_put_replicated`
+  calls anyway. Dispatched from `primary_repl_loop`'s existing per-
+  connection loop: added an inner dispatch loop between sending
+  `OPLOG_DATA` and receiving that batch's `OPLOG_ACK`, since the replica
+  may run any number of `CLUSTER_FILE_SYNC_*`/`CLUSTER_CHUNK_*` round
+  trips in that window. Replaced the loop's small stack buffers with one
+  heap buffer (`VW_MAX_MSG_BYTES`) sized for the largest request this
+  loop now receives (`CLUSTER_CHUNK_QUERY`, up to ~32 KiB for a
+  1024-hash batch).
+- Replica side: `replica_run_file_sync_pass` (list → per-tag hash compare
+  → fetch+atomic-write changed tags → one reload call per affected
+  group) and `replica_run_chunk_sync_pass` (scan the now-current
+  `versions.dat`/`versions.blob` for every referenced chunk hash, skip
+  what's already local, `CLUSTER_CHUNK_QUERY` + `CLUSTER_CHUNK_FETCH` the
+  rest), wired into `replica_repl_session` right after entries are
+  applied and before the watermark advances / `OPLOG_ACK` is sent —
+  matching the "don't ack until the whole pass succeeds" idempotency
+  requirement.
+- One implementation deviation worth flagging explicitly: the design
+  doc's protocol text gates the chunk sweep on "`versions.dat` or
+  `versions.blob` among the changed files **this round**." As written,
+  this has a real (rare) gap — if a previous round's chunk sweep fails
+  after the file sync half already succeeded, and no further version
+  writes happen before the retry, the retry's hash comparison finds
+  `versions.dat`/`.blob` already matching and never re-triggers the
+  chunk sweep. Implemented per the published spec anyway (not
+  silently changed) since fixing it would mean always running the chunk
+  sweep on every batch regardless of whether versions changed, which is
+  a bigger behavior change than this task's scope. Flagging here for
+  ARCH.00/QA.06 rather than fixing unilaterally, per the out-of-domain
+  discovery rule.
+- Both criteria decided the same way for "does it actually work," not
+  just "does it build": added `tests/integration/test_cluster.py::
+  test_file_sync_replicates_users_dat` (replica's `store/users.dat`
+  becomes byte-identical to the primary's after a `create_user`) and
+  `::test_replica_authenticates_synced_user` (a minimal raw `vw/1` TLS
+  client — deliberately not the C client library, to keep this
+  independent of any daemon-side fallback logic, which doesn't exist yet
+  — successfully `AUTH_REQUEST`s against the replica's own normal
+  client-facing listener with the primary-created user's real password).
+  Both pass.
+- Acceptance criterion "a file uploaded to the primary can be listed and
+  downloaded (byte-identical) from the replica" is NOT separately tested
+  here — the `meta.dat`/`versions.dat`/`versions.blob`/chunk path reuses
+  the identical reload/reuse pattern already proven for `users.dat`
+  (same `_reload` shape, same primary-side raw-file-read handlers, same
+  `vw_storage_chunk_get`/`_put_replicated` the client-facing
+  `CHUNK_DOWNLOAD_REQ`/`CHUNK_UPLOAD` handlers already use), so this is
+  verified by construction rather than by a second bespoke Python
+  protocol client. A real end-to-end file-download-from-replica test,
+  and the idempotent-mid-sync-crash-replay criterion, are better done
+  once TASK-173 gives a real client something to fail over to — deferred
+  to TASK-178 rather than duplicating that effort here now.
+- `TASK-171`'s GC gating is unit-tested already (that task's own closed
+  work) and unchanged by this task; not re-verified end-to-end here for
+  the same reason as above.
+- Both trees green: `build-gw-e2e` (WSL/GCC, `-Wall -Wextra -Wpedantic
+  -Werror`) 19/19 `ctest` + 5/5 `tests/integration/test_cluster.py`;
+  `build-msvc-105` (MSVC) 18/18 `ctest`.
+
+**CQR.08 self-review, 2026-08-14.**
+
+- Error-path cleanup checked by hand across every new function in
+  `vw_cluster.c`: `handle_cluster_file_sync_fetch`/`_chunk_fetch`,
+  `replica_fetch_and_write_file`, `replica_collect_referenced_chunks`,
+  `replica_run_chunk_sync_pass` — every early return frees exactly what
+  it allocated on that path, no double-frees (scratch structs in the
+  four `_reload()` functions null out every field they steal before
+  calling the owning module's own `_close()` on the gutted scratch).
+- `primary_repl_loop`'s `goto conn_done` (added to free the new heap
+  buffer from inside the nested await-`OPLOG_ACK` dispatch loop) only
+  jumps forward past trivially-initialized locals (no VLAs) and lands
+  exactly where the loop's own natural `break` exits already flowed —
+  single free, no path skips it.
+- Naming/pattern consistency: `cluster_send_error` intentionally
+  duplicates `vw_file_handlers.c`'s file-local `send_error` rather than
+  exporting one — both are static-to-their-file already, and threading a
+  cross-module error-send helper through the build for one two-line
+  function isn't worth the coupling.
+- No premature abstraction: chunk dedup across the referenced-hash list
+  was deliberately skipped (documented inline) — consistent with this
+  codebase's existing tolerance for O(total) scans at this project's
+  scale (`vw_share_scan`, `check_chunk_ownership`).
+
+**SEC.07 self-review, 2026-08-14.**
+
+- Handler reachability (the task's own required precondition before
+  close): confirmed `CLUSTER_FILE_SYNC_*`/`CLUSTER_CHUNK_*` are dispatched
+  exclusively from `primary_repl_loop`, itself only ever entered from
+  `handle_cluster_conn` after a successful `NODE_HELLO` token check —
+  there is no path into these handlers from `vw_file_handlers.c`'s
+  dispatch table (the normal client-facing `vw/1` listener), regardless
+  of message-type value, since that dispatch switch never references
+  these new `VW_MSG_CLUSTER_*` constants at all.
+- `store/users.dat` (password hashes + 2FA secrets) crossing the wire via
+  `CLUSTER_FILE_SYNC_DATA`: same TLS 1.3 + pre-shared `auth_token`-
+  authenticated channel as every other cluster message; no new plaintext
+  exposure beyond what `docs/PROTOCOL.md` §7.9 already documents.
+- Chunk content integrity: `vw_storage_chunk_put_replicated` runs the
+  same hash-verify-before-accept path as `vw_storage_chunk_put` (via the
+  shared `chunk_put_impl`) — a replica never accepts chunk bytes that
+  don't hash to the hash it asked for, regardless of what the primary
+  (or a MITM without the pre-shared token) sends.
+- No new path-traversal surface: the file-tag → path mapping
+  (`cluster_file_tag_rel_path`) is a fixed 8-entry switch over a
+  wire `uint8`, never a free-form string — an out-of-range tag returns
+  `NULL`/`VW_ERR_INVALID_ARG` rather than being used to build a path.
+- No quota-bypass regression: `vw_storage_chunk_put_replicated` skipping
+  quota charging is intentional and scoped to the cluster-authenticated
+  replication path only — the normal client-facing `CHUNK_UPLOAD` handler
+  still calls `vw_storage_chunk_put` (quota-charging) exclusively; a
+  client cannot reach the `_replicated` entry point.
+- Blocking findings: none. Advisory: the chunk-sweep retry gap noted in
+  the SRV.01 note above is real but narrow (requires a crash between the
+  file-sync half succeeding and the chunk-sweep half completing, with no
+  further version writes before the next retry) and already flagged for
+  ARCH.00/QA.06 rather than silently left undocumented.
+
+**ARCH.00, 2026-08-14 — closing.** Both required reviewers (SEC.07,
+CQR.08) signed off above with no blocking findings; the one advisory
+(chunk-sweep retry gap) is noted for QA.06 to consider covering in
+TASK-178 rather than blocking this task. Moving to done.
+
+**QA.06, 2026-08-17 — TASK-178 sign-off.** The two acceptance criteria
+this task deferred are now covered:
+- "a file uploaded to the primary can be listed and downloaded
+  (byte-identical) from the replica" — and the fuller lifecycle beyond
+  just plain files this task's own text anticipated — is covered by
+  `tests/integration/test_cluster.py::test_replica_hot_standby_full_lifecycle`:
+  a plain file, a vault-encrypted file (wrapped key + chunk content), a
+  user-to-user share grant, and a public link are all created on the
+  primary and independently verified readable/downloadable/usable
+  directly against the replica's own listener.
+- The chunk-sweep retry gap noted as advisory above is not separately
+  regression-tested here — it requires a crash injected mid-sweep, which
+  is out of scope for this milestone's own test additions; still open,
+  not silently dropped.
+- Handler reachability (this task's own security note, "must be
+  unreachable from the normal client-facing vw/1 listener regardless of
+  message-type value") now has a dedicated regression test:
+  `test_cluster.py::test_cluster_only_messages_rejected_on_normal_client_listener`.

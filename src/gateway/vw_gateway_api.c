@@ -126,6 +126,50 @@ static int get_cookie_value(const vw_http_request_t *req, const char *name,
 }
 
 /*
+ * TASK-176: same four network-shaped failure codes vw_sync.c's is_net_err
+ * treats as "connection problem, not a real rejection" — the signal this
+ * gateway uses to decide a fallback attempt is warranted (never for
+ * VW_ERR_AUTH_2FA_REQUIRED/_BAD_CREDS/etc., which mean the primary was
+ * reached and answered).
+ */
+static int is_net_err(vw_err_t err) {
+    return err == VW_ERR_NET_CONNECT || err == VW_ERR_NET_CLOSED ||
+           err == VW_ERR_NET_TIMEOUT || err == VW_ERR_NET_TLS;
+}
+
+static int fallback_configured(const vw_gateway_server_cfg_t *cfg) {
+    return cfg->fallback_host != NULL && cfg->fallback_host[0] != '\0';
+}
+
+static void build_client_cfg(const vw_gateway_server_cfg_t *cfg, int use_fallback,
+                              vw_client_cfg_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->host             = use_fallback ? cfg->fallback_host : cfg->server_host;
+    out->port             = use_fallback ? cfg->fallback_port : cfg->server_port;
+    out->cert_verify      = VW_CERT_VERIFY_REQUIRED;
+    out->ca_cert_pem_path = use_fallback ? cfg->fallback_ca_cert_pem_path : cfg->ca_cert_pem_path;
+}
+
+/*
+ * TASK-176: send the "this session is on the fallback right now"
+ * rejection for a write endpoint. Called after require_session() already
+ * succeeded for `cookie` — an unknown cookie here would mean
+ * require_session() itself already sent a 401 and the caller already
+ * returned, so this only ever sees a genuinely live session. Returns 1
+ * (and has already written the HTTP response) if the caller must stop;
+ * 0 if the write may proceed.
+ */
+static int reject_if_read_only(vw_gateway_session_pool_t *pool, const char *cookie,
+                                vw_http_conn_t *conn) {
+    int read_only = 0;
+    if (vw_gateway_session_is_read_only(pool, cookie, &read_only) == VW_OK && read_only) {
+        send_error(conn, 503, "read_only_fallback");
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Resolves the calling browser's session from its cookie. Returns VW_OK
  * with *out_sess set (and *out_cookie filled in - needed by
  * send_file_op_error below to evict this exact session if the connection
@@ -164,12 +208,11 @@ static vw_err_t try_resume_and_reinsert(vw_gateway_session_pool_t *pool, const c
         return VW_ERR_AUTH_REQUIRED;
     }
 
+    /* TASK-176: always the primary — a resume token is meaningless
+     * against a different server (see this file's fallback-connect
+     * comments in handle_login). */
     vw_client_cfg_t client_cfg;
-    memset(&client_cfg, 0, sizeof(client_cfg));
-    client_cfg.host = g_server_cfg->server_host;
-    client_cfg.port = g_server_cfg->server_port;
-    client_cfg.cert_verify = VW_CERT_VERIFY_REQUIRED;
-    client_cfg.ca_cert_pem_path = g_server_cfg->ca_cert_pem_path;
+    build_client_cfg(g_server_cfg, 0, &client_cfg);
 
     vw_client_sess_t *sess = NULL;
     if (vw_client_resume(&client_cfg, token, &sess) != VW_OK) {
@@ -424,16 +467,33 @@ static void handle_login(vw_gateway_session_pool_t *pool,
     remember = remember && (g_remember_store != NULL);
 
     vw_client_cfg_t client_cfg;
-    memset(&client_cfg, 0, sizeof(client_cfg));
-    client_cfg.host = cfg->server_host;
-    client_cfg.port = cfg->server_port;
-    client_cfg.cert_verify = VW_CERT_VERIFY_REQUIRED;
-    client_cfg.ca_cert_pem_path = cfg->ca_cert_pem_path;
+    build_client_cfg(cfg, 0, &client_cfg);
 
     vw_client_sess_t *sess = NULL;
     vw_err_t err = vw_client_connect(&client_cfg, username, username_len,
                                       password, password_len,
                                       login_otp_cb, &otp_ctx, &sess);
+
+    /* TASK-176: the primary is unreachable and a fallback is configured —
+     * retry with the SAME already-in-hand credentials against it before
+     * giving up. Unlike the daemon (TASK-173), this gateway never needs
+     * to retain a derived credential for later: every login already has
+     * the raw password in hand for exactly this one retry, so there is
+     * nothing to persist. A session created this way is read-only for
+     * its entire lifetime (see vw_gateway_session_create's read_only
+     * param) — remember-me resume (try_resume_and_reinsert) never
+     * attempts a fallback connect at all, since a primary-issued resume
+     * token is meaningless against a different server (docs/PROTOCOL.md
+     * §7.1); only a fresh login like this one can fail over. */
+    int read_only = 0;
+    if (is_net_err(err) && fallback_configured(cfg)) {
+        vw_client_cfg_t fallback_cfg;
+        build_client_cfg(cfg, 1, &fallback_cfg);
+        vw_err_t fb_err = vw_client_connect(&fallback_cfg, username, username_len,
+                                             password, password_len,
+                                             login_otp_cb, &otp_ctx, &sess);
+        if (fb_err == VW_OK) { err = VW_OK; read_only = 1; }
+    }
 
     vw_crypto_secure_zero(password, sizeof(password));
     vw_crypto_secure_zero(otp, sizeof(otp));
@@ -441,12 +501,16 @@ static void handle_login(vw_gateway_session_pool_t *pool,
     if (err == VW_OK) {
         evict_slot_if_present(pool, req, target_slot);
         char cookie_hex[VW_GATEWAY_COOKIE_HEX_LEN + 1];
-        if (vw_gateway_session_create(pool, sess, username, cookie_hex) != VW_OK) {
+        if (vw_gateway_session_create(pool, sess, username, read_only, cookie_hex) != VW_OK) {
             vw_client_close(sess);
             send_error(conn, 503, "too_many_sessions");
             return;
         }
-        if (remember) {
+        /* TASK-176: never persist a remember-me token issued by the
+         * fallback — try_resume_and_reinsert only ever resumes against
+         * the primary (see this function's own comment above), so a
+         * fallback-issued token would just silently never resume. */
+        if (remember && !read_only) {
             uint8_t token[32];
             vw_client_get_token(sess, token);
             /* Best-effort: a failed persist here just means this login
@@ -460,8 +524,11 @@ static void handle_login(vw_gateway_session_pool_t *pool,
         /* Max-Age=2592000 (30 days, matching the server's own
          * DEFAULT_SESSION_TTL_SECS, src/server/vw_auth.c) only when
          * remember was actually honored - a session-only cookie for
-         * every other case, unchanged from before this task. */
-        if (remember) {
+         * every other case, unchanged from before this task. TASK-176:
+         * also session-only when read_only, since the persist above was
+         * skipped — a long-lived cookie would promise a durability this
+         * login never actually got. */
+        if (remember && !read_only) {
             snprintf(cookie_header, sizeof(cookie_header),
                      "%s=%s; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000",
                      slot_name, cookie_hex);
@@ -717,6 +784,7 @@ static void handle_file_mkdir(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     char name[256];
@@ -752,6 +820,7 @@ static void handle_file_delete(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     char path[VW_MAX_PATH_BYTES];
@@ -773,6 +842,7 @@ static void handle_file_move(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     uint64_t file_id = 0, new_parent_dir_id = 0;
@@ -904,6 +974,7 @@ static void handle_chunk_upload(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
 
     const char *hash_hex = vw_http_header_get(req, VW_GATEWAY_CHUNK_HASH_HEADER);
     if (hash_hex == NULL || strlen(hash_hex) != VW_HASH_BYTES * 2u ||
@@ -985,6 +1056,7 @@ static void handle_file_commit(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     char path[VW_MAX_PATH_BYTES];
@@ -1274,6 +1346,7 @@ static void handle_share_grant(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     uint64_t file_id = 0;
@@ -1314,6 +1387,7 @@ static void handle_share_revoke(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     uint64_t share_id = 0;
@@ -1375,6 +1449,7 @@ static void handle_link_create(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     uint64_t file_id = 0;
@@ -1422,6 +1497,7 @@ static void handle_link_revoke(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     uint64_t share_id = 0;
@@ -1522,14 +1598,24 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
     }
 
     vw_client_cfg_t client_cfg;
-    memset(&client_cfg, 0, sizeof(client_cfg));
-    client_cfg.host = cfg->server_host;
-    client_cfg.port = cfg->server_port;
-    client_cfg.cert_verify = VW_CERT_VERIFY_REQUIRED;
-    client_cfg.ca_cert_pem_path = cfg->ca_cert_pem_path;
+    build_client_cfg(cfg, 0, &client_cfg);
 
     vw_client_sess_t *sess = NULL;
     vw_err_t err = vw_client_link_access(&client_cfg, link_token, &sess);
+
+    /* TASK-176: same fallback treatment as handle_login — an anonymous
+     * link redemption can fail over too (the resulting session is
+     * read-only regardless, same as any other fallback session, so an
+     * EDIT-permission link's writes are correctly blocked while degraded
+     * either way). */
+    int read_only = 0;
+    if (is_net_err(err) && fallback_configured(cfg)) {
+        vw_client_cfg_t fallback_cfg;
+        build_client_cfg(cfg, 1, &fallback_cfg);
+        vw_err_t fb_err = vw_client_link_access(&fallback_cfg, link_token, &sess);
+        if (fb_err == VW_OK) { err = VW_OK; read_only = 1; }
+    }
+
     if (err != VW_OK) {
         /* Anti-enumeration (vw_client_link_access's own doc): unknown,
          * revoked, and expired tokens are all indistinguishable here too. */
@@ -1541,7 +1627,7 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
     char cookie_hex[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     /* No real logged-in username for a link session - see
      * vw_gateway_session_create's own doc on the NULL convention. */
-    if (vw_gateway_session_create(pool, sess, NULL, cookie_hex) != VW_OK) {
+    if (vw_gateway_session_create(pool, sess, NULL, read_only, cookie_hex) != VW_OK) {
         vw_client_close(sess);
         send_error(conn, 503, "too_many_sessions");
         return;
@@ -1569,6 +1655,7 @@ static void handle_vault_create(vw_gateway_session_pool_t *pool,
     vw_client_sess_t *sess;
     char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
     if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
     if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
 
     uint64_t folder_file_id = 0;
@@ -1756,6 +1843,9 @@ static void handle_accounts(vw_gateway_session_pool_t *pool,
             vw_gateway_session_get_username(pool, cookie, username, sizeof(username)) != VW_OK) {
             continue;
         }
+        int read_only = 0;
+        (void)vw_gateway_session_is_read_only(pool, cookie, &read_only);
+
         vw_json_write_object_start(&w);
         vw_json_write_key(&w, "slot");
         vw_json_write_uint(&w, i);
@@ -1763,6 +1853,11 @@ static void handle_accounts(vw_gateway_session_pool_t *pool,
         /* Empty for a redeemed-public-link session - see
          * vw_gateway_session_create's own doc on the NULL convention. */
         vw_json_write_string(&w, username, strlen(username));
+        /* TASK-176: lets the frontend show "read-only fallback" and grey
+         * out/explain disabled write actions for this slot, mirroring the
+         * daemon/GUI's own conn_mode surfacing (TASK-173/175). */
+        vw_json_write_key(&w, "read_only");
+        vw_json_write_bool(&w, read_only != 0);
         vw_json_write_object_end(&w);
     }
 

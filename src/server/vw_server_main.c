@@ -769,6 +769,7 @@ int vw_server_main_run(int argc, char *argv[]) {
     if (cfg.cluster.cluster_port != 0 || cfg.cluster.is_replica) {
         if (vw_cluster_open(cfg.data_dir, &cfg.cluster,
                             cfg.cert_pem_path, cfg.key_pem_path, oplog,
+                            store, file_store, chunks, share_store, vault_store,
                             &cluster) != VW_OK) {
             vw_log(LOG_WARN, "vw_cluster_open failed — running without cluster replication");
         } else if (vw_cluster_start(cluster) != VW_OK) {

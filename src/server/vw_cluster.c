@@ -14,6 +14,10 @@
 
 #include "vw_cluster.h"
 #include "vw_oplog.h"
+#include "vw_store.h"
+#include "vw_storage.h"
+#include "vw_share.h"
+#include "vw_vault.h"
 #include "../core/vw_net.h"
 #include "../core/vw_crypto.h"
 #include "../core/vw_fs.h"
@@ -83,9 +87,19 @@ struct vw_cluster_ctx {
     vw_cluster_cfg_t cfg;
     char cert_pem_path[512];
     char key_pem_path[512];
+    char data_dir[512];
 
     /* Shared oplog reference (lifetime: owned by caller of vw_cluster_open) */
     vw_oplog_t *oplog;
+
+    /* TASK-172: this server's own live store handles (borrowed — owned by
+     * the caller of vw_cluster_open, same lifetime contract as oplog).
+     * share_store/vault_store may be NULL (see vw_cluster_open's doc). */
+    vw_store_t       *store;
+    vw_file_store_t  *file_store;
+    vw_storage_t     *chunks;
+    vw_share_store_t *share_store;
+    vw_vault_store_t *vault_store;
 
     /* Node store */
     char         nodes_path[600];  /* {data_dir}/cluster/nodes.db */
@@ -283,6 +297,184 @@ static void send_hello_fail(vw_conn_t *conn)
 /* Max entries per OPLOG_PULL request the primary will honour. */
 #define OPLOG_PULL_MAX_ENTRIES 256u
 
+/* ── TASK-172: replica hot-standby data replication (docs/PROTOCOL.md §7.7) ── */
+
+/*
+ * Send VW_MSG_ERROR with a numeric error code and no human-readable message.
+ * Mirrors vw_file_handlers.c's send_error — duplicated rather than shared
+ * across the module boundary (that one is file-local static there too).
+ */
+static vw_err_t cluster_send_error(vw_conn_t *conn, vw_err_t code)
+{
+    uint8_t buf[8];
+    uint32_t len;
+    vw_err_t err = vw_proto_encode_error((uint32_t)code, NULL, 0, buf, sizeof(buf), &len);
+    if (err != VW_OK) return err;
+    return vw_proto_send(conn, VW_MSG_ERROR, buf, len);
+}
+
+#define VW_CLUSTER_FILE_TAG_COUNT 8u
+
+/* Fixed, non-negotiated file-tag -> path mapping (docs/PROTOCOL.md §7.7's
+ * table). Deliberately never a free-form path string on the wire — see the
+ * doc comment there for why. */
+static const char *cluster_file_tag_rel_path(uint8_t tag)
+{
+    switch (tag) {
+    case 1: return "store/users.dat";
+    case 2: return "store/quotas.db";
+    case 3: return "files/meta.dat";
+    case 4: return "files/versions.dat";
+    case 5: return "files/versions.blob";
+    case 6: return "shares/shares.db";
+    case 7: return "vaults/vaults.db";
+    case 8: return "vaults/vaults.blob";
+    default: return NULL;
+    }
+}
+
+/*
+ * Read a syncable file's full current content directly off disk (no live
+ * store handle involved — see vw_cluster_open's doc for why this is safe)
+ * and hash it. A file that doesn't exist yet hashes as if empty (size 0);
+ * every one of these files is created empty-but-present by its owning
+ * module's _open() on both primary and replica, so this only matters for
+ * a not-yet-created replica data_dir mid-first-sync.
+ */
+static int cluster_hash_file_by_tag(const char *data_dir, uint8_t tag,
+                                     uint64_t *out_size, uint8_t out_hash[32])
+{
+    const char *rel = cluster_file_tag_rel_path(tag);
+    if (!rel) return -1;
+
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", data_dir, rel);
+
+    if (!vw_fs_exists(path)) {
+        *out_size = 0;
+        return (vw_crypto_sha256("", 0, out_hash) == VW_OK) ? 0 : -1;
+    }
+
+    void  *buf = NULL;
+    size_t len = 0;
+    if (vw_fs_read_file(path, &buf, &len) != VW_OK) return -1;
+    *out_size = (uint64_t)len;
+    int rc = (vw_crypto_sha256(buf, len, out_hash) == VW_OK) ? 0 : -1;
+    free(buf);
+    return rc;
+}
+
+/* ── Primary-side CLUSTER_FILE_SYNC_* / CLUSTER_CHUNK_* handlers ─────────── */
+
+static vw_err_t handle_cluster_file_sync_list(vw_cluster_t *ctx, vw_conn_t *conn)
+{
+    uint8_t resp[1u + VW_CLUSTER_FILE_TAG_COUNT * (1u + 8u + 32u)];
+    uint32_t off = 0;
+    resp[off++] = (uint8_t)VW_CLUSTER_FILE_TAG_COUNT;
+
+    for (uint8_t tag = 1; tag <= VW_CLUSTER_FILE_TAG_COUNT; tag++) {
+        uint64_t size = 0;
+        uint8_t  hash[32];
+        if (cluster_hash_file_by_tag(ctx->data_dir, tag, &size, hash) != 0) {
+            /* Read failure on the primary's own data — surface as an
+             * all-zero entry rather than failing the whole LIST; the
+             * replica will then unconditionally FETCH this tag and get a
+             * definitive ERROR/DATA answer from handle_cluster_file_sync_fetch. */
+            size = 0;
+            memset(hash, 0, sizeof(hash));
+        }
+        resp[off++] = tag;
+        vw_write_u64le(resp + off, size); off += 8;
+        memcpy(resp + off, hash, 32);     off += 32;
+    }
+
+    return vw_proto_send(conn, VW_MSG_CLUSTER_FILE_SYNC_LIST_RESP, resp, off);
+}
+
+static vw_err_t handle_cluster_file_sync_fetch(vw_cluster_t *ctx, vw_conn_t *conn,
+                                                const uint8_t *payload, uint32_t plen)
+{
+    if (plen < 1u) return cluster_send_error(conn, VW_ERR_PROTO_TRUNCATED);
+
+    uint8_t tag = payload[0];
+    const char *rel = cluster_file_tag_rel_path(tag);
+    if (!rel) return cluster_send_error(conn, VW_ERR_INVALID_ARG);
+
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", ctx->data_dir, rel);
+
+    void  *buf = NULL;
+    size_t len = 0;
+    if (vw_fs_exists(path)) {
+        if (vw_fs_read_file(path, &buf, &len) != VW_OK)
+            return cluster_send_error(conn, VW_ERR_NOT_FOUND);
+    }
+
+    uint32_t resp_len = 1u + 8u + (uint32_t)len;
+    uint8_t *resp = (uint8_t *)malloc(resp_len);
+    if (!resp) { free(buf); return cluster_send_error(conn, VW_ERR_OOM); }
+
+    resp[0] = tag;
+    vw_write_u64le(resp + 1, (uint64_t)len);
+    if (len > 0) memcpy(resp + 9, buf, len);
+    free(buf);
+
+    vw_err_t rc = vw_proto_send(conn, VW_MSG_CLUSTER_FILE_SYNC_DATA, resp, resp_len);
+    free(resp);
+    return rc;
+}
+
+static vw_err_t handle_cluster_chunk_query(vw_cluster_t *ctx, vw_conn_t *conn,
+                                            const uint8_t *payload, uint32_t plen)
+{
+    if (plen < 2u) return cluster_send_error(conn, VW_ERR_PROTO_TRUNCATED);
+
+    uint16_t count = vw_read_u16le(payload);
+    if (count > 1024u) return cluster_send_error(conn, VW_ERR_PROTO_INVALID);
+
+    uint32_t expected = 2u + (uint32_t)count * VW_HASH_BYTES;
+    if (plen < expected) return cluster_send_error(conn, VW_ERR_PROTO_TRUNCATED);
+
+    const uint8_t (*hashes)[VW_HASH_BYTES] =
+        (const uint8_t (*)[VW_HASH_BYTES])(payload + 2u);
+
+    uint32_t bitmask_bytes = count == 0u ? 0u : (count + 7u) / 8u;
+    uint8_t resp[2 + 128];
+    vw_write_u16le(resp, count);
+    uint32_t roff = 2;
+    if (count > 0) {
+        memset(resp + roff, 0, bitmask_bytes);
+        vw_err_t err = vw_storage_chunk_query(ctx->chunks, hashes, count, resp + roff);
+        if (err != VW_OK) return cluster_send_error(conn, err);
+        roff += bitmask_bytes;
+    }
+
+    return vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_QUERY_RESP, resp, roff);
+}
+
+static vw_err_t handle_cluster_chunk_fetch(vw_cluster_t *ctx, vw_conn_t *conn,
+                                           const uint8_t *payload, uint32_t plen)
+{
+    if (plen < VW_HASH_BYTES) return cluster_send_error(conn, VW_ERR_PROTO_TRUNCATED);
+
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    vw_err_t err = vw_storage_chunk_get(ctx->chunks, payload, &data, &data_len);
+    if (err != VW_OK) return cluster_send_error(conn, VW_ERR_NOT_FOUND);
+
+    uint32_t resp_size = VW_HASH_BYTES + 4u + data_len;
+    uint8_t *resp = (uint8_t *)malloc(resp_size);
+    if (!resp) { free(data); return cluster_send_error(conn, VW_ERR_OOM); }
+    memcpy(resp, payload, VW_HASH_BYTES);
+    vw_write_u32le(resp + VW_HASH_BYTES, data_len);
+    memcpy(resp + VW_HASH_BYTES + 4u, data, data_len);
+    free(data);
+
+    vw_err_t rc = vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_DATA, resp, resp_size);
+    free(resp);
+    return rc;
+}
+
 /* ── Primary-side replication loop ─────────────────────────────────────────── */
 
 /*
@@ -298,7 +490,16 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
     /* Generous recv timeout for OPLOG_PULL: replicas may be slow. */
     vw_net_conn_set_recv_timeout(conn, 120000);
 
-    uint8_t pull_buf[12];  /* from_entry_id(8) + max_entries(4) */
+    /* Sized for the largest request this loop ever receives: a
+     * CLUSTER_CHUNK_QUERY batch (up to 1024 hashes, ~32 KiB) dwarfs
+     * OPLOG_PULL's 12 bytes, so one shared heap buffer replaces the old
+     * per-message stack buffers. */
+    uint8_t *buf = (uint8_t *)malloc(VW_MAX_MSG_BYTES);
+    if (!buf) {
+        CL_WARN("primary: OOM allocating recv buffer for node %llu",
+                (unsigned long long)node_id);
+        return;
+    }
 
     for (;;) {
         if (atomic_load_acq(&ctx->shutdown)) break;
@@ -306,7 +507,7 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
         /* Wait for OPLOG_PULL */
         vw_msg_type_t msg_type;
         uint32_t plen = 0;
-        vw_err_t rc = vw_proto_recv(conn, &msg_type, pull_buf, sizeof(pull_buf), &plen);
+        vw_err_t rc = vw_proto_recv(conn, &msg_type, buf, VW_MAX_MSG_BYTES, &plen);
         if (rc != VW_OK) {
             CL_DEBUG("primary: OPLOG_PULL recv failed for node %llu: %d",
                      (unsigned long long)node_id, (int)rc);
@@ -330,8 +531,8 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
             break;
         }
 
-        uint64_t from_eid    = vw_read_u64le(pull_buf + 0);
-        uint32_t max_entries = vw_read_u32le(pull_buf + 8);
+        uint64_t from_eid    = vw_read_u64le(buf + 0);
+        uint32_t max_entries = vw_read_u32le(buf + 8);
         if (max_entries == 0 || max_entries > OPLOG_PULL_MAX_ENTRIES)
             max_entries = OPLOG_PULL_MAX_ENTRIES;
 
@@ -391,25 +592,60 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
         /* If no entries sent, skip waiting for OPLOG_ACK (replica will retry). */
         if (entries_count == 0) continue;
 
-        /* Wait for OPLOG_ACK */
-        uint8_t ack_buf[8];
-        rc = vw_proto_recv(conn, &msg_type, ack_buf, sizeof(ack_buf), &plen);
-        if (rc != VW_OK) {
-            CL_DEBUG("primary: OPLOG_ACK recv failed for node %llu: %d",
-                     (unsigned long long)node_id, (int)rc);
-            break;
-        }
-        if (msg_type != VW_MSG_OPLOG_ACK || plen != 8) {
-            CL_WARN("primary: expected OPLOG_ACK from node %llu, got 0x%04x",
-                    (unsigned long long)node_id, (unsigned)msg_type);
-            break;
+        /* TASK-172: between OPLOG_DATA and this batch's OPLOG_ACK, the
+         * replica may run a whole file/chunk sync pass — any number of
+         * CLUSTER_FILE_SYNC_LIST/_FETCH and CLUSTER_CHUNK_QUERY/_FETCH
+         * round-trips — before finally sending OPLOG_ACK. Dispatch each
+         * until OPLOG_ACK arrives. */
+        int      got_ack      = 0;
+        uint64_t confirmed_eid = 0;
+        while (!got_ack) {
+            rc = vw_proto_recv(conn, &msg_type, buf, VW_MAX_MSG_BYTES, &plen);
+            if (rc != VW_OK) {
+                CL_DEBUG("primary: recv failed while awaiting OPLOG_ACK from node %llu: %d",
+                         (unsigned long long)node_id, (int)rc);
+                goto conn_done;
+            }
+            switch (msg_type) {
+            case VW_MSG_OPLOG_ACK:
+                if (plen != 8) {
+                    CL_WARN("primary: OPLOG_ACK bad len %u from node %llu", plen,
+                            (unsigned long long)node_id);
+                    goto conn_done;
+                }
+                confirmed_eid = vw_read_u64le(buf);
+                got_ack = 1;
+                break;
+            case VW_MSG_CLUSTER_FILE_SYNC_LIST:
+                rc = handle_cluster_file_sync_list(ctx, conn);
+                if (rc != VW_OK) goto conn_done;
+                break;
+            case VW_MSG_CLUSTER_FILE_SYNC_FETCH:
+                rc = handle_cluster_file_sync_fetch(ctx, conn, buf, plen);
+                if (rc != VW_OK) goto conn_done;
+                break;
+            case VW_MSG_CLUSTER_CHUNK_QUERY:
+                rc = handle_cluster_chunk_query(ctx, conn, buf, plen);
+                if (rc != VW_OK) goto conn_done;
+                break;
+            case VW_MSG_CLUSTER_CHUNK_FETCH:
+                rc = handle_cluster_chunk_fetch(ctx, conn, buf, plen);
+                if (rc != VW_OK) goto conn_done;
+                break;
+            default:
+                CL_WARN("primary: unexpected msg 0x%04x from node %llu while awaiting OPLOG_ACK",
+                        (unsigned)msg_type, (unsigned long long)node_id);
+                goto conn_done;
+            }
         }
 
-        uint64_t confirmed_eid = vw_read_u64le(ack_buf);
         vw_cluster_node_update_watermark(ctx, node_id, confirmed_eid);
         CL_DEBUG("primary: node %llu acked entry_id %llu",
                  (unsigned long long)node_id, (unsigned long long)confirmed_eid);
     }
+
+conn_done:
+    free(buf);
 }
 
 static void handle_cluster_conn(vw_cluster_t *ctx, vw_conn_t *conn)
@@ -626,6 +862,375 @@ static void replica_sleep_ms(vw_cluster_t *ctx, uint32_t ms)
     }
 }
 
+/* ── Replica-side file/chunk sync pass (TASK-172) ─────────────────────────── */
+
+typedef struct {
+    uint8_t  tag;
+    uint64_t size;
+    uint8_t  hash[32];
+} cluster_file_entry_t;
+
+/* Send CLUSTER_FILE_SYNC_LIST, receive CLUSTER_FILE_SYNC_LIST_RESP into
+ * out_entries (caller-provided, VW_CLUSTER_FILE_TAG_COUNT capacity). */
+static vw_err_t replica_file_sync_list(vw_conn_t *conn, uint8_t *recv_buf,
+                                        cluster_file_entry_t *out_entries,
+                                        uint32_t *out_count)
+{
+    vw_err_t rc = vw_proto_send(conn, VW_MSG_CLUSTER_FILE_SYNC_LIST, NULL, 0);
+    if (rc != VW_OK) return rc;
+
+    vw_msg_type_t type;
+    uint32_t plen = 0;
+    rc = vw_proto_recv(conn, &type, recv_buf, VW_MAX_MSG_BYTES, &plen);
+    if (rc != VW_OK) return rc;
+    if (type != VW_MSG_CLUSTER_FILE_SYNC_LIST_RESP) return VW_ERR_PROTO_INVALID;
+    if (plen < 1u) return VW_ERR_PROTO_TRUNCATED;
+
+    uint8_t  count = recv_buf[0];
+    uint32_t off   = 1;
+    uint32_t n     = 0;
+    for (uint8_t i = 0; i < count && n < VW_CLUSTER_FILE_TAG_COUNT; i++) {
+        if (off + 1u + 8u + 32u > plen) return VW_ERR_PROTO_TRUNCATED;
+        out_entries[n].tag  = recv_buf[off];               off += 1;
+        out_entries[n].size = vw_read_u64le(recv_buf + off); off += 8;
+        memcpy(out_entries[n].hash, recv_buf + off, 32);     off += 32;
+        n++;
+    }
+    *out_count = n;
+    return VW_OK;
+}
+
+/* Send CLUSTER_FILE_SYNC_FETCH for tag, receive CLUSTER_FILE_SYNC_DATA, and
+ * atomically replace this replica's on-disk copy of that file. Does NOT
+ * reload the owning module's live state — callers batch that per-group
+ * (see replica_run_file_sync_pass) since tags 1/2, 3/4/5, and 7/8 each
+ * reload via a single call regardless of how many of their tags changed. */
+static vw_err_t replica_fetch_and_write_file(vw_cluster_t *ctx, vw_conn_t *conn,
+                                              uint8_t *recv_buf, uint8_t tag)
+{
+    const char *rel = cluster_file_tag_rel_path(tag);
+    if (!rel) return VW_ERR_INVALID_ARG;
+
+    uint8_t req[1] = { tag };
+    vw_err_t rc = vw_proto_send(conn, VW_MSG_CLUSTER_FILE_SYNC_FETCH, req, 1);
+    if (rc != VW_OK) return rc;
+
+    vw_msg_type_t type;
+    uint32_t plen = 0;
+    rc = vw_proto_recv(conn, &type, recv_buf, VW_MAX_MSG_BYTES, &plen);
+    if (rc != VW_OK) return rc;
+    if (type == VW_MSG_ERROR) return VW_ERR_NOT_FOUND;
+    if (type != VW_MSG_CLUSTER_FILE_SYNC_DATA) return VW_ERR_PROTO_INVALID;
+    if (plen < 9u) return VW_ERR_PROTO_TRUNCATED;
+
+    uint8_t  resp_tag = recv_buf[0];
+    uint64_t size      = vw_read_u64le(recv_buf + 1);
+    if (resp_tag != tag) return VW_ERR_PROTO_INVALID;
+    if (size > (uint64_t)(plen - 9u)) return VW_ERR_PROTO_TRUNCATED;
+
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", ctx->data_dir, rel);
+    return vw_fs_atomic_write(path, recv_buf + 9, (size_t)size);
+}
+
+/*
+ * Run one CLUSTER_FILE_SYNC_LIST pass: compare the primary's reported
+ * per-tag size+hash against this replica's own current on-disk copy,
+ * fetch+write whichever differs, then reload each affected module's live
+ * state exactly once (grouped, since e.g. tags 1+2 share one reload call).
+ * *out_versions_changed is set if tag 4 (versions.dat) or tag 5
+ * (versions.blob) was fetched — the signal that triggers the chunk sweep.
+ */
+static vw_err_t replica_run_file_sync_pass(vw_cluster_t *ctx, vw_conn_t *conn,
+                                            uint8_t *recv_buf,
+                                            int *out_versions_changed)
+{
+    *out_versions_changed = 0;
+
+    cluster_file_entry_t remote[VW_CLUSTER_FILE_TAG_COUNT];
+    uint32_t remote_count = 0;
+    vw_err_t rc = replica_file_sync_list(conn, recv_buf, remote, &remote_count);
+    if (rc != VW_OK) return rc;
+
+    int store_dirty = 0, file_store_dirty = 0, share_dirty = 0, vault_dirty = 0;
+
+    for (uint32_t i = 0; i < remote_count; i++) {
+        uint8_t tag = remote[i].tag;
+        if (!cluster_file_tag_rel_path(tag)) continue;
+
+        uint64_t local_size = 0;
+        uint8_t  local_hash[32];
+        if (cluster_hash_file_by_tag(ctx->data_dir, tag, &local_size, local_hash) != 0) {
+            memset(local_hash, 0, sizeof(local_hash));
+            local_size = 0;
+        }
+        if (local_size == remote[i].size &&
+            memcmp(local_hash, remote[i].hash, 32) == 0)
+            continue;  /* already up to date */
+
+        rc = replica_fetch_and_write_file(ctx, conn, recv_buf, tag);
+        if (rc != VW_OK) return rc;
+
+        switch (tag) {
+        case 1: case 2:       store_dirty      = 1; break;
+        case 3: case 4: case 5: file_store_dirty = 1; break;
+        case 6:                share_dirty      = 1; break;
+        case 7: case 8:        vault_dirty       = 1; break;
+        default: break;
+        }
+        if (tag == 4 || tag == 5) *out_versions_changed = 1;
+    }
+
+    if (store_dirty && ctx->store) {
+        rc = vw_store_reload_users_and_quotas(ctx->store, ctx->data_dir);
+        if (rc != VW_OK) return rc;
+    }
+    if (file_store_dirty && ctx->file_store) {
+        rc = vw_file_store_reload_meta_and_versions(ctx->file_store, ctx->data_dir);
+        if (rc != VW_OK) return rc;
+    }
+    if (share_dirty && ctx->share_store) {
+        rc = vw_share_store_reload(ctx->share_store, ctx->data_dir);
+        if (rc != VW_OK) return rc;
+    }
+    if (vault_dirty && ctx->vault_store) {
+        rc = vw_vault_store_reload(ctx->vault_store, ctx->data_dir);
+        if (rc != VW_OK) return rc;
+    }
+
+    return VW_OK;
+}
+
+/*
+ * Scan the replica's own current on-disk files/versions.dat + versions.blob
+ * (just written and reloaded by replica_run_file_sync_pass) for every
+ * chunk hash any live version references. Duplicates across versions are
+ * not de-duplicated — CLUSTER_CHUNK_QUERY/CLUSTER_CHUNK_FETCH tolerate
+ * redundant lookups; at this project's scale that's a simpler tradeoff
+ * than de-duping, matching e.g. vw_share_scan's O(total) acceptance.
+ */
+static vw_err_t replica_collect_referenced_chunks(const char *data_dir,
+                                                   uint8_t (**out_hashes)[VW_HASH_BYTES],
+                                                   uint32_t *out_count)
+{
+    *out_hashes = NULL;
+    *out_count  = 0;
+
+    char dat_path[700], blob_path[700];
+    snprintf(dat_path, sizeof(dat_path), "%s/files/versions.dat", data_dir);
+    snprintf(blob_path, sizeof(blob_path), "%s/files/versions.blob", data_dir);
+
+    void  *dat_buf = NULL;
+    size_t dat_len = 0;
+    vw_err_t rc = vw_fs_read_file(dat_path, &dat_buf, &dat_len);
+    if (rc != VW_OK) return rc;
+
+    void  *blob_buf = NULL;
+    size_t blob_len = 0;
+    rc = vw_fs_read_file(blob_path, &blob_buf, &blob_len);
+    if (rc != VW_OK) { free(dat_buf); return rc; }
+
+    uint64_t nslots = dat_len / sizeof(vw_version_record_t);
+
+    uint64_t total_hashes = 0;
+    for (uint64_t i = 0; i < nslots; i++) {
+        vw_version_record_t rec;
+        memcpy(&rec, (const uint8_t *)dat_buf + i * sizeof(rec), sizeof(rec));
+        if (rec.version_id == 0) continue;
+        total_hashes += rec.chunk_count;
+    }
+
+    uint8_t (*hashes)[VW_HASH_BYTES] = NULL;
+    if (total_hashes > 0) {
+        hashes = (uint8_t (*)[VW_HASH_BYTES])malloc((size_t)total_hashes * VW_HASH_BYTES);
+        if (!hashes) { free(dat_buf); free(blob_buf); return VW_ERR_OOM; }
+    }
+
+    uint32_t n = 0;
+    for (uint64_t i = 0; i < nslots; i++) {
+        vw_version_record_t rec;
+        memcpy(&rec, (const uint8_t *)dat_buf + i * sizeof(rec), sizeof(rec));
+        if (rec.version_id == 0 || rec.chunk_count == 0) continue;
+        uint64_t need = (uint64_t)rec.chunk_count * VW_HASH_BYTES;
+        if (rec.blob_offset > blob_len || need > blob_len - rec.blob_offset) continue;
+        memcpy(hashes + n, (const uint8_t *)blob_buf + rec.blob_offset, (size_t)need);
+        n += rec.chunk_count;
+    }
+
+    free(dat_buf);
+    free(blob_buf);
+    *out_hashes = hashes;
+    *out_count  = n;
+    return VW_OK;
+}
+
+static int hash_memcmp(const void *a, const void *b)
+{
+    return memcmp(a, b, VW_HASH_BYTES);
+}
+
+static void hash_to_hex_dbg(const uint8_t *hash, char *out)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t i;
+    for (i = 0; i < VW_HASH_BYTES; i++) {
+        out[i * 2]     = hex[hash[i] >> 4];
+        out[i * 2 + 1] = hex[hash[i] & 0xF];
+    }
+    out[VW_HASH_BYTES * 2] = '\0';
+}
+
+/*
+ * TASK-181: after every referenced hash is confirmed present locally (the
+ * fetch loop below guarantees this), reconcile this replica's own
+ * refcounts.db to the true occurrence count of each hash across `hashes`
+ * (the full, non-deduplicated per-version list from
+ * replica_collect_referenced_chunks) — matching ARCHITECTURE.md's/
+ * TASK-172's stated design ("sets its own local refcount from its own
+ * now-current versions.dat/versions.blob content"), which the old
+ * skip-if-already-present fetch loop alone did not actually implement:
+ * a hash already local from an earlier pass never got its ref_count
+ * bumped for a newly-synced second (or later) referencing version.
+ *
+ * Sorts a working copy so every run of identical hashes is contiguous,
+ * then calls vw_storage_chunk_set_refcount once per unique hash with its
+ * true count — an authoritative overwrite, not an increment, so this is
+ * safe to re-run every pass regardless of what any previous pass left
+ * behind.
+ */
+static vw_err_t replica_reconcile_chunk_refcounts(vw_storage_t *chunks,
+                                                   const uint8_t (*hashes)[VW_HASH_BYTES],
+                                                   uint32_t count)
+{
+    if (count == 0) return VW_OK;
+
+    uint8_t (*sorted)[VW_HASH_BYTES] =
+        (uint8_t (*)[VW_HASH_BYTES])malloc((size_t)count * VW_HASH_BYTES);
+    if (!sorted) return VW_ERR_OOM;
+    memcpy(sorted, hashes, (size_t)count * VW_HASH_BYTES);
+    qsort(sorted, count, VW_HASH_BYTES, hash_memcmp);
+
+    vw_err_t rc = VW_OK;
+    uint32_t i = 0;
+    while (i < count) {
+        uint32_t j = i + 1;
+        while (j < count && memcmp(sorted[j], sorted[i], VW_HASH_BYTES) == 0) j++;
+
+        vw_err_t src = vw_storage_chunk_set_refcount(chunks, sorted[i], j - i);
+        if (src != VW_OK && src != VW_ERR_NOT_FOUND) { rc = src; break; }
+        if (src == VW_ERR_NOT_FOUND) {
+            /* Should not happen: the fetch loop above ensures every
+             * referenced hash exists locally first. Skip defensively
+             * rather than aborting the whole reconciliation pass over
+             * one hash a concurrent local GC may have just zeroed. */
+            char hex[VW_HASH_BYTES * 2 + 1];
+            hash_to_hex_dbg(sorted[i], hex);
+            CL_WARN("replica: set_refcount NOT_FOUND for %s (count %u) — skipping",
+                    hex, (unsigned)(j - i));
+        }
+
+        i = j;
+    }
+
+    free(sorted);
+    return rc;
+}
+
+/*
+ * Sweep every chunk hash referenced by the replica's current versions.dat/
+ * versions.blob: skip what it already has locally, confirm the rest exists
+ * on the primary via CLUSTER_CHUNK_QUERY, then CLUSTER_CHUNK_FETCH and
+ * vw_storage_chunk_put_replicated each confirmed hash — in batches of up
+ * to 1024, matching CHUNK_QUERY's existing wire cap (§7.2). Once every
+ * referenced hash is confirmed present, reconcile ref_counts to their true
+ * occurrence counts (TASK-181; see replica_reconcile_chunk_refcounts).
+ */
+static vw_err_t replica_run_chunk_sync_pass(vw_cluster_t *ctx, vw_conn_t *conn,
+                                             uint8_t *recv_buf)
+{
+    if (!ctx->chunks || !ctx->file_store) return VW_OK;
+
+    uint8_t (*hashes)[VW_HASH_BYTES] = NULL;
+    uint32_t count = 0;
+    vw_err_t rc = replica_collect_referenced_chunks(ctx->data_dir, &hashes, &count);
+    if (rc != VW_OK) return rc;
+
+    for (uint32_t base = 0; base < count; base += 1024u) {
+        uint16_t batch = (uint16_t)((count - base) > 1024u ? 1024u : (count - base));
+
+        uint8_t local_bitmask[128];
+        memset(local_bitmask, 0, sizeof(local_bitmask));
+        rc = vw_storage_chunk_query(ctx->chunks,
+                                     (const uint8_t (*)[VW_HASH_BYTES])(hashes + base),
+                                     batch, local_bitmask);
+        if (rc != VW_OK) { free(hashes); return rc; }
+
+        uint8_t (*missing)[VW_HASH_BYTES] =
+            (uint8_t (*)[VW_HASH_BYTES])malloc((size_t)batch * VW_HASH_BYTES);
+        if (!missing) { free(hashes); return VW_ERR_OOM; }
+        uint16_t missing_count = 0;
+        for (uint16_t i = 0; i < batch; i++) {
+            int have = (local_bitmask[i / 8] >> (7 - (i % 8))) & 1;
+            if (!have) memcpy(missing[missing_count++], hashes[base + i], VW_HASH_BYTES);
+        }
+        if (missing_count == 0) { free(missing); continue; }
+
+        uint32_t qlen = 2u + (uint32_t)missing_count * VW_HASH_BYTES;
+        uint8_t *qbuf = (uint8_t *)malloc(qlen);
+        if (!qbuf) { free(missing); free(hashes); return VW_ERR_OOM; }
+        vw_write_u16le(qbuf, missing_count);
+        memcpy(qbuf + 2, missing, (size_t)missing_count * VW_HASH_BYTES);
+        rc = vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_QUERY, qbuf, qlen);
+        free(qbuf);
+        if (rc != VW_OK) { free(missing); free(hashes); return rc; }
+
+        vw_msg_type_t rtype;
+        uint32_t rplen = 0;
+        rc = vw_proto_recv(conn, &rtype, recv_buf, VW_MAX_MSG_BYTES, &rplen);
+        if (rc != VW_OK) { free(missing); free(hashes); return rc; }
+        if (rtype != VW_MSG_CLUSTER_CHUNK_QUERY_RESP || rplen < 2u) {
+            free(missing); free(hashes); return VW_ERR_PROTO_INVALID;
+        }
+        uint16_t resp_count = vw_read_u16le(recv_buf);
+        uint32_t bitmask_bytes = resp_count == 0u ? 0u : (resp_count + 7u) / 8u;
+        if (resp_count != missing_count || rplen < 2u + bitmask_bytes) {
+            free(missing); free(hashes); return VW_ERR_PROTO_INVALID;
+        }
+        uint8_t primary_bitmask[128];
+        memcpy(primary_bitmask, recv_buf + 2, bitmask_bytes);
+
+        for (uint16_t i = 0; i < missing_count; i++) {
+            int on_primary = (primary_bitmask[i / 8] >> (7 - (i % 8))) & 1;
+            if (!on_primary) continue;  /* GC gating should prevent this; skip defensively */
+
+            rc = vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_FETCH, missing[i], VW_HASH_BYTES);
+            if (rc != VW_OK) { free(missing); free(hashes); return rc; }
+
+            vw_msg_type_t dtype;
+            uint32_t dplen = 0;
+            rc = vw_proto_recv(conn, &dtype, recv_buf, VW_MAX_MSG_BYTES, &dplen);
+            if (rc != VW_OK) { free(missing); free(hashes); return rc; }
+            if (dtype == VW_MSG_ERROR) continue;  /* primary no longer has it; skip defensively */
+            if (dtype != VW_MSG_CLUSTER_CHUNK_DATA || dplen < VW_HASH_BYTES + 4u) {
+                free(missing); free(hashes); return VW_ERR_PROTO_INVALID;
+            }
+            uint32_t data_len = vw_read_u32le(recv_buf + VW_HASH_BYTES);
+            if (dplen < VW_HASH_BYTES + 4u + data_len) {
+                free(missing); free(hashes); return VW_ERR_PROTO_TRUNCATED;
+            }
+            rc = vw_storage_chunk_put_replicated(ctx->chunks, recv_buf,
+                                                  recv_buf + VW_HASH_BYTES + 4u, data_len);
+            if (rc != VW_OK) { free(missing); free(hashes); return rc; }
+        }
+
+        free(missing);
+    }
+
+    rc = replica_reconcile_chunk_refcounts(ctx->chunks, hashes, count);
+    free(hashes);
+    return rc;
+}
+
 static void replica_repl_session(vw_cluster_t *ctx)
 {
     /* Connect to primary (TLS 1.3, certificate verification required).
@@ -802,6 +1407,28 @@ static void replica_repl_session(vw_cluster_t *ctx)
 
         if (!apply_ok) break;
 
+        /* TASK-172: run one file/chunk sync pass for this batch before
+         * advancing/acking the watermark — the oplog entries themselves
+         * carry no usable content, only a "something changed" signal
+         * (docs/PROTOCOL.md §7.7). A failure here reconnects (backoff
+         * retries the whole batch — safe: hash comparison makes both the
+         * file and chunk passes idempotent). */
+        {
+            int versions_changed = 0;
+            rc = replica_run_file_sync_pass(ctx, conn, data_buf, &versions_changed);
+            if (rc != VW_OK) {
+                CL_WARN("replica: file sync pass failed: %d — reconnecting", (int)rc);
+                break;
+            }
+            if (versions_changed) {
+                rc = replica_run_chunk_sync_pass(ctx, conn, data_buf);
+                if (rc != VW_OK) {
+                    CL_WARN("replica: chunk sync pass failed: %d — reconnecting", (int)rc);
+                    break;
+                }
+            }
+        }
+
         my_watermark = last_applied;
 
         /* Send OPLOG_ACK */
@@ -862,18 +1489,30 @@ vw_err_t vw_cluster_open(const char *data_dir,
                           const char *cert_pem_path,
                           const char *key_pem_path,
                           vw_oplog_t *oplog,
+                          vw_store_t *store,
+                          vw_file_store_t *file_store,
+                          vw_storage_t *chunks,
+                          vw_share_store_t *share_store,
+                          vw_vault_store_t *vault_store,
                           vw_cluster_t **out)
 {
-    if (!data_dir || !cfg || !cert_pem_path || !key_pem_path || !oplog || !out)
+    if (!data_dir || !cfg || !cert_pem_path || !key_pem_path || !oplog || !out ||
+        !store || !file_store || !chunks)
         return VW_ERR_INVALID_ARG;
 
     vw_cluster_t *ctx = (vw_cluster_t *)calloc(1, sizeof(*ctx));
     if (!ctx) return VW_ERR_OOM;
 
-    ctx->cfg   = *cfg;
-    ctx->oplog = oplog;
+    ctx->cfg         = *cfg;
+    ctx->oplog       = oplog;
+    ctx->store       = store;
+    ctx->file_store  = file_store;
+    ctx->chunks      = chunks;
+    ctx->share_store = share_store;
+    ctx->vault_store = vault_store;
     snprintf(ctx->cert_pem_path, sizeof(ctx->cert_pem_path), "%s", cert_pem_path);
     snprintf(ctx->key_pem_path,  sizeof(ctx->key_pem_path),  "%s", key_pem_path);
+    snprintf(ctx->data_dir,      sizeof(ctx->data_dir),      "%s", data_dir);
 
     /* Ensure cluster directory exists */
     char cluster_dir[600];
@@ -1248,4 +1887,10 @@ int vw_cluster_has_active_replicas(vw_cluster_t *ctx)
             return 1;
     }
     return 0;
+}
+
+int vw_cluster_is_replica(const vw_cluster_t *ctx)
+{
+    if (!ctx) return 0;
+    return ctx->cfg.is_replica ? 1 : 0;
 }
