@@ -2991,6 +2991,88 @@ static vw_err_t handle_notify_prefs_set(vw_store_t *store, vw_conn_t *conn,
     return vw_proto_send(conn, VW_MSG_NOTIFY_PREFS_SET_ACK, resp, sizeof(resp));
 }
 
+/* ── ACCOUNT_EMAIL_GET / _SET (TASK-222; docs/PROTOCOL.md §7.14) ─────────── */
+
+/* ACCOUNT_EMAIL_GET payload: session_token[32].
+ * _GET_RESP: error_code(u32) + email(string) — empty string if no email
+ * is on file, never an error on that account (having no email is the
+ * default, expected state for most accounts today). */
+static vw_err_t handle_account_email_get(vw_store_t *store, vw_conn_t *conn,
+                                          const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    vw_user_record_t rec;
+    err = vw_store_user_get_by_id(store, user_id, &rec);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+
+    char email_str[129];
+    memcpy(email_str, rec.email, 128);
+    email_str[128] = '\0';
+    uint16_t email_len = (uint16_t)strlen(email_str);
+
+    uint8_t resp[4u + 2u + 128u];
+    uint32_t off = 0;
+    vw_write_u32le(resp, 0u); /* VW_OK */ off += 4u;
+    (void)vw_proto_write_str(resp, sizeof(resp), &off, email_str, email_len);
+    return vw_proto_send(conn, VW_MSG_ACCOUNT_EMAIL_GET_RESP, resp, off);
+}
+
+/* ACCOUNT_EMAIL_SET payload: session_token[32] + email(string, up to 128
+ * bytes — empty string clears the email back to unset).
+ * _SET_ACK: error_code(u32) + email(string) — the stored value after this
+ * call (unchanged-from-before on any error), echoed back so a client
+ * never needs a follow-up GET to confirm what it just set (same pattern
+ * as NOTIFY_PREFS_SET_ACK, §7.13). error_code is VW_ERR_INVALID_ARG for
+ * a malformed address (vw_email_validate) or one over 128 bytes,
+ * VW_ERR_ALREADY_EXISTS if another account already owns that address. */
+static vw_err_t handle_account_email_set(vw_store_t *store, vw_conn_t *conn,
+                                          const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    if (plen < VW_TOKEN_BYTES + 2u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    const uint8_t *var = payload + VW_TOKEN_BYTES;
+    uint32_t var_len   = plen - VW_TOKEN_BYTES;
+    uint32_t off = 0;
+    const char *email; uint16_t email_len;
+    err = vw_proto_read_str(var, var_len, &off, &email, &email_len);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    char email_buf[129];
+    if (email_len > 128)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+    memcpy(email_buf, email, email_len);
+    email_buf[email_len] = '\0';
+
+    /* Empty string clears the email back to unset — skip format
+     * validation for that one case only, same "empty is exempt" posture
+     * VERSION_RESTORE's now-optional virtual_path uses (TASK-214). */
+    if (email_len > 0) {
+        err = vw_email_validate(email_buf, email_len);
+        if (err != VW_OK)
+            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+    }
+
+    err = vw_store_user_set_email(store, user_id, email_buf);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+
+    uint8_t resp[4u + 2u + 128u];
+    uint32_t roff = 0;
+    vw_write_u32le(resp, 0u); /* VW_OK */ roff += 4u;
+    (void)vw_proto_write_str(resp, sizeof(resp), &roff, email_buf, email_len);
+    return vw_proto_send(conn, VW_MSG_ACCOUNT_EMAIL_SET_ACK, resp, roff);
+}
+
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
 /*
@@ -3021,6 +3103,7 @@ static int is_write_shaped_msg(vw_msg_type_t type)
     case VW_MSG_LINK_REVOKE:
     case VW_MSG_VAULT_CREATE:
     case VW_MSG_NOTIFY_PREFS_SET:
+    case VW_MSG_ACCOUNT_EMAIL_SET:
         return 1;
     default:
         return 0;
@@ -3071,6 +3154,12 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_notify_prefs_get(store, conn, payload, plen);
     case VW_MSG_NOTIFY_PREFS_SET:
         return handle_notify_prefs_set(store, conn, payload, plen);
+    case VW_MSG_ACCOUNT_EMAIL_GET:
+        /* Account-only, no file/chunk store dependency (TASK-222) — same
+         * dispatch placement as NOTIFY_PREFS_GET/SET above. */
+        return handle_account_email_get(store, conn, payload, plen);
+    case VW_MSG_ACCOUNT_EMAIL_SET:
+        return handle_account_email_set(store, conn, payload, plen);
     default:
         break;
     }

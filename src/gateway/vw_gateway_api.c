@@ -1090,6 +1090,69 @@ static void handle_notify_prefs_set(vw_gateway_session_pool_t *pool,
     vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
 }
 
+/*
+ * Account self-service email (TASK-222; docs/PROTOCOL.md §7.14). Same
+ * thin-passthrough shape as NOTIFY_PREFS_GET/SET above — require_session()
+ * derives the account entirely from the caller's own session cookie, no
+ * user_id/account_id field anywhere in either request.
+ */
+static void handle_account_email_get(vw_gateway_session_pool_t *pool,
+                                      const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+
+    char email[129];
+    vw_err_t err = vw_client_account_email_get(sess, email, sizeof(email));
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[192];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "email");
+    vw_json_write_string(&w, email, strlen(email));
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
+static void handle_account_email_set(vw_gateway_session_pool_t *pool,
+                                      const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    char email[129];
+    if (get_json_string_field(req, "email", email, sizeof(email)) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    char stored[129];
+    vw_err_t err = vw_client_account_email_set(sess, email, stored, sizeof(stored));
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[192];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "email");
+    vw_json_write_string(&w, stored, strlen(stored));
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
 /* ── Chunk transfer endpoints (TASK-139's backend prerequisite) ───────────
  *
  * The browser drives CHUNK_QUERY/CHUNK_UPLOAD/FILE_COMMIT (upload) and
@@ -2070,6 +2133,14 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/notify/prefs/set") == 0) {
         handle_notify_prefs_set(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/account/email") == 0) {
+        handle_account_email_get(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/account/email/set") == 0) {
+        handle_account_email_set(pool, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/stat") == 0) {

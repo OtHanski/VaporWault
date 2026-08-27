@@ -1368,26 +1368,23 @@ vw_err_t vw_client_file_mkdir(vw_client_sess_t *sess,
 
 /* ── vw_client_version_list ──────────────────────────────────────────────── */
 
-vw_err_t vw_client_version_list(vw_client_sess_t *sess,
-                                  const char *virtual_path,
-                                  vw_version_entry_t **out,
-                                  uint32_t *out_count)
+/*
+ * Shared body of vw_client_version_list/_by_id (TASK-214/223) — the wire
+ * message has always been file_id-based server-side; the two public
+ * entry points differ only in how they obtain that file_id (a path
+ * resolution vs. one supplied directly by the caller, e.g. from
+ * vw_client_share_list for content the caller doesn't own).
+ */
+static vw_err_t version_list_by_file_id(vw_client_sess_t *sess, uint64_t file_id,
+                                         vw_version_entry_t **out, uint32_t *out_count)
 {
     vw_err_t err;
-    if (!sess || !virtual_path || !out || !out_count) return VW_ERR_INVALID_ARG;
-    if ((err = sess_check_valid(sess)) != VW_OK)     return err;
-    if ((err = path_validate_client(virtual_path)) != VW_OK) return err;
-
-    /* Resolve file_id via FILE_STAT */
-    vw_file_entry_t entry;
-    err = vw_client_file_stat(sess, virtual_path, &entry);
-    if (err != VW_OK) return err;
 
     /* VERSION_LIST payload: token[32] + file_id(u64) + offset(u32)=0 + limit(u32)=0 */
     uint8_t pbuf[VW_TOKEN_BYTES + 8u + 4u + 4u];
     uint8_t *p = pbuf;
     memcpy(p, sess->session_token, VW_TOKEN_BYTES); p += VW_TOKEN_BYTES;
-    vw_write_u64le(p, entry.file_id); p += 8;
+    vw_write_u64le(p, file_id); p += 8;
     vw_write_u32le(p, 0); p += 4;  /* offset */
     vw_write_u32le(p, 0);           /* limit = server default */
 
@@ -1427,18 +1424,50 @@ vw_err_t vw_client_version_list(vw_client_sess_t *sess,
     return VW_OK;
 }
 
-/* ── vw_client_version_restore ───────────────────────────────────────────── */
-
-vw_err_t vw_client_version_restore(vw_client_sess_t *sess,
-                                     const char *virtual_path,
-                                     uint64_t version_id)
+vw_err_t vw_client_version_list(vw_client_sess_t *sess,
+                                  const char *virtual_path,
+                                  vw_version_entry_t **out,
+                                  uint32_t *out_count)
 {
     vw_err_t err;
-    if (!sess || !virtual_path) return VW_ERR_INVALID_ARG;
+    if (!sess || !virtual_path || !out || !out_count) return VW_ERR_INVALID_ARG;
     if ((err = sess_check_valid(sess)) != VW_OK)     return err;
     if ((err = path_validate_client(virtual_path)) != VW_OK) return err;
 
-    uint16_t path_len = (uint16_t)strlen(virtual_path);
+    /* Resolve file_id via FILE_STAT */
+    vw_file_entry_t entry;
+    err = vw_client_file_stat(sess, virtual_path, &entry);
+    if (err != VW_OK) return err;
+
+    return version_list_by_file_id(sess, entry.file_id, out, out_count);
+}
+
+vw_err_t vw_client_version_list_by_id(vw_client_sess_t *sess,
+                                       uint64_t file_id,
+                                       vw_version_entry_t **out,
+                                       uint32_t *out_count)
+{
+    vw_err_t err;
+    if (!sess || !out || !out_count) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+    return version_list_by_file_id(sess, file_id, out, out_count);
+}
+
+/* ── vw_client_version_restore ───────────────────────────────────────────── */
+
+/*
+ * Shared body of vw_client_version_restore/_by_id (TASK-214/223).
+ * virtual_path may be "" (path_len 0) — the server-side relaxation
+ * landed in TASK-214 (docs/PROTOCOL.md §7.3 rev 25) accepts an empty
+ * virtual_path to mean "resolve by version_id/file_id alone," since
+ * handle_version_restore never actually uses virtual_path's contents
+ * for resolution or authorization, only its (now-optional) shape.
+ */
+static vw_err_t version_restore_send(vw_client_sess_t *sess,
+                                      const char *virtual_path, uint16_t path_len,
+                                      uint64_t version_id)
+{
+    vw_err_t err;
 
     /* token[32] + version_id(u64) + path_len(u16) + path */
     uint32_t plen = VW_TOKEN_BYTES + 8u + 2u + (uint32_t)path_len;
@@ -1448,7 +1477,7 @@ vw_err_t vw_client_version_restore(vw_client_sess_t *sess,
     memcpy(p, sess->session_token, VW_TOKEN_BYTES); p += VW_TOKEN_BYTES;
     vw_write_u64le(p, version_id); p += 8;
     vw_write_u16le(p, path_len); p += 2;
-    memcpy(p, virtual_path, path_len);
+    if (path_len > 0) memcpy(p, virtual_path, path_len);
 
     err = vw_proto_send(sess->conn, VW_MSG_VERSION_RESTORE, pbuf, plen);
     free(pbuf);
@@ -1464,6 +1493,26 @@ vw_err_t vw_client_version_restore(vw_client_sess_t *sess,
         if (ec != 0) err = (vw_err_t)ec;
     }
     return err;
+}
+
+vw_err_t vw_client_version_restore(vw_client_sess_t *sess,
+                                     const char *virtual_path,
+                                     uint64_t version_id)
+{
+    vw_err_t err;
+    if (!sess || !virtual_path) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK)     return err;
+    if ((err = path_validate_client(virtual_path)) != VW_OK) return err;
+
+    return version_restore_send(sess, virtual_path, (uint16_t)strlen(virtual_path), version_id);
+}
+
+vw_err_t vw_client_version_restore_by_id(vw_client_sess_t *sess, uint64_t version_id)
+{
+    vw_err_t err;
+    if (!sess) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+    return version_restore_send(sess, "", 0, version_id);
 }
 
 /* ── Sharing (TASK-095; server side: TASK-094, docs/PROTOCOL.md §7.5) ────── */
@@ -1845,6 +1894,74 @@ vw_err_t vw_client_notify_prefs_set(vw_client_sess_t *sess, uint32_t prefs,
     if (rplen < 8u) return VW_ERR_PROTO_TRUNCATED;
 
     if (out_prefs) *out_prefs = vw_read_u32le(rbuf + 4);
+    return VW_OK;
+}
+
+/* ── Account self-service: email (TASK-222; docs/PROTOCOL.md §7.14) ──────── */
+
+vw_err_t vw_client_account_email_get(vw_client_sess_t *sess, char *out_email,
+                                      size_t out_email_size)
+{
+    vw_err_t err;
+    if (!sess || !out_email || out_email_size < 129u) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    err = vw_proto_send(sess->conn, VW_MSG_ACCOUNT_EMAIL_GET,
+                         sess->session_token, VW_TOKEN_BYTES);
+    if (err != VW_OK) return err;
+
+    uint8_t rbuf[4u + 2u + 128u];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_ACCOUNT_EMAIL_GET_RESP, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+
+    /* error_code(u32) is always VW_OK here — a real failure already
+     * returned above via recv_expect's VW_MSG_ERROR path, same
+     * convention as vw_client_notify_prefs_get's own RESP handling. */
+    uint32_t off = 4u;
+    const char *email; uint16_t email_len;
+    err = vw_proto_read_str(rbuf, rplen, &off, &email, &email_len);
+    if (err != VW_OK) return VW_ERR_PROTO_TRUNCATED;
+
+    uint16_t ncopy = (uint16_t)VW_MIN(email_len, (uint16_t)(out_email_size - 1u));
+    memcpy(out_email, email, ncopy);
+    out_email[ncopy] = '\0';
+    return VW_OK;
+}
+
+vw_err_t vw_client_account_email_set(vw_client_sess_t *sess, const char *email,
+                                      char *out_email, size_t out_email_size)
+{
+    vw_err_t err;
+    if (!sess || !email) return VW_ERR_INVALID_ARG;
+    if (out_email && out_email_size < 129u) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    uint16_t email_len = (uint16_t)strlen(email);
+    if (email_len > 128u) return VW_ERR_INVALID_ARG;
+
+    uint8_t pbuf[VW_TOKEN_BYTES + 2u + 128u];
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES);
+    uint32_t poff = VW_TOKEN_BYTES;
+    (void)vw_proto_write_str(pbuf, sizeof(pbuf), &poff, email, email_len);
+
+    err = vw_proto_send(sess->conn, VW_MSG_ACCOUNT_EMAIL_SET, pbuf, poff);
+    if (err != VW_OK) return err;
+
+    uint8_t rbuf[4u + 2u + 128u];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_ACCOUNT_EMAIL_SET_ACK, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+
+    if (out_email) {
+        uint32_t off = 4u;
+        const char *stored; uint16_t stored_len;
+        if (vw_proto_read_str(rbuf, rplen, &off, &stored, &stored_len) != VW_OK)
+            return VW_ERR_PROTO_TRUNCATED;
+        uint16_t ncopy = (uint16_t)VW_MIN(stored_len, (uint16_t)(out_email_size - 1u));
+        memcpy(out_email, stored, ncopy);
+        out_email[ncopy] = '\0';
+    }
     return VW_OK;
 }
 

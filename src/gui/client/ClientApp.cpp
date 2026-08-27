@@ -302,6 +302,14 @@ int ClientApp::ipc_notify_prefs_set(uint32_t prefs, uint32_t *out_prefs) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.notify_prefs_set(active_account_id_, prefs, out_prefs);
 }
+bool ClientApp::ipc_account_email_get(std::string *out_email) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.account_email_get(active_account_id_, out_email);
+}
+int ClientApp::ipc_account_email_set(const std::string &email, std::string *out_email) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.account_email_set(active_account_id_, email, out_email);
+}
 bool ClientApp::ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.file_list(active_account_id_, prefix, out);

@@ -63,6 +63,25 @@ static void refresh_notify_prefs(ClientApp &app) {
     }
 }
 
+/* Account email (TASK-222; docs/PROTOCOL.md §7.14) — the first real path
+ * that can put an email on an account, so this section sits above
+ * "Email notifications", which is silently a no-op without one. */
+static bool s_email_loaded  = false;
+static char s_email_current[129] = "";
+static char s_email_input[129]   = "";
+static char s_email_status[160]  = "";
+
+static void refresh_account_email(ClientApp &app) {
+    std::string email;
+    if (app.ipc_account_email_get(&email)) {
+        snprintf(s_email_current, sizeof(s_email_current), "%s", email.c_str());
+        snprintf(s_email_input,   sizeof(s_email_input),   "%s", email.c_str());
+        s_email_loaded = true;
+    } else {
+        snprintf(s_email_status, sizeof(s_email_status), "Failed to fetch account email.");
+    }
+}
+
 void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     ImGuiIO &io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 28));
@@ -180,6 +199,36 @@ void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
         }
         if (s_folder_rules_status[0]) ImGui::TextUnformatted(s_folder_rules_status);
     }
+
+    /* Account email (TASK-222; docs/PROTOCOL.md §7.14). */
+    ImGui::Spacing();
+    ImGui::SeparatorText("Account email");
+    if (!s_email_loaded) refresh_account_email(app);
+    ImGui::TextDisabled(
+        "Used for password recovery and the email notifications below. "
+        "Not set by account creation or invites — set it here.");
+    ImGui::SetNextItemWidth(320);
+    ImGui::InputText("##account_email", s_email_input, sizeof(s_email_input));
+    ImGui::SameLine();
+    if (ImGui::Button("Save##account_email")) {
+        std::string stored;
+        int rc = app.ipc_account_email_set(s_email_input, &stored);
+        if (rc == 0) {
+            snprintf(s_email_current, sizeof(s_email_current), "%s", stored.c_str());
+            snprintf(s_email_input,   sizeof(s_email_input),   "%s", stored.c_str());
+            s_email_status[0] = '\0';
+        } else if (rc == (int)VW_ERR_ALREADY_EXISTS) {
+            snprintf(s_email_status, sizeof(s_email_status),
+                     "That address is already in use by another account.");
+            refresh_account_email(app); /* re-sync input with real server state */
+        } else {
+            snprintf(s_email_status, sizeof(s_email_status),
+                     "Invalid email address (err %d).", rc);
+            refresh_account_email(app); /* re-sync input with real server state */
+        }
+    }
+    ImGui::TextDisabled("Current: %s", s_email_current[0] ? s_email_current : "(none)");
+    if (s_email_status[0]) ImGui::TextUnformatted(s_email_status);
 
     /* Notification preferences (TASK-206/207/209/210). */
     ImGui::Spacing();

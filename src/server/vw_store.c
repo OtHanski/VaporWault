@@ -263,10 +263,15 @@ static uint64_t uname_ht_find(const vw_store_t *ctx, const char *username)
 
 /* ── Email hash table ─────────────────────────────────────────────────────── */
 
+static uint64_t email_ht_probe_start(const char *email, size_t cap)
+{
+    return fnv1a(email, strlen(email)) % (uint64_t)cap;
+}
+
 static int email_ht_insert_raw(email_ht_entry_t *ht, size_t cap,
                                 const char *email, uint64_t slot)
 {
-    uint64_t h = fnv1a(email, strlen(email)) % (uint64_t)cap;
+    uint64_t h = email_ht_probe_start(email, cap);
     size_t i;
     for (i = 0; i < cap; i++) {
         size_t idx = (size_t)((h + (uint64_t)i) % (uint64_t)cap);
@@ -307,6 +312,23 @@ static int email_ht_grow(vw_store_t *ctx)
 
 static int email_ht_insert(vw_store_t *ctx, const char *email, uint64_t slot)
 {
+    /* An empty email means "no email on file" — never occupies a slot in
+     * this uniqueness index at all (matches email_ht_find's existing
+     * !email[0] guard below). Before this guard existed, every account
+     * without an email (until TASK-222, that was *every* account) still
+     * ran through email_ht_insert_raw("", slot): email_ht_find("") always
+     * reports "not found" by the same guard, so is_new was always true
+     * and ctx->email_ht_len incremented once per user *even when the
+     * actual stored key/slot pairing never changed* (email_ht_insert_raw
+     * repeatedly rewrites the same bucket near hash("")'s home position,
+     * since an empty key is indistinguishable from an unused slot).
+     * Net effect: email_ht_len grew unboundedly and unnecessarily,
+     * triggering far more 2x table growths than the real number of
+     * distinct emails ever justified. Skipping empty emails entirely
+     * fixes both the wasted growth and keeps the invariant "a key actually
+     * present in this table is a real, unique email" — see TASK-222. */
+    if (!email || !email[0]) return 0;
+
     int is_new = (email_ht_find(ctx, email) == 0); /* 0 = not found */
     /* Grow at 75% load only for new entries (updates reuse an existing bucket). */
     if (is_new && ctx->email_ht_len * 4 >= ctx->email_ht_cap * 3) {
@@ -316,6 +338,71 @@ static int email_ht_insert(vw_store_t *ctx, const char *email, uint64_t slot)
         return -1;
     if (is_new) ctx->email_ht_len++;
     return 0;
+}
+
+/*
+ * True if `hole` lies on the open-addressing probe path from `home` up to
+ * (but not including) `cur` — i.e. whether an entry currently at `cur`,
+ * whose ideal bucket is `home`, would have been displaced past `hole` on
+ * insertion. Used by email_ht_remove_at to decide whether it's safe to
+ * backward-shift `cur` into `hole` without breaking that entry's probe
+ * chain. Identical in shape to vw_store_files.c's path_ht_hole_on_probe_path
+ * — same open-addressing deletion algorithm, different hash table.
+ */
+static int email_ht_hole_on_probe_path(size_t home, size_t hole, size_t cur)
+{
+    if (home <= cur)
+        return hole >= home && hole < cur;
+    return hole >= home || hole < cur;
+}
+
+static void email_ht_remove_at(vw_store_t *ctx, size_t slot)
+{
+    size_t cap = ctx->email_ht_cap;
+    email_ht_entry_t *ht = ctx->email_ht;
+    size_t hole = slot;
+
+    memset(&ht[hole], 0, sizeof(ht[hole]));
+    ctx->email_ht_len--;
+
+    size_t cur = hole;
+    for (;;) {
+        cur = (cur + 1) % cap;
+        if (ht[cur].key[0] == '\0') break; /* end of probe chain */
+
+        size_t home = (size_t)email_ht_probe_start(ht[cur].key, cap);
+        if (email_ht_hole_on_probe_path(home, hole, cur)) {
+            ht[hole] = ht[cur];
+            memset(&ht[cur], 0, sizeof(ht[cur]));
+            hole = cur;
+        }
+    }
+}
+
+/*
+ * Remove the email_ht entry for `email` (no-op if empty or not found —
+ * callers that are merely defensive about index consistency may call this
+ * even when unsure an entry exists). Needed whenever a user's email
+ * changes: the on-disk record is overwritten in place, but this hash
+ * table has no other way to stop mapping the OLD address to that user's
+ * slot — see vw_store_user_set_email.
+ */
+static void email_ht_remove(vw_store_t *ctx, const char *email)
+{
+    if (!ctx->email_ht_cap || !email || !email[0]) return;
+    uint64_t h = email_ht_probe_start(email, ctx->email_ht_cap);
+    size_t i;
+
+    for (i = 0; i < ctx->email_ht_cap; i++) {
+        size_t idx = (size_t)((h + (uint64_t)i) % (uint64_t)ctx->email_ht_cap);
+        email_ht_entry_t *e = &ctx->email_ht[idx];
+
+        if (e->key[0] == '\0') return; /* empty slot — end of probe chain */
+        if (strncmp(e->key, email, 128) == 0) {
+            email_ht_remove_at(ctx, idx);
+            return;
+        }
+    }
 }
 
 static uint64_t email_ht_find(const vw_store_t *ctx, const char *email)
@@ -1161,6 +1248,158 @@ vw_err_t vw_store_user_update_field(vw_store_t *ctx,
         }
         rwlock_wrunlock(&ctx->users_lock);
         return rc;
+    }
+
+    confirm_rc = vw_oplog_confirm(ctx->oplog, eid);
+    if (confirm_rc != VW_OK) {
+        /* Data is durable; unconfirmed oplog hole truncated by seg_scan on next open. */
+    }
+
+    rwlock_wrunlock(&ctx->users_lock);
+    return VW_OK;
+}
+
+/* ── vw_email_validate ────────────────────────────────────────────────────── */
+
+vw_err_t vw_email_validate(const char *email, size_t len)
+{
+    if (!email || len == 0 || len > 128) return VW_ERR_INVALID_ARG;
+
+    size_t at_pos = (size_t)-1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)email[i];
+        if (c == '@') {
+            if (at_pos != (size_t)-1) return VW_ERR_INVALID_ARG; /* only one '@' allowed */
+            at_pos = i;
+            continue;
+        }
+        if (at_pos == (size_t)-1) {
+            /* Local part: alnum plus a conservative set of punctuation. */
+            int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') ||
+                     c == '.' || c == '_' || c == '%' || c == '+' || c == '-';
+            if (!ok) return VW_ERR_INVALID_ARG;
+        } else {
+            /* Domain part: alnum, '.', '-' only. */
+            int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') || c == '.' || c == '-';
+            if (!ok) return VW_ERR_INVALID_ARG;
+        }
+    }
+    if (at_pos == (size_t)-1 || at_pos == 0 || at_pos == len - 1)
+        return VW_ERR_INVALID_ARG; /* no '@', or empty local/domain part */
+    if (email[0] == '.' || email[at_pos - 1] == '.')
+        return VW_ERR_INVALID_ARG; /* local part cannot start/end with '.' */
+
+    const char *domain = email + at_pos + 1;
+    size_t domain_len = len - at_pos - 1;
+    int has_dot = 0;
+    for (size_t i = 0; i < domain_len; i++) {
+        if (domain[i] == '.') has_dot = 1;
+    }
+    if (!has_dot) return VW_ERR_INVALID_ARG; /* require at least one dot, e.g. "user@host" is rejected */
+    if (domain[0] == '.' || domain[0] == '-' ||
+        domain[domain_len - 1] == '.' || domain[domain_len - 1] == '-')
+        return VW_ERR_INVALID_ARG;
+
+    return VW_OK;
+}
+
+/* ── vw_store_user_set_email ──────────────────────────────────────────────── */
+
+vw_err_t vw_store_user_set_email(vw_store_t *ctx, uint64_t user_id, const char *email)
+{
+    vw_err_t rc = VW_OK;
+    vw_err_t confirm_rc = VW_OK;
+    vw_err_t abort_rc = VW_OK;
+    uint64_t slot = 0;
+    uint64_t eid = 0;
+    uint64_t file_off = 0;
+    char new_email[129];
+    char old_email[129];
+    vw_user_record_t old_rec;
+
+    if (!ctx || !email) return VW_ERR_INVALID_ARG;
+    if (user_id == 0) return VW_ERR_NOT_FOUND;
+
+    size_t elen = strlen(email);
+    if (elen > 128) return VW_ERR_INVALID_ARG;
+    memset(new_email, 0, sizeof(new_email));
+    memcpy(new_email, email, elen);
+
+    rwlock_wrlock(&ctx->users_lock);
+
+    if (user_id >= (uint64_t)ctx->uid_to_slot_cap) {
+        rwlock_wrunlock(&ctx->users_lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    slot = ctx->uid_to_slot[user_id];
+    if (slot == 0) {
+        /* uid_to_slot[user_id] == 0 means no entry (slot 0 is the guard). */
+        rwlock_wrunlock(&ctx->users_lock);
+        return VW_ERR_NOT_FOUND;
+    }
+
+    rc = read_user_slot(ctx, slot, &old_rec);
+    if (rc != VW_OK) {
+        rwlock_wrunlock(&ctx->users_lock);
+        return rc;
+    }
+    memcpy(old_email, old_rec.email, 128);
+    old_email[128] = '\0';
+
+    if (strncmp(new_email, old_email, 128) == 0) {
+        /* Setting the same value the account already has (including
+         * empty -> empty) is a harmless no-op, accepted for idempotency
+         * rather than forced through VW_ERR_ALREADY_EXISTS. */
+        rwlock_wrunlock(&ctx->users_lock);
+        return VW_OK;
+    }
+
+    /* Duplicate check: reject only if a *different* user already owns
+     * this non-empty email. email_ht_find already treats "" as always
+     * not-found, so multiple users may simultaneously have no email. */
+    if (new_email[0] != '\0') {
+        uint64_t existing_slot = email_ht_find(ctx, new_email);
+        if (existing_slot != 0 && existing_slot != slot) {
+            rwlock_wrunlock(&ctx->users_lock);
+            return VW_ERR_ALREADY_EXISTS;
+        }
+    }
+
+    rc = vw_oplog_append(ctx->oplog, VW_OPLOG_USER_WRITE,
+                         &user_id, sizeof(user_id), &eid);
+    if (rc != VW_OK) { rwlock_wrunlock(&ctx->users_lock); return rc; }
+
+    file_off = slot * (uint64_t)sizeof(vw_user_record_t) +
+               (uint64_t)offsetof(vw_user_record_t, email);
+    rc = vw_fs_pwrite(ctx->users_path, file_off, new_email, 128);
+    if (rc != VW_OK) {
+        abort_rc = vw_oplog_abort(ctx->oplog, eid);
+        if (abort_rc != VW_OK && abort_rc != VW_ERR_NOT_FOUND) {
+            /* abort failure leaks a pending slot; log when logging exists */
+        }
+        rwlock_wrunlock(&ctx->users_lock);
+        return rc;
+    }
+
+    rc = vw_fs_sync_file(ctx->users_path);
+    if (rc != VW_OK) {
+        abort_rc = vw_oplog_abort(ctx->oplog, eid);
+        if (abort_rc != VW_OK && abort_rc != VW_ERR_NOT_FOUND) {
+            /* abort failure leaks a pending slot; log when logging exists */
+        }
+        rwlock_wrunlock(&ctx->users_lock);
+        return rc;
+    }
+
+    /* Update in-memory index: evict the old key (if any) before inserting
+     * the new one — email_ht has no other way to stop a stale mapping
+     * from shadowing this slot in a later vw_store_user_get_by_email. */
+    email_ht_remove(ctx, old_email);
+    if (email_ht_insert(ctx, new_email, slot) != 0) {
+        /* OOM on index update: data is durable but the index is stale.
+         * Indexes rebuild correctly from disk on the next open. */
     }
 
     confirm_rc = vw_oplog_confirm(ctx->oplog, eid);

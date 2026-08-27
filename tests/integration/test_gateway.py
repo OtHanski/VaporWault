@@ -175,6 +175,12 @@ class GatewayClient:
     def notify_prefs_set(self, prefs):
         return self.post("/api/notify/prefs/set", {"prefs": prefs})
 
+    def account_email(self):
+        return self.post("/api/account/email", {})
+
+    def account_email_set(self, email):
+        return self.post("/api/account/email/set", {"email": email})
+
     def share_grant(self, file_id, target_username, permission, expires_at=0):
         return self.post("/api/shares/grant", {
             "file_id": file_id, "target_username": target_username,
@@ -663,6 +669,69 @@ def test_notify_prefs_scoped_to_the_calling_session_only(server, clients, unique
     r = b.notify_prefs()
     assert r.status_code == 200, r.text
     assert r.json()["prefs"] == 0, "a different account must never see another account's preference"
+    b.logout()
+
+
+def test_account_email_default_empty_and_roundtrip(server, clients, unique_username):
+    """
+    TASK-222's gateway passthrough of ACCOUNT_EMAIL_GET/SET
+    (docs/PROTOCOL.md §7.14), verified at the actual HTTP/JSON layer
+    web/src/api.ts's getAccountEmail()/setAccountEmail() calls — the
+    server-side storage/validation semantics are already unit- and
+    CLI-integration-tested; this proves the gateway carries that state
+    through correctly.
+    """
+    client = clients.login(unique_username, server=server)
+
+    r = client.account_email()
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "", "a fresh account must have no email on file"
+
+    address = f"{unique_username}@example.com"
+    r = client.account_email_set(address)
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == address
+
+    # Independent fetch, not the SET call's own echoed response.
+    r = client.account_email()
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == address
+
+    # A malformed address is rejected with 400, and does not clobber the
+    # value already on file.
+    r = client.account_email_set("not-an-email")
+    assert r.status_code == 400, r.text
+    r = client.account_email()
+    assert r.json()["email"] == address
+
+    client.logout()
+
+
+def test_account_email_scoped_to_the_calling_session_only(server, clients, unique_username):
+    """
+    Security note on TASK-222: neither endpoint accepts any account/user
+    identifier in its request body — require_session() derives the
+    account entirely from the caller's own session cookie (same posture
+    as notify prefs above). This also proves the server-side uniqueness
+    check actually reaches the gateway caller: a second account cannot
+    claim an address the first already owns.
+    """
+    other_username = f"{unique_username}_other"
+    server.create_user(other_username, PASSWORD)
+
+    a = clients.login(unique_username, server=server)
+    address = f"{unique_username}@example.com"
+    a_result = a.account_email_set(address)
+    assert a_result.status_code == 200, a_result.text
+    a.logout()
+
+    b = clients.login(other_username, create_user=False)
+    r = b.account_email()
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "", "a different account must never see another account's email"
+
+    dup = b.account_email_set(address)
+    assert dup.status_code == 409, dup.text
     b.logout()
 
 

@@ -262,6 +262,17 @@ typedef enum {
     VW_MSG_NOTIFY_PREFS_GET_RESP = 0x0A02,
     VW_MSG_NOTIFY_PREFS_SET      = 0x0A03,
     VW_MSG_NOTIFY_PREFS_SET_ACK  = 0x0A04,
+
+    /* Account self-service: email address (TASK-222; docs/PROTOCOL.md
+     * §7.14). Account-scoped only, same trust bar as NOTIFY_PREFS_GET/SET
+     * or a session changing its own password — no user_id field, no
+     * VW_PERM_* concept. This is the first (and, as of TASK-222, only)
+     * real wire path that can ever put a non-empty email on a user
+     * record: neither USER_CREATE_REQ nor INVITE_REDEEM carry one. */
+    VW_MSG_ACCOUNT_EMAIL_GET      = 0x0B01,
+    VW_MSG_ACCOUNT_EMAIL_GET_RESP = 0x0B02,
+    VW_MSG_ACCOUNT_EMAIL_SET      = 0x0B03,
+    VW_MSG_ACCOUNT_EMAIL_SET_ACK  = 0x0B04,
 } vw_msg_type_t;
 
 /* ── Notification preference bitmask (TASK-205/206) ──────────────────────── */

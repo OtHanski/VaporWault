@@ -193,6 +193,44 @@ int VwGuiIpc::notify_prefs_set(uint32_t account_id, uint32_t prefs, uint32_t *ou
     return (int)code;
 }
 
+bool VwGuiIpc::account_email_get(uint32_t account_id, std::string *out_email) {
+    uint8_t req[4]; vw_write_u32le(req, account_id);
+    uint8_t resp[4 + 2 + 128]; uint32_t plen;
+    if (one_shot(VW_IPC_ACCOUNT_EMAIL_GET_REQ, req, sizeof(req), VW_IPC_ACCOUNT_EMAIL_GET_RESP,
+                 resp, sizeof(resp), &plen) != VW_OK || plen < 4)
+        return false;
+    if (read_u32_le(resp) != 0) return false; /* error_code */
+    uint32_t off = 4;
+    const char *email = nullptr; uint16_t email_len = 0;
+    if (vw_ipc_read_str(resp, plen, &off, &email, &email_len) != VW_OK) return false;
+    *out_email = std::string(email, email_len);
+    return true;
+}
+
+int VwGuiIpc::account_email_set(uint32_t account_id, const std::string &email,
+                                 std::string *out_email) {
+    uint8_t req[4 + 2 + 128];
+    uint32_t off = 0;
+    vw_write_u32le(req, account_id); off += 4;
+    if (vw_ipc_write_str(req, sizeof(req), &off, email.c_str(),
+                          (uint16_t)email.size()) != VW_OK)
+        return (int)VW_ERR_INVALID_ARG;
+
+    uint8_t resp[4 + 2 + 128]; uint32_t plen;
+    vw_err_t err = one_shot(VW_IPC_ACCOUNT_EMAIL_SET_REQ, req, off,
+                             VW_IPC_ACCOUNT_EMAIL_SET_ACK, resp, sizeof(resp), &plen);
+    if (err != VW_OK) return (int)err;
+    if (plen < 4) return (int)VW_ERR_IO;
+    uint32_t code = read_u32_le(resp);
+    if (code == 0 && out_email) {
+        uint32_t roff = 4;
+        const char *stored = nullptr; uint16_t stored_len = 0;
+        if (vw_ipc_read_str(resp, plen, &roff, &stored, &stored_len) == VW_OK)
+            *out_email = std::string(stored, stored_len);
+    }
+    return (int)code;
+}
+
 bool VwGuiIpc::account_list(std::vector<VwGuiAccountEntry> *out) {
     static const uint32_t kRespCap = 65536;
     std::vector<uint8_t> resp(kRespCap);

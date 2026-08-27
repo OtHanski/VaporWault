@@ -1980,6 +1980,115 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_ACCOUNT_EMAIL_GET_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_ACCOUNT_EMAIL_GET_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            uint8_t rbuf[4u + 2u] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_ACCOUNT_EMAIL_GET_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        /* Read-only fallback restricts writes, not reads (same posture as
+         * NOTIFY_PREFS_GET above) — always dispatched, even on fallback. */
+        char email[129];
+        vw_err_t rc = vw_client_account_email_get(a->sess, email, sizeof(email));
+        uint8_t rbuf[4u + 2u + 128u];
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf, (uint32_t)rc); roff += 4u;
+        (void)vw_ipc_write_str(rbuf, sizeof(rbuf), &roff, (rc == VW_OK) ? email : "",
+                                (uint16_t)((rc == VW_OK) ? strlen(email) : 0u));
+        vw_ipc_send(conn, VW_IPC_ACCOUNT_EMAIL_GET_RESP, rbuf, roff);
+        break;
+    }
+
+    case VW_IPC_ACCOUNT_EMAIL_SET_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_ACCOUNT_EMAIL_SET_ACK, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t off = 0;
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        const char *email = NULL; uint16_t email_len = 0;
+        vw_err_t err = vw_ipc_read_str(buf, plen, &off, &email, &email_len);
+        if (err != VW_OK || !a || !a->sess) {
+            uint8_t rbuf[4u + 2u] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(err != VW_OK ? VW_ERR_PROTO_TRUNCATED :
+                                             !a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_ACCOUNT_EMAIL_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[4u + 2u] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            vw_ipc_send(conn, VW_IPC_ACCOUNT_EMAIL_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        char email_buf[129];
+        size_t ecopy = email_len < sizeof(email_buf) - 1u ? email_len : sizeof(email_buf) - 1u;
+        memcpy(email_buf, email, ecopy); email_buf[ecopy] = '\0';
+
+        char stored[129];
+        vw_err_t rc = vw_client_account_email_set(a->sess, email_buf, stored, sizeof(stored));
+        uint8_t rbuf[4u + 2u + 128u];
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf, (uint32_t)rc); roff += 4u;
+        (void)vw_ipc_write_str(rbuf, sizeof(rbuf), &roff, (rc == VW_OK) ? stored : "",
+                                (uint16_t)((rc == VW_OK) ? strlen(stored) : 0u));
+        vw_ipc_send(conn, VW_IPC_ACCOUNT_EMAIL_SET_ACK, rbuf, roff);
+        break;
+    }
+
+    case VW_IPC_VERSION_LIST_BY_ID_REQ: {
+        if (plen < 12u) { ipc_send_u32(conn, VW_IPC_VERSION_LIST_BY_ID_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        uint64_t file_id = vw_read_u64le(buf + 4);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_VERSION_LIST_BY_ID_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+
+        vw_version_entry_t *entries = NULL; uint32_t count = 0;
+        vw_err_t rc = vw_client_version_list_by_id(a->sess, file_id, &entries, &count);
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_VERSION_LIST_BY_ID_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4;
+        vw_write_u32le(rbuf + roff, (rc == VW_OK) ? count : 0u); roff += 4;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count && roff + 24u <= 65536u; i++) {
+                vw_write_u64le(rbuf + roff, entries[i].version_id); roff += 8;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].created_at); roff += 8;
+                vw_write_u64le(rbuf + roff, entries[i].size_bytes); roff += 8;
+            }
+        }
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_VERSION_LIST_BY_ID_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
+    case VW_IPC_VERSION_RESTORE_BY_ID_REQ: {
+        if (plen < 12u) { ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_BY_ID_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        uint64_t version_id = vw_read_u64le(buf + 4);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_BY_ID_RESP,
+                         (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_BY_ID_RESP, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            break;
+        }
+        vw_err_t rc = vw_client_version_restore_by_id(a->sess, version_id);
+        ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_BY_ID_RESP, (uint32_t)rc);
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }

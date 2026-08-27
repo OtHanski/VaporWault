@@ -459,6 +459,199 @@ VW_TEST_SUITE("vw_store") {
          * _Static_assert in vw_store.h; no need to re-check it here. */
         VW_ASSERT(vw_admin_has_cap(&legacy, VW_CAP_CLUSTER_MGMT));
     }
+
+    /* ── vw_email_validate (TASK-222) ─────────────────────────────────────── */
+
+    VW_TEST_CASE("vw_email_validate: ordinary address accepted") {
+        const char *e = "user@example.com";
+        VW_ASSERT_OK(vw_email_validate(e, strlen(e)));
+    }
+
+    VW_TEST_CASE("vw_email_validate: local part with allow-listed punctuation accepted") {
+        const char *e = "first.last+tag_99%x@sub.example.co";
+        VW_ASSERT_OK(vw_email_validate(e, strlen(e)));
+    }
+
+    VW_TEST_CASE("vw_email_validate: empty string rejected") {
+        VW_ASSERT_ERR(vw_email_validate("", 0), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: missing '@' rejected") {
+        const char *e = "not-an-email";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: two '@' rejected") {
+        const char *e = "a@b@example.com";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: empty local part rejected") {
+        const char *e = "@example.com";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: domain with no dot rejected") {
+        const char *e = "user@localhost";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: domain starting/ending with '.' or '-' rejected") {
+        VW_ASSERT_ERR(vw_email_validate("user@.example.com", 18), VW_ERR_INVALID_ARG);
+        VW_ASSERT_ERR(vw_email_validate("user@example.com.", 18), VW_ERR_INVALID_ARG);
+        VW_ASSERT_ERR(vw_email_validate("user@-example.com", 18), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: CR/LF (SMTP command injection attempt) rejected") {
+        const char *e = "evil@example.com\r\nDATA";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: embedded space rejected") {
+        const char *e = "us er@example.com";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: '<'/'>' rejected (address-literal wrapping confusion)") {
+        const char *e = "user@example.com>\r\nMAIL FROM:<attacker";
+        VW_ASSERT_ERR(vw_email_validate(e, strlen(e)), VW_ERR_INVALID_ARG);
+    }
+
+    VW_TEST_CASE("vw_email_validate: over 128 bytes rejected") {
+        char buf[140];
+        memset(buf, 'a', sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        memcpy(buf, "user@", 5); /* keep a valid-looking prefix, still too long overall */
+        VW_ASSERT_ERR(vw_email_validate(buf, strlen(buf)), VW_ERR_INVALID_ARG);
+    }
+
+    /* ── vw_store_user_set_email (TASK-222) ───────────────────────────────── */
+
+    VW_TEST_CASE("user_set_email: set on a fresh (empty-email) account, then found by email") {
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_set");
+        {
+            vw_user_record_t rec, out;
+            uint64_t uid;
+            fill_user_rec(&rec, "alice", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid));
+
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, "alice@example.com"));
+            VW_ASSERT_OK(vw_store_user_get_by_email(s.store, "alice@example.com", &out));
+            VW_ASSERT_EQ((unsigned)uid, (unsigned)out.user_id);
+        }
+        store_stack_close(&s);
+    }
+
+    VW_TEST_CASE("user_set_email: changing address evicts the old email_ht mapping") {
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_change");
+        {
+            vw_user_record_t rec, out;
+            uint64_t uid;
+            fill_user_rec(&rec, "bob", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid));
+
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, "bob-old@example.com"));
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, "bob-new@example.com"));
+
+            /* The OLD address must no longer resolve to anything — proving
+             * the stale email_ht entry was actually evicted, not just
+             * shadowed by an on-disk record that no longer matches it. */
+            VW_ASSERT_ERR(vw_store_user_get_by_email(s.store, "bob-old@example.com", &out),
+                          VW_ERR_NOT_FOUND);
+            VW_ASSERT_OK(vw_store_user_get_by_email(s.store, "bob-new@example.com", &out));
+            VW_ASSERT_EQ((unsigned)uid, (unsigned)out.user_id);
+        }
+        store_stack_close(&s);
+    }
+
+    VW_TEST_CASE("user_set_email: a second user cannot claim an email already on file") {
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_dup");
+        {
+            vw_user_record_t rec;
+            uint64_t uid1, uid2;
+            fill_user_rec(&rec, "carol", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid1));
+            fill_user_rec(&rec, "dave", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid2));
+
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid1, "shared@example.com"));
+            VW_ASSERT_ERR(vw_store_user_set_email(s.store, uid2, "shared@example.com"),
+                          VW_ERR_ALREADY_EXISTS);
+        }
+        store_stack_close(&s);
+    }
+
+    VW_TEST_CASE("user_set_email: multiple accounts may simultaneously have no email") {
+        /* Regression guard for the email_ht bug this task fixed: before the
+         * fix, every empty-email insert still incremented email_ht_len,
+         * but never actually blocked a second empty-email account (the
+         * early-return in email_ht_find already made lookups by "" always
+         * report not-found) — this proves that harmless-by-accident
+         * behavior is still correct now that empty emails are never
+         * inserted into the index at all. */
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_multi_empty");
+        {
+            vw_user_record_t rec;
+            uint64_t uid1, uid2;
+            fill_user_rec(&rec, "erin", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid1));
+            fill_user_rec(&rec, "frank", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid2));
+            VW_ASSERT(uid1 != uid2);
+        }
+        store_stack_close(&s);
+    }
+
+    VW_TEST_CASE("user_set_email: setting the current value again is a harmless no-op") {
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_noop");
+        {
+            vw_user_record_t rec, out;
+            uint64_t uid;
+            fill_user_rec(&rec, "grace", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid));
+
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, "grace@example.com"));
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, "grace@example.com"));
+            VW_ASSERT_OK(vw_store_user_get_by_email(s.store, "grace@example.com", &out));
+            VW_ASSERT_EQ((unsigned)uid, (unsigned)out.user_id);
+        }
+        store_stack_close(&s);
+    }
+
+    VW_TEST_CASE("user_set_email: clearing back to empty removes the email_ht mapping") {
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_clear");
+        {
+            vw_user_record_t rec, out;
+            uint64_t uid;
+            fill_user_rec(&rec, "heidi", "", 0);
+            VW_ASSERT_OK(vw_store_user_create(s.store, &rec, &uid));
+
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, "heidi@example.com"));
+            VW_ASSERT_OK(vw_store_user_set_email(s.store, uid, ""));
+
+            VW_ASSERT_ERR(vw_store_user_get_by_email(s.store, "heidi@example.com", &out),
+                          VW_ERR_NOT_FOUND);
+            VW_ASSERT_OK(vw_store_user_get_by_id(s.store, uid, &out));
+            VW_ASSERT_EQ(0, (int)out.email[0]);
+        }
+        store_stack_close(&s);
+    }
+
+    VW_TEST_CASE("user_set_email: unknown user_id returns NOT_FOUND") {
+        store_stack_t s = {0};
+        store_stack_open(&s, "email_unknown");
+        {
+            VW_ASSERT_ERR(vw_store_user_set_email(s.store, 999999, "x@example.com"),
+                          VW_ERR_NOT_FOUND);
+        }
+        store_stack_close(&s);
+    }
 }
 
 VW_TEST_SUITE_END()

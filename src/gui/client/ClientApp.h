@@ -117,6 +117,8 @@ public:
     int  ipc_folder_set_excludes(const char *local, const std::vector<std::string> &patterns);
     bool ipc_notify_prefs_get(uint32_t *out_prefs);
     int  ipc_notify_prefs_set(uint32_t prefs, uint32_t *out_prefs);
+    bool ipc_account_email_get(std::string *out_email);
+    int  ipc_account_email_set(const std::string &email, std::string *out_email);
     bool ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
     bool ipc_search(const char *query, std::vector<VwGuiSearchEntry> *out,
                      uint8_t *out_truncated, int *out_error_code);

@@ -205,6 +205,19 @@ public:
      * *out_prefs (if non-null) receives the stored value on success. */
     int notify_prefs_set(uint32_t account_id, uint32_t prefs, uint32_t *out_prefs);
 
+    /* Account self-service email (TASK-222; docs/PROTOCOL.md §7.14).
+     * Fetch the account's current email address. Returns true on success
+     * (*out_email set, "" if no email is on file); false on IPC failure
+     * or a non-zero error_code. */
+    bool account_email_get(uint32_t account_id, std::string *out_email);
+
+    /* Set (or clear, with an empty string) the account's email address.
+     * Returns vw_err_t encoded as int; VW_ERR_INVALID_ARG for a malformed
+     * address, VW_ERR_ALREADY_EXISTS if another account owns it already.
+     * *out_email (if non-null) receives the stored value on success. */
+    int account_email_set(uint32_t account_id, const std::string &email,
+                           std::string *out_email);
+
     /*
      * Multi-account (TASK-161/163).
      */

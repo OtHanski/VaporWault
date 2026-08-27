@@ -216,12 +216,26 @@ number of files around and don't want it fighting with you), click
 **Pause** on the Files screen. Click **Resume** when you're done. Nothing
 is lost while paused — VaporWault just picks up where it left off.
 
+### Setting your account email
+
+Before any email notification (below) or password recovery can reach
+you, VaporWault needs an email address on file for your account —
+**nothing sets this automatically**, not account creation and not an
+invite, so this is a one-time step worth doing right after you set up
+your account.
+
+Go to **Settings** and find **Account email** (same in the desktop app
+and the web version), type your address, and click **Save**. That's it
+— no confirmation email to click, no admin approval needed. You can
+change it later the same way.
+
 ### Email notifications
 
 VaporWault can send you an email for a few things worth knowing about
 right away, instead of only finding out next time you open the app.
 **Every one of these is off until you turn it on** — turning nothing on
-means you'll never get an email from VaporWault at all.
+means you'll never get an email from VaporWault at all. (And none of
+them can reach you until you've set an account email, above.)
 
 To turn one on, go to **Settings** and find **Email notifications** (this
 looks the same whether you're using the desktop app or the web version at
@@ -235,9 +249,8 @@ you want):
 | **A new login succeeds on my account** — useful as a heads-up in case it wasn't you. This never fires just from your own app reconnecting after a network hiccup, only an actual new login. |
 | **My password or 2FA setting changes** — a heads-up in case you didn't make that change yourself. |
 
-These are emailed to whatever address is on file for your account — the
-same one your admin used when they set your account up. If you're not
-sure what that address is, ask your admin.
+These are emailed to whatever address you set under **Account email**,
+above.
 
 ---
 

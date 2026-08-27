@@ -173,6 +173,29 @@ typedef enum {
     VW_IPC_NOTIFY_PREFS_GET_RESP = 0x8040, /* D→C: error_code + prefs_bitmask    */
     VW_IPC_NOTIFY_PREFS_SET_REQ  = 0x8041, /* C→D: account_id + prefs_bitmask    */
     VW_IPC_NOTIFY_PREFS_SET_ACK  = 0x8042, /* D→C: error_code + prefs_bitmask    */
+
+    /* TASK-222: account self-service email — thin passthrough to the
+     * server's ACCOUNT_EMAIL_GET/SET (docs/PROTOCOL.md §7.14) via
+     * vw_client_account_email_get/_set(). _SET is write-shaped: rejected
+     * with VW_ERR_READ_ONLY_FALLBACK while the account is on read-only
+     * fallback, same as NOTIFY_PREFS_SET above; _GET is a read and
+     * always works on fallback. */
+    VW_IPC_ACCOUNT_EMAIL_GET_REQ  = 0x8043, /* C→D: account_id                   */
+    VW_IPC_ACCOUNT_EMAIL_GET_RESP = 0x8044, /* D→C: error_code + email string    */
+    VW_IPC_ACCOUNT_EMAIL_SET_REQ  = 0x8045, /* C→D: account_id + email string    */
+    VW_IPC_ACCOUNT_EMAIL_SET_ACK  = 0x8046, /* D→C: error_code + email string    */
+
+    /* TASK-223: file_id-based version history — lets a grantee use
+     * version history on a file shared with them, which they have no
+     * owner-namespaced path for. Thin passthrough to
+     * vw_client_version_list_by_id/_restore_by_id (docs/PROTOCOL.md
+     * §7.3, TASK-214's server-side relaxation). Same shapes as
+     * VW_IPC_VERSION_LIST_REQ/VW_IPC_VERSION_RESTORE_REQ above, minus
+     * the virtual_path field. */
+    VW_IPC_VERSION_LIST_BY_ID_REQ     = 0x8047, /* C→D: account_id + file_id     */
+    VW_IPC_VERSION_LIST_BY_ID_RESP    = 0x8048, /* D→C: error_code + count + entries */
+    VW_IPC_VERSION_RESTORE_BY_ID_REQ  = 0x8049, /* C→D: account_id + version_id  */
+    VW_IPC_VERSION_RESTORE_BY_ID_RESP = 0x804A, /* D→C: error_code               */
 } vw_ipc_msg_t;
 
 /*
@@ -540,6 +563,39 @@ typedef enum {
  *     u64    vault_id      0 = unencrypted or a directory
  *     u8     is_shared     1 = visible via a grant, not owned
  *   }
+ *
+ * VW_IPC_ACCOUNT_EMAIL_GET_REQ:
+ *   u32    account_id
+ * VW_IPC_ACCOUNT_EMAIL_GET_RESP:
+ *   u32    error_code      vw_err_t; 0 = VW_OK. Works while on fallback
+ *                          (read-only) since this is a read.
+ *   string email           "" if no email is on file (the default state)
+ *
+ * VW_IPC_ACCOUNT_EMAIL_SET_REQ:
+ *   u32    account_id
+ *   string email           forwarded as-is to vw_client_account_email_set();
+ *                          "" clears the email back to unset. See
+ *                          docs/PROTOCOL.md §7.14 for format validation.
+ * VW_IPC_ACCOUNT_EMAIL_SET_ACK:
+ *   u32    error_code      vw_err_t; 0 = VW_OK. VW_ERR_READ_ONLY_FALLBACK
+ *                          if the account is currently on its fallback
+ *                          connection (TASK-173) — setting is a write.
+ *   string email           the stored value after this call (unchanged
+ *                          from before on any error)
+ *
+ * VW_IPC_VERSION_LIST_BY_ID_REQ:
+ *   u32    account_id
+ *   u64    file_id         from vw_client_share_list, for content the
+ *                          caller doesn't own
+ * VW_IPC_VERSION_LIST_BY_ID_RESP: same shape as VW_IPC_VERSION_LIST_RESP.
+ *
+ * VW_IPC_VERSION_RESTORE_BY_ID_REQ:
+ *   u32    account_id
+ *   u64    version_id      from VW_IPC_VERSION_LIST_BY_ID_RESP above
+ * VW_IPC_VERSION_RESTORE_BY_ID_RESP:
+ *   u32 error_code         vw_err_t; 0 = VW_OK. VW_ERR_READ_ONLY_FALLBACK
+ *                          if the account is currently on its fallback
+ *                          connection (TASK-173) — restoring is a write.
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

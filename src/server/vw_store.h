@@ -317,8 +317,10 @@ vw_err_t vw_store_user_get_by_email(vw_store_t *ctx,
  * Update a single field within an existing user record via in-place pwrite.
  * field_offset is the byte offset of the field within vw_user_record_t.
  *
- * Do NOT use for username or email fields — those require index updates and
- * are not supported in Phase 1. Use only for is_active, otp_enabled, etc.
+ * Do NOT use for the username or email fields — those require index
+ * updates this raw pwrite does not perform. Use only for is_active,
+ * otp_enabled, etc. Email now has its own dedicated setter, below
+ * (TASK-222) — username still has no post-creation setter of any kind.
  *
  * Returns VW_ERR_INVALID_ARG if field_offset + len > 256.
  * Returns VW_ERR_NOT_FOUND if user_id does not exist.
@@ -328,6 +330,50 @@ vw_err_t vw_store_user_update_field(vw_store_t *ctx,
                                      uint64_t user_id,
                                      uint32_t field_offset,
                                      const void *data, size_t len);
+
+/*
+ * Conservative allow-list check for an address before it is ever persisted
+ * into vw_user_record_t.email (TASK-222). This is the sole gate on what
+ * can reach vw_smtp.c's "RCPT TO:<%s>"/"MAIL FROM:<%s>" interpolation
+ * (vw_smtp_send) — that call site does no escaping of its own, so an
+ * email containing CR/LF or other SMTP-command-meaningful bytes would be
+ * command injection into the outbound relay session. Deliberately
+ * stricter than full RFC 5322: exactly one '@', a non-empty local part
+ * and a non-empty domain part containing at least one '.', and every
+ * byte restricted to a safe allow-list — no whitespace, no control
+ * characters, nothing that could confuse SMTP command parsing.
+ *
+ * email need not be NUL-terminated; len is the exact byte count to check
+ * (as read off the wire, before any local NUL-terminated copy is made).
+ * Returns VW_OK if safe to store, VW_ERR_INVALID_ARG otherwise.
+ */
+vw_err_t vw_email_validate(const char *email, size_t len);
+
+/*
+ * Set (or change) a user's email address — the first, and as of TASK-222
+ * the only, real path that can put a non-empty email on an account
+ * (neither USER_CREATE_REQ nor INVITE_REDEEM carry one). Unlike
+ * vw_store_user_update_field, this correctly maintains the email_ht
+ * uniqueness index: the old address (if any) is evicted before the new
+ * one is inserted, so a stale mapping never lingers and shadows a later
+ * vw_store_user_get_by_email lookup.
+ *
+ * Does NOT itself call vw_email_validate — callers (the ACCOUNT_EMAIL_SET
+ * handler) must validate before calling this, so this function stays a
+ * generic "persist this byte string as the email field + fix up the
+ * index" primitive, consistent with every other vw_store_* setter never
+ * re-deriving policy its caller already enforced.
+ *
+ * email may be "" (empty) to clear a user's email back to unset.
+ * Returns VW_ERR_INVALID_ARG if len > 128. Returns VW_ERR_ALREADY_EXISTS
+ * if a *different* user already owns this exact non-empty email.
+ * Returns VW_OK (a no-op) if email already matches the caller's current
+ * value. Returns VW_ERR_NOT_FOUND if user_id does not exist.
+ * Uses oplog two-phase commit.
+ */
+vw_err_t vw_store_user_set_email(vw_store_t *ctx,
+                                  uint64_t user_id,
+                                  const char *email);
 
 /*
  * Invoke callback for every active user slot, in user_id order.

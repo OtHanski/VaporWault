@@ -333,6 +333,35 @@ vw_err_t vw_client_file_upload_to_id(vw_client_sess_t *sess,
                                       void *userdata);
 
 /*
+ * List all versions of the file identified by file_id directly (TASK-223)
+ * — skips the path-based FILE_STAT that vw_client_version_list does
+ * internally, usable for a file the caller doesn't own (a grant target),
+ * same as vw_client_file_stat_by_id above. The server side has always
+ * been file_id-based; TASK-214 found and corrected the original wrong
+ * assumption that a wire change was needed here at all — this is purely
+ * a client-side addition. Same permission requirement as the path-based
+ * form (VW_PERM_VIEW).
+ */
+vw_err_t vw_client_version_list_by_id(vw_client_sess_t *sess,
+                                       uint64_t file_id,
+                                       vw_version_entry_t **out,
+                                       uint32_t *out_count);
+
+/*
+ * Restore version_id as the new HEAD directly, without resolving any
+ * path (TASK-223) — sends an empty virtual_path on the wire, which
+ * TASK-214's server-side relaxation (docs/PROTOCOL.md §7.3 rev 25)
+ * accepts to mean "resolve by version_id/file_id alone." This is what
+ * actually lets a grantee use version history on a file shared with
+ * them: they have no owner-namespaced path to give
+ * vw_client_version_restore, but they do have a file_id (from
+ * vw_client_share_list) and a version_id (from
+ * vw_client_version_list_by_id above). Same permission requirement as
+ * the path-based form (VW_PERM_EDIT).
+ */
+vw_err_t vw_client_version_restore_by_id(vw_client_sess_t *sess, uint64_t version_id);
+
+/*
  * Create a NEW file named leaf_name inside the folder identified by
  * folder_file_id — the file_id-addressed equivalent of creating a file at
  * an owned path, usable through an EDIT grant/scope on a shared folder
@@ -665,6 +694,31 @@ vw_err_t vw_client_notify_prefs_get(vw_client_sess_t *sess, uint32_t *out_prefs)
  */
 vw_err_t vw_client_notify_prefs_set(vw_client_sess_t *sess, uint32_t prefs,
                                      uint32_t *out_prefs);
+
+/* ── Account self-service: email (TASK-222; docs/PROTOCOL.md §7.14) ──────── */
+
+/*
+ * Fetch the caller's own email address. out_email must be at least 129
+ * bytes; receives a NUL-terminated string, empty ("") if no email is on
+ * file (the default state for any account today — TASK-222 is the first
+ * real wire path that can ever set one). Returns VW_ERR_PERMISSION for a
+ * scoped (LINK_ACCESS-redeemed anonymous) session, same as
+ * vw_client_notify_prefs_get.
+ */
+vw_err_t vw_client_account_email_get(vw_client_sess_t *sess, char *out_email,
+                                      size_t out_email_size);
+
+/*
+ * Set (or clear, with an empty string) the caller's own email address.
+ * Validated server-side (vw_email_validate) before being stored — an
+ * invalid address returns VW_ERR_INVALID_ARG and changes nothing.
+ * Returns VW_ERR_ALREADY_EXISTS if another account already owns that
+ * exact address. out_email (if non-NULL) receives the stored value after
+ * the call (echoed back by ACCOUNT_EMAIL_SET_ACK) — identical to the
+ * request on success, unchanged on any error; must be at least 129 bytes.
+ */
+vw_err_t vw_client_account_email_set(vw_client_sess_t *sess, const char *email,
+                                      char *out_email, size_t out_email_size);
 
 #ifdef __cplusplus
 }

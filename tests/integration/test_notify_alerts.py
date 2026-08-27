@@ -31,6 +31,20 @@ while the server is stopped, matching vw_store.h's documented on-disk
 `vw_user_record_t` layout exactly - a test-only technique, explicitly
 not a product code change, used only because no product API exists yet.
 
+**Update (TASK-222, closed)**: a real self-service wire path now exists
+(ACCOUNT_EMAIL_GET/SET, docs/PROTOCOL.md §7.14) - see
+test_cli_account_email.py and test_gateway.py's account_email tests for
+coverage of it directly, which is what TASK-222's own acceptance
+criteria asked for ("verified by an integration test that does NOT need
+to patch users.dat directly"). `_set_user_email_raw()` below is left in
+place rather than retrofitted across this file's six call sites:
+replacing raw-patch-while-stopped with a live daemon/CLI round trip in
+every one of them is a mechanical but non-trivial rewrite of an already-
+reviewed, already-passing security-sensitive suite, and doing so here
+would risk exactly the kind of unreviewed churn this project's own
+protocol warns against. Migrating this file to the real mechanism is a
+reasonable future cleanup, not a blocker on TASK-222's closure.
+
 Coverage map against TASK-213's own acceptance criteria:
   - Default-off regression:            test_default_off_no_email_for_any_user_category
   - Each user category, opted in:      test_user_category_share_received,

@@ -231,6 +231,23 @@ export function setNotifyPrefs(prefs: number): Promise<ApiResult<NotifyPrefsResp
   return apiPost("/api/notify/prefs/set", { prefs });
 }
 
+// Account self-service email (TASK-222; docs/PROTOCOL.md §7.14) - the
+// first real path that can put an email on an account, since neither
+// account creation nor invite redemption ever ask for one. Needed for
+// password recovery and for the notification categories above to ever
+// actually fire.
+export interface AccountEmailResponse {
+  email: string; // "" if no email is on file
+}
+
+export function getAccountEmail(): Promise<ApiResult<AccountEmailResponse>> {
+  return apiPost("/api/account/email", {});
+}
+
+export function setAccountEmail(email: string): Promise<ApiResult<AccountEmailResponse>> {
+  return apiPost("/api/account/email/set", { email });
+}
+
 export function mkdir(name: string, parentDirId = 0): Promise<ApiResult<{ dir_id: number }>> {
   return apiPost("/api/files/mkdir", { name, parent_dir_id: parentDirId });
 }

@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 25 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 26 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -1814,6 +1814,87 @@ requirement.
 
 ---
 
+## 7.14 Account Self-Service: Email Address (TASK-222)
+
+Neither `USER_CREATE_REQ` (admin socket) nor `INVITE_REDEEM` carry an
+email field, and `USER_MODIFY` (`0x0603`/`0x0604`) is a reserved opcode
+with no handler — so before this section, **no wire or admin path
+anywhere could ever put a non-empty email on a user record**. That
+silently made the already-shipped password-recovery feature
+(`TASK-046`, `vw_store_user_get_by_email`) and the notify-preferences
+system above (§7.13, `TASK-207`) unreachable for every real account —
+`rec.email[0] == '\0'` short-circuits both, and it always was, for any
+account created through either existing path.
+
+This section is the fix: a self-service pair, operating **only on the
+calling session's own account**, same trust bar and shape as §7.13 —
+no `user_id` field, no `VW_PERM_*` concept, any real non-scoped session
+may read or write its own email, full stop.
+
+| Opcode | Message                | Direction | Purpose |
+|--------|-------------------------|-----------|---------|
+| 0x0B01 | ACCOUNT_EMAIL_GET       | C → S     | Fetch the caller's own email address |
+| 0x0B02 | ACCOUNT_EMAIL_GET_RESP  | S → C     | Current address (`""` if none on file) |
+| 0x0B03 | ACCOUNT_EMAIL_SET       | C → S     | Set (or clear) the caller's own email address |
+| 0x0B04 | ACCOUNT_EMAIL_SET_ACK   | S → C     | New address, echoed back for confirmation |
+
+**ACCOUNT_EMAIL_GET payload:**
+
+| Field         | Type      | Notes |
+|---------------|-----------|-------|
+| session_token | bytes[32] | Must be a real, non-scoped session. |
+
+**ACCOUNT_EMAIL_GET_RESP payload:**
+
+| Field      | Type   | Notes |
+|------------|--------|-------|
+| error_code | uint32 | `VW_OK`, `VW_ERR_AUTH_REQUIRED` (no session), or `VW_ERR_PERMISSION` (a scoped `LINK_ACCESS` session — same restriction §7.12/§7.13 already place on `SEARCH`/`NOTIFY_PREFS_GET`) |
+| email      | string | `""` if no email is on file — the default state for every account today, not an error |
+
+**ACCOUNT_EMAIL_SET payload:**
+
+| Field         | Type      | Notes |
+|---------------|-----------|-------|
+| session_token | bytes[32] | Must be a real, non-scoped session. |
+| email         | string    | Up to 128 bytes. `""` clears the email back to unset — exempt from the format check below (an empty value can never fail validation). Any non-empty value must pass `vw_email_validate` (server-side, `vw_store.c`): exactly one `@`, non-empty local and domain parts, domain contains at least one `.`, every byte restricted to a conservative allow-list — no whitespace, no control characters, nothing that could be interpreted as an SMTP command terminator. This is a hard security requirement, not cosmetic: `vw_smtp.c`'s `MAIL FROM`/`RCPT TO` lines interpolate `rec.email` with no escaping of their own, so an unvalidated address would be CRLF/SMTP-command injection into the server's own authenticated outbound relay session the moment `TASK-207`'s notify triggers (or `TASK-046`'s recovery flow) tried to mail it. |
+
+**ACCOUNT_EMAIL_SET_ACK payload:**
+
+| Field      | Type   | Notes |
+|------------|--------|-------|
+| error_code | uint32 | `VW_OK`, `VW_ERR_AUTH_REQUIRED`, `VW_ERR_PERMISSION` (scoped session), `VW_ERR_INVALID_ARG` (malformed address or over 128 bytes), or `VW_ERR_ALREADY_EXISTS` (a *different* account already owns that exact address) |
+| email      | string | The stored value after this call — identical to the request's value on `VW_OK`, unchanged-from-before on any error. Echoed back so a client never has to issue a follow-up `GET` just to confirm what it just set (same pattern as `NOTIFY_PREFS_SET_ACK`, §7.13). |
+
+**Storage**: `vw_store_user_set_email` (`vw_store.c`) — unlike the
+generic `vw_store_user_update_field` (which explicitly forbids email:
+see its own doc comment), this correctly maintains the `email_ht`
+uniqueness index across a change, evicting the old address before
+inserting the new one. Fixed alongside this task: `email_ht_insert`
+previously still counted every *empty*-email account against the
+index's growth threshold (an empty string always reported "not found"
+by `email_ht_find`'s own existing guard, so it was harmless in effect,
+but wasted unbounded table growth — every account lacked an email until
+this task shipped, i.e. this bug fired on every single account created
+before today). Empty emails are now never inserted into the index at
+all, matching `email_ht_find`'s existing treatment of `""` as "no
+email," and the index correctly supports multiple simultaneous
+no-email accounts.
+
+**Deliberately out of scope**: `USER_CREATE_REQ` and `INVITE_REDEEM`
+still do not carry an email field — an admin provisioning an account,
+or a user redeeming an invite, still needs a separate
+`ACCOUNT_EMAIL_SET` call afterward. This self-service pair alone fully
+satisfies `TASK-222`'s acceptance criteria (a real, documented,
+implemented path exists), so adding email to either creation path is
+left as a possible future enhancement rather than folded into this
+task. Client-core/daemon-IPC/CLI/GUI/web surfacing shipped directly
+alongside this section as part of closing `TASK-222` — see
+`vw_client_account_email_get`/`_set`, `vapourwault-cli account email`,
+the desktop GUI's Settings view, and the web gateway's
+`/api/account/email` endpoints.
+
+---
+
 ## 8. Authentication Design
 
 ### 8.1 Password transport
@@ -1934,6 +2015,7 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 26      | 2026-08-27 | PRT.04  | Account self-service email address (§7.14), resolving `TASK-222`: new `ACCOUNT_EMAIL_GET`/`_GET_RESP`/`SET`/`_SET_ACK` (0x0B01–0x0B04). The first real wire path that can ever put a non-empty email on a user record — neither `USER_CREATE_REQ` nor `INVITE_REDEEM` carry one, which silently made the already-shipped `TASK-046` password recovery and `TASK-207`'s notify-preferences system unreachable for every real account. Server-side format validation (`vw_email_validate`) is a hard security requirement, not cosmetic: `vw_smtp.c`'s `MAIL FROM`/`RCPT TO` lines do no escaping of their own, so this is the sole gate against SMTP command injection into the outbound relay. Also fixed in the same pass: `email_ht_insert`'s pre-existing bug where every empty-email account (i.e. every account, until this task) still counted against the index's growth threshold. Entirely new message pair-of-pairs, no existing byte layout changed; no protocol version bump required. |
 | 25      | 2026-08-27 | PRT.04  | Shared-file version history (§7.3), resolving `TASK-214` — **corrects `TASK-182`'s own filed assumption** that `VERSION_RESTORE` resolves by path server-side the same owner-namespaced way `FILE_STAT` does; reading `handle_version_restore` in full found it already resolves `version_id → file_id` and requires `VW_PERM_EDIT` via `effective_permission()`, never using `virtual_path` for anything but shape validation. `VERSION_LIST` was already fully correct too (`file_id` + `VW_PERM_VIEW`). The one real, small gap: `virtual_path` was a *mandatory* non-empty field even though unused — now may be an empty string, meaning "no meaningful path, resolve by `version_id`/`file_id` alone" (a grantee's own case). A caller supplying a real path is completely unaffected; this is a pure server-side permissive relaxation (a previously-always-rejected zero-length string is now accepted), not a new field — no protocol version bump required. The server-side relaxation itself was small enough to land directly in `TASK-214` rather than a separate SRV.01 follow-up; filed the remaining CLI.02 follow-up (`TASK-223`) for the client-core/daemon-IPC/CLI/GUI work needed to actually reach it. |
 | 24      | 2026-08-26 | PRT.04  | Notification preferences (§7.13), resolving `TASK-206`: new `NOTIFY_PREFS_GET`/`_GET_RESP`/`SET`/`_SET_ACK` (0x0A01–0x0A04). Account-scoped only (no `user_id` field, no `VW_PERM_*` concept — same trust bar as a session changing its own password), covering the four user-facing alert categories from `TASK-205`'s design (`share_received`/`quota_warning`/`new_login`/`account_security_change`) as bits 0–3 of a `uint32` bitmask, bits 4–31 reserved. `SET` replaces the whole bitmask rather than toggling one bit, and rejects any reserved bit with `VW_ERR_INVALID_ARG`. Admin-category alerts (`replica_lag` etc.) are deliberately **not** part of this wire protocol — `vapourwaultd.conf`-only per `TASK-205`. Entirely new message pair-of-pairs, no existing byte layout changed; no protocol version bump required. |
 | 23      | 2026-08-26 | PRT.04  | Filename search (§7.12), resolving `TASK-197`: new `SEARCH`/`SEARCH_RESP` (0x0901/0x0902). Server-side, scoped to `effective_permission()`'s existing visibility rule; no scoped-session support; no pagination (a 200-entry cap + `truncated` flag instead — checked this document for a cursor convention to reuse first and found none exist anywhere in it, correcting `TASK-196`'s design assumption that one did). Entirely new message pair, no existing byte layout changed; no protocol version bump required. |

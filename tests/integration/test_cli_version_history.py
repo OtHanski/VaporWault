@@ -150,36 +150,63 @@ def test_cli_version_list_and_restore(binaries, tmp_path_factory, cli_bin, runni
         server.stop()
 
 
-def test_cli_version_restore_not_available_for_a_shared_file(
+def _list_shares_to_me(cli_bin, ipc_port, account, name):
+    """Parse `list-shares --to-me` and return the file_id for the share
+    whose NAME column matches (the last whitespace-split column)."""
+    rc, out, err = _cli(cli_bin, ipc_port, "--account", account,
+                         "list-shares", "--to-me")
+    assert rc == 0, f"list-shares --to-me failed: {out}\n{err}"
+    for line in out.strip().splitlines()[1:]:  # skip header
+        cols = line.split()
+        if cols and cols[-1] == name:
+            return int(cols[1])  # SHARE_ID, FILE, TYPE, PERM, TARGET, EXPIRES..., NAME
+    raise AssertionError(f"no share named {name!r} found in list-shares --to-me output:\n{out}")
+
+
+def test_cli_version_history_by_file_id_for_a_shared_file(
         binaries, tmp_path_factory, cli_bin, running_daemon, unique_username):
     """
-    Known, documented limitation (recorded on TASK-182, corrected and
-    tracked as TASK-214, client-side follow-up filed as TASK-224):
-    vw_client_version_list/vw_client_version_restore are 100% path-based
-    (both resolve file_id via vw_client_file_stat first), and path
-    resolution is owner-namespaced (ARCHITECTURE.md's TASK-106 note) —
-    unlike FILE_LIST/STAT/UPLOAD/DOWNLOAD/DELETE, version history never got
-    a file_id-based client entry point. The server side is NOT the
-    blocker: handle_version_list/handle_version_restore already resolve
-    and authorize purely via file_id/version_id + effective_permission()
-    (TASK-214 found and corrected TASK-182's original claim that
-    VERSION_RESTORE resolved by path server-side — it never did). So a
-    grantee still gets VW_ERR_NOT_FOUND here today, but only because the
-    client never gives them a way to reach the server without an
-    owner-namespaced path first — this test locks in that it fails
-    *cleanly* (a legible error, not a hang or a crash), not that
-    permission is being enforced by level (it isn't reached yet)."""
+    TASK-223: the real fix for the gap `test_cli_version_restore_not_
+    available_for_a_shared_file` used to lock in (that test name/docstring
+    is gone — this replaces it, per TASK-223's own acceptance criteria).
+
+    Background: TASK-214 found the server side was never actually the
+    blocker — handle_version_list/handle_version_restore already resolved
+    and authorized purely via file_id/version_id + effective_permission().
+    The real gap was client-side: vw_client_version_list/_restore only
+    ever obtained file_id via an owner-namespaced FILE_STAT. TASK-223
+    added vw_client_version_list_by_id/_restore_by_id (and this test)
+    to actually close that gap: a grantee identifies the file via
+    `list-shares --to-me` (which already returns file_id) instead of a
+    path they don't have, then uses `version list --file-id <id>` /
+    `version restore --file-id <id> <version_id>`.
+
+    Proves the permission boundary is real and level-dependent, not just
+    "fails cleanly regardless of level" (the old test's only claim):
+    a VIEW grantee can list versions (VW_PERM_VIEW) but not restore one
+    (VW_PERM_EDIT required — handle_version_restore rejects with
+    VW_ERR_VERSION_NOT_FOUND rather than a distinct permission error, a
+    deliberate existing "don't leak existence below EDIT" posture, not
+    something this task introduced); an EDIT grantee can do both.
+    """
     binaries.require_server()
     binaries.require_tls()
     password = "TestP@ssw0rd!"
     owner = unique_username
     viewer = f"{unique_username}_viewer"
+    editor = f"{unique_username}_editor"
 
-    server = ServerInstance(binaries, str(tmp_path_factory.mktemp("vw_cli_version_perm_server")))
+    # max_workers=4: three concurrently-connected daemon accounts (owner,
+    # viewer, editor) exceed ServerInstance's default of 2 — same
+    # worker-pool-exhaustion class of timeout test_cli_search.py and
+    # test_notify_alerts.py both already hit and fixed the same way.
+    server = ServerInstance(binaries, str(tmp_path_factory.mktemp("vw_cli_version_perm_server")),
+                             max_workers=4)
     server.start()
     try:
         server.create_user(owner, password)
         server.create_user(viewer, password)
+        server.create_user(editor, password)
 
         rc, out, err = _cli(cli_bin, running_daemon, "account", "add",
                              server.host, str(server.port), owner, password,
@@ -189,29 +216,75 @@ def test_cli_version_restore_not_available_for_a_shared_file(
         tmpdir = str(tmp_path_factory.mktemp("vw_cli_version_perm_root"))
         owner_root = os.path.join(tmpdir, "owner_root")
         os.makedirs(owner_root, exist_ok=True)
-        with open(os.path.join(owner_root, "shared.txt"), "w") as f:
-            f.write("owner's original content\n")
+        local_file = os.path.join(owner_root, "shared.txt")
+        with open(local_file, "w") as f:
+            f.write("v1 content\n")
 
         rc, out, err = _cli(cli_bin, running_daemon, "--account", owner,
                              "add-folder", owner_root, "/")
         assert rc == 0, f"add-folder failed: {out}\n{err}"
-        assert _wait_for_sync(cli_bin, running_daemon), "initial upload never completed"
+        assert _wait_for_sync(cli_bin, running_daemon), "v1 upload never completed"
+
+        with open(local_file, "w") as f:
+            f.write("v2 content, a bit longer\n")
+        assert _wait_for_sync(cli_bin, running_daemon), "v2 upload never completed"
 
         rc, out, err = _cli(cli_bin, running_daemon, "--account", owner,
                              "share", "/shared.txt", viewer, "view")
         assert rc == 0, f"share (view) failed: {out}\n{err}"
+        rc, out, err = _cli(cli_bin, running_daemon, "--account", owner,
+                             "share", "/shared.txt", editor, "edit")
+        assert rc == 0, f"share (edit) failed: {out}\n{err}"
 
-        rc, out, err = _cli(cli_bin, running_daemon, "account", "add",
-                             server.host, str(server.port), viewer, password,
-                             "--ca-cert", server.cert, "--label", viewer)
-        assert rc == 0, f"account add (viewer) failed: {out}\n{err}"
+        for grantee in (viewer, editor):
+            rc, out, err = _cli(cli_bin, running_daemon, "account", "add",
+                                 server.host, str(server.port), grantee, password,
+                                 "--ca-cert", server.cert, "--label", grantee)
+            assert rc == 0, f"account add ({grantee}) failed: {out}\n{err}"
+
+        # ── VIEW grantee: list succeeds (VW_PERM_VIEW), restore does not
+        #    (VW_PERM_EDIT required) — the permission boundary itself, not
+        #    a path-resolution failure. ──
+        viewer_file_id = _list_shares_to_me(cli_bin, running_daemon, viewer, "shared.txt")
+        rc, out, err = _cli(cli_bin, running_daemon, "--account", viewer,
+                             "version", "list", "--file-id", str(viewer_file_id))
+        assert rc == 0, f"VIEW grantee's version list --file-id failed: {out}\n{err}"
+        lines = [l for l in out.strip().splitlines() if l.strip()]
+        rows = [l.split() for l in lines[1:]]
+        assert len(rows) >= 2, f"expected at least 2 versions visible to VIEW grantee: {out}"
+        viewer_v1_id = min(int(r[0]) for r in rows)
 
         rc, out, err = _cli(cli_bin, running_daemon, "--account", viewer,
-                             "version", "restore", "/shared.txt", "1")
+                             "version", "restore", "--file-id", str(viewer_file_id),
+                             str(viewer_v1_id))
         assert rc != 0, (
-            f"restore against another owner's path must fail cleanly (path "
-            f"resolution is owner-namespaced — see TASK-214), not hang or "
-            f"crash: {out}\n{err}"
+            f"a VIEW-only grantee must not be able to restore a version: {out}\n{err}"
+        )
+
+        # ── EDIT grantee: both list and restore succeed for real. ──
+        editor_file_id = _list_shares_to_me(cli_bin, running_daemon, editor, "shared.txt")
+        assert editor_file_id == viewer_file_id, "same underlying file, same file_id"
+
+        rc, out, err = _cli(cli_bin, running_daemon, "--account", editor,
+                             "version", "list", "--file-id", str(editor_file_id))
+        assert rc == 0, f"EDIT grantee's version list --file-id failed: {out}\n{err}"
+        rows = [l.split() for l in out.strip().splitlines()[1:] if l.strip()]
+        v1_id = min(int(r[0]) for r in rows)
+        count_before = len(rows)
+
+        rc, out, err = _cli(cli_bin, running_daemon, "--account", editor,
+                             "version", "restore", "--file-id", str(editor_file_id), str(v1_id))
+        assert rc == 0, f"EDIT grantee's version restore --file-id failed: {out}\n{err}"
+        assert str(v1_id) in out
+
+        rc, out, err = _cli(cli_bin, running_daemon, "--account", owner,
+                             "version", "list", "/shared.txt")
+        assert rc == 0
+        rows_after = [l.split() for l in out.strip().splitlines()[1:] if l.strip()]
+        assert len(rows_after) == count_before + 1, (
+            f"restore by an EDIT grantee should create exactly one new "
+            f"version, same as an owner's own restore: before={count_before}, "
+            f"after={len(rows_after)}"
         )
     finally:
         server.stop()

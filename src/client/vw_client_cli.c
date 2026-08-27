@@ -1031,6 +1031,65 @@ static int cmd_version_restore(vw_ipc_conn_t *conn, uint32_t account_id,
     return 0;
 }
 
+/* ── version --file-id (TASK-223): shared-file version history ───────────── */
+/* Lets a grantee use version history on a file shared with them, which
+ * they have no owner-namespaced path to give the commands above — see
+ * "list-shares" for the file_id, docs/PROTOCOL.md §7.14/§7.3 background. */
+
+/* VERSION_LIST_BY_ID_REQ: u32 account_id, u64 file_id.
+ * _RESP: same shape as VERSION_LIST_RESP. */
+static int cmd_version_list_by_id(vw_ipc_conn_t *conn, uint32_t account_id, uint64_t file_id) {
+    uint8_t req[12];
+    vw_write_u32le(req, account_id);
+    vw_write_u64le(req + 4, file_id);
+
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "version list: out of memory\n"); return 1; }
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_VERSION_LIST_BY_ID_REQ, req, sizeof(req),
+                             VW_IPC_VERSION_LIST_BY_ID_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) { fprintf(stderr, "version list: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "version list")) { free(resp); return 1; }
+    if (rlen < 8u) { free(resp); return 0; }
+
+    uint32_t count = vw_read_u32le(resp + 4u);
+    uint32_t roff = 8u;
+
+    printf("%-12s  %-19s  %s\n", "VERSION_ID", "CREATED (UTC)", "SIZE");
+    for (uint32_t i = 0; i < count; i++) {
+        if (roff + 24u > rlen) break;
+        uint64_t version_id  = vw_read_u64le(resp + roff); roff += 8;
+        int64_t  created_at  = (int64_t)vw_read_u64le(resp + roff); roff += 8;
+        uint64_t size_bytes  = vw_read_u64le(resp + roff); roff += 8;
+
+        char ts_buf[24]; format_ts(created_at, ts_buf, sizeof(ts_buf), 0);
+        printf("%-12llu  %-19s  %llu\n",
+               (unsigned long long)version_id, ts_buf, (unsigned long long)size_bytes);
+    }
+
+    free(resp);
+    return 0;
+}
+
+/* VERSION_RESTORE_BY_ID_REQ: u32 account_id, u64 version_id.
+ * _RESP: u32 error_code. */
+static int cmd_version_restore_by_id(vw_ipc_conn_t *conn, uint32_t account_id,
+                                      uint64_t version_id) {
+    uint8_t req[12];
+    vw_write_u32le(req, account_id);
+    vw_write_u64le(req + 4, version_id);
+
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_VERSION_RESTORE_BY_ID_REQ, req, sizeof(req),
+                             VW_IPC_VERSION_RESTORE_BY_ID_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "version restore: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "version restore")) return 1;
+
+    printf("restored version %llu\n", (unsigned long long)version_id);
+    return 0;
+}
+
 /* ── Subcommand: search (TASK-199; docs/PROTOCOL.md §7.12) ───────────────── */
 
 /* SEARCH_REQ: u32 account_id, string query. SEARCH_RESP: u32 error_code,
@@ -1189,6 +1248,56 @@ static int cmd_notify_set(uint16_t ipc_port, uint32_t account_id,
     return 0;
 }
 
+/* ── Subcommand: account email (TASK-222; docs/PROTOCOL.md §7.14) ────────── */
+
+/* ACCOUNT_EMAIL_GET_REQ: u32 account_id. _GET_RESP: u32 error_code, string email. */
+static int cmd_account_email_get(vw_ipc_conn_t *conn, uint32_t account_id) {
+    uint8_t req[4];
+    vw_write_u32le(req, account_id);
+
+    uint8_t resp[4u + 2u + 128u];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_ACCOUNT_EMAIL_GET_REQ, req, sizeof(req),
+                             VW_IPC_ACCOUNT_EMAIL_GET_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "account email: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "account email")) return 1;
+
+    uint32_t off = 4u;
+    const char *email; uint16_t email_len;
+    if (vw_ipc_read_str(resp, rlen, &off, &email, &email_len) != VW_OK) {
+        fprintf(stderr, "account email: truncated response\n");
+        return 1;
+    }
+    if (email_len == 0) {
+        printf("(no email on file — set one with: account email set <address>)\n");
+    } else {
+        printf("%.*s\n", (int)email_len, email);
+    }
+    return 0;
+}
+
+/* ACCOUNT_EMAIL_SET_REQ: u32 account_id, string email (""=clear).
+ * _SET_ACK: u32 error_code, string email (stored value after the call). */
+static int cmd_account_email_set(vw_ipc_conn_t *conn, uint32_t account_id, const char *address) {
+    uint8_t req[4u + 2u + 128u];
+    uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    if (vw_ipc_write_str(req, sizeof(req), &off, address, (uint16_t)strlen(address)) != VW_OK) {
+        fprintf(stderr, "account email set: address too long\n");
+        return 1;
+    }
+
+    uint8_t resp[4u + 2u + 128u];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_ACCOUNT_EMAIL_SET_REQ, req, off,
+                             VW_IPC_ACCOUNT_EMAIL_SET_ACK, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "account email set: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "account email set")) return 1;
+
+    printf("email set: %s\n", address);
+    return 0;
+}
+
 /* ── Usage ───────────────────────────────────────────────────────────────── */
 
 static void print_usage(const char *prog) {
@@ -1218,6 +1327,11 @@ static void print_usage(const char *prog) {
         "  account remove <label-or-id>  Log out and forget an account (local\n"
         "                                cache deleted; already-synced files on\n"
         "                                disk are untouched)\n"
+        "  account email                 Show the current account's email address\n"
+        "                                (use --account to pick which one)\n"
+        "  account email set <address>   Set (or change) the current account's\n"
+        "                                email address — required for password\n"
+        "                                recovery and email alerts (see \"notify\")\n"
         "\n"
         "Commands (account-scoped ones use --account, or the sole configured\n"
         "account if only one exists):\n"
@@ -1247,6 +1361,12 @@ static void print_usage(const char *prog) {
         "  version list <path>           List all versions of a file\n"
         "  version restore <path> <version_id>\n"
         "                                Restore an older version as HEAD\n"
+        "  version list --file-id <id>  List versions of a file shared with you\n"
+        "                                (get <id> from list-shares — you have no\n"
+        "                                path for content you don't own)\n"
+        "  version restore --file-id <id> <version_id>\n"
+        "                                Restore an older version of a shared file\n"
+        "                                (requires an EDIT grant, not just VIEW)\n"
         "  search <query>                Search filenames across everything visible\n"
         "                                (owned + shared); case-insensitive substring\n"
         "  notify list                   Show your email notification preferences\n"
@@ -1597,7 +1717,35 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
             return rc;
         }
 
-        fprintf(stderr, "error: unknown account subcommand '%s' (expected add|list|remove)\n", subcmd);
+        if (strcmp(subcmd, "email") == 0) {
+            uint32_t account_id = 0;
+            if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+
+            if (argi >= argc) {
+                vw_ipc_conn_t *c = cli_connect(ipc_port);
+                if (!c) return 1;
+                int rc = cmd_account_email_get(c, account_id);
+                vw_ipc_conn_close(c);
+                return rc;
+            }
+            if (strcmp(argv[argi], "set") == 0) {
+                argi++;
+                if (argi >= argc) {
+                    fprintf(stderr, "Usage: %s account email set <address>\n", argv[0]);
+                    return 1;
+                }
+                const char *address = argv[argi++];
+                vw_ipc_conn_t *c = cli_connect(ipc_port);
+                if (!c) return 1;
+                int rc = cmd_account_email_set(c, account_id, address);
+                vw_ipc_conn_close(c);
+                return rc;
+            }
+            fprintf(stderr, "Usage: %s account email | account email set <address>\n", argv[0]);
+            return 1;
+        }
+
+        fprintf(stderr, "error: unknown account subcommand '%s' (expected add|list|remove|email)\n", subcmd);
         return 1;
     }
 
@@ -1753,38 +1901,68 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
     if (strcmp(cmd, "version") == 0) {
         HELP_IF_REQUESTED();
         if (argi >= argc) {
-            fprintf(stderr, "Usage: %s version list <path> | version restore <path> <version_id>\n", argv[0]);
+            fprintf(stderr, "Usage: %s version list <path>|--file-id <id> | "
+                            "version restore <path>|--file-id <id> <version_id>\n", argv[0]);
             return 1;
         }
         const char *subcmd = argv[argi++];
 
         if (strcmp(subcmd, "list") == 0) {
             if (argi >= argc) {
-                fprintf(stderr, "Usage: %s version list <path>\n", argv[0]);
+                fprintf(stderr, "Usage: %s version list <path>|--file-id <id>\n", argv[0]);
                 return 1;
             }
-            const char *path = argv[argi++];
             uint32_t account_id = 0;
             if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
             vw_ipc_conn_t *c = cli_connect(ipc_port);
             if (!c) return 1;
-            int rc = cmd_version_list(c, account_id, path);
+            int rc;
+            /* --file-id (TASK-223): for a file shared with this account,
+             * which has no owner-namespaced path to give the path-based
+             * form above — see "list-shares" for the file_id to pass. */
+            if (strcmp(argv[argi], "--file-id") == 0) {
+                if (argi + 1 >= argc) {
+                    fprintf(stderr, "Usage: %s version list --file-id <id>\n", argv[0]);
+                    vw_ipc_conn_close(c);
+                    return 1;
+                }
+                uint64_t file_id = strtoull(argv[argi + 1], NULL, 10);
+                rc = cmd_version_list_by_id(c, account_id, file_id);
+            } else {
+                rc = cmd_version_list(c, account_id, argv[argi]);
+            }
             vw_ipc_conn_close(c);
             return rc;
         }
 
         if (strcmp(subcmd, "restore") == 0) {
             if (argi + 1 >= argc) {
-                fprintf(stderr, "Usage: %s version restore <path> <version_id>\n", argv[0]);
+                fprintf(stderr, "Usage: %s version restore <path>|--file-id <id> <version_id>\n", argv[0]);
                 return 1;
             }
-            const char *path = argv[argi++];
-            uint64_t version_id = strtoull(argv[argi++], NULL, 10);
             uint32_t account_id = 0;
             if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
             vw_ipc_conn_t *c = cli_connect(ipc_port);
             if (!c) return 1;
-            int rc = cmd_version_restore(c, account_id, path, version_id);
+            int rc;
+            if (strcmp(argv[argi], "--file-id") == 0) {
+                if (argi + 2 >= argc) {
+                    fprintf(stderr, "Usage: %s version restore --file-id <id> <version_id>\n", argv[0]);
+                    vw_ipc_conn_close(c);
+                    return 1;
+                }
+                /* file_id itself is unused here (VERSION_RESTORE resolves
+                 * entirely by version_id server-side — see TASK-214,
+                 * docs/PROTOCOL.md §7.3 rev 25); required on the command
+                 * line anyway so `version restore --file-id <id> <vid>`
+                 * mirrors `version list --file-id <id>` symmetrically and
+                 * a caller doesn't need to know that asymmetry exists. */
+                uint64_t version_id = strtoull(argv[argi + 2], NULL, 10);
+                rc = cmd_version_restore_by_id(c, account_id, version_id);
+            } else {
+                uint64_t version_id = strtoull(argv[argi + 1], NULL, 10);
+                rc = cmd_version_restore(c, account_id, argv[argi], version_id);
+            }
             vw_ipc_conn_close(c);
             return rc;
         }

@@ -35,6 +35,8 @@ import {
   search,
   getNotifyPrefs,
   setNotifyPrefs,
+  getAccountEmail,
+  setAccountEmail,
   type FileEntry,
   type VersionEntry,
   type ShareEntry,
@@ -97,6 +99,9 @@ const settingsView = el<HTMLElement>("settings-view");
 const settingsBackBtn = el<HTMLButtonElement>("settings-back-btn");
 const notifyPrefsList = el<HTMLElement>("notify-prefs-list");
 const settingsError = el<HTMLElement>("settings-error");
+const accountEmailInput = el<HTMLInputElement>("account-email-input");
+const accountEmailSaveBtn = el<HTMLButtonElement>("account-email-save-btn");
+const accountEmailCurrent = el<HTMLElement>("account-email-current");
 
 const shareView = el<HTMLElement>("share-view");
 const shareFileLabel = el<HTMLElement>("share-file-label");
@@ -1146,7 +1151,46 @@ const NOTIFY_CATEGORIES: { name: string; bit: number; label: string; desc: strin
 async function enterSettingsView(): Promise<void> {
   browserView.hidden = true;
   settingsView.hidden = false;
+  await refreshAccountEmail();
   await refreshNotifyPrefs();
+}
+
+// ── Settings view: account email (TASK-222; docs/PROTOCOL.md §7.14) ────────
+// The first real path that can put an email on an account - neither
+// account creation nor invite redemption ever ask for one, and the
+// notification categories below are silently a no-op without one.
+
+async function refreshAccountEmail(): Promise<void> {
+  clearError(settingsError);
+  const result = await getAccountEmail();
+  if (!result.ok) {
+    showError(settingsError, `Could not load account email: ${result.data.status ?? "error"}`);
+    return;
+  }
+  renderAccountEmail(result.data.email);
+}
+
+function renderAccountEmail(email: string): void {
+  accountEmailInput.value = email;
+  accountEmailCurrent.textContent = `Current: ${email || "(none)"}`;
+}
+
+accountEmailSaveBtn.addEventListener("click", () => { void saveAccountEmail(); });
+
+async function saveAccountEmail(): Promise<void> {
+  clearError(settingsError);
+  const result = await setAccountEmail(accountEmailInput.value);
+  if (!result.ok) {
+    const reason = result.status === 409
+      ? "that address is already in use by another account"
+      : (result.data.status ?? "invalid address");
+    showError(settingsError, `Could not update account email: ${reason}`);
+    await refreshAccountEmail(); // re-sync input with real server state
+    return;
+  }
+  // Re-render from the ACK's echoed value, never assumed - same
+  // never-assume-the-write-applied posture as notify prefs below.
+  renderAccountEmail(result.data.email);
 }
 
 settingsBtn.addEventListener("click", () => { void enterSettingsView(); });
