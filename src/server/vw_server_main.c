@@ -21,6 +21,7 @@
  */
 
 #include "vw_server_main.h"
+#include "vw_version.h"
 #include "vw_server_core.h"
 #include "vw_file_handlers.h"
 #include "vw_invite.h"
@@ -303,6 +304,10 @@ static void cfg_defaults(vw_server_main_cfg_t *c) {
     strncpy(c->smtp.from_name, "VaporWault", sizeof(c->smtp.from_name) - 1);
     c->smtp.tls_mode    = VW_SMTP_TLS_STARTTLS;
     c->smtp.verify_cert = 1;
+    /* TASK-208: all admin alert categories default off; thresholds get
+     * their real defaults from vw_notify.h's VW_NOTIFY_*_DEFAULT macros
+     * if left at 0 here (see vw_notify_replica_lag/etc.'s own
+     * "cfg field or default" fallback) — no need to duplicate them. */
 }
 
 vw_err_t vw_server_main_cfg_load(const char *path, vw_server_main_cfg_t *out) {
@@ -377,6 +382,27 @@ vw_err_t vw_server_main_cfg_load(const char *path, vw_server_main_cfg_t *out) {
         if (!strcmp(key, "cluster_poll_interval_secs")) {
             out->cluster.replica_poll_interval_secs =
                 (uint32_t)strtoul(val, NULL, 10); continue; }
+        /* TASK-208: admin operational alerts — config-only, no wire
+         * message (docs/PROTOCOL.md §7.13's own note on this). */
+        S(out->notify.admin_email, "notify.admin_email")
+        if (!strcmp(key, "notify.replica_lag")) {
+            out->notify.replica_lag_enabled = (int)strtol(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.acme_renewal_failure")) {
+            out->notify.acme_renewal_failure_enabled = (int)strtol(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.disk_capacity")) {
+            out->notify.disk_capacity_enabled = (int)strtol(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.lockout_spike")) {
+            out->notify.lockout_spike_enabled = (int)strtol(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.crash_recovery")) {
+            out->notify.crash_recovery_enabled = (int)strtol(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.replica_lag_threshold_entries")) {
+            out->notify.replica_lag_threshold_entries = (uint32_t)strtoul(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.disk_capacity_threshold_pct")) {
+            out->notify.disk_capacity_threshold_pct = (uint32_t)strtoul(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.lockout_spike_threshold_count")) {
+            out->notify.lockout_spike_threshold_count = (uint32_t)strtoul(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.lockout_spike_window_secs")) {
+            out->notify.lockout_spike_window_secs = (uint32_t)strtoul(val, NULL, 10); continue; }
 #undef S
 #undef U
 #undef I
@@ -430,7 +456,23 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         "cluster_is_replica        = 0\n"
         "cluster_primary_host      = \n"
         "cluster_primary_port      = 9010\n"
-        "cluster_poll_interval_secs = %u\n",
+        "cluster_poll_interval_secs = %u\n\n"
+        "# Admin operational email alerts (TASK-205/208) — reuses the SMTP\n"
+        "# relay above. All categories default off. Setting any category to 1\n"
+        "# with notify.admin_email left empty fails startup (fail loud, not a\n"
+        "# silent no-op) — see docs/DEPLOYMENT.md.\n"
+        "notify.admin_email       = \n"
+        "notify.replica_lag               = 0\n"
+        "notify.acme_renewal_failure      = 0\n"
+        "notify.disk_capacity             = 0\n"
+        "notify.lockout_spike             = 0\n"
+        "notify.crash_recovery            = 0\n"
+        "# Thresholds below are optional; 0 (or omitted) uses the built-in\n"
+        "# default noted in each comment.\n"
+        "notify.replica_lag_threshold_entries   = 0  # default %u\n"
+        "notify.disk_capacity_threshold_pct     = 0  # default %u\n"
+        "notify.lockout_spike_threshold_count   = 0  # default %u\n"
+        "notify.lockout_spike_window_secs       = 0  # default %u\n",
         cfg->listen_host, cfg->listen_port,
         cfg->data_dir, cfg->cert_pem_path, cfg->key_pem_path,
         cfg->log_level, cfg->max_connections, cfg->max_workers,
@@ -441,7 +483,11 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         (unsigned)cfg->gc.interval_secs,
         (unsigned)(cfg->gc.trash_retention_secs / (24u * 3600u)),
         (unsigned)cfg->cluster.cluster_port,
-        (unsigned)cfg->cluster.replica_poll_interval_secs);
+        (unsigned)cfg->cluster.replica_poll_interval_secs,
+        (unsigned)VW_NOTIFY_REPLICA_LAG_THRESHOLD_ENTRIES_DEFAULT,
+        (unsigned)VW_NOTIFY_DISK_CAPACITY_THRESHOLD_PCT_DEFAULT,
+        (unsigned)VW_NOTIFY_LOCKOUT_SPIKE_THRESHOLD_COUNT_DEFAULT,
+        (unsigned)VW_NOTIFY_LOCKOUT_SPIKE_WINDOW_SECS_DEFAULT);
     fclose(f);
     return VW_OK;
 }
@@ -463,6 +509,18 @@ static int cfg_validate(const vw_server_main_cfg_t *c, int check_only) {
         char smtp_err[256];
         if (vw_smtp_validate_cfg(&c->smtp, smtp_err, sizeof(smtp_err)) != VW_OK) {
             vw_log(LOG_ERROR, "config SMTP: %s", smtp_err); return 1; }
+    }
+    /* TASK-208: fail loud, not a silent no-op — same posture as the
+     * existing CA-store VW_ERR_INVALID_ARG decision (ARCHITECTURE.md's
+     * Architectural Decisions table). A category enabled with no
+     * recipient configured is almost certainly an operator mistake, not
+     * an intentional "notify nobody". */
+    if ((c->notify.replica_lag_enabled || c->notify.acme_renewal_failure_enabled ||
+         c->notify.disk_capacity_enabled || c->notify.lockout_spike_enabled ||
+         c->notify.crash_recovery_enabled) && c->notify.admin_email[0] == '\0') {
+        vw_log(LOG_ERROR, "config: a notify.* admin alert category is enabled "
+                           "but notify.admin_email is empty");
+        return 1;
     }
     return 0;
 }
@@ -628,7 +686,12 @@ int vw_server_main_run(int argc, char *argv[]) {
                 "                    /etc/vapourwaultd/server.conf)\n"
                 "  --daemon          Daemonise after binding (POSIX only)\n"
                 "  --check-config    Validate config and exit 0/1 without binding\n"
+                "  --version         Print version and exit\n"
                 "  --help            Print this message and exit\n");
+            return 0;
+        }
+        if (!strcmp(argv[i], "--version")) {
+            fprintf(stdout, "vapourwaultd %s\n", VW_VERSION_STRING);
             return 0;
         }
         if (!strcmp(argv[i], "--config") && i + 1 < argc) { cfg_path = argv[++i]; continue; }
@@ -710,6 +773,33 @@ int vw_server_main_run(int argc, char *argv[]) {
     vw_server_ctx_set_file_stores(sctx, file_store, chunks);
     vw_server_ctx_set_oplog(sctx, oplog);
     vw_storage_set_store(chunks, store);
+
+    /* TASK-207: notification dispatch is independent of password recovery
+     * (below) — both derive the same "is SMTP actually configured"
+     * pointer from cfg.smtp, but notify's four user-facing categories
+     * work whether or not recovery_store ever opens successfully. */
+    {
+        const vw_smtp_cfg_t *smtp = (cfg.smtp.host[0] != '\0') ? &cfg.smtp : NULL;
+        vw_server_ctx_set_notify(sctx, smtp);
+        if (!smtp)
+            vw_log(LOG_INFO, "SMTP not configured — notification emails disabled");
+
+        vw_notify_ctx_t *notify = vw_server_ctx_notify(sctx);
+        vw_notify_ctx_set_admin_cfg(notify, &cfg.notify);
+        /* lockout_spike is checked on every failed login, so wire it into
+         * vw_auth now rather than later — the other four admin categories
+         * attach to their own subsystem below, once each one opens. */
+        vw_auth_ctx_set_notify(auth, notify);
+
+        /* TASK-208 crash_recovery: one-shot, checked once right here at
+         * startup — vw_oplog_open (above) already ran its recovery scan
+         * before this point, so the flag is final by now. */
+        if (vw_oplog_did_recover_from_crash(oplog)) {
+            vw_log(LOG_WARN, "oplog crash-recovery replay ran at startup — "
+                              "server did not shut down cleanly last time");
+            vw_notify_crash_recovery(notify);
+        }
+    }
 
     if (vw_conn_registry_open(&conn_registry) != VW_OK) {
         vw_log(LOG_WARN, "connection registry allocation failed — list-connections will be empty");
@@ -801,6 +891,7 @@ int vw_server_main_run(int argc, char *argv[]) {
                             &acme_ctx) != VW_OK)
         vw_log(LOG_WARN, "ACME initialisation failed — continuing without automatic renewal");
     else if (acme_ctx) {
+        vw_acme_ctx_set_notify(acme_ctx, vw_server_ctx_notify(sctx)); /* TASK-208 */
         if (vw_acme_start(acme_ctx, net_ctx) != VW_OK) {
             vw_log(LOG_WARN, "ACME renewal thread failed to start");
             vw_acme_ctx_destroy(acme_ctx);
@@ -814,8 +905,12 @@ int vw_server_main_run(int argc, char *argv[]) {
     /* Expose cluster to TLS handler (for CLUSTER_STATUS). NULL is fine. */
     vw_server_ctx_set_cluster(sctx, cluster);
 
-    /* Start GC thread. cluster may be NULL (single-node mode). */
-    if (vw_gc_create(&cfg.gc, store, file_store, chunks, oplog, cluster, &gc_ctx) != VW_OK) {
+    /* Start GC thread. cluster may be NULL (single-node mode). data_dir +
+     * notify (TASK-208) drive the periodic admin replica_lag/disk_capacity
+     * checks; vw_server_ctx_notify(sctx) may itself be NULL if
+     * vw_server_ctx_set_notify above failed, which just disables them. */
+    if (vw_gc_create(&cfg.gc, store, file_store, chunks, oplog, cluster,
+                      cfg.data_dir, vw_server_ctx_notify(sctx), &gc_ctx) != VW_OK) {
         vw_log(LOG_WARN, "GC context allocation failed — running without GC");
     } else if (vw_gc_start(gc_ctx) != VW_OK) {
         vw_log(LOG_WARN, "GC thread failed to start — running without GC");

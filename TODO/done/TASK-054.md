@@ -1,6 +1,6 @@
 ---
 id:          TASK-054
-title:       Unit test harness and core module tests
+title:       "Unit test harness and core module tests"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

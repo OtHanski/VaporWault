@@ -1,6 +1,6 @@
 ---
 id:          TASK-045
-title:       Invite token server-side implementation
+title:       "Invite token server-side implementation"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

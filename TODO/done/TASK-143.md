@@ -1,6 +1,6 @@
 ---
 id:          TASK-143
-title:       Integration tests for the web gateway + browser client
+title:       "Integration tests for the web gateway + browser client"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

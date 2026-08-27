@@ -1,6 +1,6 @@
 ---
 id:          TASK-076
-title:       AUTH_OK always reports quota_bytes=0 and used_bytes=0 (hardcoded stub, never populated from store)
+title:       "AUTH_OK always reports quota_bytes=0 and used_bytes=0 (hardcoded stub, never populated from store)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

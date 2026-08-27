@@ -64,3 +64,7 @@ fuzz_target(fuzz_cluster_hello)
 
 # 5. Admin socket message parser (inline replication of handle_admin_connection logic)
 fuzz_target(fuzz_admin_dispatch)
+
+# 6. SEARCH query parser + case-insensitive matcher (TASK-198/202; the
+#    matcher itself is an inline replication — see fuzz_search.c's own note)
+fuzz_target(fuzz_search)

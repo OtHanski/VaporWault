@@ -1,6 +1,6 @@
 ---
 id:          TASK-002
-title:       Write wire protocol specification (docs/PROTOCOL.md)
+title:       "Write wire protocol specification (docs/PROTOCOL.md)"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

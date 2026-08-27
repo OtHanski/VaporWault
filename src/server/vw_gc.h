@@ -23,6 +23,7 @@
 #include "vw_storage.h"
 #include "vw_oplog.h"
 #include "vw_cluster.h"
+#include "vw_notify.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -54,6 +55,16 @@ typedef struct vw_gc_ctx vw_gc_ctx_t;
  * cluster may be NULL (single-node mode); when set, pass 2 uses the minimum
  * replica sync watermark instead of last_entry_id to avoid truncating oplog
  * segments that lagging replicas still need.
+ *
+ * data_dir and notify (TASK-208) are both optional (NULL disables the
+ * corresponding check, not an error): when both are set, each GC cycle
+ * additionally reports the current replica lag (only meaningful when
+ * cluster is also non-NULL) and data_dir's disk usage percentage to
+ * vw_notify_replica_lag/vw_notify_disk_capacity — reusing this loop's
+ * existing periodic cadence rather than spawning a second timer thread
+ * for what is, in this project's threat model, a low-frequency
+ * operational health check.
+ *
  * Returns VW_OK and sets *out on success; VW_ERR_OOM on allocation failure.
  */
 vw_err_t vw_gc_create(const vw_gc_cfg_t *cfg,
@@ -62,6 +73,8 @@ vw_err_t vw_gc_create(const vw_gc_cfg_t *cfg,
                        vw_storage_t     *chunk_store,
                        vw_oplog_t       *oplog,
                        vw_cluster_t     *cluster,
+                       const char       *data_dir,
+                       vw_notify_ctx_t  *notify,
                        vw_gc_ctx_t     **out);
 
 /*

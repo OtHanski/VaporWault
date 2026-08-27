@@ -1,0 +1,165 @@
+---
+id:          TASK-201
+title:       "Web gateway/frontend: search bar"
+status:      done
+assignee:    WEB.09
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  [TASK-198]
+blocks:      []
+review_by:   [SEC.07, CQR.08]
+tags:        [security-sensitive, gateway]
+---
+
+## Work
+
+- Gateway API: passthrough of `SEARCH`/`SEARCH_RESP` into HTTP/JSON, per
+  `docs/PROTOCOL.md`.
+- Frontend: a search bar in the file browser, same UX shape as
+  `TASK-200`'s GUI version.
+
+## Security note (`security-sensitive`)
+
+New externally-reachable query surface (browser-supplied query string
+reaches the gateway's HTTP/JSON parsing layer) — same general posture as
+every other gateway endpoint per `ARCHITECTURE.md`'s Risk table entry on
+the gateway. Confirm query strings are never reflected unescaped into
+any HTML the frontend renders (XSS via a crafted "filename" in results is
+the concrete risk already called out generally for the gateway).
+
+## Acceptance criteria
+
+- End-to-end through the actual browser frontend: search returns correct,
+  permission-scoped results; a filename containing HTML-special
+  characters renders as literal text, not markup.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+WEB.09 [2026-08-26]: Implemented per the Work section above.
+
+- `vw_gateway_api.c`: new `handle_search` + `write_search_entry`, calling
+  `vw_client_search()` directly (the gateway is its own authenticated
+  `vw/1` client, CLAUDE.md's WEB.09 charter — no daemon IPC hop, same as
+  every other endpoint in this file). Modeled on `handle_version_list`'s
+  shape (session required, JSON body → `vw_client_*` call →
+  `send_file_op_error` on failure → JSON array response on success).
+  Registered `POST /api/search`.
+- `web/src/api.ts`: `SearchEntry`/`SearchResponse` types + `search()`,
+  matching `listFiles`'s `apiPost` convention.
+- `web/index.html`/`style.css`: search input + "Clear search" button in
+  the existing toolbar, a `.note` status line (new, neutral-colored
+  sibling of the existing red `.error` class — "no matches"/"truncated"
+  aren't errors).
+- `web/src/main.ts`: debounced (350ms after typing stops, not per
+  keystroke — purely to avoid spamming the gateway with one request per
+  character; there's no separate "blocks the browser" concern the way
+  TASK-200's GUI correction had to address, since every `fetch()` here is
+  already non-blocking by construction) `performSearch`/
+  `renderSearchTable`/`renderSearchRow`. Results replace the normal
+  directory table in place, same shape as TASK-200's GUI version.
+  `refreshFileList()` now also clears search state at its start, so any
+  real "list this directory" action (folder click, up-navigation, mkdir)
+  can't leave the search box/results in a stale, inconsistent state.
+- **Scope, matching TASK-200's own corrected precedent**: only Share is
+  wired up as an action on a search result (`enterShareView`'s param
+  type narrowed from `FileEntry` to `{file_id, name}` — checked first
+  that it only ever reads those two fields, so this is a safe narrowing,
+  not a behavior change). Download/History/Rename/Delete/folder-
+  navigation all need either a virtual path or a version_id that
+  SEARCH_RESP doesn't carry (§7.12's own rationale) — not wired up here,
+  same honest scoping TASK-200 already established for the GUI, not
+  re-litigated per-platform.
+
+**XSS-safety (the security note)**: `renderSearchRow` builds every result
+row via `document.createElement` + `.textContent` exclusively, never
+`.innerHTML` — the same rule `renderFileRow` already documents and
+follows for every other filename-displaying path in this file. Verified
+by reading the code just written, not assumed.
+
+**Testing**:
+
+- `tests/integration/test_gateway.py`: two new tests,
+  `test_search_permission_scoped_results` (owner/grantee/stranger
+  through the real HTTP/JSON `/api/search`, proving the gateway
+  passthrough carries the server's permission-safety property through
+  correctly — not re-proving the server's own logic, that's TASK-198's
+  job) and `test_search_html_special_characters_survive_as_literal_data`
+  (uploads a file named with `<`, `>`, `&`, `"`, `'` and an `onerror=`
+  payload shape, searches for it, asserts the JSON response returns the
+  exact original name byte-for-byte).
+- **Found and fixed two real bugs in my own first draft of these
+  tests, not in the product**: (1) the shared `server`/`gateway`
+  fixtures' 2-worker test server can't hold 3 concurrent logged-in
+  gateway sessions open at once (same class of issue TASK-198/199 each
+  hit) — restructured to log in/search/log out one account at a time;
+  (2) my first "HTML special characters" test filename was
+  `<b>bold</b>&"'.txt` — `</b>` contains a literal `/`, which is this
+  protocol's path separator, so `FILE_COMMIT` correctly parsed
+  everything before it as a parent directory to resolve and correctly
+  returned `NOT_FOUND` (that directory doesn't exist). Not a bug in
+  either the gateway or the server — just the wrong test string for what
+  I was actually trying to check. Replaced with a `/`-free XSS-shaped
+  name (`<img src=x onerror=alert('xss')>&".txt`) that still exercises
+  every HTML-special character relevant to the actual concern.
+- `tsc -p tsconfig.json` (frontend type-check/build): clean, exit 0.
+- Full regression: `ctest --test-dir build-gw-e2e` (19/19) and the full
+  `test_gateway.py` suite (32/32) both green after this change; full
+  non-cluster pytest suite run once more before closing this task.
+
+Moving to `review`.
+
+WEB.09 [2026-08-26]: Full regression confirmed green after finalizing —
+full non-cluster pytest integration suite: `110 passed, 15 deselected`
+(includes both new `test_gateway.py` search tests).
+
+SEC.07 [2026-08-26]: Reviewed against this task's own security note
+(new externally-reachable query surface; XSS via a crafted filename).
+
+- Confirmed `handle_search` requires a real session (`require_session`)
+  before doing anything else — no unauthenticated query surface added.
+- Confirmed with a real cross-user HTTP test, not just code reading: a
+  stranger's `/api/search` for a query with a real match elsewhere
+  returns `results: []`, not an error — the match is genuinely
+  invisible through this layer too, consistent with the server's own
+  guarantee (`TASK-198`) rather than the gateway accidentally
+  broadening or narrowing it.
+- XSS: `renderSearchRow` uses `.textContent` exclusively (verified by
+  reading the diff, not assumed) — no `.innerHTML` or other
+  markup-interpreting sink touches a filename anywhere in this path.
+  The `test_search_html_special_characters_survive_as_literal_data`
+  test proves the JSON layer underneath this doesn't corrupt or strip
+  the dangerous characters before they'd reach that (safe) sink.
+- Query length is still bounded server-side (256 bytes, §7.12) — the
+  gateway's own `query[257]` buffer plus `get_json_string_field`'s
+  bounds-checked decode means an oversized query is rejected (400) at
+  the gateway layer before it would even reach the server's own check,
+  not a new path that could bypass it.
+- The `</b>`-contains-a-slash discovery is correctly characterized as
+  expected path-separator behavior, not a security gap — a filename can
+  no more contain a literal `/` here than in a POSIX filesystem, and
+  nothing about that is attacker-exploitable (it can only ever target
+  paths the same permission checks already gate).
+- No blocking findings. Approved.
+
+CQR.08 [2026-08-26]: Reviewed for code quality and consistency.
+
+- `handle_search`/`write_search_entry` follow `handle_version_list`'s
+  established shape exactly — no new gateway-handler pattern introduced.
+- `enterShareView`'s parameter narrowed from `FileEntry` to a minimal
+  structural type: correct call, verified the function body only ever
+  reads `.file_id`/`.name`, and the sole existing call site (a real
+  `FileEntry`) still satisfies the narrower type structurally — not a
+  behavior change, just a more honest signature.
+- `refreshFileList()` clearing search state at its own start is the
+  right place for it — every code path that legitimately needs to leave
+  search mode (folder click, up-nav, mkdir's refresh) already funnels
+  through this one function, so this is one fix covering all of them
+  rather than scattering `clearSearchState()` calls at each call site.
+- The two self-found test bugs (worker-pool exhaustion; the `/`-in-`</b>`
+  filename) are both accurately diagnosed with the actual mechanism
+  identified, not just "test flaked, retried" — consistent with this
+  session's own established standard.
+- No blocking findings. Approved.

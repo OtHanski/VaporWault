@@ -1,6 +1,6 @@
 ---
 id:          TASK-168
-title:       Integration tests: multi-account daemon sync, gateway multi-slot switching, remember-me resume
+title:       "Integration tests - multi-account daemon sync, gateway multi-slot switching, remember-me resume"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

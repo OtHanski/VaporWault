@@ -1,6 +1,6 @@
 ---
 id:          TASK-175
-title:       GUI: fallback fields + read-only-fallback indicator
+title:       "GUI - fallback fields + read-only-fallback indicator"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

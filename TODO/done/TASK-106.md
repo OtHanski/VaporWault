@@ -1,6 +1,6 @@
 ---
 id:          TASK-106
-title:       Sync engine awareness of shared folders (local tree integration)
+title:       "Sync engine awareness of shared folders (local tree integration)"
 status:      done
 assignee:    CLI.02
 created_by:  CLI.02

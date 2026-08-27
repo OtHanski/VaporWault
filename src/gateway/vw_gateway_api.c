@@ -948,6 +948,148 @@ static void handle_version_restore(vw_gateway_session_pool_t *pool,
     send_json_status(conn, 200, "ok", NULL);
 }
 
+/* ── Search (TASK-198/199/201; docs/PROTOCOL.md §7.12) ────────────────────
+ * The gateway is its own authenticated `vw/1` client (CLAUDE.md's WEB.09
+ * charter) — this calls vw_client_search() directly, same as every other
+ * endpoint in this file calling straight through to vw_client_core.c,
+ * not a daemon IPC hop (the daemon and the gateway are siblings, not
+ * client/server of each other).
+ */
+static void write_search_entry(vw_json_writer_t *w, const vw_search_entry_t *e) {
+    vw_json_write_object_start(w);
+    vw_json_write_key(w, "name");
+    vw_json_write_string(w, e->name, strlen(e->name));
+    vw_json_write_key(w, "file_id");
+    vw_json_write_uint(w, e->file_id);
+    vw_json_write_key(w, "is_dir");
+    vw_json_write_uint(w, e->is_dir);
+    vw_json_write_key(w, "size_bytes");
+    vw_json_write_uint(w, e->size_bytes);
+    vw_json_write_key(w, "mtime_unix");
+    vw_json_write_int(w, e->mtime_unix);
+    vw_json_write_key(w, "vault_id");
+    vw_json_write_uint(w, e->vault_id);
+    vw_json_write_key(w, "is_shared");
+    vw_json_write_uint(w, e->is_shared);
+    vw_json_write_object_end(w);
+}
+
+static void handle_search(vw_gateway_session_pool_t *pool,
+                           const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    /* +1 for get_json_string_field's own NUL; the field itself is
+     * capped at 256 bytes server-side (§7.12) regardless of what this
+     * buffer allows through. */
+    char query[257];
+    if (get_json_string_field(req, "query", query, sizeof(query)) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    vw_search_entry_t *entries = NULL;
+    uint32_t count = 0;
+    uint8_t truncated = 0;
+    vw_err_t err = vw_client_search(sess, query, &entries, &count, &truncated);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char *buf = malloc(65536);
+    if (buf == NULL) { free(entries); send_error(conn, 500, "error"); return; }
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, 65536);
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "truncated");
+    vw_json_write_bool(&w, truncated != 0);
+    vw_json_write_key(&w, "results");
+    vw_json_write_array_start(&w);
+    for (uint32_t i = 0; i < count; i++) write_search_entry(&w, &entries[i]);
+    vw_json_write_array_end(&w);
+    vw_json_write_object_end(&w);
+    free(entries);
+
+    size_t len = 0;
+    if (vw_json_writer_result(&w, &len) != VW_OK) {
+        free(buf);
+        send_error(conn, 500, "response_too_large");
+        return;
+    }
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+    free(buf);
+}
+
+/* ── Notification preferences (TASK-206/207/211; docs/PROTOCOL.md §7.13) ──
+ * Thin passthrough, as directed — the gateway does not decode the
+ * bitmask into named fields; the frontend hardcodes the same category/
+ * bit table vapourwault-cli and the desktop GUI already do (TASK-209/
+ * 210), and does its own read-flip-write dance client-side, exactly
+ * mirroring how those two surfaces work. require_session() derives the
+ * account entirely from the caller's own session cookie — there is no
+ * user_id/account_id field anywhere in either request body, so this
+ * cannot be pointed at any account but the caller's own.
+ */
+static void handle_notify_prefs_get(vw_gateway_session_pool_t *pool,
+                                     const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+
+    uint32_t prefs = 0;
+    vw_err_t err = vw_client_notify_prefs_get(sess, &prefs);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[64];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "prefs");
+    vw_json_write_uint(&w, prefs);
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
+static void handle_notify_prefs_set(vw_gateway_session_pool_t *pool,
+                                     const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    uint64_t prefs_raw = 0;
+    if (get_json_uint_field(req, "prefs", &prefs_raw) != VW_OK || prefs_raw > 0xFFFFFFFFull) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint32_t stored = 0;
+    vw_err_t err = vw_client_notify_prefs_set(sess, (uint32_t)prefs_raw, &stored);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[64];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "prefs");
+    vw_json_write_uint(&w, stored);
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
 /* ── Chunk transfer endpoints (TASK-139's backend prerequisite) ───────────
  *
  * The browser drives CHUNK_QUERY/CHUNK_UPLOAD/FILE_COMMIT (upload) and
@@ -1338,6 +1480,8 @@ static void write_link_entry(vw_json_writer_t *w, const vw_link_entry_t *e) {
     vw_json_write_int(w, e->expires_at);
     vw_json_write_key(w, "revoked");
     vw_json_write_bool(w, e->revoked);
+    vw_json_write_key(w, "has_password");
+    vw_json_write_bool(w, e->has_password);
     vw_json_write_object_end(w);
 }
 
@@ -1462,11 +1606,16 @@ static void handle_link_create(vw_gateway_session_pool_t *pool,
         return;
     }
     (void)get_json_uint_field(req, "expires_at", &expires_at);
+    char password[257];
+    password[0] = '\0';
+    (void)get_json_string_field(req, "password", password, sizeof(password)); /* optional */
 
     uint64_t out_share_id = 0;
     uint8_t link_token[32];
     vw_err_t err = vw_client_link_create(sess, file_id, perm, (int64_t)expires_at,
+                                          password[0] ? password : NULL,
                                           &out_share_id, link_token);
+    vw_crypto_secure_zero(password, sizeof(password));
     if (err != VW_OK) {
         send_file_op_error(pool, cookie, conn, err);
         return;
@@ -1597,11 +1746,19 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
         return;
     }
 
+    /* TASK-186: optional password — a redemption attempt against a
+     * password-protected link with none/a wrong one gets a distinguishable
+     * response (see below), unlike an unknown/revoked/expired token. */
+    char password[257];
+    password[0] = '\0';
+    (void)get_json_string_field(req, "password", password, sizeof(password));
+
     vw_client_cfg_t client_cfg;
     build_client_cfg(cfg, 0, &client_cfg);
 
     vw_client_sess_t *sess = NULL;
-    vw_err_t err = vw_client_link_access(&client_cfg, link_token, &sess);
+    vw_err_t err = vw_client_link_access(&client_cfg, link_token,
+                                          password[0] ? password : NULL, &sess);
 
     /* TASK-176: same fallback treatment as handle_login — an anonymous
      * link redemption can fail over too (the resulting session is
@@ -1612,10 +1769,20 @@ static void handle_link_access(vw_gateway_session_pool_t *pool,
     if (is_net_err(err) && fallback_configured(cfg)) {
         vw_client_cfg_t fallback_cfg;
         build_client_cfg(cfg, 1, &fallback_cfg);
-        vw_err_t fb_err = vw_client_link_access(&fallback_cfg, link_token, &sess);
+        vw_err_t fb_err = vw_client_link_access(&fallback_cfg, link_token,
+                                                 password[0] ? password : NULL, &sess);
         if (fb_err == VW_OK) { err = VW_OK; read_only = 1; }
     }
+    vw_crypto_secure_zero(password, sizeof(password));
 
+    if (err == VW_ERR_LINK_PASSWORD_REQUIRED) {
+        send_error(conn, 401, "link_password_required");
+        return;
+    }
+    if (err == VW_ERR_LINK_PASSWORD_WRONG) {
+        send_error(conn, 401, "link_password_wrong");
+        return;
+    }
     if (err != VW_OK) {
         /* Anti-enumeration (vw_client_link_access's own doc): unknown,
          * revoked, and expired tokens are all indistinguishable here too. */
@@ -1891,6 +2058,18 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/list") == 0) {
         handle_file_list(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/search") == 0) {
+        handle_search(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/notify/prefs") == 0) {
+        handle_notify_prefs_get(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/notify/prefs/set") == 0) {
+        handle_notify_prefs_set(pool, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/stat") == 0) {

@@ -24,6 +24,7 @@
 #include "vw_recovery.h"
 #include "vw_share.h"
 #include "vw_smtp.h"
+#include "vw_notify.h"
 #include "vw_store.h"
 #include "vw_storage.h"
 #include "vw_oplog.h"
@@ -99,6 +100,17 @@ vw_store_t        *vw_server_ctx_store(const vw_server_ctx_t *ctx);
 vw_file_store_t   *vw_server_ctx_file_store(const vw_server_ctx_t *ctx);
 vw_storage_t      *vw_server_ctx_chunk_store(const vw_server_ctx_t *ctx);
 vw_invite_store_t *vw_server_ctx_invite_store(const vw_server_ctx_t *ctx);
+
+/*
+ * Create (or replace) the notification dispatch context (TASK-205/207)
+ * and register it as vw_store's quota_warning hook. smtp_cfg is
+ * borrowed; may be NULL to disable all outbound notification email
+ * (every trigger becomes a silent no-op). Safe to call again later (e.g.
+ * after a config reload changes SMTP settings) — replaces the previous
+ * notify context and re-registers the hook.
+ */
+void vw_server_ctx_set_notify(vw_server_ctx_t *ctx, const vw_smtp_cfg_t *smtp_cfg);
+vw_notify_ctx_t *vw_server_ctx_notify(const vw_server_ctx_t *ctx);
 
 /*
  * Attach the share store (TASK-094). Borrowed; caller keeps it alive until

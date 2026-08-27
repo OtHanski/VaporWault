@@ -1,6 +1,6 @@
 ---
 id:          TASK-067
-title:       Client daemon Linux packaging — systemd user service and install script
+title:       "Client daemon Linux packaging — systemd user service and install script"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

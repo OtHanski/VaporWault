@@ -1,6 +1,6 @@
 ---
 id:          TASK-091
-title:       Replace list-connections stub with real live-connection tracking
+title:       "Replace list-connections stub with real live-connection tracking"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

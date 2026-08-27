@@ -421,9 +421,29 @@ vw_err_t vw_share_grant_create(vw_share_store_t *ss,
     return share_create_common(ss, &rec, out_share_id);
 }
 
+/* TASK-186: derives the Argon2id salt for a public link's password from
+ * its link_token, rather than storing one — see vw_share.h's field
+ * comment and docs/PROTOCOL.md §7.5 for the full rationale. Not secret
+ * (salts never need to be); just needs to be unique/unpredictable per
+ * link, which link_token already is. HMAC (not raw truncation of
+ * link_token) keeps this derivation cryptographically distinct from
+ * link_token's own use as a bearer capability. */
+static vw_err_t derive_link_password_salt(const uint8_t link_token[32],
+                                           uint8_t out_salt[VW_ARGON2_SALT_BYTES])
+{
+    static const char kInfo[] = "vw-link-pw-salt";
+    uint8_t mac[VW_HASH_BYTES];
+    vw_err_t err = vw_crypto_hmac_sha256(link_token, 32, kInfo, sizeof(kInfo) - 1, mac);
+    if (err != VW_OK) return err;
+    memcpy(out_salt, mac, VW_ARGON2_SALT_BYTES);
+    vw_crypto_secure_zero(mac, sizeof(mac));
+    return VW_OK;
+}
+
 vw_err_t vw_share_link_create(vw_share_store_t *ss,
                                uint64_t file_id, uint64_t owner_id,
                                vw_perm_t permission, int64_t expires_at,
+                               const void *password, size_t password_len,
                                uint8_t out_link_token[32],
                                uint64_t *out_share_id)
 {
@@ -451,11 +471,38 @@ vw_err_t vw_share_link_create(vw_share_store_t *ss,
         if (token_is_zero(rec.link_token)) return VW_ERR_CRYPTO;
     }
 
+    if (password && password_len > 0) {
+        uint8_t salt[VW_ARGON2_SALT_BYTES];
+        err = derive_link_password_salt(rec.link_token, salt);
+        if (err != VW_OK) return err;
+        err = vw_crypto_argon2id_hash(password, password_len, salt, NULL,
+                                       rec.link_password_hash);
+        vw_crypto_secure_zero(salt, sizeof(salt));
+        if (err != VW_OK) return err;
+        rec.has_link_password = 1;
+    }
+
     err = share_create_common(ss, &rec, out_share_id);
     if (err != VW_OK) return err;
 
     memcpy(out_link_token, rec.link_token, 32);
     return VW_OK;
+}
+
+vw_err_t vw_share_link_verify_password(const vw_share_record_t *share,
+                                        const void *password, size_t password_len)
+{
+    if (!share) return VW_ERR_INVALID_ARG;
+    if (!share->has_link_password) return VW_OK;
+    if (!password || password_len == 0) return VW_ERR_LINK_PASSWORD_REQUIRED;
+
+    uint8_t salt[VW_ARGON2_SALT_BYTES];
+    vw_err_t err = derive_link_password_salt(share->link_token, salt);
+    if (err != VW_OK) return err;
+
+    err = vw_crypto_argon2id_verify(share->link_password_hash, salt, password, password_len);
+    vw_crypto_secure_zero(salt, sizeof(salt));
+    return (err == VW_OK) ? VW_OK : VW_ERR_LINK_PASSWORD_WRONG;
 }
 
 vw_err_t vw_share_get_by_id(vw_share_store_t *ss, uint64_t share_id,

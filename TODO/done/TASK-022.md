@@ -1,6 +1,6 @@
 ---
 id:          TASK-022
-title:       Implement file and version metadata tables in vw_store (Phase 2)
+title:       "Implement file and version metadata tables in vw_store (Phase 2)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

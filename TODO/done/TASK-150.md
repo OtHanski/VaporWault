@@ -1,6 +1,6 @@
 ---
 id:          TASK-150
-title:       Linux .rpm packages for server & client (CPack RPM, reusing TASK-149 scripts)
+title:       "Linux .rpm packages for server & client (CPack RPM, reusing TASK-149 scripts)"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

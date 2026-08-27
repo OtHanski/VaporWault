@@ -7,7 +7,7 @@ target_include_directories(vwdump PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core
 )
 
-target_link_libraries(vwdump PRIVATE vw_core)
+target_link_libraries(vwdump PRIVATE vw_core vw_version)
 
 if(UNIX)
     target_link_libraries(vwdump PRIVATE pthread)

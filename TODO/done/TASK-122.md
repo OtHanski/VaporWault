@@ -1,6 +1,6 @@
 ---
 id:          TASK-122
-title:       FILE_WRITE oplog payload is ambiguous between owner_id and file_id
+title:       "FILE_WRITE oplog payload is ambiguous between owner_id and file_id"
 status:      done
 assignee:    PRT.04
 created_by:  GUI.03

@@ -1,6 +1,6 @@
 ---
 id:          TASK-073
-title:       Fix credential-derivation mismatch between admin user-create and login (AUTH_FAIL code=300)
+title:       "Fix credential-derivation mismatch between admin user-create and login (AUTH_FAIL code=300)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 21 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 25 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -491,6 +491,50 @@ The receiver must verify `SHA-256(data) == chunk_hash` and treat a mismatch as a
 | 0x0305 | VERSION_CHUNKS       | C → S     | Get ordered chunk hash list for a version |
 | 0x0306 | VERSION_CHUNKS_RESP  | S → C     | Chunk hash array                         |
 
+**Shared-file addressing (`TASK-214`, corrected from `TASK-182`'s own
+assumption)**: `VERSION_LIST` already takes `file_id` directly (never a
+path) and its handler already calls `effective_permission()` requiring
+`VW_PERM_VIEW` — checked by reading `handle_version_list` in full, not
+assumed — so it has always worked correctly for a shared file, for any
+caller that has the right `file_id` in hand. `VERSION_RESTORE` similarly
+resolves `version_id → file_id` and requires `VW_PERM_EDIT` via
+`effective_permission()`, **never** using its own `virtual_path` field
+for resolution or authorization at all — that field is read and
+shape-validated but otherwise unused by the handler. `TASK-182`'s own
+filing of this gap (repeated in `TASK-214`'s original text) claimed the
+server resolves `VERSION_RESTORE` by path "the same [owner-namespaced]
+way" `FILE_STAT` does; that turned out to be incorrect once the actual
+handler was read line by line — corrected here rather than silently
+carried forward into a design built on it.
+
+The **real** gap, once the above was actually verified: `virtual_path`
+is a *mandatory*, shape-validated (`vw_path_validate` — rejects
+zero-length) field on the wire even though the server never uses its
+contents — and `vw_client_version_list`/`vw_client_version_restore`
+(`src/client/vw_client_core.c`) only ever obtain a `file_id`/`version_id`
+by resolving a path via `FILE_STAT` first, which is owner-namespaced and
+so never succeeds for a grantee. Every actual blocker is **client-side**;
+the wire protocol needed exactly one small loosening, documented below,
+to make a `file_id`-only round trip possible at all — no new fields, no
+version bump.
+
+**`VERSION_RESTORE`'s `virtual_path` may now be an empty string**
+(`path_len == 0`) to mean "no meaningful path — addressing by
+`version_id`/`file_id` alone," e.g. a grantee restoring a version of a
+file shared with them, which has no path in their own namespace. The
+server skips `vw_path_validate` entirely in this case (todo before this
+revision: always ran validation, rejecting a zero-length string with
+`VW_ERR_PATH_INVALID` before ever reaching the permission check) and
+proceeds exactly as it already did for the `version_id`/`effective_permission()`
+resolution — nothing else about the handler's behavior changes. A caller
+that does supply a real path continues to get it shape-validated exactly
+as before (`VW_ERR_PATH_INVALID` on a malformed one) — **byte-for-byte
+unchanged for a caller that doesn't opt into this**, since a non-empty
+path always used to be required and still works identically. This is a
+purely permissive server-side relaxation (accepting a previously-always-
+rejected zero-length string), not a new field, so no protocol version
+bump is required.
+
 **VERSION_LIST payload:**
 
 | Field         | Type   |
@@ -510,11 +554,11 @@ The receiver must verify `SHA-256(data) == chunk_hash` and treat a mismatch as a
 
 **VERSION_RESTORE payload:**
 
-| Field         | Type      |
-|---------------|-----------|
-| session_token | bytes[32] |
-| version_id    | uint64    |
-| virtual_path  | string    |
+| Field         | Type      | Notes |
+|---------------|-----------|-------|
+| session_token | bytes[32] | |
+| version_id    | uint64    | |
+| virtual_path  | string    | Not used for resolution or authorization — the server resolves entirely from `version_id`'s own `file_id`. Shape-validated (`vw_path_validate`) when non-empty; **may be an empty string** (`TASK-214`) to mean "no meaningful path," e.g. addressing a shared item by `file_id`/`version_id` alone — see this section's own note above. |
 
 **VERSION_RESTORE_ACK payload:**
 
@@ -674,6 +718,8 @@ bytes/slot — matches this codebase's fixed-size-record convention):**
 | owner_id         | uint64    | Copied from the file's `owner_id` at grant time — the authority for the "can only grant up to your own permission level" rule below, and for quota resolution |
 | target_user_id   | uint64    | User-to-user grants only; 0 for public links |
 | link_token       | bytes[32] | Public links only; 256-bit CSPRNG (`vw_crypto_random`, same generator as cluster `auth_token`/session tokens). Zero for user grants. |
+| link_password_hash | bytes[32] | Public links only (`TASK-186`/187`). Argon2id output; all-zero = no password (this codebase's established convention for "reserved bytes, zero = not set," e.g. `vw_store.h`'s `vault_id`/`deleted_at`). **The Argon2id salt is not stored** — it is derived on demand as `HMAC-SHA256(key=link_token, "vw-link-pw-salt")[0:16]`, since `link_token` is already a unique, unpredictable 256-bit value per link; this fits the field into the share record's existing reserved-byte budget with no on-disk format/size change (see the "why no stored salt" note below) |
+| has_link_password | uint8    | Public links only; explicit flag rather than relying solely on the all-zero-hash sentinel, so a (cryptographically inconceivable but not worth reasoning about at 2 a.m.) genuine all-zero Argon2id output is never misread as "no password" |
 | share_type       | uint8     | 0 = user grant, 1 = public link |
 | permission       | uint8     | `vw_perm_t`: `VW_PERM_VIEW` (1, = list/stat/download) or `VW_PERM_EDIT` (2, = VIEW + create/modify/delete). Never `VW_PERM_NONE`/`VW_PERM_OWNER`. |
 | revoked          | uint8     | 1 = revoked. Rows are never hard-deleted — kept for audit trail, matching this project's soft-delete convention elsewhere (`TASK-090`) |
@@ -684,6 +730,30 @@ Two in-memory indexes are rebuilt on startup by scanning, matching every
 other table in this codebase: `file_id → [share_id...]` (permission checks)
 and `link_token → share_id` (O(1) `LINK_ACCESS` redemption, avoiding a linear
 scan over every link on every anonymous request).
+
+**Why the link password's Argon2id salt is derived, not stored
+(`TASK-186`, added 2026-08-26):** `vw_share_record_t` is a fixed 128-byte
+record with exactly 40 bytes of `_reserved` headroom, by design, so that
+fields like this can be added without changing the on-disk record size —
+growing the record would silently corrupt every existing `shares.dat`
+written before the change (`nslots = file_len / sizeof(record)` would
+compute the wrong slot count and misalign every read). A full
+Argon2id hash (32 bytes) plus a real salt (`VW_ARGON2_SALT_BYTES` = 16)
+would need 48 of those 40 bytes — doesn't fit. Rather than shrink the
+salt (which would need a second, bespoke Argon2id API distinct from the
+one real account passwords use) or grow the record (which would need a
+migration), the salt is derived on demand from data already in the
+record: `HMAC-SHA256(key=link_token, "vw-link-pw-salt")[0:16]`.
+`link_token` is already a unique, unpredictable 256-bit CSPRNG value
+per link, so it satisfies a salt's actual requirements (uniqueness,
+unpredictability — a salt has never needed to be *secret*; it sits
+right next to the hash in every conventional password-storage scheme).
+The HMAC step, not raw truncation of `link_token` itself, keeps the
+bearer-capability value and the KDF input cryptographically distinct
+constructions even though they're derived from the same underlying
+secret, for review hygiene. `vw_crypto_argon2id_hash`/`_verify` are used
+completely unmodified — no new hashing/comparison code, only a
+salt-derivation step ahead of the existing calls.
 
 **SHARE_GRANT payload:**
 
@@ -713,7 +783,15 @@ resolvable in a non-owner viewer's own namespace anyway; this field is
 display-only.
 
 **LINK_CREATE payload:** `session_token[32]`, `file_id` (uint64), `permission`
-(uint8), `expires_at` (int64, 0 = never).
+(uint8), `expires_at` (int64, 0 = never), `password` (string, optional
+trailing field — `TASK-186`, empty or absent = no password; additive,
+no version bump, same precedent as `FILE_LIST`'s `dir_file_id`
+extension, `TASK-106`). Sent over the already-authenticated, already-TLS
+connection — not client-side hashed the way `AUTH_REQUEST`'s real
+account password is (§8.1): a link password isn't a user credential and
+doesn't need that zero-knowledge treatment. The server hashes it
+(Argon2id, derived salt — see the share-record note above) and never
+stores or logs the plaintext.
 
 **LINK_CREATE_ACK payload:** `error_code` (uint32), `share_id` (uint64),
 `link_token[32]`. The raw token is returned **exactly once**, at creation —
@@ -727,16 +805,20 @@ must revoke and re-create the link.
 links).
 
 **LINK_LIST_RESP payload:** `count` (uint32), then `count` repetitions of
-`{share_id, file_id, name, permission, created_at, expires_at, revoked}` —
-**never** the raw `link_token` (same "never re-disclose a secret token"
-rule as CLUSTER_STATUS_RESP omitting `auth_token`, §7.9). `name` is the
-same display-only leaf name as `SHARE_LIST_RESP` (see its note above).
+`{share_id, file_id, name, permission, created_at, expires_at, revoked,
+has_password}` — **never** the raw `link_token`, and never the password
+or its hash (same "never re-disclose a secret token" rule as
+CLUSTER_STATUS_RESP omitting `auth_token`, §7.9). `has_password`
+(uint8, trailing field, `TASK-186`) lets the owner's own UI show which
+of their links are password-protected. `name` is the same display-only
+leaf name as `SHARE_LIST_RESP` (see its note above).
 
 **LINK_ACCESS payload (unauthenticated — sent before AUTH_REQUEST):**
 
 | Field      | Type      | Notes |
 |------------|-----------|-------|
 | link_token | bytes[32] | The token from `LINK_CREATE_ACK` |
+| password   | string    | Optional trailing field (`TASK-186`) — length-prefixed, empty or absent if the caller has none to offer. The server's existing strict `plen != 32` payload-length check becomes `plen < 32`, so a caller sending exactly 32 bytes (no password) behaves byte-for-byte as before. |
 
 On success: same shape and semantics as `INVITE_REDEEM_ACK` — the server
 establishes a session immediately. Except this session is **scoped** (see
@@ -746,6 +828,25 @@ was redeemed. On failure (unknown / expired / revoked token): `AUTH_FAIL`
 with the same generic error code used for bad credentials — a client must
 not be able to distinguish "token never existed" from "token was revoked"
 (enumeration resistance, same rationale as `NODE_HELLO_FAIL`, §7.9).
+
+**Password check ordering (`TASK-186`/`187`):** the token lookup
+(unknown/expired/revoked, all collapsed to the same generic failure
+above) happens first, exactly as before this feature existed — a caller
+gets no distinguishable signal about whether a password would have
+mattered for a token that's already dead. Only once a *live* token is
+found does the server check `has_link_password`: unset → proceed exactly
+as before (any submitted password is ignored, even if the caller sent
+one). Set and no password submitted → `VW_ERR_LINK_PASSWORD_REQUIRED`.
+Set and wrong password → `VW_ERR_LINK_PASSWORD_WRONG`. Both are new,
+distinguishable codes (§10.1) — unlike the token-validity checks, this
+step does not need to hide "protected" vs "not protected" from the
+caller, since knowing a link needs a password is not itself a
+meaningful enumeration primitive (the caller already possesses the
+token, which is the actual secret; the password is a second factor on
+top of it, not instead of it). Every `LINK_ACCESS` outcome — including a
+wrong-password rejection — still runs through the existing per-IP
+`vw_share_link_access_is_blocked`/`_record_failure` rate limiter
+(5 failures/60s, unchanged); no second lockout mechanism was added.
 
 **LINK_ACCESS_ACK payload:** Same as `AUTH_OK`, with `user_id = 0` and
 `is_admin = 0` signaling an anonymous scoped session; `quota_bytes`/
@@ -781,7 +882,7 @@ rule above referenced `permission_needed_for_this_op` without defining it):**
 
 | Operation | Required permission | Notes |
 |-----------|---------------------|-------|
-| `FILE_LIST`, `FILE_STAT`, `CHUNK_DOWNLOAD_REQ`, `VERSION_LIST`, `VERSION_CHUNKS` | `VW_PERM_VIEW` | Read-only ops |
+| `FILE_LIST`, `FILE_STAT`, `CHUNK_DOWNLOAD_REQ`, `VERSION_LIST`, `VERSION_CHUNKS`, `SEARCH` | `VW_PERM_VIEW` | Read-only ops. `SEARCH` (`TASK-196`/`197`) additionally requires a non-scoped session — see §7.12 |
 | `CHUNK_UPLOAD`, `FILE_COMMIT` (modifying an existing file) | `VW_PERM_EDIT` on the file | |
 | `FILE_COMMIT` (creating a new file under a shared folder) | `VW_PERM_EDIT` on the **parent folder** | The new file's `owner_id` is set to the **folder's** `owner_id` (matches the quota-resolution rule below) — the creator does not become the owner of a file it creates inside someone else's shared folder |
 | `FILE_DELETE` | `VW_PERM_EDIT` on the file | Public/grant EDIT includes delete, matching common product conventions (Dropbox/Drive-style "editor" access) |
@@ -1554,6 +1655,165 @@ surprise.
 
 ---
 
+## 7.12 Filename Search (TASK-196/197)
+
+Server-side substring search over filenames, scoped to exactly what the
+caller can already see via `FILE_LIST`/`effective_permission()` — owned
+files and folders, plus anything shared with them (grant-based; a
+`LINK_ACCESS`-redeemed scoped session cannot search, see below).
+Filename/leaf-name matching only, never content: vault contents are
+opaque ciphertext to the server by design (§7.11), and non-vault content
+search would need an index this flat-file store doesn't have. Neither is
+in scope for this feature.
+
+**Implementation note**: the server has no `owner_id`-indexed enumeration
+of "every file this user owns" — file lookup is either by exact path
+(owner-namespaced) or by one directory level at a time (`FILE_LIST`).
+Rather than a recursive per-directory walk mirroring the client's own
+sync-engine BFS, `SEARCH` is implemented as a single linear scan over the
+entire file table, calling the already-reviewed `effective_permission()`
+per record (the same function every other file operation's access check
+already goes through — no new permission logic). This is the same
+accepted complexity tradeoff already on record for `vw_share_scan`
+("O(total shares) scan per call — acceptable at Phase-8 scale, candidate
+follow-up if this becomes a hot path"): fine at this project's
+personal-scale target, and a real, disclosed limitation rather than a
+hidden one if the file count ever grows large enough to matter.
+
+| Opcode | Message      | Direction | Purpose |
+|--------|--------------|-----------|---------|
+| 0x0901 | SEARCH       | C → S     | Search filenames across everything the caller can see |
+| 0x0902 | SEARCH_RESP  | S → C     | Matching entries |
+
+**SEARCH payload:**
+
+| Field         | Type   | Notes |
+|---------------|--------|-------|
+| session_token | bytes[32] | Must be a real, non-scoped session — same restriction §7.5 already places on `SHARE_GRANT`/`LINK_CREATE`. A `LINK_ACCESS`-redeemed anonymous session gets `VW_ERR_PERMISSION`: it already sees only the one subtree it was scoped to, directly browsable via `FILE_LIST`, so "search everything visible" adds nothing for it and isn't worth a second permission model to reason about. |
+| query         | string | Case-insensitive substring match against each candidate's leaf name (`vw_file_record_t.name`), not the full path. Empty query is valid (matches everything the caller can see, subject to the cap below) — the client's own UI is expected to debounce/gate this, not the server. Rejected with `VW_ERR_INVALID_ARG` (before any table scan) if longer than 256 bytes. |
+
+**SEARCH_RESP payload:**
+
+| Field     | Type   | Notes |
+|-----------|--------|-------|
+| error_code | uint32 | `VW_OK`, `VW_ERR_AUTH_REQUIRED` (no session), `VW_ERR_PERMISSION` (scoped session), or `VW_ERR_INVALID_ARG` (oversized query) |
+| count      | uint32 | 0 if error_code != 0 |
+| truncated  | uint8  | 1 = more matches existed than `count` — the cap below was hit. Not an error; the client should suggest narrowing the query. |
+| *count* × entry | — | see below |
+
+Each entry: `file_id` (uint64), `name` (string — leaf name, display-only,
+same convention `SHARE_LIST_RESP`/`LINK_LIST_RESP` already use for their
+own `name` field), `is_dir` (uint8), `size_bytes` (uint64), `mtime_unix`
+(int64), `vault_id` (uint64, 0 = unencrypted or unknown — same convention
+as `FILE_LIST_RESP`'s per-entry `vault_id`, `TASK-158`), `is_shared`
+(uint8, 1 = the caller sees this via a grant rather than owning it —
+`effective_permission() != VW_PERM_OWNER`).
+
+**No virtual path in either direction.** An owned match's path is
+reconstructable by the caller via repeated `FILE_STAT_BY_ID`/parent
+lookups if truly needed; a shared match has no meaningful path in the
+caller's own namespace at all (the same reason `FILE_LIST`'s
+`dir_file_id` extension, `TASK-106`, addresses shared content by
+`file_id` rather than path) — fabricating one would mean either guessing
+at the owner's directory structure above the shared root (never shown to
+the grantee) or inventing something that isn't real. `file_id` already
+round-trips through every existing file-id-addressed operation
+(`TASK-095`/`106`), which is enough for a client to act on a result
+(open it, list its parent via `dir_file_id`, etc.).
+
+**Result cap**: 200 entries per call. No pagination — checked
+`docs/PROTOCOL.md` (this document) for an existing cursor convention to
+reuse before designing one; there isn't one anywhere in this protocol.
+Every other multi-entry response (`FILE_LIST_RESP`, `SHARE_LIST_RESP`,
+`LINK_LIST_RESP`) returns its whole result set in one response with a
+hard entry cap instead (`FILE_LIST`'s BFS caps at 65535). `SEARCH`
+follows that actual existing convention rather than introducing
+pagination as a new paradigm this protocol has never used — the
+`truncated` flag above is the entire mechanism for "there were more."
+
+**Security**: a match on a file the caller cannot see must never be
+observable in any form — not in the result set, not in `count`, not in
+`truncated`, not in response timing (same SEC-ADV posture recorded early
+in this project for the original chunk endpoints). Achieved structurally,
+not by a special case: the scan evaluates `effective_permission()` for
+*every* candidate record and only ever appends a match the caller has at
+least `VW_PERM_VIEW` on — an invisible file is filtered before it's ever
+compared against the query, the same as it would be if it simply didn't
+exist in the scan at all.
+
+---
+
+## 7.13 Notification Preferences (TASK-206)
+
+Per-user, opt-in email alert preferences (`TASK-205`'s design) for the four
+user-facing categories: `share_received`, `quota_warning`, `new_login`,
+`account_security_change`. Operates **only on the calling session's own
+account** — there is no `user_id` parameter anywhere in either message, and
+no `VW_PERM_*`/admin-capability concept applies. Same trust bar as an
+authenticated session changing its own password: any real, non-scoped
+session may read or write its own preferences, full stop.
+
+Admin-category alert configuration (`replica_lag`, `acme_renewal_failure`,
+`disk_capacity`, `lockout_spike`, `crash_recovery`) is **not** part of this
+wire protocol at all — per `TASK-205`'s design, those are
+`vapourwaultd.conf`-only operator settings, read at startup, with no live
+socket/wire toggle in v1.
+
+| Opcode | Message              | Direction | Purpose |
+|--------|----------------------|-----------|---------|
+| 0x0A01 | NOTIFY_PREFS_GET      | C → S     | Fetch the caller's own notification preference bitmask |
+| 0x0A02 | NOTIFY_PREFS_GET_RESP | S → C     | Current bitmask |
+| 0x0A03 | NOTIFY_PREFS_SET      | C → S     | Replace the caller's own notification preference bitmask |
+| 0x0A04 | NOTIFY_PREFS_SET_ACK  | S → C     | New bitmask, echoed back for confirmation |
+
+**Category bit assignments** (`uint32`, one bit per category, extensible —
+same "leave room to grow" spirit as the 2FA provider interface; bits 4–31
+reserved for future categories):
+
+| Bit    | Value  | Category                  |
+|--------|--------|----------------------------|
+| 0      | 0x0001 | `share_received`           |
+| 1      | 0x0002 | `quota_warning`             |
+| 2      | 0x0004 | `new_login`                 |
+| 3      | 0x0008 | `account_security_change`   |
+
+Default value for a new account (no `NOTIFY_PREFS_SET` ever sent): `0`
+(every category off) — per `TASK-205`'s hard "default off everywhere"
+requirement.
+
+**NOTIFY_PREFS_GET payload:**
+
+| Field         | Type      | Notes |
+|---------------|-----------|-------|
+| session_token | bytes[32] | Must be a real, non-scoped session. |
+
+**NOTIFY_PREFS_GET_RESP payload:**
+
+| Field       | Type   | Notes |
+|-------------|--------|-------|
+| error_code  | uint32 | `VW_OK`, `VW_ERR_AUTH_REQUIRED` (no session), or `VW_ERR_PERMISSION` (a `LINK_ACCESS`-redeemed scoped session — it has no "own account" preferences to fetch, same restriction §7.12 already places on `SEARCH`) |
+| prefs_bitmask | uint32 | 0 if error_code != 0 |
+
+**NOTIFY_PREFS_SET payload:**
+
+| Field         | Type      | Notes |
+|---------------|-----------|-------|
+| session_token | bytes[32] | Must be a real, non-scoped session. |
+| prefs_bitmask | uint32    | The caller's **complete new** preference bitmask — this replaces the stored value, it does not toggle one bit. A client that wants to flip a single category must `NOTIFY_PREFS_GET` first, flip the one bit locally, and send the full result back; this keeps the wire message itself stateless and trivial rather than inventing a second "set one bit" shape. Any bit outside the currently-defined range above (bits 4–31) is rejected with `VW_ERR_INVALID_ARG` rather than silently accepted-and-stored — consistent with this project's existing fail-loud-on-unrecognized-input posture (e.g. the CA-store `VW_ERR_INVALID_ARG` decision, `ARCHITECTURE.md`'s Architectural Decisions table) rather than the alternative of forward-compatibly storing bits a future version might define; revisit this rejection rule the day a real second wave of categories ships, since a mixed-version client/daemon pair would otherwise be unable to round-trip an unknown-to-it bit it didn't set itself. |
+
+**NOTIFY_PREFS_SET_ACK payload:**
+
+| Field       | Type   | Notes |
+|-------------|--------|-------|
+| error_code  | uint32 | `VW_OK`, `VW_ERR_AUTH_REQUIRED`, `VW_ERR_PERMISSION` (scoped session), or `VW_ERR_INVALID_ARG` (reserved bit set) |
+| prefs_bitmask | uint32 | The stored value after this call — identical to the request's value on `VW_OK`, unchanged-from-before on any error. Echoed back (rather than leaving the client to assume its own request applied) so a client never has to issue a follow-up `GET` just to confirm what it just set. |
+
+**Storage**: a new `notify_prefs` `uint32` field on the user record
+(`vw_user_record_t`/`vw_store`), same precedent as the existing
+`otp_enabled` flag — see `TASK-207`.
+
+---
+
 ## 8. Authentication Design
 
 ### 8.1 Password transport
@@ -1634,6 +1894,8 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 | 604  | `VW_ERR_DIR_NOT_EMPTY`       | File transfer  | Directory delete: non-empty directory        |
 | 605  | `VW_ERR_RATE_LIMITED`        | File transfer  | Scoped-session write-count rate limit exceeded (§7.5, `TASK-094`) |
 | 606  | `VW_ERR_READ_ONLY_REPLICA`   | File transfer  | Write-shaped request rejected: this server is a cluster replica (`TASK-179`) |
+| 607  | `VW_ERR_LINK_PASSWORD_REQUIRED` | File transfer | `LINK_ACCESS` against a password-protected link with no password supplied (`TASK-186`) |
+| 608  | `VW_ERR_LINK_PASSWORD_WRONG`  | File transfer | `LINK_ACCESS` against a password-protected link with an incorrect password (`TASK-186`) |
 | 700  | `VW_ERR_IPC_NOT_RUNNING`     | IPC            | Daemon not listening on its IPC port (client-daemon transport only; never sent over `vw/1`) |
 | 800  | `VW_ERR_SYNC_TREE_TOO_LARGE` | Client-local   | Shared-folder BFS exceeded the client's resource ceiling for one sync cycle (`TASK-111`); never sent over the wire, daemon-internal/IPC only |
 | 801  | `VW_ERR_READ_ONLY_FALLBACK`  | Client-local   | Daemon rejected a write-shaped IPC request because this account is currently on its read-only fallback server (`TASK-173`); never sent over the wire, IPC-response only |
@@ -1672,6 +1934,10 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 25      | 2026-08-27 | PRT.04  | Shared-file version history (§7.3), resolving `TASK-214` — **corrects `TASK-182`'s own filed assumption** that `VERSION_RESTORE` resolves by path server-side the same owner-namespaced way `FILE_STAT` does; reading `handle_version_restore` in full found it already resolves `version_id → file_id` and requires `VW_PERM_EDIT` via `effective_permission()`, never using `virtual_path` for anything but shape validation. `VERSION_LIST` was already fully correct too (`file_id` + `VW_PERM_VIEW`). The one real, small gap: `virtual_path` was a *mandatory* non-empty field even though unused — now may be an empty string, meaning "no meaningful path, resolve by `version_id`/`file_id` alone" (a grantee's own case). A caller supplying a real path is completely unaffected; this is a pure server-side permissive relaxation (a previously-always-rejected zero-length string is now accepted), not a new field — no protocol version bump required. The server-side relaxation itself was small enough to land directly in `TASK-214` rather than a separate SRV.01 follow-up; filed the remaining CLI.02 follow-up (`TASK-223`) for the client-core/daemon-IPC/CLI/GUI work needed to actually reach it. |
+| 24      | 2026-08-26 | PRT.04  | Notification preferences (§7.13), resolving `TASK-206`: new `NOTIFY_PREFS_GET`/`_GET_RESP`/`SET`/`_SET_ACK` (0x0A01–0x0A04). Account-scoped only (no `user_id` field, no `VW_PERM_*` concept — same trust bar as a session changing its own password), covering the four user-facing alert categories from `TASK-205`'s design (`share_received`/`quota_warning`/`new_login`/`account_security_change`) as bits 0–3 of a `uint32` bitmask, bits 4–31 reserved. `SET` replaces the whole bitmask rather than toggling one bit, and rejects any reserved bit with `VW_ERR_INVALID_ARG`. Admin-category alerts (`replica_lag` etc.) are deliberately **not** part of this wire protocol — `vapourwaultd.conf`-only per `TASK-205`. Entirely new message pair-of-pairs, no existing byte layout changed; no protocol version bump required. |
+| 23      | 2026-08-26 | PRT.04  | Filename search (§7.12), resolving `TASK-197`: new `SEARCH`/`SEARCH_RESP` (0x0901/0x0902). Server-side, scoped to `effective_permission()`'s existing visibility rule; no scoped-session support; no pagination (a 200-entry cap + `truncated` flag instead — checked this document for a cursor convention to reuse first and found none exist anywhere in it, correcting `TASK-196`'s design assumption that one did). Entirely new message pair, no existing byte layout changed; no protocol version bump required. |
+| 22      | 2026-08-26 | PRT.04  | Public link password protection (§7.5), resolving `TASK-186`: `LINK_CREATE` gains an optional trailing `password` field; `LINK_ACCESS` gains an optional trailing `password` field (its previous strict `plen != 32` check becomes `plen < 32`); `LINK_LIST_RESP` gains a trailing `has_password` boolean; two new error codes `VW_ERR_LINK_PASSWORD_REQUIRED`/`_WRONG` (607/608, §10.1). The share record's Argon2id password hash is stored in previously-`_reserved` bytes with no record-size change (its salt is derived from `link_token` rather than stored, to fit — see the share-record note in §7.5); brute-force mitigation reuses the existing `LINK_ACCESS` per-IP rate limiter rather than adding a new one. Purely additive; no protocol version bump required (this table tracks spec-revision count, not wire version, per revision 16's own clarifying note below). **Note, corrected 2026-08-26**: an earlier version of this task's own design mistakenly also proposed adding `expires_at` to `LINK_CREATE` — that field already existed and was already enforced (`vw_share.c:505`) before this revision; nothing here touches expiration. |
 | 21      | 2026-08-17 | SRV.01  | New error code `VW_ERR_READ_ONLY_REPLICA` (606, §10.1), resolving `TASK-179`: `vw_server_dispatch_file_op`'s single dispatch choke point now rejects every write-shaped message with this code when the server is configured as a cluster replica, before the corresponding handler runs — closes the gap `ARCHITECTURE.md`'s "Client-side automatic fallback" decision flagged, where read-only was previously enforced only by the daemon's own good behavior (`TASK-173`). Purely additive (a new error code, no existing message's byte layout changed); no protocol version bump required. Also backfills this table with two pre-existing but previously undocumented codes (`VW_ERR_IPC_NOT_RUNNING` = 700, `VW_ERR_READ_ONLY_FALLBACK` = 801) found missing while adding this row. |
 | 20      | 2026-08-14 | PRT.04  | Hot-standby data replication (§7.7) published, resolving `TASK-169`/`170`: eight new cluster-channel messages (`CLUSTER_FILE_SYNC_LIST`/`_LIST_RESP`/`_FETCH`/`_DATA`, `CLUSTER_CHUNK_QUERY`/`_QUERY_RESP`/`_FETCH`/`_DATA`, `0x0708`–`0x070F`) let a replica fetch and apply the actual record each oplog entry points to — previously a replica only replicated the bare-ID oplog notification stream itself (see §7.7's own note on `vw_oplog_op_t` payloads), giving it an audit trail but no independently queryable copy of the primary's data. §7.9 (cluster channel security model) extended with this exchange's integrity/reachability guarantees and an amended "what this does NOT protect against" entry (a compromised replica now also receives password hashes/2FA secrets and full file content, not just the oplog). Cluster-channel-only (`vw-cluster/1` ALPN, never the client-facing `vw/1` listener) — no existing client-facing message's byte layout changed, no protocol version bump required. Backfilled into this table by `SRV.01` (`TASK-179`, 2026-08-17) after being found missing — the §7.7/§7.9 prose was already present in this document, but this revision's own Version History row was not. |
 | 19      | 2026-08-12 | PRT.04  | `FILE_LIST_RESP` (§7.2) gains a second trailing `count * uint64 vault_id` parallel array, appended after revision 16's `version_id` array, resolving `TASK-156`. **Reverses revision 14's explicit decision** not to add this field, on the strength of concrete evidence that decision's own reasoning didn't hold up in practice: revision 14 argued populating per-entry `vault_id` for a whole listing "would mean one version lookup per entry" and that callers wanting this should `FILE_STAT` each entry of interest instead — but both real consumers that have since needed exactly this (the native GUI's `refresh_vault_badges`, capped at 200 lookups specifically *because* a real network round-trip per file is far more expensive than the in-process version lookup this array now does instead; the web gateway's folder-level-only workaround, `TASK-141`) prove the "just `FILE_STAT` it" alternative was actually costlier than the one-lookup-per-entry cost it was avoiding — doing that same lookup server-side, in-process, during the already-in-flight `FILE_LIST` call turns out to be cheaper than the escape hatch recommended instead of it. Same trailing-parallel-array technique as revision 16, for the same reason: an old client's decode loop stops after `version_id`'s array (or after the fixed-size entries, if even older) and never touches these new trailing bytes; a new client checks the payload is long enough before reading it, gated on `version_id`'s own array having been read successfully first. No protocol version bump required, matching every other purely-additive extension in this document. Directories and files with no current version encode `0` without any lookup; anything else costs exactly one `vw_store_version_get` call, the same cost `FILE_STAT` (revision 14) already pays for a single entry. |

@@ -1,6 +1,6 @@
 ---
 id:          TASK-142
-title:       Packaging + deployment docs for the web gateway and nginx frontend
+title:       "Packaging + deployment docs for the web gateway and nginx frontend"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

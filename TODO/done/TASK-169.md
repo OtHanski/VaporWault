@@ -1,6 +1,6 @@
 ---
 id:          TASK-169
-title:       ARCH.00 design: opt-in automatic client fallback to a replica
+title:       "ARCH.00 design: opt-in automatic client fallback to a replica"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

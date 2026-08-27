@@ -1,6 +1,6 @@
 ---
 id:          TASK-133
-title:       Implement gateway file endpoints (list/stat/mkdir/move/delete, chunk upload/download, versions)
+title:       "Implement gateway file endpoints (list/stat/mkdir/move/delete, chunk upload/download, versions)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

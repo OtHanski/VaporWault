@@ -1,6 +1,6 @@
 ---
 id:          TASK-134
-title:       Implement gateway sharing endpoints (grants, public links)
+title:       "Implement gateway sharing endpoints (grants, public links)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

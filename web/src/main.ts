@@ -8,6 +8,7 @@ import {
   login,
   loginWithOtp,
   logout,
+  linkAccess,
   getAccounts,
   setActiveSlot,
   getActiveSlot,
@@ -31,11 +32,15 @@ import {
   vaultList,
   uploadFileEncrypted,
   downloadFileEncrypted,
+  search,
+  getNotifyPrefs,
+  setNotifyPrefs,
   type FileEntry,
   type VersionEntry,
   type ShareEntry,
   type LinkEntry,
   type AccountSlot,
+  type SearchEntry,
 } from "./api.js";
 
 // ── Element lookups ─────────────────────────────────────────────────────────
@@ -47,6 +52,13 @@ function el<T extends HTMLElement>(id: string): T {
 }
 
 const loginView = el<HTMLElement>("login-view");
+const linkView = el<HTMLElement>("link-view");
+const linkAccessForm = el<HTMLFormElement>("link-access-form");
+const linkAccessStatus = el<HTMLElement>("link-access-status");
+const linkAccessPasswordField = el<HTMLElement>("link-access-password-field");
+const linkAccessPasswordInput = el<HTMLInputElement>("link-access-password");
+const linkAccessSubmitBtn = el<HTMLButtonElement>("link-access-submit-btn");
+const linkAccessError = el<HTMLElement>("link-access-error");
 const browserView = el<HTMLElement>("browser-view");
 const loginForm = el<HTMLFormElement>("login-form");
 const usernameInput = el<HTMLInputElement>("login-username");
@@ -66,6 +78,9 @@ const uploadBtn = el<HTMLButtonElement>("upload-btn");
 const uploadInput = el<HTMLInputElement>("upload-input");
 const transferList = el<HTMLUListElement>("transfer-list");
 const vaultCreateBtn = el<HTMLButtonElement>("vault-create-btn");
+const searchInput = el<HTMLInputElement>("search-input");
+const searchClearBtn = el<HTMLButtonElement>("search-clear-btn");
+const searchStatus = el<HTMLElement>("search-status");
 const vaultBanner = el<HTMLElement>("vault-banner");
 const vaultBannerText = el<HTMLElement>("vault-banner-text");
 const vaultUnlockBtn = el<HTMLButtonElement>("vault-unlock-btn");
@@ -77,6 +92,12 @@ const historyBackBtn = el<HTMLButtonElement>("history-back-btn");
 const versionTableBody = el<HTMLTableSectionElement>("version-table-body");
 const historyError = el<HTMLElement>("history-error");
 
+const settingsBtn = el<HTMLButtonElement>("settings-btn");
+const settingsView = el<HTMLElement>("settings-view");
+const settingsBackBtn = el<HTMLButtonElement>("settings-back-btn");
+const notifyPrefsList = el<HTMLElement>("notify-prefs-list");
+const settingsError = el<HTMLElement>("settings-error");
+
 const shareView = el<HTMLElement>("share-view");
 const shareFileLabel = el<HTMLElement>("share-file-label");
 const shareBackBtn = el<HTMLButtonElement>("share-back-btn");
@@ -85,6 +106,10 @@ const sharePermissionSelect = el<HTMLSelectElement>("share-permission");
 const shareGrantBtn = el<HTMLButtonElement>("share-grant-btn");
 const shareTableBody = el<HTMLTableSectionElement>("share-table-body");
 const linkCreateBtn = el<HTMLButtonElement>("link-create-btn");
+const linkExpiryCheck = el<HTMLInputElement>("link-expiry-check");
+const linkExpiryDays = el<HTMLInputElement>("link-expiry-days");
+const linkPasswordCheck = el<HTMLInputElement>("link-password-check");
+const linkPasswordInput = el<HTMLInputElement>("link-password");
 const linkNewTokenBox = el<HTMLElement>("link-new-token");
 const linkNewTokenInput = el<HTMLInputElement>("link-new-token-input");
 const linkCopyBtn = el<HTMLButtonElement>("link-copy-btn");
@@ -199,6 +224,7 @@ function showLoginView(opts: { cancelable: boolean }): void {
   browserView.hidden = true;
   historyView.hidden = true;
   shareView.hidden = true;
+  settingsView.hidden = true;
   loginView.hidden = false;
   usernameInput.focus();
 }
@@ -326,8 +352,10 @@ async function enterBrowserView(): Promise<void> {
   // looking at either would leave TWO sections visible at once, since
   // neither of those views' own "Back" buttons run here to hide
   // themselves.
+  linkView.hidden = true;
   historyView.hidden = true;
   shareView.hidden = true;
+  settingsView.hidden = true;
   renderAccountSwitcher();
   currentPath = "/";
   await refreshFileList();
@@ -356,6 +384,11 @@ function joinPath(base: string, name: string): string {
 
 async function refreshFileList(): Promise<void> {
   clearError(browserError);
+  // Any real "list this directory" action (folder click, up-navigation,
+  // mkdir's own refresh, initial load) implicitly leaves search mode -
+  // otherwise the search box could keep showing stale text/results while
+  // the table underneath silently became a normal directory listing.
+  clearSearchState();
   currentPathLabel.textContent = currentPath;
 
   const result = await listFiles(currentPath, false);
@@ -648,6 +681,130 @@ function renderFileRow(entry: FileEntry): HTMLTableRowElement {
     void handleDelete(entry);
   });
   actionsCell.appendChild(deleteBtn);
+  row.appendChild(actionsCell);
+
+  return row;
+}
+
+// ── Search (TASK-198/199/201; docs/PROTOCOL.md §7.12) ───────────────────
+//
+// Debounced client-side (fires performSearch() only after typing pauses,
+// not per keystroke) - there's no separate "async vs sync" concern here
+// the way TASK-200's GUI correction had to work through: every fetch()
+// call in this file is already async/non-blocking by the nature of the
+// browser event loop, so debouncing is purely about not spamming the
+// gateway with one request per character.
+//
+// Results reuse file-table-body directly rather than a second table -
+// same "shown in place of the normal directory listing" shape as
+// TASK-200's GUI version. Actions are deliberately narrower than a normal
+// directory row's: SEARCH_RESP carries no virtual path and no version_id
+// (see §7.12's own rationale), so only Share (file_id + name is all
+// enterShareView needs) is wired up here - Download/History/Rename/
+// Delete/folder-navigation would need either a path or a version_id this
+// response doesn't have, and adding a new round-trip just to resolve one
+// wasn't worth it for what search is actually for (finding a file, then
+// acting on it after navigating to its real location).
+const SEARCH_DEBOUNCE_MS = 350;
+let searchDebounceTimer: number | undefined;
+
+function clearSearchState(): void {
+  searchInput.value = "";
+  searchClearBtn.hidden = true;
+  clearError(searchStatus);
+  if (searchDebounceTimer !== undefined) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = undefined;
+  }
+}
+
+function showSearchStatus(message: string, isError: boolean): void {
+  searchStatus.textContent = message;
+  searchStatus.className = isError ? "error" : "note";
+  searchStatus.hidden = false;
+}
+
+searchInput.addEventListener("input", () => {
+  if (searchDebounceTimer !== undefined) window.clearTimeout(searchDebounceTimer);
+  const query = searchInput.value;
+  if (query === "") {
+    clearSearchState();
+    void refreshFileList();
+    return;
+  }
+  searchDebounceTimer = window.setTimeout(() => {
+    void performSearch(query);
+  }, SEARCH_DEBOUNCE_MS);
+});
+
+searchClearBtn.addEventListener("click", () => {
+  clearSearchState();
+  void refreshFileList();
+});
+
+async function performSearch(query: string): Promise<void> {
+  clearError(browserError);
+  searchClearBtn.hidden = false;
+  clearError(searchStatus);
+
+  const result = await search(query);
+  if (!result.ok) {
+    fileTableBody.replaceChildren();
+    showSearchStatus(`Search failed: ${result.data.status ?? "error"}`, true);
+    return;
+  }
+
+  renderSearchTable(result.data.results);
+  if (result.data.results.length === 0) {
+    showSearchStatus("No matches.", false);
+  } else if (result.data.truncated) {
+    showSearchStatus("More matches exist than shown - narrow your search.", false);
+  }
+}
+
+function renderSearchTable(entries: SearchEntry[]): void {
+  fileTableBody.replaceChildren();
+  const sorted = [...entries].sort((a, b) => {
+    if (a.is_dir !== b.is_dir) return b.is_dir - a.is_dir; // folders first
+    return a.name.localeCompare(b.name);
+  });
+  for (const entry of sorted) {
+    fileTableBody.appendChild(renderSearchRow(entry));
+  }
+}
+
+function renderSearchRow(entry: SearchEntry): HTMLTableRowElement {
+  const row = document.createElement("tr");
+  const isDir = entry.is_dir !== 0;
+
+  const nameCell = document.createElement("td");
+  // textContent, never innerHTML - same XSS-safety rule as renderFileRow:
+  // a search result can be a file someone else named, shared with this
+  // account, and must never be interpreted as markup.
+  const nameSpan = document.createElement("span");
+  const lockPrefix = !isDir && entry.vault_id !== 0 ? "\u{1F512} " : "";
+  const sharedSuffix = entry.is_shared !== 0 ? " (shared)" : "";
+  nameSpan.textContent =
+    lockPrefix + (isDir ? "\u{1F4C1} " : "\u{1F4C4} ") + entry.name + sharedSuffix;
+  nameCell.appendChild(nameSpan);
+  row.appendChild(nameCell);
+
+  const sizeCell = document.createElement("td");
+  sizeCell.textContent = isDir ? "-" : formatSize(entry.size_bytes);
+  row.appendChild(sizeCell);
+
+  const mtimeCell = document.createElement("td");
+  mtimeCell.textContent = isDir ? "-" : formatMtime(entry.mtime_unix);
+  row.appendChild(mtimeCell);
+
+  const actionsCell = document.createElement("td");
+  const shareBtn = document.createElement("button");
+  shareBtn.textContent = "Share";
+  shareBtn.className = "row-action";
+  shareBtn.addEventListener("click", () => {
+    void enterShareView(entry);
+  });
+  actionsCell.appendChild(shareBtn);
   row.appendChild(actionsCell);
 
   return row;
@@ -951,7 +1108,9 @@ function permissionLabel(p: number): string {
   }
 }
 
-async function enterShareView(entry: FileEntry): Promise<void> {
+// Only file_id/name are ever read here - narrowed (rather than FileEntry)
+// so a SearchEntry (TASK-201, no virtual path) can open this view too.
+async function enterShareView(entry: { file_id: number; name: string }): Promise<void> {
   shareFileId = entry.file_id;
   shareFileLabel.textContent = entry.name;
   browserView.hidden = true;
@@ -967,6 +1126,97 @@ shareBackBtn.addEventListener("click", () => {
   linkNewTokenInput.value = "";
   linkNewTokenBox.hidden = true;
 });
+
+// ── Settings view: notification preferences (TASK-206/207/211) ─────────────
+// Thin passthrough on the gateway (docs/PROTOCOL.md §7.13) - the bit
+// table below mirrors vapourwault-cli's NOTIFY_CATEGORIES[] and the
+// desktop GUI's own copy (TASK-209/210) exactly, so all three surfaces
+// describe the same four categories identically.
+const NOTIFY_CATEGORIES: { name: string; bit: number; label: string; desc: string }[] = [
+  { name: "share_received", bit: 0x0001, label: "Someone shares something with me",
+    desc: "A grant or link naming you was created" },
+  { name: "quota_warning", bit: 0x0002, label: "My storage usage crosses 90% of quota",
+    desc: "Re-arms once usage drops back under the threshold" },
+  { name: "new_login", bit: 0x0004, label: "A new login succeeds on my account",
+    desc: "Never fires for a normal reconnect" },
+  { name: "account_security_change", bit: 0x0008, label: "My password or 2FA setting changes",
+    desc: "Password change or 2FA enable/disable" },
+];
+
+async function enterSettingsView(): Promise<void> {
+  browserView.hidden = true;
+  settingsView.hidden = false;
+  await refreshNotifyPrefs();
+}
+
+settingsBtn.addEventListener("click", () => { void enterSettingsView(); });
+
+settingsBackBtn.addEventListener("click", () => {
+  settingsView.hidden = true;
+  browserView.hidden = false;
+});
+
+async function refreshNotifyPrefs(): Promise<void> {
+  clearError(settingsError);
+  const result = await getNotifyPrefs();
+  if (!result.ok) {
+    showError(settingsError, `Could not load notification preferences: ${result.data.status ?? "error"}`);
+    return;
+  }
+  renderNotifyPrefs(result.data.prefs);
+}
+
+function renderNotifyPrefs(prefs: number): void {
+  notifyPrefsList.replaceChildren();
+  for (const cat of NOTIFY_CATEGORIES) {
+    const label = document.createElement("label");
+    label.className = "checkbox-field";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = (prefs & cat.bit) !== 0;
+    checkbox.addEventListener("change", () => { void toggleNotifyCategory(cat, checkbox); });
+
+    const text = document.createElement("span");
+    text.textContent = cat.label;
+
+    const note = document.createElement("span");
+    note.className = "note";
+    note.textContent = `(${cat.desc})`;
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+    label.appendChild(note);
+    notifyPrefsList.appendChild(label);
+  }
+}
+
+async function toggleNotifyCategory(
+  cat: { name: string; bit: number },
+  checkbox: HTMLInputElement,
+): Promise<void> {
+  clearError(settingsError);
+  // Read-modify-write against the server's current value, not the
+  // locally-displayed one - the same pattern vapourwault-cli's `notify
+  // set` and the desktop GUI's settings panel both use (§7.13's own
+  // documented "SET replaces the complete bitmask" contract).
+  const current = await getNotifyPrefs();
+  if (!current.ok) {
+    showError(settingsError, `Could not load current preferences: ${current.data.status ?? "error"}`);
+    checkbox.checked = !checkbox.checked; // revert the optimistic toggle
+    return;
+  }
+  const requested = checkbox.checked ? (current.data.prefs | cat.bit) : (current.data.prefs & ~cat.bit);
+  const result = await setNotifyPrefs(requested);
+  if (!result.ok) {
+    showError(settingsError, `Could not update notification setting: ${result.data.status ?? "error"}`);
+    checkbox.checked = !checkbox.checked;
+    return;
+  }
+  // Re-render from the ACK's echoed value, never assumed - mirrors the
+  // desktop GUI's own "never assume the write applied" handling.
+  renderNotifyPrefs(result.data.prefs);
+}
 
 async function refreshShareLists(): Promise<void> {
   clearError(shareError);
@@ -1068,6 +1318,10 @@ function renderLinkRow(l: LinkEntry): HTMLTableRowElement {
   permCell.textContent = permissionLabel(l.permission);
   row.appendChild(permCell);
 
+  const passwordCell = document.createElement("td");
+  passwordCell.textContent = l.has_password ? "Yes" : "No";
+  row.appendChild(passwordCell);
+
   const statusCell = document.createElement("td");
   statusCell.textContent = l.revoked ? "Revoked" : "Active";
   row.appendChild(statusCell);
@@ -1096,13 +1350,34 @@ async function handleRevokeLink(shareId: number): Promise<void> {
   await refreshShareLists();
 }
 
+linkExpiryCheck.addEventListener("change", () => {
+  linkExpiryDays.disabled = !linkExpiryCheck.checked;
+});
+linkPasswordCheck.addEventListener("change", () => {
+  linkPasswordInput.disabled = !linkPasswordCheck.checked;
+  if (!linkPasswordCheck.checked) linkPasswordInput.value = "";
+});
+
 linkCreateBtn.addEventListener("click", () => {
   void handleCreateLink();
 });
 
 async function handleCreateLink(): Promise<void> {
   const permission = Number(sharePermissionSelect.value);
-  const result = await createLink(shareFileId, permission);
+  // expiresAt (TASK-190): the gateway API already accepted this
+  // parameter (`api.ts`'s createLink) before this task — the form
+  // itself never surfaced a way to set it. password is new end-to-end
+  // (TASK-186-190).
+  const expiresAt = linkExpiryCheck.checked
+    ? Math.floor(Date.now() / 1000) + Number(linkExpiryDays.value || "1") * 86400
+    : 0;
+  const password = linkPasswordCheck.checked ? linkPasswordInput.value : "";
+  const result = await createLink(shareFileId, permission, expiresAt, password);
+  // Never let a typed password linger in the DOM longer than the request
+  // that used it, success or failure.
+  linkPasswordInput.value = "";
+  linkPasswordCheck.checked = false;
+  linkPasswordInput.disabled = true;
   if (!result.ok) {
     showError(shareError, `Could not create link: ${result.data.status ?? "error"}`);
     return;
@@ -1133,6 +1408,121 @@ currentPathLabel.addEventListener("click", () => {
   void refreshFileList();
 });
 
+// ── Public link redemption (TASK-134/186; frontend: TASK-216) ────────────
+//
+// URL shape: a query parameter (?link=<64-hex-char token>), not a path
+// segment - nginx serves this frontend as a static, SPA-less page with no
+// server-side routing at all (CLAUDE.md's WEB.09 constraint: "nginx ...
+// reverse-proxies /api/* ... [this frontend needs] no server-side
+// routing change"). A query parameter needs none either; a path segment
+// would need nginx to rewrite unknown paths back to index.html, which
+// isn't configured today. The token is stripped from the URL immediately
+// (history.replaceState, before any redemption attempt) purely as
+// hygiene - once used it doesn't need to keep sitting in the address bar
+// or browser history, though the link itself is still just as usable
+// again from a fresh copy of the original URL.
+//
+// The password is NEVER put in the URL, ever - only the token, in a
+// query param; a password (when the link needs one) is collected only
+// via this view's own password field and sent as a POST body, same as
+// every other password in this frontend (TASK-190's create-link form
+// already established this same rule for the other direction).
+//
+// Product decision on VIEW vs EDIT scope, recorded here per TASK-216's
+// own note that this needed one rather than being assumed: once
+// redemption succeeds, the browser view is reused COMPLETELY UNCHANGED,
+// with no client-side hiding or graying-out of actions based on the
+// link's permission level. This matches how this frontend already
+// treats an ordinary VIEW-only share grant everywhere else - there is no
+// existing precedent anywhere in this codebase for a client-side
+// permission-shaped UI, only server-side enforcement with a clean error
+// message on an action the caller's effective_permission() doesn't
+// allow (e.g. handleDelete's showError path). Introducing client-side
+// scoping just for link sessions specifically would be a new, one-off
+// pattern rather than consistency with the rest of the app. Recorded in
+// ARCHITECTURE.md's Decision Log alongside this note.
+
+function getLinkTokenFromUrl(): string | null {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("link");
+  if (!token) return null;
+  params.delete("link");
+  const rest = params.toString();
+  const newUrl = window.location.pathname + (rest ? `?${rest}` : "") + window.location.hash;
+  window.history.replaceState(null, "", newUrl);
+  return token;
+}
+
+let pendingLinkToken: string | null = null;
+
+function showLinkView(): void {
+  loginView.hidden = true;
+  browserView.hidden = true;
+  linkView.hidden = false;
+}
+
+async function attemptLinkAccess(token: string, password: string): Promise<void> {
+  clearError(linkAccessError);
+  linkAccessStatus.textContent = "Opening shared link...";
+  linkAccessSubmitBtn.hidden = true;
+
+  // Captured before the call, not assumed from array position afterward:
+  // this call never passes its own `slot` option, so the gateway picks
+  // whichever slot resolve_login_slot considers "next free" - not
+  // necessarily the highest-numbered one if a lower slot was freed by an
+  // earlier logout, which would make "last element of the accounts
+  // array" (if it happens to be sorted by slot number) the wrong guess.
+  // Diffing the before/after slot sets is correct regardless of gaps or
+  // sort order.
+  const slotsBefore = new Set(accounts.map((a) => a.slot));
+  const result = await linkAccess(token, password ? { password } : {});
+  if (result.ok) {
+    pendingLinkToken = null;
+    await refreshAccounts();
+    const added = accounts.find((a) => !slotsBefore.has(a.slot));
+    if (added) {
+      setActiveSlot(added.slot);
+      saveLastSlot(added.slot);
+    }
+    linkView.hidden = true;
+    await enterBrowserView();
+    return;
+  }
+
+  if (result.data.status === "link_password_required") {
+    linkAccessStatus.textContent = "This link requires a password.";
+    linkAccessPasswordField.hidden = false;
+    linkAccessSubmitBtn.hidden = false;
+    linkAccessPasswordInput.focus();
+    return;
+  }
+  if (result.data.status === "link_password_wrong") {
+    linkAccessStatus.textContent = "This link requires a password.";
+    linkAccessPasswordField.hidden = false;
+    linkAccessSubmitBtn.hidden = false;
+    linkAccessPasswordInput.value = "";
+    linkAccessPasswordInput.focus();
+    showError(linkAccessError, "Wrong password.");
+    return;
+  }
+  if (result.data.status === "no_free_slot") {
+    // Distinct from "the link itself is bad" - this browser already has
+    // every account slot occupied. Not the link's fault, so not worded
+    // as if it were.
+    linkAccessStatus.textContent = "Too many accounts are already open in this browser.";
+    showError(linkAccessError, "Log out of one first, then reopen this link.");
+    return;
+  }
+  linkAccessStatus.textContent = "This link could not be opened.";
+  showError(linkAccessError, "It may be invalid, expired, or revoked.");
+}
+
+linkAccessForm.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  if (!pendingLinkToken) return;
+  void attemptLinkAccess(pendingLinkToken, linkAccessPasswordInput.value);
+});
+
 // ── Bootstrap (TASK-166) ─────────────────────────────────────────────────
 //
 // index.html's own default markup shows login-view and hides
@@ -1146,6 +1536,14 @@ currentPathLabel.addEventListener("click", () => {
 // than a 401 when nothing is live, so this is safe to call
 // unconditionally before the user has done anything.
 async function init(): Promise<void> {
+  const linkToken = getLinkTokenFromUrl();
+  if (linkToken) {
+    pendingLinkToken = linkToken;
+    showLinkView();
+    await attemptLinkAccess(linkToken, "");
+    return;
+  }
+
   await refreshAccounts();
   if (accounts.length === 0) return;
 

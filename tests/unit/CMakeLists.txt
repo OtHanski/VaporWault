@@ -146,6 +146,18 @@ if(TARGET vw_server_lib)
     )
     target_link_libraries(test_vw_vault PRIVATE vw_server_lib)
     add_test(NAME unit_vw_vault COMMAND test_vw_vault)
+
+    add_executable(test_vw_notify
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_notify.c
+    )
+    target_include_directories(test_vw_notify PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/core
+        ${CMAKE_SOURCE_DIR}/src/server
+        ${CMAKE_SOURCE_DIR}/src/client
+        ${CMAKE_SOURCE_DIR}/tests/unit
+    )
+    target_link_libraries(test_vw_notify PRIVATE vw_server_lib)
+    add_test(NAME unit_vw_notify COMMAND test_vw_notify)
 endif()
 
 # test_vw_gc: compiled directly (no vw_server_lib) so VW_OPLOG_SEGMENT_MAX
@@ -157,6 +169,8 @@ add_executable(test_vw_gc
     ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
 )
 
 target_compile_definitions(test_vw_gc PRIVATE
@@ -286,6 +300,7 @@ add_executable(test_vw_file_handlers
     ${CMAKE_SOURCE_DIR}/src/server/vw_conn_registry.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_vault.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
 )
 target_compile_definitions(test_vw_file_handlers PRIVATE VW_FILE_HANDLERS_TEST_HOOKS)
 target_include_directories(test_vw_file_handlers PRIVATE

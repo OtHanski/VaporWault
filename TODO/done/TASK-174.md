@@ -1,6 +1,6 @@
 ---
 id:          TASK-174
-title:       vapourwault-cli: --fallback-* flags on account add/list
+title:       "vapourwault-cli, --fallback-* flags on account add/list"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

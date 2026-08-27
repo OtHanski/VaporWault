@@ -214,7 +214,7 @@ VW_TEST_SUITE("vw_share") {
             uint8_t  token[32];
             uint64_t share_id = 0;
             VW_ASSERT_OK(vw_share_link_create(s.ss, folder, owner, VW_PERM_VIEW, 0,
-                                               token, &share_id));
+                                               NULL, 0, token, &share_id));
 
             vw_share_record_t rec;
             VW_ASSERT_OK(vw_share_get_by_token(s.ss, token, &rec));
@@ -246,6 +246,31 @@ VW_TEST_SUITE("vw_share") {
             memset(bogus, 0xAB, sizeof(bogus));
             vw_share_record_t rec;
             VW_ASSERT_ERR(vw_share_get_by_token(s.ss, bogus, &rec), VW_ERR_NOT_FOUND);
+        }
+        stack_close(&s);
+    }
+
+    /* TASK-191: filed after noticing this codebase's existing test suite
+     * covers expired-GRANT rejection (above) but never a link with the
+     * same property, even though both share types are gated by the exact
+     * same vw_share_get_by_token check (vw_share.c:505) — worth closing
+     * for real rather than just asserting it must be fine because the
+     * code path is shared. */
+    VW_TEST_CASE("link: expired link no longer resolves by token") {
+        share_stack_t s = {0};
+        stack_open(&s, "link_expired");
+        {
+            uint64_t owner = 100;
+            uint64_t file = make_entry(&s, owner, 0, "doc.txt", VW_ENTRY_FILE);
+
+            uint8_t  token[32];
+            uint64_t share_id = 0;
+            /* expires_at in the past. */
+            VW_ASSERT_OK(vw_share_link_create(s.ss, file, owner, VW_PERM_VIEW, 1,
+                                               NULL, 0, token, &share_id));
+
+            vw_share_record_t rec;
+            VW_ASSERT_ERR(vw_share_get_by_token(s.ss, token, &rec), VW_ERR_NOT_FOUND);
         }
         stack_close(&s);
     }

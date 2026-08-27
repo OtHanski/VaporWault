@@ -1,6 +1,6 @@
 ---
 id:          TASK-003
-title:       Implement vw_crypto module
+title:       "Implement vw_crypto module"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

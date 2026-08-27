@@ -1,6 +1,6 @@
 ---
 id:          TASK-079
-title:       Add lockout window-reset/expiry test coverage (no time-mocking infra)
+title:       "Add lockout window-reset/expiry test coverage (no time-mocking infra)"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

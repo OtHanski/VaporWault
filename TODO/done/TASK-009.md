@@ -1,6 +1,6 @@
 ---
 id:          TASK-009
-title:       Implement vw_auth — Argon2id hashing, sessions, 2FA orchestration
+title:       "Implement vw_auth — Argon2id hashing, sessions, 2FA orchestration"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

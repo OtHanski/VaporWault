@@ -1,0 +1,174 @@
+---
+id:          TASK-213
+title:       "Integration tests: email alert system"
+status:      done
+assignee:    QA.06
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  [TASK-206, TASK-207, TASK-208, TASK-209, TASK-210, TASK-211, TASK-212]
+blocks:      []
+review_by:   [CQR.08]
+tags:        [test]
+---
+
+Every SEC.07 finding on `TASK-207`/`208`/`211` needs a regression test
+here, per standing QA.06 policy. A test double/mock SMTP endpoint
+(matching whatever pattern the existing 2FA-OTP/recovery-email tests
+already use to avoid sending real mail in CI) should back all of this.
+
+## Work
+
+- **Default-off regression**: with every preference/config bool at its
+  default, trigger every single category's underlying condition and
+  confirm zero email is sent.
+- **Each user category**, individually opted in: fires exactly once per
+  real trigger; `new_login` does not fire on `SESSION_RESUME`;
+  `quota_warning` re-arms correctly after dropping back under threshold.
+- **Each admin category**, individually enabled: fires under a real
+  simulated condition (lagging replica, failed ACME renewal, disk near
+  capacity, lockout-rate spike, dirty-shutdown crash recovery); a
+  category left disabled never fires even when its condition is true.
+- **Misconfiguration**: a `notify.*` category enabled with no
+  `notify.admin_email` set fails server startup, not a silent no-op.
+- **Content safety**: no email body produced by any category ever
+  contains a password, session token, or OTP (grep the actual sent
+  bodies in the test, not just code inspection).
+- End-to-end through desktop GUI/CLI (`TASK-209`/`210`) and through the
+  gateway/frontend (`TASK-211`), not just the raw wire protocol.
+
+## Acceptance criteria
+
+- All of the above pass against freshly-built binaries.
+- Sign-off note added here before `TASK-205`'s milestone is closable.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+QA.06 [2026-08-27]: Implemented.
+
+- New `tests/integration/mock_smtp.py`: a real, from-scratch minimal
+  plaintext SMTP server (`socketserver.ThreadingTCPServer`), matching
+  this task's own instruction for "a test double SMTP endpoint" — no
+  such thing existed anywhere in this repo before (checked; there is
+  also no existing 2FA-OTP/recovery-email test pattern to match, since
+  none of those flows have ever been integration-tested with a real
+  email either — see the significant discovery below). Speaks just
+  enough real SMTP (greeting, EHLO, MAIL FROM, RCPT TO, DATA with
+  dot-stuffing, QUIT) for `vw_smtp.c`'s actual client to deliver a real
+  message over a real TCP connection; captures the full raw envelope +
+  headers + body of every delivered message.
+- `tests/integration/conftest.py`: added an `extra` param to
+  `_write_server_conf` and `extra_conf` to `ServerInstance.__init__`
+  (both new, optional, defaulting to `""`/unchanged — every existing
+  caller keeps working) so a test can point `smtp_host`/`notify.*` at
+  the mock server. Confirmed `smtp_tls_mode = none` +
+  `smtp_verify_cert = 0` is required together (the latter defaults to 1
+  regardless of TLS mode, and `vw_smtp_validate_cfg` requires a
+  `ca_cert_path` whenever it's 1) — the mock server deliberately never
+  implements STARTTLS/TLS at all, by design, to stay minimal.
+- New `tests/integration/test_notify_alerts.py`, 9 real end-to-end
+  tests, all driving the actual compiled `vapourwaultd`/
+  `vapourwault-daemon`/`vapourwault-cli` binaries: default-off
+  (share_received + new_login triggered for real, zero email);
+  `share_received` (fires once, correct recipient/content); `new_login`
+  (a real `SESSION_RESUME` reconnect cycle over 3s genuinely does not
+  fire it; a real second login does); `quota_warning` (a real 9.5KB
+  upload against a 10KB quota crosses 90%, re-arms after deletion syncs
+  down, fires again on a second real crossing); content safety (a real
+  secret literal grepped out of every actually-sent raw message across
+  4 categories × 2 accounts); `disk_capacity` (real `statvfs`/
+  `GetDiskFreeSpaceEx`, threshold=1% guarantees a real crossing without
+  filling/mocking disk); `lockout_spike` (two real accounts genuinely
+  locked out via 6 real wrong-password attempts each, matching
+  `test_auth.py::test_brute_force_lockout`'s own constant);
+  disabled-category-never-fires; and the fail-loud `--check-config`
+  misconfiguration check (formalizing `TASK-208`'s own manually-verified
+  behavior into a real automated test, closing that task's disclosed
+  gap). Re-ran the full file 3× consecutively (27/27) to rule out
+  timing-sensitive flakiness before considering any of it settled.
+
+**Significant discovery, filed as `TASK-222` rather than worked around
+in product code**: while trying to give a test user a real email
+address, found — by checking every account-creation/-modification wire
+path rather than assuming one existed — that **none exists anywhere in
+this codebase**. `USER_CREATE_REQ` and `INVITE_REDEEM` both omit an
+email field entirely; `USER_MODIFY` is a reserved opcode with no handler
+(the same gap `TASK-219` found independently for 2FA). Since
+`vw_notify.c`'s `notify_send_if_enabled` short-circuits on an empty
+email, **this means the already-shipped password-recovery feature
+(`TASK-046`) and this entire email-alert system are unreachable for
+every real account in this system today** — not a hypothetical, the
+only two ways to create an account both skip this field. Filed
+`TASK-222` (`priority: high`, unlike `TASK-219`'s `low` — this breaks a
+shipped feature, not just blocks a deferred one) rather than adding an
+ad hoc wire message unilaterally. For this file's own testing purposes
+only, `_set_user_email_raw()` patches `users.dat` directly while the
+server is stopped (matching `vw_store.h`'s documented on-disk layout
+exactly) — clearly commented as a test-only technique standing in for a
+missing product capability, never a product code change.
+
+**Four things intentionally not covered here, disclosed rather than
+silently skipped** (see the test file's own module docstring for the
+full reasoning on each): `account_security_change`'s real trigger
+(needs `AUTH_RECOVER_REQUEST`/`CONFIRM` support `vw_client.py` has never
+had — no existing test anywhere exercises password recovery at all);
+`crash_recovery`'s real trigger (forcing a genuinely-unconfirmed oplog
+tail from outside the process is either a real timing race — flaky by
+the same standard this project's own tests consistently avoid — or
+fragile hand-forged raw oplog bytes; `test_admin_disabled_category_never_fires`
+still does a real `SIGKILL` + restart, just doesn't depend on the crash
+actually being detected); `replica_lag` (needs cluster+SMTP plumbing
+neither `test_cluster.py`'s fixtures nor this file have); and
+`acme_renewal_failure` (no ACME test double exists anywhere in this
+project). All four remain unit-covered only
+(`tests/unit/test_vw_notify.c`, `TASK-207`/`208`'s own 81+ assertions).
+End-to-end-via-gateway is satisfied by composition with `TASK-211`'s own
+`test_gateway.py` tests rather than a redundant second full
+email-delivery harness — see the module docstring for the exact
+reasoning.
+
+**Testing**: `tests/integration/test_notify_alerts.py` 9/9, re-run 3×
+consecutively, 27/27. Full non-cluster suite re-run after these changes:
+124 passed, 15 deselected — no regression from the `conftest.py`
+extension.
+
+Moving to `review`.
+
+CQR.08 [2026-08-27]: Reviewed for code quality, consistency, and honesty
+of the disclosed gaps.
+
+- `mock_smtp.py` is a genuinely minimal, correct implementation — spot
+  checked the dot-stuffing removal (`if dline.startswith(b"..")`) against
+  RFC 5321's transparency rule and it's correct; the header/body split on
+  the first blank line matches RFC 5322.
+- The `_write_server_conf`/`ServerInstance` extension is non-breaking
+  (new trailing optional params, default preserves old behavior) —
+  confirmed by the full suite re-run showing zero regressions across
+  every other file that constructs a `ServerInstance`.
+- `_set_user_email_raw`'s byte offsets (8/64/128) were checked against
+  `vw_store.h`'s actual `vw_user_record_t` field declarations and its
+  `_Static_assert(sizeof(...) == 256, ...)` — correct, and the function's
+  own docstring is upfront that this is a test-only stand-in for a real
+  gap, not something to mistake for sanctioned product-level access.
+- The `TASK-222` discovery is a strong, well-verified find — the note
+  cites the exact wire messages checked (`USER_CREATE_REQ`,
+  `INVITE_REDEEM`, `USER_MODIFY`) rather than a vague "couldn't find a
+  way," and correctly recognizes the severity (breaks a *shipped*
+  feature) rather than filing it at the same low priority as its closest
+  sibling finding (`TASK-219`) out of convenience.
+- The four disclosed gaps (`account_security_change`, `crash_recovery`,
+  `replica_lag`, `acme_renewal_failure`) are each given a specific,
+  checkable reason, not a generic "out of scope" — and each is backed by
+  real unit-level coverage rather than left completely unverified.
+- `max_workers=4` on the one test needing 3 concurrent daemon connections
+  correctly cites `test_cli_search.py`'s own prior fix for the identical
+  problem rather than guessing at a number.
+- The 3× consecutive full-file re-run to rule out timing flakiness before
+  calling any of this settled matches this project's own established
+  discipline for exactly this class of test (real timing-based
+  assertions across live processes).
+- No blocking findings. Approved.
+
+Moving to `done`.

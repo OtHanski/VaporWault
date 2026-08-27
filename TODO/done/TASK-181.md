@@ -1,6 +1,6 @@
 ---
 id:          TASK-181
-title:       Server - replica-side chunk refcount under-counts a chunk referenced by more than one synced version
+title:       "Server - replica-side chunk refcount under-counts a chunk referenced by more than one synced version"
 status:      done
 assignee:    SRV.01
 created_by:  SEC.07

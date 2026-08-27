@@ -1,6 +1,6 @@
 ---
 id:          TASK-149
-title:       Linux .deb packages for server & client (CPack DEB + maintainer scripts)
+title:       "Linux .deb packages for server & client (CPack DEB + maintainer scripts)"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

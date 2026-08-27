@@ -1,6 +1,6 @@
 ---
 id:          TASK-121
-title:       Add a timestamp to oplog entries so the audit log can be filtered by date/time
+title:       "Add a timestamp to oplog entries so the audit log can be filtered by date/time"
 status:      done
 assignee:    PRT.04
 created_by:  GUI.03

@@ -1,6 +1,6 @@
 ---
 id:          TASK-147
-title:       Windows server MSI (WiX ServiceInstall + firewall rule)
+title:       "Windows server MSI (WiX ServiceInstall + firewall rule)"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

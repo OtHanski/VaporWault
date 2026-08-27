@@ -1197,6 +1197,28 @@ vw_err_t vw_store_file_scan_deleted(vw_file_store_t *fs,
     return VW_OK;
 }
 
+vw_err_t vw_store_file_scan_all(vw_file_store_t *fs,
+                                 int (*cb)(const vw_file_record_t *, void *),
+                                 void *userdata)
+{
+    if (!fs || !cb) return VW_ERR_INVALID_ARG;
+
+    rwlock_rdlock(&fs->files_lock);
+
+    uint64_t s;
+    for (s = 1; s < fs->file_slots; s++) {
+        vw_file_record_t rec;
+        uint64_t off = s * (uint64_t)sizeof(vw_file_record_t);
+        if (fs_pread(fs->meta_path, &rec, sizeof(rec), off) != 0) continue;
+        if (rec.file_id == 0 || rec.deleted) continue;
+
+        if (cb(&rec, userdata) != 0) break;
+    }
+
+    rwlock_rdunlock(&fs->files_lock);
+    return VW_OK;
+}
+
 vw_err_t vw_store_file_hard_delete(vw_file_store_t *fs, uint64_t file_id)
 {
     if (!fs || file_id == 0) return VW_ERR_INVALID_ARG;

@@ -1,6 +1,6 @@
 ---
 id:          TASK-160
-title:       Design multi-account support (local clients + web gateway remember-me/multi-session)
+title:       "Design multi-account support (local clients + web gateway remember-me/multi-session)"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

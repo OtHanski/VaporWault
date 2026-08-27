@@ -1,5 +1,6 @@
 #include "vw_daemon.h"
 #include "../core/vw_proto.h"
+#include "vw_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,7 @@ static void print_usage(const char *prog) {
             "\n"
             "  --daemon          Daemonize (Linux only; Windows: foreground)\n"
             "  --state-dir <dir> Override default state directory\n"
+            "  --version         Print version and exit\n"
             "\n"
             "Default state dir:\n"
 #ifdef _WIN32
@@ -62,6 +64,9 @@ int main(int argc, char *argv[]) {
             daemon_mode = 1;
         } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {
             snprintf(state_dir, sizeof(state_dir), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("vapourwault-daemon %s\n", VW_VERSION_STRING);
+            return 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;

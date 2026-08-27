@@ -1,6 +1,6 @@
 ---
 id:          TASK-023
-title:       Implement vw_storage_files — chunk store, dedup ref-counting, version GC
+title:       "Implement vw_storage_files — chunk store, dedup ref-counting, version GC"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

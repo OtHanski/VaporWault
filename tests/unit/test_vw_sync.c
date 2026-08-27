@@ -153,6 +153,31 @@ static void stack_close(sync_stack_t *s) {
     rm_rf(s->tmpdir);
 }
 
+/* Like stack_open, but also registers a "/"-rooted owned sync folder at
+ * s->tmpdir — for vw_sync_mark_local_modified tests, which need a real
+ * registered folder to map a local_path into a virtual_path at all. */
+static void mark_stack_setup(sync_stack_t *s, const char *label) {
+    stack_open(s, label);
+    vw_sync_folder_t folder;
+    memset(&folder, 0, sizeof(folder));
+    snprintf(folder.local_root, sizeof(folder.local_root), "%s", s->tmpdir);
+    snprintf(folder.virtual_root, sizeof(folder.virtual_root), "/");
+    VW_ASSERT_OK(vw_cache_folder_add(s->cache, &folder));
+}
+
+/* Write `content` to a real file at `path` — for vw_sync_mark_local_modified
+ * tests below, which stat the real file (get_mtime/get_fsize), unlike every
+ * other scenario in this file (chosen so no real filesystem I/O was ever
+ * needed). */
+static int write_test_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t len = strlen(content);
+    size_t written = fwrite(content, 1, len, f);
+    fclose(f);
+    return written == len ? 0 : -1;
+}
+
 /* Seed a SYNCED cache entry with the given local/server metadata. */
 static void seed_synced(vw_cache_t *cache, const char *vpath, const char *lpath,
                          int64_t local_mtime, uint64_t local_size,
@@ -227,6 +252,47 @@ VW_TEST_CASE("under_root: trailing slash on root is normalized away") {
 
 VW_TEST_CASE("under_root: backslash separator recognized (Windows paths)") {
     VW_ASSERT(under_root("C:\\a\\b\\file.txt", "C:\\a\\b"));
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * vw_sync_glob_match() — selective-sync exclude patterns (TASK-192/193)
+ * ══════════════════════════════════════════════════════════════════════ */
+VW_TEST_CASE("glob: exact literal match") {
+    VW_ASSERT(vw_sync_glob_match("notes.txt", "notes.txt"));
+    VW_ASSERT(!vw_sync_glob_match("notes.txt", "notes.tx"));
+}
+
+VW_TEST_CASE("glob: '*' matches within one segment only") {
+    VW_ASSERT(vw_sync_glob_match("*.tmp", "build.tmp"));
+    VW_ASSERT(!vw_sync_glob_match("*.tmp", "sub/build.tmp"));
+}
+
+VW_TEST_CASE("glob: '?' matches exactly one character") {
+    VW_ASSERT(vw_sync_glob_match("a?c", "abc"));
+    VW_ASSERT(!vw_sync_glob_match("a?c", "ac"));
+    VW_ASSERT(!vw_sync_glob_match("a?c", "abbc"));
+}
+
+VW_TEST_CASE("glob: literal segment must match exactly, no cross-segment leakage") {
+    VW_ASSERT(!vw_sync_glob_match("photos", "photos/vacation"));
+    VW_ASSERT(!vw_sync_glob_match("photos/vacation", "photos"));
+}
+
+VW_TEST_CASE("glob: '**' matches the directory itself and everything under it") {
+    VW_ASSERT(vw_sync_glob_match("node_modules/**", "node_modules"));
+    VW_ASSERT(vw_sync_glob_match("node_modules/**", "node_modules/x.js"));
+    VW_ASSERT(vw_sync_glob_match("node_modules/**", "node_modules/a/b/c.js"));
+    VW_ASSERT(!vw_sync_glob_match("node_modules/**", "other/node_modules/x.js"));
+}
+
+VW_TEST_CASE("glob: leading '**' matches at any depth") {
+    VW_ASSERT(vw_sync_glob_match("**/*.tmp", "build.tmp"));
+    VW_ASSERT(vw_sync_glob_match("**/*.tmp", "a/b/build.tmp"));
+    VW_ASSERT(!vw_sync_glob_match("**/*.tmp", "a/b/build.txt"));
+}
+
+VW_TEST_CASE("glob: no match across unrelated paths") {
+    VW_ASSERT(!vw_sync_glob_match("photos/*.raw", "docs/report.raw"));
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -472,7 +538,7 @@ VW_TEST_CASE("resolve_or_create_dir: fully offline (root never seeded) resolves 
 
     dirmap_t dm = {0}; /* root NOT pushed — simulates "never went online this cycle" */
     uint64_t out_id = 12345; /* poison value to prove it gets overwritten to 0 */
-    vw_err_t err = resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/a/b", &out_id);
+    vw_err_t err = resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/a/b", 1, &out_id);
 
     VW_ASSERT_OK(err);
     VW_ASSERT_EQ(out_id, 0u);
@@ -492,7 +558,7 @@ VW_TEST_CASE("resolve_or_create_dir: intermediate ancestors get memoized as unre
 
     dirmap_t dm = {0};
     uint64_t out_id = 0;
-    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/a/b", &out_id));
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/a/b", 1, &out_id));
 
     VW_ASSERT_EQ(dirmap_lookup(&dm, "/shared/a"),   VW_DIRMAP_UNRESOLVABLE);
     VW_ASSERT_EQ(dirmap_lookup(&dm, "/shared/a/b"), VW_DIRMAP_UNRESOLVABLE);
@@ -509,7 +575,7 @@ VW_TEST_CASE("resolve_or_create_dir: root already known resolves immediately") {
     VW_ASSERT_OK(dirmap_push(&dm, "/shared", 111));
 
     uint64_t out_id = 0;
-    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared", &out_id));
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared", 1, &out_id));
     VW_ASSERT_EQ(out_id, 111u);
 
     free(dm.arr);
@@ -525,7 +591,7 @@ VW_TEST_CASE("resolve_or_create_dir: already-known target short-circuits without
     VW_ASSERT_OK(dirmap_push(&dm, "/shared/sub", 222));
 
     uint64_t out_id = 0;
-    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/sub", &out_id));
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/sub", 1, &out_id));
     VW_ASSERT_EQ(out_id, 222u);
 
     free(dm.arr);
@@ -543,7 +609,7 @@ VW_TEST_CASE("resolve_or_create_dir: sentinel short-circuits without re-attempti
     VW_ASSERT_OK(dirmap_push(&dm, "/shared/x", VW_DIRMAP_UNRESOLVABLE));
 
     uint64_t out_id = 999; /* poison */
-    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/x", &out_id));
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/shared", "/shared/x", 1, &out_id));
     VW_ASSERT_EQ(out_id, 0u);
     VW_ASSERT_EQ(vw_sync_action_error_count(s.ctx), 0u);
     VW_ASSERT_EQ(vw_sync_permission_denied_count(s.ctx), 0u);
@@ -561,13 +627,237 @@ VW_TEST_CASE("resolve_or_create_dir: root-path-normalization fallback branch") {
      * must fall back to root_vpath rather than leaving an empty string. */
     dirmap_t dm = {0}; /* root not seeded -> still resolves to "offline" */
     uint64_t out_id = 0;
-    vw_err_t err = resolve_or_create_dir(s.ctx, NULL, &dm, "/", "/x", &out_id);
+    vw_err_t err = resolve_or_create_dir(s.ctx, NULL, &dm, "/", "/x", 1, &out_id);
 
     VW_ASSERT_OK(err);
     VW_ASSERT_EQ(out_id, 0u);
     VW_ASSERT_EQ(dirmap_lookup(&dm, "/x"), VW_DIRMAP_UNRESOLVABLE);
 
     free(dm.arr);
+    stack_close(&s);
+}
+
+/* ── TASK-218: resolve_or_create_dir(), shared=0 (owned folder) cases ─────
+ * Same sess=NULL discipline as the shared=1 cases above: every scenario
+ * here is chosen so the new owned-tree path-lookup branch is never
+ * actually reached (vw_client_file_stat would need a real sess) — either
+ * the "/" root fast path short-circuits first, or dm is pre-seeded. The
+ * genuinely-new-subdirectory case that DOES need a real vw_client_file_stat
+ * round trip is integration-level only (test_cli_selective_sync.py-style),
+ * deliberately, same rationale this file's own header already states for
+ * the mkdir-outcome classification above. */
+
+VW_TEST_CASE("resolve_or_create_dir: owned, \"/\"-rooted, file directly at root needs no lookup") {
+    sync_stack_t s;
+    stack_open(&s, "resolve_owned_root_slash");
+
+    /* An owned folder's own virtual_root == "/": 0 already legitimately
+     * means "server root" by FILE_MKDIR/FILE_LIST's own convention, for
+     * both the outer call (vpath == root_vpath == "/") and — the actual
+     * real-world caller shape, compute_actions computing a root-level
+     * file's own parent — asked for vpath == "/" too. Either way, no
+     * vw_client_file_stat call should ever be attempted (sess = NULL is
+     * exercised, not just tolerated). */
+    dirmap_t dm = {0};
+    uint64_t out_id = 999; /* poison */
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/", "/", 0, &out_id));
+    VW_ASSERT_EQ(out_id, 0u);
+    VW_ASSERT_EQ(vw_sync_action_error_count(s.ctx), 0u);
+
+    free(dm.arr);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("resolve_or_create_dir: owned, non-\"/\" root, already-known subdirectory short-circuits") {
+    sync_stack_t s;
+    stack_open(&s, "resolve_owned_known");
+
+    /* Owned folder rooted at "/notes" (not "/") — root and one
+     * subdirectory both pre-seeded, so this must resolve immediately via
+     * dm without ever attempting a path lookup. */
+    dirmap_t dm = {0};
+    VW_ASSERT_OK(dirmap_push(&dm, "/notes", 500));
+    VW_ASSERT_OK(dirmap_push(&dm, "/notes/sub", 600));
+
+    uint64_t out_id = 0;
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/notes", "/notes/sub", 0, &out_id));
+    VW_ASSERT_EQ(out_id, 600u);
+
+    free(dm.arr);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("resolve_or_create_dir: owned, sentinel short-circuits without attempting a path lookup") {
+    sync_stack_t s;
+    stack_open(&s, "resolve_owned_sentinel");
+
+    /* Pre-seeded as already-failed this cycle, WITHOUT seeding the root —
+     * if the sentinel check didn't short-circuit first (before the owned
+     * branch's path-lookup attempt), this would call vw_client_file_stat
+     * with sess = NULL. Must return immediately instead. */
+    dirmap_t dm = {0};
+    VW_ASSERT_OK(dirmap_push(&dm, "/notes/sub", VW_DIRMAP_UNRESOLVABLE));
+
+    uint64_t out_id = 999; /* poison */
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/notes", "/notes/sub", 0, &out_id));
+    VW_ASSERT_EQ(out_id, 0u);
+    VW_ASSERT_EQ(vw_sync_action_error_count(s.ctx), 0u);
+    VW_ASSERT_EQ(vw_sync_permission_denied_count(s.ctx), 0u);
+
+    free(dm.arr);
+    stack_close(&s);
+}
+
+VW_TEST_CASE("resolve_or_create_dir: owned, \"/\" root resolves to 0 without being marked unresolvable") {
+    sync_stack_t s;
+    stack_open(&s, "resolve_owned_root_not_unresolvable");
+
+    /* The precondition the fix in compute_actions's caller-side check
+     * relies on: resolving an owned "/"-rooted folder's own root must
+     * leave dm WITHOUT an UNRESOLVABLE marker for "/" — only that lets
+     * `dirmap_lookup(dm, parent_vpath) == VW_DIRMAP_UNRESOLVABLE` (the
+     * check that replaced "parent_id == 0", exactly because 0 is
+     * ambiguous between "legitimately root" and "failed") correctly
+     * treat a root-level file's resolved parent_id of 0 as SUCCESS, not
+     * failure. Before this fix, this same "/" case being folded into
+     * the *out_id == 0 catch-all path meant any caller checking
+     * "did resolving vpath fail" via a dm sentinel look would need
+     * exactly this guarantee — this test locks it in directly rather
+     * than only indirectly via a full create attempt (which would need
+     * a real sess). */
+    dirmap_t dm = {0};
+    uint64_t out_id = 999; /* poison */
+    VW_ASSERT_OK(resolve_or_create_dir(s.ctx, NULL, &dm, "/", "/", 0, &out_id));
+    VW_ASSERT_EQ(out_id, 0u);
+    VW_ASSERT_NE(dirmap_lookup(&dm, "/"), VW_DIRMAP_UNRESOLVABLE);
+
+    free(dm.arr);
+    stack_close(&s);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * vw_sync_mark_local_modified() — TASK-215/218: the filesystem-watcher
+ * event handler, a separate code path from compute_actions's own
+ * periodic-walk Pass 1 (which these tests never exercise).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+VW_TEST_CASE("vw_sync_mark_local_modified: new file creates a NEW_LOCAL entry with the real mtime/size") {
+    sync_stack_t s;
+    mark_stack_setup(&s, "mark_new");
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/file.txt", s.tmpdir);
+    VW_ASSERT_EQ(write_test_file(path, "hello"), 0);
+
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path));
+
+    vw_cache_entry_t ce;
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    VW_ASSERT_EQ((int)ce.sync_state, (int)VW_SYNC_NEW_LOCAL);
+    VW_ASSERT_EQ(ce.local_size, 5u);
+
+    stack_close(&s);
+}
+
+VW_TEST_CASE("vw_sync_mark_local_modified: unchanged file leaves a SYNCED entry untouched (TASK-215)") {
+    /* This is the actual bug: exec_action's ACT_DOWNLOAD synchronously
+     * sets a cache entry to SYNCED with the real post-download mtime/
+     * size right after downloading, but the filesystem watcher queues
+     * its own event for that same write and dispatches it moments later
+     * through this function — which used to unconditionally flip ANY
+     * existing entry to LOCAL_MOD, with no comparison against what was
+     * already cached, causing an immediate spurious re-upload of
+     * content that had just been downloaded (a duplicate version). */
+    sync_stack_t s;
+    mark_stack_setup(&s, "mark_unchanged");
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/file.txt", s.tmpdir);
+    VW_ASSERT_EQ(write_test_file(path, "hello"), 0);
+
+    /* First call establishes the entry with the file's real mtime/size
+     * (mirrors ACT_UPLOAD's own initial NEW_LOCAL discovery). */
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path));
+    vw_cache_entry_t ce;
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    ce.sync_state = VW_SYNC_SYNCED; /* simulate: upload/download completed */
+    VW_ASSERT_OK(vw_cache_upsert(s.cache, &ce));
+
+    /* Second call, same file, nothing changed — must NOT flip back to
+     * LOCAL_MOD (a self-triggered or duplicate watcher event). */
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path));
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    VW_ASSERT_EQ((int)ce.sync_state, (int)VW_SYNC_SYNCED);
+
+    stack_close(&s);
+}
+
+VW_TEST_CASE("vw_sync_mark_local_modified: genuinely changed file transitions SYNCED to LOCAL_MOD") {
+    sync_stack_t s;
+    mark_stack_setup(&s, "mark_changed");
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/file.txt", s.tmpdir);
+    VW_ASSERT_EQ(write_test_file(path, "hello"), 0);
+
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path));
+    vw_cache_entry_t ce;
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    ce.sync_state = VW_SYNC_SYNCED;
+    VW_ASSERT_OK(vw_cache_upsert(s.cache, &ce));
+
+    /* A real edit — different size is enough to trigger this regardless
+     * of the filesystem's mtime resolution. */
+    VW_ASSERT_EQ(write_test_file(path, "hello world, now quite a bit longer"), 0);
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path));
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    VW_ASSERT_EQ((int)ce.sync_state, (int)VW_SYNC_LOCAL_MOD);
+
+    stack_close(&s);
+}
+
+VW_TEST_CASE("vw_sync_mark_local_modified: an already-dirty entry is left alone") {
+    sync_stack_t s;
+    mark_stack_setup(&s, "mark_already_dirty");
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/file.txt", s.tmpdir);
+    VW_ASSERT_EQ(write_test_file(path, "hello"), 0);
+
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path)); /* -> NEW_LOCAL */
+    vw_cache_entry_t ce;
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    VW_ASSERT_EQ((int)ce.sync_state, (int)VW_SYNC_NEW_LOCAL);
+
+    /* A second watcher event for the same still-unchanged file (e.g. a
+     * duplicate inotify event for one logical write) must not disturb
+     * an already-dirty state — matches compute_actions's own Pass 1,
+     * which only ever transitions SYNCED/REMOTE_MOD, never NEW_LOCAL/
+     * LOCAL_MOD/CONFLICT. */
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, path));
+    VW_ASSERT_OK(vw_cache_get(s.cache, "/file.txt", &ce));
+    VW_ASSERT_EQ((int)ce.sync_state, (int)VW_SYNC_NEW_LOCAL);
+
+    stack_close(&s);
+}
+
+VW_TEST_CASE("vw_sync_mark_local_modified: a directory path creates no cache entry (TASK-218)") {
+    sync_stack_t s;
+    mark_stack_setup(&s, "mark_dir");
+
+    char dirpath[600];
+    snprintf(dirpath, sizeof(dirpath), "%s/subdir", s.tmpdir);
+#ifdef _WIN32
+    CreateDirectoryA(dirpath, NULL);
+#else
+    mkdir(dirpath, 0700);
+#endif
+
+    VW_ASSERT_OK(vw_sync_mark_local_modified(s.ctx, dirpath));
+
+    vw_cache_entry_t ce;
+    VW_ASSERT_ERR(vw_cache_get(s.cache, "/subdir", &ce), VW_ERR_NOT_FOUND);
+
     stack_close(&s);
 }
 

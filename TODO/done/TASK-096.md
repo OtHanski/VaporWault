@@ -1,6 +1,6 @@
 ---
 id:          TASK-096
-title:       Sharing UI (share/unshare, link management, permission indicators)
+title:       "Sharing UI (share/unshare, link management, permission indicators)"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

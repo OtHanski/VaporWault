@@ -1,6 +1,6 @@
 ---
 id:          TASK-098
-title:       Server-side vault storage (wrapped keys, opaque encrypted chunks)
+title:       "Server-side vault storage (wrapped keys, opaque encrypted chunks)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

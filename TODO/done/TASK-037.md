@@ -1,6 +1,6 @@
 ---
 id:          TASK-037
-title:       Fix CMake naming conflict — rename client daemon binary to vapourwault-daemon
+title:       "Fix CMake naming conflict — rename client daemon binary to vapourwault-daemon"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

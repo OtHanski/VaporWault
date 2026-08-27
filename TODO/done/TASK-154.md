@@ -1,6 +1,6 @@
 ---
 id:          TASK-154
-title:       Document installer packages in docs/RELEASE.md and docs/DEPLOYMENT.md
+title:       "Document installer packages in docs/RELEASE.md and docs/DEPLOYMENT.md"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

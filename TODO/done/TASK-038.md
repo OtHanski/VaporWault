@@ -1,6 +1,6 @@
 ---
 id:          TASK-038
-title:       Integration test suite — full server/client round-trips
+title:       "Integration test suite — full server/client round-trips"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

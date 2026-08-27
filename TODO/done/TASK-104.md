@@ -1,6 +1,6 @@
 ---
 id:          TASK-104
-title:       No wire message to create a directory (VW_ENTRY_DIR) — folders can only exist via ancestor auto-creation gaps
+title:       "No wire message to create a directory (VW_ENTRY_DIR) — folders can only exist via ancestor auto-creation gaps"
 status:      done
 assignee:    PRT.04
 created_by:  SRV.01

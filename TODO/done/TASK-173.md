@@ -1,6 +1,6 @@
 ---
 id:          TASK-173
-title:       Daemon: per-account read-only fallback to a replica
+title:       "Daemon - per-account read-only fallback to a replica"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

@@ -57,7 +57,17 @@ typedef struct {
     uint8_t  _pad_align[4];    /* reserved; aligns created_at to an 8-byte offset */
     int64_t  created_at;
     int64_t  expires_at;       /* 0 = never expires                            */
-    uint8_t  _reserved[40];
+    /* TASK-186: public links only. has_link_password==0 means
+     * link_password_hash is meaningless (and, per this codebase's
+     * reserved-bytes convention, actually all-zero — every record starts
+     * from a memset(0) and this field is only ever written together with
+     * has_link_password). No salt is stored — see docs/PROTOCOL.md §7.5's
+     * share-record note for why (derived from link_token via HMAC-SHA256,
+     * which already carries enough entropy/uniqueness that a stored salt
+     * would add nothing but 16 bytes this record doesn't have to spare). */
+    uint8_t  link_password_hash[32];
+    uint8_t  has_link_password;
+    uint8_t  _reserved[7];
 } vw_share_record_t;
 
 _Static_assert(sizeof(vw_share_record_t) == 128,
@@ -100,12 +110,31 @@ vw_err_t vw_share_grant_create(vw_share_store_t *ss,
  * Create a public link. out_link_token[32] receives the raw token — the
  * only time it is ever available in plaintext; the caller must relay it to
  * the client immediately (LINK_CREATE_ACK) and never persist or log it.
+ *
+ * password/password_len (TASK-186): optional — pass NULL/0 for no
+ * password. When non-empty, hashed (Argon2id, salt derived from the
+ * freshly-generated link_token) and stored; the raw password is never
+ * persisted or logged, matching every other password-handling path in
+ * this codebase.
  */
 vw_err_t vw_share_link_create(vw_share_store_t *ss,
                                uint64_t file_id, uint64_t owner_id,
                                vw_perm_t permission, int64_t expires_at,
+                               const void *password, size_t password_len,
                                uint8_t out_link_token[32],
                                uint64_t *out_share_id);
+
+/*
+ * Verify a candidate password against share's stored link password
+ * (derives the Argon2id salt from share->link_token — see the record's
+ * own doc comment). Returns:
+ *   VW_OK                          — no password set, or a correct one given
+ *   VW_ERR_LINK_PASSWORD_REQUIRED  — a password is set, none given
+ *   VW_ERR_LINK_PASSWORD_WRONG     — a password is set, given one is wrong
+ * password/password_len may be NULL/0 (treated as "none given").
+ */
+vw_err_t vw_share_link_verify_password(const vw_share_record_t *share,
+                                        const void *password, size_t password_len);
 
 /* Fetch by share_id. Returns VW_ERR_NOT_FOUND if absent (including a
  * revoked or expired row is still "found" — callers check revoked/expires_at

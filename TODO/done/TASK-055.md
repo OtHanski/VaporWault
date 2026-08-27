@@ -1,6 +1,6 @@
 ---
 id:          TASK-055
-title:       Integration test suite — full client-server round-trips
+title:       "Integration test suite — full client-server round-trips"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

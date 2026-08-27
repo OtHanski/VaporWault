@@ -346,7 +346,7 @@ VW_TEST_CASE("effective_permission: anonymous scoped public-link session resolve
 
     uint8_t token[32];
     uint64_t link_share_id = 0;
-    VW_ASSERT_OK(vw_share_link_create(s.ss, file, owner, VW_PERM_VIEW, 0, token, &link_share_id));
+    VW_ASSERT_OK(vw_share_link_create(s.ss, file, owner, VW_PERM_VIEW, 0, NULL, 0, token, &link_share_id));
 
     vw_file_record_t rec;
     VW_ASSERT_OK(vw_store_file_get_by_id(s.fs, file, &rec));
@@ -362,6 +362,36 @@ VW_TEST_CASE("effective_permission: anonymous scoped public-link session resolve
     VW_ASSERT_EQ((int)p, (int)VW_PERM_NONE);
 
     stack_close(&s);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * search_name_matches() — TASK-198's case-insensitive substring matcher
+ * ══════════════════════════════════════════════════════════════════════ */
+
+VW_TEST_CASE("search_name_matches: empty needle matches everything") {
+    VW_ASSERT_EQ(search_name_matches("anything.txt", 12, "", 0), 1);
+    VW_ASSERT_EQ(search_name_matches("", 0, "", 0), 1);
+}
+
+VW_TEST_CASE("search_name_matches: case-insensitive substring match") {
+    /* needle_lc must already be lower-cased by the caller (see its own
+     * doc comment) — the case-insensitivity being tested here is on the
+     * haystack (name) side, mixed-case in "Report_Q3.PDF" below. */
+    VW_ASSERT_EQ(search_name_matches("Report_Q3.PDF", 13, "report", 6), 1);
+    VW_ASSERT_EQ(search_name_matches("Report_Q3.PDF", 13, "q3.pdf", 6), 1);
+    VW_ASSERT_EQ(search_name_matches("Report_Q3.PDF", 13, "_q3_", 4), 0);
+}
+
+VW_TEST_CASE("search_name_matches: needle longer than haystack never matches") {
+    VW_ASSERT_EQ(search_name_matches("a.txt", 5, "a much longer needle", 20), 0);
+}
+
+VW_TEST_CASE("search_name_matches: no match returns 0") {
+    VW_ASSERT_EQ(search_name_matches("invoice.txt", 11, "xyz", 3), 0);
+}
+
+VW_TEST_CASE("search_name_matches: needle exactly equal to haystack matches") {
+    VW_ASSERT_EQ(search_name_matches("EXACT.TXT", 9, "exact.txt", 9), 1);
 }
 
 /* ══════════════════════════════════════════════════════════════════════

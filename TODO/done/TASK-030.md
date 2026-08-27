@@ -1,6 +1,6 @@
 ---
 id:          TASK-030
-title:       Implement vw_daemon — client daemon process and main loop
+title:       "Implement vw_daemon — client daemon process and main loop"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

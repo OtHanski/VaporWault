@@ -1,6 +1,6 @@
 ---
 id:          TASK-001
-title:       Set up CMake build system for all targets
+title:       "Set up CMake build system for all targets"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

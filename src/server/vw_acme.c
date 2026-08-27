@@ -41,6 +41,8 @@ vw_err_t vw_acme_renew_if_needed(vw_acme_ctx_t *ctx,
 vw_err_t vw_acme_start(vw_acme_ctx_t *ctx, vw_net_ctx_t *net_ctx)
 { (void)ctx; (void)net_ctx; return VW_OK; }
 void     vw_acme_stop(vw_acme_ctx_t *ctx)                     { (void)ctx; }
+void     vw_acme_ctx_set_notify(vw_acme_ctx_t *ctx, vw_notify_ctx_t *notify)
+{ (void)ctx; (void)notify; }
 
 #else /* POSIX implementation */
 
@@ -122,6 +124,7 @@ struct vw_acme_ctx {
     pthread_mutex_t          lock;
     int                      shutdown;
     int                      thread_started;
+    vw_notify_ctx_t         *notify; /* borrowed; NULL = admin alert disabled (TASK-208) */
 };
 
 /* ── Logging shim ────────────────────────────────────────────────────────── */
@@ -1243,11 +1246,22 @@ cleanup_challenge:
 
 #define RENEW_CHECK_INTERVAL_S  (12 * 3600)
 
+/* TASK-208: fire the admin alert on a failed renewal attempt. A renewal
+ * that simply wasn't due yet returns VW_OK (see vw_acme_renew_if_needed's
+ * own early-return), so this only ever fires for a real failure, never
+ * on the common "nothing to do" case. */
+static void acme_report_renewal_result(vw_acme_ctx_t *ctx, vw_err_t rc) {
+    if (rc == VW_OK || !ctx->notify) return;
+    char reason[64];
+    snprintf(reason, sizeof(reason), "error code %d", (int)rc);
+    vw_notify_acme_renewal_failure(ctx->notify, reason);
+}
+
 static void *acme_thread_fn(void *arg) {
     vw_acme_ctx_t *ctx = arg;
 
     /* First check immediately on startup. */
-    vw_acme_renew_if_needed(ctx, NULL);
+    acme_report_renewal_result(ctx, vw_acme_renew_if_needed(ctx, NULL));
 
     int elapsed = 0;
     while (1) {
@@ -1258,7 +1272,7 @@ static void *acme_thread_fn(void *arg) {
         if (stop) break;
         if (++elapsed >= RENEW_CHECK_INTERVAL_S) {
             elapsed = 0;
-            vw_acme_renew_if_needed(ctx, NULL);
+            acme_report_renewal_result(ctx, vw_acme_renew_if_needed(ctx, NULL));
         }
     }
     return NULL;
@@ -1375,6 +1389,11 @@ void vw_acme_stop(vw_acme_ctx_t *ctx) {
     pthread_mutex_unlock(&ctx->lock);
     pthread_join(ctx->thread, NULL);
     ctx->thread_started = 0;
+}
+
+void vw_acme_ctx_set_notify(vw_acme_ctx_t *ctx, vw_notify_ctx_t *notify) {
+    if (!ctx) return;
+    ctx->notify = notify;
 }
 
 #endif /* _WIN32 */

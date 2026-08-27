@@ -1,6 +1,6 @@
 ---
 id:          TASK-101
-title:       E2EE regression tests (round-trip, dedup-defeat, key-loss scoping)
+title:       "E2EE regression tests (round-trip, dedup-defeat, key-loss scoping)"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

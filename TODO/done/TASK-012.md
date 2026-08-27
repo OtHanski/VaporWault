@@ -1,6 +1,6 @@
 ---
 id:          TASK-012
-title:       Build robust test harness — unit, integration, fuzz, crash-injection
+title:       "Build robust test harness — unit, integration, fuzz, crash-injection"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

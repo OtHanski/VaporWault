@@ -2,16 +2,23 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl3.h"
+#include "vw_version.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <cstdio>
+#include <cstring>
 
-#ifndef VW_VERSION
-#define VW_VERSION "dev"
-#endif
+#define VW_VERSION VW_VERSION_STRING
 
-int main(int /*argc*/, char ** /*argv*/)
+int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--version") == 0) {
+            std::printf("vapourwault-server-gui %s\n", VW_VERSION_STRING);
+            return 0;
+        }
+    }
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;

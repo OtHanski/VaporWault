@@ -1,6 +1,6 @@
 ---
 id:          TASK-170
-title:       Protocol: publish CLUSTER_RECORD_*/CLUSTER_CHUNK_* wire spec
+title:       "Protocol: publish CLUSTER_RECORD_*/CLUSTER_CHUNK_* wire spec"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

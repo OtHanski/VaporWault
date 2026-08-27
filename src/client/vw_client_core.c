@@ -1623,6 +1623,7 @@ vw_err_t vw_client_link_create(vw_client_sess_t *sess,
                                  uint64_t file_id,
                                  vw_perm_t permission,
                                  int64_t expires_at,
+                                 const char *password,
                                  uint64_t *out_share_id,
                                  uint8_t out_link_token[32])
 {
@@ -1632,15 +1633,20 @@ vw_err_t vw_client_link_create(vw_client_sess_t *sess,
         return VW_ERR_INVALID_ARG;
     if ((err = sess_check_valid(sess)) != VW_OK) return err;
 
-    /* token[32] + file_id(u64) + permission(u8) + expires_at(i64) */
-    uint8_t pbuf[VW_TOKEN_BYTES + 8u + 1u + 8u];
-    uint8_t *p = pbuf;
-    memcpy(p, sess->session_token, VW_TOKEN_BYTES); p += VW_TOKEN_BYTES;
-    vw_write_u64le(p, file_id); p += 8;
-    *p++ = (uint8_t)permission;
-    vw_write_u64le(p, (uint64_t)expires_at);
+    /* token[32] + file_id(u64) + permission(u8) + expires_at(i64) +
+     * password(string, TASK-186 — optional trailing field) */
+    uint16_t password_len = password ? (uint16_t)strlen(password) : 0u;
+    uint8_t pbuf[VW_TOKEN_BYTES + 8u + 1u + 8u + 2u + 256u];
+    if (password_len > 256u) return VW_ERR_INVALID_ARG;
+    uint32_t off = 0;
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES); off += VW_TOKEN_BYTES;
+    vw_write_u64le(pbuf + off, file_id); off += 8;
+    pbuf[off++] = (uint8_t)permission;
+    vw_write_u64le(pbuf + off, (uint64_t)expires_at); off += 8;
+    err = vw_proto_write_str(pbuf, sizeof(pbuf), &off, password ? password : "", password_len);
+    if (err != VW_OK) return err;
 
-    err = vw_proto_send(sess->conn, VW_MSG_LINK_CREATE, pbuf, sizeof(pbuf));
+    err = vw_proto_send(sess->conn, VW_MSG_LINK_CREATE, pbuf, off);
     if (err != VW_OK) return err;
 
     /* LINK_CREATE_ACK: error_code(u32) + share_id(u64) + link_token[32] */
@@ -1702,11 +1708,12 @@ vw_err_t vw_client_link_list(vw_client_sess_t *sess,
         memcpy(entries[i].name, name, ncopy);
         entries[i].name[ncopy] = '\0';
 
-        if (off + 1u + 8u + 8u + 1u > rplen) goto trunc;
+        if (off + 1u + 8u + 8u + 1u + 1u > rplen) goto trunc;
         entries[i].permission = rbuf[off++];
         entries[i].created_at = (int64_t)vw_read_u64le(rbuf + off); off += 8;
         entries[i].expires_at = (int64_t)vw_read_u64le(rbuf + off); off += 8;
         entries[i].revoked    = rbuf[off++];
+        entries[i].has_password = rbuf[off++]; /* TASK-186, trailing field */
     }
     free(rbuf);
     *out = entries;
@@ -1717,6 +1724,128 @@ trunc:
     free(entries);
     free(rbuf);
     return VW_ERR_PROTO_TRUNCATED;
+}
+
+/* ── Search (TASK-196/197/198; docs/PROTOCOL.md §7.12) ────────────────────── */
+
+vw_err_t vw_client_search(vw_client_sess_t *sess,
+                           const char *query,
+                           vw_search_entry_t **out,
+                           uint32_t *out_count,
+                           uint8_t *out_truncated)
+{
+    vw_err_t err;
+    if (!sess || !query || !out || !out_count || !out_truncated) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    uint16_t query_len = (uint16_t)strlen(query);
+
+    uint8_t pbuf[VW_TOKEN_BYTES + 2u + 256u];
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES);
+    uint32_t poff = VW_TOKEN_BYTES;
+    err = vw_proto_write_str(pbuf, sizeof(pbuf), &poff, query, query_len);
+    if (err != VW_OK) return VW_ERR_INVALID_ARG; /* query too long to even send */
+
+    err = vw_proto_send(sess->conn, VW_MSG_SEARCH, pbuf, poff);
+    if (err != VW_OK) return err;
+
+    uint8_t *rbuf = malloc(VW_MAX_MSG_BYTES);
+    if (!rbuf) return VW_ERR_OOM;
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_SEARCH_RESP, rbuf, VW_MAX_MSG_BYTES, &rplen);
+    if (err != VW_OK) { free(rbuf); return err; }
+
+    /* error_code(u32) + count(u32) + truncated(u8) + entries. error_code
+     * is always VW_OK here — a real failure already returned above via
+     * recv_expect's VW_MSG_ERROR path, same convention as every other
+     * RESP/ACK in this protocol that carries a nominal error_code field. */
+    if (rplen < 9u) { free(rbuf); return VW_ERR_PROTO_TRUNCATED; }
+    uint32_t count = vw_read_u32le(rbuf + 4u);
+    uint8_t  truncated = rbuf[8];
+    uint32_t off = 9u;
+
+    vw_search_entry_t *entries = NULL;
+    if (count > 0) {
+        entries = calloc(count, sizeof(*entries));
+        if (!entries) { free(rbuf); return VW_ERR_OOM; }
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 8u > rplen) goto trunc;
+        entries[i].file_id = vw_read_u64le(rbuf + off); off += 8;
+
+        const char *name; uint16_t name_len;
+        if (vw_proto_read_str(rbuf, rplen, &off, &name, &name_len) != VW_OK) goto trunc;
+        uint16_t ncopy = (uint16_t)VW_MIN(name_len, (uint16_t)(sizeof(entries[i].name) - 1u));
+        memcpy(entries[i].name, name, ncopy);
+        entries[i].name[ncopy] = '\0';
+
+        if (off + 1u + 8u + 8u + 8u + 1u > rplen) goto trunc;
+        entries[i].is_dir     = rbuf[off++];
+        entries[i].size_bytes = vw_read_u64le(rbuf + off); off += 8;
+        entries[i].mtime_unix = (int64_t)vw_read_u64le(rbuf + off); off += 8;
+        entries[i].vault_id   = vw_read_u64le(rbuf + off); off += 8;
+        entries[i].is_shared  = rbuf[off++];
+    }
+    free(rbuf);
+    *out = entries;
+    *out_count = count;
+    *out_truncated = truncated;
+    return VW_OK;
+
+trunc:
+    free(entries);
+    free(rbuf);
+    return VW_ERR_PROTO_TRUNCATED;
+}
+
+/* ── Notification preferences (TASK-206/207/209) ─────────────────────────── */
+
+vw_err_t vw_client_notify_prefs_get(vw_client_sess_t *sess, uint32_t *out_prefs)
+{
+    vw_err_t err;
+    if (!sess || !out_prefs) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    err = vw_proto_send(sess->conn, VW_MSG_NOTIFY_PREFS_GET,
+                         sess->session_token, VW_TOKEN_BYTES);
+    if (err != VW_OK) return err;
+
+    uint8_t rbuf[8];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_NOTIFY_PREFS_GET_RESP, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+    if (rplen < 8u) return VW_ERR_PROTO_TRUNCATED;
+
+    /* error_code(u32) is always VW_OK here — a real failure already
+     * returned above via recv_expect's VW_MSG_ERROR path, same
+     * convention as vw_client_search's own SEARCH_RESP handling. */
+    *out_prefs = vw_read_u32le(rbuf + 4);
+    return VW_OK;
+}
+
+vw_err_t vw_client_notify_prefs_set(vw_client_sess_t *sess, uint32_t prefs,
+                                     uint32_t *out_prefs)
+{
+    vw_err_t err;
+    if (!sess) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    uint8_t pbuf[VW_TOKEN_BYTES + 4u];
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES);
+    vw_write_u32le(pbuf + VW_TOKEN_BYTES, prefs);
+
+    err = vw_proto_send(sess->conn, VW_MSG_NOTIFY_PREFS_SET, pbuf, sizeof(pbuf));
+    if (err != VW_OK) return err;
+
+    uint8_t rbuf[8];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_NOTIFY_PREFS_SET_ACK, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+    if (rplen < 8u) return VW_ERR_PROTO_TRUNCATED;
+
+    if (out_prefs) *out_prefs = vw_read_u32le(rbuf + 4);
+    return VW_OK;
 }
 
 /* ── Vault registry (TASK-099; server side: TASK-098) ────────────────────── */
@@ -1864,6 +1993,7 @@ vw_err_t vw_client_vault_list(vw_client_sess_t *sess,
 
 vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
                                  const uint8_t link_token[32],
+                                 const char *password,
                                  vw_client_sess_t **out_sess)
 {
     if (!cfg || !link_token || !out_sess) return VW_ERR_INVALID_ARG;
@@ -1878,7 +2008,16 @@ vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
     err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
-    err = vw_proto_send(sess->conn, VW_MSG_LINK_ACCESS, link_token, 32u);
+    /* TASK-186: optional trailing password field. */
+    uint16_t password_len = password ? (uint16_t)strlen(password) : 0u;
+    uint8_t pbuf[32u + 2u + 256u];
+    if (password_len > 256u) { sess_destroy(sess); return VW_ERR_INVALID_ARG; }
+    memcpy(pbuf, link_token, 32u);
+    uint32_t off = 32u;
+    err = vw_proto_write_str(pbuf, sizeof(pbuf), &off, password ? password : "", password_len);
+    if (err != VW_OK) { sess_destroy(sess); return err; }
+
+    err = vw_proto_send(sess->conn, VW_MSG_LINK_ACCESS, pbuf, off);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     /* LINK_ACCESS_ACK has the same wire shape as AUTH_OK (§7.5): user_id=0,

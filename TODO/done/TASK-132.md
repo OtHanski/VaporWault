@@ -1,6 +1,6 @@
 ---
 id:          TASK-132
-title:       Implement gateway auth endpoints (login, 2FA, logout, resume)
+title:       "Implement gateway auth endpoints (login, 2FA, logout, resume)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

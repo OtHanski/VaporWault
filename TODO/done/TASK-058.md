@@ -1,6 +1,6 @@
 ---
 id:          TASK-058
-title:       CI pipeline — GitHub Actions for build, test, and fuzz regression
+title:       "CI pipeline — GitHub Actions for build, test, and fuzz regression"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-093
-title:       Real peer-UID verification for the daemon IPC channel on Linux
+title:       "Real peer-UID verification for the daemon IPC channel on Linux"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

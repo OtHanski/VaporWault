@@ -1,6 +1,6 @@
 ---
 id:          TASK-123
-title:       Implement oplog v17 entry format (append timestamp + FILE_WRITE split)
+title:       "Implement oplog v17 entry format (append timestamp + FILE_WRITE split)"
 status:      done
 assignee:    SRV.01
 created_by:  PRT.04

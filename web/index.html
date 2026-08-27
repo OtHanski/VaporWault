@@ -26,10 +26,23 @@
       </form>
     </section>
 
+    <section id="link-view" hidden>
+      <form id="link-access-form">
+        <h1>VaporWault</h1>
+        <p id="link-access-status">Opening shared link...</p>
+        <div id="link-access-password-field" hidden>
+          <input id="link-access-password" type="password" placeholder="Password" autocomplete="off">
+        </div>
+        <button type="submit" id="link-access-submit-btn" hidden>Open</button>
+        <p id="link-access-error" class="error" hidden></p>
+      </form>
+    </section>
+
     <section id="browser-view" hidden>
       <header>
         <div id="account-switcher"></div>
         <span id="current-path" title="Click to go up one level">/</span>
+        <button id="settings-btn">Settings</button>
         <button id="logout-btn">Log out</button>
       </header>
       <div id="toolbar">
@@ -37,7 +50,10 @@
         <button id="upload-btn">Upload</button>
         <input id="upload-input" type="file" multiple hidden>
         <button id="vault-create-btn">Make this folder a vault</button>
+        <input id="search-input" type="text" placeholder="Search files...">
+        <button id="search-clear-btn" hidden>Clear search</button>
       </div>
+      <p id="search-status" class="error" hidden></p>
       <div id="vault-banner" class="vault-banner" hidden>
         <span id="vault-banner-text"></span>
         <button id="vault-unlock-btn">Unlock</button>
@@ -91,6 +107,10 @@
 
       <h3>Public links</h3>
       <div class="inline-form">
+        <label><input id="link-expiry-check" type="checkbox"> Expires in
+          <input id="link-expiry-days" type="number" min="1" value="30" style="width:4em"> days</label>
+        <label><input id="link-password-check" type="checkbox"> Password
+          <input id="link-password" type="password" placeholder="Password" disabled></label>
         <button id="link-create-btn">Create public link</button>
       </div>
       <div id="link-new-token" class="inline-form" hidden>
@@ -100,12 +120,24 @@
       </div>
       <table id="link-table">
         <thead>
-          <tr><th>Link</th><th>Permission</th><th>Status</th><th></th></tr>
+          <tr><th>Link</th><th>Permission</th><th>Password</th><th>Status</th><th></th></tr>
         </thead>
         <tbody id="link-table-body"></tbody>
       </table>
 
       <p id="share-error" class="error" hidden></p>
+    </section>
+
+    <section id="settings-view" hidden>
+      <header>
+        <span>Settings</span>
+        <button id="settings-back-btn">Back</button>
+      </header>
+
+      <h3>Email notifications</h3>
+      <p class="note">Sent to your account's on-file email address. Off by default.</p>
+      <div id="notify-prefs-list"></div>
+      <p id="settings-error" class="error" hidden></p>
     </section>
   </div>
   <script type="module" src="dist/main.js"></script>

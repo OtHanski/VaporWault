@@ -139,10 +139,15 @@ vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
 
 vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                 dirmap_t *dm, const char *root_vpath,
-                                const char *vpath, uint64_t *out_id);
+                                const char *vpath, int shared, uint64_t *out_id);
 
 vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                       const action_t *a);
+
+/* Selective sync (TASK-192/193) — see vw_sync.c's own header comment on
+ * this pair for the exact glob syntax supported. */
+int vw_sync_glob_seg_match(const char *pat, const char *str);
+int vw_sync_glob_match(const char *pattern, const char *path);
 
 #endif /* VW_SYNC_TEST_HOOKS */
 

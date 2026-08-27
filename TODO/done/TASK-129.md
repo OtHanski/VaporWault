@@ -1,6 +1,6 @@
 ---
 id:          TASK-129
-title:       Implement minimal HTTP/1.1 layer for the web gateway (vw_http)
+title:       "Implement minimal HTTP/1.1 layer for the web gateway (vw_http)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

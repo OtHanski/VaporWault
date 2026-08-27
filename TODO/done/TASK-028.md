@@ -1,6 +1,6 @@
 ---
 id:          TASK-028
-title:       Implement vw_watch_linux and vw_watch_windows — filesystem event watchers
+title:       "Implement vw_watch_linux and vw_watch_windows — filesystem event watchers"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

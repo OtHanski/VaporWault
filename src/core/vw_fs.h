@@ -59,6 +59,16 @@ vw_err_t vw_fs_file_size(const char *path, uint64_t *out_size);
 int vw_fs_exists(const char *path);
 
 /*
+ * TASK-208: report the filesystem containing path's overall disk usage
+ * as a whole-number percentage (0-100) via *out_pct — the filesystem's
+ * total capacity, not this application's logical quota accounting
+ * (vw_store's quotas.db, a separate concept). path must already exist
+ * (e.g. the server's data_dir). Returns VW_ERR_NOT_FOUND if it does not,
+ * VW_ERR_IO on a platform statvfs/GetDiskFreeSpaceEx failure.
+ */
+vw_err_t vw_fs_disk_usage_pct(const char *path, uint32_t *out_pct);
+
+/*
  * Unlink (delete) a file. Returns VW_ERR_NOT_FOUND if it does not exist
  * (treated as success — idempotent delete).
  */

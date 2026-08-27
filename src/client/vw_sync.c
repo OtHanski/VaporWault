@@ -464,6 +464,100 @@ done:
     return err;
 }
 
+/* ── Selective sync: glob matching (TASK-192/193) ────────────────────────
+ *
+ * Deliberately minimal — no POSIX fnmatch() (not available on Windows/
+ * MSVC, and this project avoids adding a vendored dependency for
+ * something this small), no character classes, no negation. Supports
+ * exactly what TASK-192's design calls for: '*' (any run of characters
+ * within one path segment), '?' (exactly one character), and '**' as a
+ * whole path segment (zero or more whole segments — a recursive
+ * wildcard). Case-sensitive, matching this project's path handling
+ * elsewhere (e.g. vw_client_core.c's path_validate_client never
+ * case-folds).
+ */
+
+/* Classic single-segment glob match (no '/' expected in either string):
+ * '*' backtracks over any run of characters, '?' matches exactly one. */
+VW_SYNC_TESTABLE int vw_sync_glob_seg_match(const char *pat, const char *str) {
+    const char *star_pat = NULL, *star_str = NULL;
+    while (*str) {
+        if (*pat == '?') { pat++; str++; }
+        else if (*pat == '*') { star_pat = pat++; star_str = str; }
+        else if (*pat == *str) { pat++; str++; }
+        else if (star_pat) { pat = star_pat + 1; str = ++star_str; }
+        else return 0;
+    }
+    while (*pat == '*') pat++;
+    return *pat == '\0';
+}
+
+/* Splits path in place on '/' into up to max_segs non-empty segments
+ * (consecutive/leading/trailing slashes collapse, matching how a real
+ * virtual/relative path is normally already well-formed but costs
+ * nothing extra to tolerate). Returns the segment count. buf is mutated
+ * (NUL terminators written in place of '/'); segs[i] point into buf. */
+static uint32_t glob_split(char *buf, const char **segs, uint32_t max_segs) {
+    uint32_t n = 0;
+    char *p = buf;
+    while (*p == '/') p++;
+    while (*p && n < max_segs) {
+        segs[n++] = p;
+        while (*p && *p != '/') p++;
+        if (*p == '/') { *p = '\0'; p++; while (*p == '/') p++; }
+    }
+    return n;
+}
+
+/* Recursive path match over pre-split segment arrays — see the module
+ * header comment above for exactly what syntax this supports. */
+static int glob_path_match_segs(const char **pat_segs, uint32_t npat,
+                                 const char **str_segs, uint32_t nstr) {
+    if (npat == 0) return nstr == 0;
+    if (strcmp(pat_segs[0], "**") == 0) {
+        for (uint32_t k = 0; k <= nstr; k++)
+            if (glob_path_match_segs(pat_segs + 1, npat - 1, str_segs + k, nstr - k))
+                return 1;
+        return 0;
+    }
+    if (nstr == 0) return 0;
+    if (!vw_sync_glob_seg_match(pat_segs[0], str_segs[0])) return 0;
+    return glob_path_match_segs(pat_segs + 1, npat - 1, str_segs + 1, nstr - 1);
+}
+
+#define VW_GLOB_MAX_SEGS 64u
+
+/* pattern/path are NOT mutated (glob_split needs a mutable scratch copy,
+ * taken internally) — up to 511 bytes of either is honored, matching
+ * this codebase's existing VW_MAX_PATH_BYTES-adjacent path buffers;
+ * anything longer is truncated for matching purposes only (an
+ * unreasonably long single pattern/path is not this function's problem
+ * to solve). */
+VW_SYNC_TESTABLE int vw_sync_glob_match(const char *pattern, const char *path) {
+    char pbuf[512], sbuf[512];
+    snprintf(pbuf, sizeof(pbuf), "%s", pattern);
+    snprintf(sbuf, sizeof(sbuf), "%s", path);
+
+    const char *psegs[VW_GLOB_MAX_SEGS], *ssegs[VW_GLOB_MAX_SEGS];
+    uint32_t np = glob_split(pbuf, psegs, VW_GLOB_MAX_SEGS);
+    uint32_t ns = glob_split(sbuf, ssegs, VW_GLOB_MAX_SEGS);
+    return glob_path_match_segs(psegs, np, ssegs, ns);
+}
+
+/* One sync folder's exclude-pattern set, keyed by local_root. */
+typedef struct {
+    char      local_root[512];
+    char    **patterns;
+    uint32_t  count;
+} folder_excludes_t;
+
+static void folder_excludes_free_one(folder_excludes_t *fe) {
+    for (uint32_t i = 0; i < fe->count; i++) free(fe->patterns[i]);
+    free(fe->patterns);
+    fe->patterns = NULL;
+    fe->count = 0;
+}
+
 /* ── Struct vw_sync_ctx ──────────────────────────────────────────────────── */
 
 struct vw_sync_ctx {
@@ -479,7 +573,32 @@ struct vw_sync_ctx {
     uint64_t          bytes_total;
     uint32_t          action_errors; /* per-cycle count of non-network action failures */
     uint32_t          permission_denied_count; /* per-cycle count, see note_permission_denied */
+    folder_excludes_t *excludes;      /* TASK-192/193: selective sync, keyed by local_root */
+    uint32_t           excludes_count;
 };
+
+static folder_excludes_t *find_excludes(vw_sync_ctx_t *ctx, const char *local_root) {
+    for (uint32_t i = 0; i < ctx->excludes_count; i++)
+        if (strcmp(ctx->excludes[i].local_root, local_root) == 0)
+            return &ctx->excludes[i];
+    return NULL;
+}
+
+/* True if virtual_path (an absolute path already rooted at
+ * folder_virtual_root, e.g. a srv_entry_t/lfile_t's own virtual_path
+ * field) matches any of ex's patterns once made relative to
+ * folder_virtual_root. ex may be NULL (no rules — nothing excluded). */
+static int path_is_excluded(const folder_excludes_t *ex, const char *folder_virtual_root,
+                             const char *virtual_path) {
+    if (!ex || ex->count == 0) return 0;
+    const char *rel = virtual_path;
+    size_t vrlen = strlen(folder_virtual_root);
+    if (vrlen > 0 && strncmp(rel, folder_virtual_root, vrlen) == 0) rel += vrlen;
+    while (*rel == '/') rel++;
+    for (uint32_t i = 0; i < ex->count; i++)
+        if (vw_sync_glob_match(ex->patterns[i], rel)) return 1;
+    return 0;
+}
 
 /* ── Offline queue helpers ────────────────────────────────────────────────── */
 
@@ -962,7 +1081,7 @@ VW_SYNC_TESTABLE vw_err_t exec_action(vw_sync_ctx_t *ctx, vw_client_sess_t *sess
  */
 VW_SYNC_TESTABLE vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_sess_t *sess,
                                        dirmap_t *dm, const char *root_vpath,
-                                       const char *vpath, uint64_t *out_id) {
+                                       const char *vpath, int shared, uint64_t *out_id) {
     uint64_t known = dirmap_lookup(dm, vpath);
     if (known == VW_DIRMAP_UNRESOLVABLE) {
         /* Already attempted (and its outcome already counted) earlier this
@@ -971,12 +1090,68 @@ VW_SYNC_TESTABLE vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_se
         return VW_OK;
     }
     *out_id = known;
-    if (*out_id != 0 || strcmp(vpath, root_vpath) == 0) {
-        /* Either already known, or this *is* the folder root — which is
-         * always pushed into dm unconditionally at the start of
-         * srv_collect_by_id, so reaching here with lookup still failing
-         * would mean the root itself couldn't be resolved this cycle
-         * (e.g. offline) — nothing to create, not this function's job. */
+    if (*out_id != 0) return VW_OK; /* already known */
+
+    int is_root = (strcmp(vpath, root_vpath) == 0);
+
+    if (!shared) {
+        /* TASK-218: an OWNED folder never goes through srv_collect_by_id's
+         * BFS (that pre-populates dm for a SHARED folder's whole tree
+         * before compute_actions ever calls this function) — "not in dm"
+         * here only ever means "never looked up," not "doesn't exist
+         * yet," at ANY level, including the folder's own registered root.
+         * Path lookups work for an owned tree (unlike a shared one,
+         * namespaced to the caller's own owner_id — see the `else if
+         * (is_root)` branch below, which relies entirely on the BFS
+         * having already seeded dm instead). Resolve by path first;
+         * only ever consider creating something once that's genuinely
+         * come back NOT_FOUND. */
+        if (is_root && strcmp(root_vpath, "/") == 0) {
+            /* 0 already legitimately means "server root" by this
+             * protocol's own FILE_MKDIR/FILE_LIST convention — *out_id
+             * (still 0, from above) is already correct; nothing to look
+             * up. Deliberately scoped to the OWNED case only: a SHARED
+             * folder's virtual_root is just a grantee-chosen local label
+             * for its own sync bookkeeping, never validated against
+             * being the real remote server root, so "/" carries no such
+             * special meaning there — see the `else if (is_root)` branch
+             * below for that case instead. */
+            return VW_OK;
+        }
+        vw_file_entry_t e;
+        vw_err_t rerr = vw_client_file_stat(sess, vpath, &e);
+        if (rerr == VW_OK) {
+            rerr = dirmap_push(dm, vpath, e.file_id);
+            if (rerr != VW_OK) return rerr; /* OOM */
+            *out_id = e.file_id;
+            return VW_OK;
+        }
+        if (is_net_err(rerr)) return rerr;
+        if (rerr != VW_ERR_NOT_FOUND || is_root) {
+            /* Either a real (non-network) error, or this IS the folder's
+             * own registered root and it's genuinely gone — never
+             * auto-(re)create a folder's own root; a vanished root is
+             * this folder's problem to surface some other way, not
+             * something for this function to paper over. */
+            (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
+            return VW_OK;
+        }
+        /* Genuinely new, and not the root — fall through to create it. */
+    } else if (is_root) {
+        /* Shared folder's own root: always pushed into dm unconditionally
+         * at the start of srv_collect_by_id, so reaching here with lookup
+         * still failing means the root itself couldn't be resolved this
+         * cycle (e.g. offline) — nothing to create, not this function's
+         * job. *out_id is already 0 (from `known` above); explicitly
+         * memoize the root itself as unresolvable too — not just left
+         * silently at 0 — so a sibling file's recursion up to this same
+         * root short-circuits immediately via the sentinel check at the
+         * top of this function instead of redoing this same "offline"
+         * determination, and so the caller one level down can tell
+         * "resolved to 0" (the "/" case above) apart from "failed to
+         * resolve" via dm rather than via *out_id's value, which is 0
+         * either way. */
+        (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
         return VW_OK;
     }
 
@@ -987,13 +1162,18 @@ VW_SYNC_TESTABLE vw_err_t resolve_or_create_dir(vw_sync_ctx_t *ctx, vw_client_se
     else snprintf(parent_vpath, sizeof(parent_vpath), "%s", root_vpath);
 
     uint64_t parent_id = 0;
-    vw_err_t err = resolve_or_create_dir(ctx, sess, dm, root_vpath, parent_vpath, &parent_id);
+    vw_err_t err = resolve_or_create_dir(ctx, sess, dm, root_vpath, parent_vpath, shared, &parent_id);
     if (err != VW_OK) return err;      /* real (network) error: propagate */
-    if (parent_id == 0) {
-        /* Ancestor unresolved (already counted/memoized at whichever depth
-         * actually failed) — this level is transitively unresolvable too;
-         * memoize it so sibling files don't re-recurse into the same
-         * already-failed ancestor chain. */
+    if (dirmap_lookup(dm, parent_vpath) == VW_DIRMAP_UNRESOLVABLE) {
+        /* Ancestor genuinely unresolved (already counted/memoized at
+         * whichever depth actually failed) — this level is transitively
+         * unresolvable too; memoize it so sibling files don't re-recurse
+         * into the same already-failed ancestor chain. Checked via dm
+         * directly, not "parent_id == 0": for an owned "/"-rooted folder,
+         * a file directly under the root legitimately resolves its
+         * parent to id 0 (the server root itself, never marked
+         * unresolvable above) — treating that 0 as failure would wrongly
+         * defer every such upload forever. */
         (void)dirmap_push(dm, vpath, VW_DIRMAP_UNRESOLVABLE);
         return VW_OK;
     }
@@ -1054,11 +1234,31 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
     int shared = folder->remote_dir_id != 0;
     vw_err_t err = VW_OK;
 
+    /* Selective sync (TASK-192/193): looked up once per call, consulted
+     * at every point below that would otherwise either create a new
+     * cache entry for an excluded path or infer a local/remote deletion
+     * for one that's already tracked from before the rule existed.
+     * Filtering the lfiles/srv snapshots passed into this function
+     * instead of checking here was tried first and found to be actively
+     * wrong, not just incomplete: the LOCAL_DEL/REMOTE_DEL passes below
+     * reason over vw_cache_list (the durable, persisted cache — every
+     * file this folder has ever seen), completely independent of
+     * whatever this call's lfiles/srv arrays contain. Silently dropping
+     * an already-SYNCED entry from those arrays made this function
+     * conclude the file had been deleted and issue a real
+     * ACT_DEL_REMOTE against the server — the exact "never deletes an
+     * already-synced file" property TASK-192 decision 5 requires this
+     * feature to preserve. Checking inline here, against every place
+     * that reasons over the persisted cache, is the actually-correct
+     * fix. */
+    folder_excludes_t *ex = find_excludes(ctx, folder->local_root);
+
     /* ── Pass 1: Update cache states from local walk ─────────────────── */
 
     /* Mark files present in local walk as LOCAL_MOD or NEW_LOCAL */
     for (uint32_t i = 0; i < lfiles->count; i++) {
         const lfile_t *lf = &lfiles->arr[i];
+        if (path_is_excluded(ex, folder->virtual_root, lf->virtual_path)) continue;
         vw_cache_entry_t ce;
         vw_err_t cerr = vw_cache_get(ctx->cache, lf->virtual_path, &ce);
         if (cerr == VW_ERR_NOT_FOUND) {
@@ -1092,6 +1292,7 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
         if (strncmp(ce->virtual_path, folder->virtual_root, vroot_len) != 0) continue;
         if (ce->entry_type != VW_ENTRY_FILE) continue;
         if (ce->sync_state != VW_SYNC_SYNCED) continue;
+        if (path_is_excluded(ex, folder->virtual_root, ce->virtual_path)) continue;
         int found = 0;
         for (uint32_t j = 0; j < lfiles->count; j++) {
             if (strcmp(lfiles->arr[j].virtual_path, ce->virtual_path) == 0) {
@@ -1111,6 +1312,7 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
         for (uint32_t i = 0; i < srv->count; i++) {
             const srv_entry_t *se = &srv->arr[i];
             if (se->entry_type == VW_ENTRY_DIR) continue;
+            if (path_is_excluded(ex, folder->virtual_root, se->virtual_path)) continue;
             vw_cache_entry_t ce;
             vw_err_t cerr = vw_cache_get(ctx->cache, se->virtual_path, &ce);
             if (cerr == VW_ERR_NOT_FOUND) {
@@ -1175,6 +1377,7 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
             if (strncmp(ce->virtual_path, folder->virtual_root, vroot_len) != 0) continue;
             if (ce->entry_type != VW_ENTRY_FILE) continue;
             if (ce->sync_state != VW_SYNC_SYNCED) continue;
+            if (path_is_excluded(ex, folder->virtual_root, ce->virtual_path)) continue;
             /* Check if present in server list */
             int on_srv = 0;
             for (uint32_t j = 0; j < srv->count; j++) {
@@ -1199,15 +1402,30 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
         const vw_cache_entry_t *ce = &all_ce[i];
         if (strncmp(ce->virtual_path, folder->virtual_root, vroot_len) != 0) continue;
         if (ce->entry_type != VW_ENTRY_FILE) continue;
+        /* Defense-in-depth: a cache entry can already be sitting in a
+         * non-SYNCED state (e.g. LOCAL_MOD queued up) from before this
+         * path was excluded — every earlier pass above already stops
+         * *creating new* non-SYNCED states for an excluded path, but
+         * this still needs to suppress acting on one that already
+         * existed, so exclusion truly stops "further actions" starting
+         * the moment the rule is set, not just from the next unrelated
+         * state transition. */
+        if (path_is_excluded(ex, folder->virtual_root, ce->virtual_path)) continue;
         switch (ce->sync_state) {
         case VW_SYNC_LOCAL_MOD:
         case VW_SYNC_NEW_LOCAL: {
             uint64_t parent_dir_id = 0;
-            if (shared && ce->file_id == 0) {
-                /* New file inside a shared folder: resolve its immediate
-                 * parent's file_id, auto-creating it (and any missing
-                 * ancestors, TASK-113) if it has no server-side counterpart
-                 * yet. dirname(ce->virtual_path) — strip the leaf. */
+            if (ce->file_id == 0) {
+                /* New file: resolve its immediate parent's file_id,
+                 * auto-creating it (and any missing ancestors) if it has
+                 * no server-side counterpart yet. Originally TASK-113,
+                 * shared-folders-only ("a new file inside a shared
+                 * folder"); TASK-218 extended resolve_or_create_dir to
+                 * handle an OWNED folder's tree too (path-based lookups
+                 * instead of the BFS a shared folder's dm gets
+                 * pre-populated from) rather than leave a new local
+                 * subdirectory in an owned folder permanently unable to
+                 * sync up. dirname(ce->virtual_path) — strip the leaf. */
                 char parent_vpath[512];
                 snprintf(parent_vpath, sizeof(parent_vpath), "%s", ce->virtual_path);
                 char *psl = strrchr(parent_vpath, '/');
@@ -1215,8 +1433,18 @@ VW_SYNC_TESTABLE vw_err_t compute_actions(vw_sync_ctx_t *ctx, vw_client_sess_t *
                 if (parent_vpath[0] == '\0')
                     snprintf(parent_vpath, sizeof(parent_vpath), "/");
                 err = resolve_or_create_dir(ctx, sess, dm, folder->virtual_root,
-                                             parent_vpath, &parent_dir_id);
+                                             parent_vpath, shared, &parent_dir_id);
                 if (err != VW_OK) break; /* network error: abort the whole walk below */
+                /* parent_dir_id is only ever consulted by exec_action for
+                 * a SHARED upload (vw_client_file_upload_into_folder) —
+                 * an owned upload is plain path-based
+                 * (vw_client_file_upload) and resolves its own parent by
+                 * path server-side, same as always. The call above still
+                 * matters for the owned case: its only job there is the
+                 * side effect of having created any missing directory
+                 * ancestors, so that path-based upload's own parent
+                 * lookup now succeeds instead of NOT_FOUND. */
+                if (!shared) parent_dir_id = 0;
             }
             err = action_push(out, ACT_UPLOAD,
                               ce->virtual_path, ce->local_path,
@@ -1395,6 +1623,9 @@ void vw_sync_close(vw_sync_ctx_t *ctx) {
     if (!ctx) return;
     vw__mu_destroy(&ctx->mu);
     free(ctx->oq);
+    for (uint32_t i = 0; i < ctx->excludes_count; i++)
+        folder_excludes_free_one(&ctx->excludes[i]);
+    free(ctx->excludes);
     free(ctx);
 }
 
@@ -1402,6 +1633,41 @@ void vw_sync_set_session(vw_sync_ctx_t *ctx, vw_client_sess_t *sess) {
     vw__mu_lock(&ctx->mu);
     ctx->sess = sess;
     vw__mu_unlock(&ctx->mu);
+}
+
+vw_err_t vw_sync_set_folder_excludes(vw_sync_ctx_t *ctx, const char *local_root,
+                                      const char *const *patterns, uint32_t count) {
+    if (!ctx || !local_root || !local_root[0] || (count > 0 && !patterns))
+        return VW_ERR_INVALID_ARG;
+
+    folder_excludes_t *fe = find_excludes(ctx, local_root);
+    if (!fe) {
+        if (count == 0) return VW_OK; /* nothing to clear, nothing to add */
+        folder_excludes_t *tmp = realloc(ctx->excludes,
+                                          (ctx->excludes_count + 1u) * sizeof(*tmp));
+        if (!tmp) return VW_ERR_OOM;
+        ctx->excludes = tmp;
+        fe = &ctx->excludes[ctx->excludes_count++];
+        memset(fe, 0, sizeof(*fe));
+        snprintf(fe->local_root, sizeof(fe->local_root), "%s", local_root);
+    } else {
+        folder_excludes_free_one(fe);
+    }
+
+    if (count == 0) return VW_OK;
+
+    fe->patterns = calloc(count, sizeof(char *));
+    if (!fe->patterns) return VW_ERR_OOM;
+    for (uint32_t i = 0; i < count; i++) {
+        fe->patterns[i] = strdup(patterns[i]);
+        if (!fe->patterns[i]) {
+            for (uint32_t j = 0; j < i; j++) free(fe->patterns[j]);
+            free(fe->patterns); fe->patterns = NULL;
+            return VW_ERR_OOM;
+        }
+    }
+    fe->count = count;
+    return VW_OK;
 }
 
 void vw_sync_set_read_only(vw_sync_ctx_t *ctx, int read_only) {
@@ -1446,6 +1712,30 @@ vw_err_t vw_sync_run(vw_sync_ctx_t *ctx) {
 vw_err_t vw_sync_mark_local_modified(vw_sync_ctx_t *ctx, const char *local_path) {
     if (!ctx || !local_path || !local_path[0]) return VW_ERR_INVALID_ARG;
 
+    /* TASK-218: the filesystem watcher fires a CREATED/MODIFIED event for
+     * a newly-created SUBDIRECTORY too, not just for files inside it —
+     * this function, called directly from that event dispatch
+     * (vw_daemon.c), used to unconditionally mark whatever path it was
+     * given as entry_type = VW_ENTRY_FILE. For a directory path, that
+     * poisons the cache with a permanent bogus "file" entry: nothing
+     * else in this whole module ever represents a directory as its own
+     * cache entry (the periodic walk's lfiles_push only ever pushes
+     * files, recursing into directories instead — see walk_cb), so
+     * nothing ever revisits or corrects it once created here, and every
+     * later compute_actions cycle picks the same bogus entry back up as
+     * a "new file," repeatedly attempting a real upload of what's
+     * actually a directory (guaranteed to fail, every cycle, forever —
+     * this was the actual, second, root cause of the perpetual "1 action
+     * error(s)" TASK-218 was filed over; the missing-parent-directory
+     * fix elsewhere in this file was necessary but not sufficient by
+     * itself, since this bogus entry blocked the retry loop from ever
+     * settling regardless). A directory doesn't need a cache entry of
+     * its own here at all — any real files newly appearing inside it
+     * get their own CREATED events separately, and (once this level's
+     * own missing-parent-directory fix runs) their own upload correctly
+     * creates the matching remote folder as a side effect. */
+    if (is_directory(local_path)) return VW_OK;
+
     vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
     vw_err_t err = vw_cache_folder_list(ctx->cache, &folders, &nf);
     if (err != VW_OK) return err;
@@ -1469,13 +1759,48 @@ vw_err_t vw_sync_mark_local_modified(vw_sync_ctx_t *ctx, const char *local_path)
         vw_cache_entry_t ce;
         vw_err_t cerr = vw_cache_get(ctx->cache, vpath, &ce);
         if (cerr == VW_OK) {
-            ce.sync_state = VW_SYNC_LOCAL_MOD;
+            /* TASK-215: this used to unconditionally flip an existing
+             * entry to LOCAL_MOD, regardless of whether the file's
+             * mtime/size actually changed since the cache last recorded
+             * it — including for a write THIS DAEMON ITSELF just made
+             * (exec_action's ACT_DOWNLOAD already updates local_mtime/
+             * local_size and sets SYNCED synchronously right after a
+             * download completes, but the filesystem watcher still
+             * queues its own event for that same write, drained and
+             * dispatched here moments later). That self-triggered event
+             * was being treated as a genuine new local edit, causing the
+             * very next cycle to re-upload the exact content that had
+             * just been downloaded — a spurious duplicate version. Now
+             * mirrors compute_actions's own Pass 1 comparison exactly:
+             * only transition SYNCED/REMOTE_MOD to LOCAL_MOD if the
+             * current on-disk mtime/size actually differ from what's
+             * cached; an already-dirty state (LOCAL_MOD/NEW_LOCAL/
+             * CONFLICT) is left alone either way, same as Pass 1. */
+            int64_t  mtime = get_mtime(local_path);
+            uint64_t size  = get_fsize(local_path);
+            if (mtime != ce.local_mtime || size != ce.local_size) {
+                if (ce.sync_state == VW_SYNC_SYNCED ||
+                    ce.sync_state == VW_SYNC_REMOTE_MOD) {
+                    ce.sync_state = VW_SYNC_LOCAL_MOD;
+                }
+                ce.local_mtime = mtime;
+                ce.local_size  = size;
+            } else {
+                /* Nothing actually changed — this is exactly the
+                 * self-triggered-by-our-own-write case (or a duplicate/
+                 * redundant watcher event for the same real change);
+                 * don't touch sync_state, and skip the upsert below
+                 * entirely (no-op write to the cache). */
+                break;
+            }
         } else {
             memset(&ce, 0, sizeof(ce));
             snprintf(ce.virtual_path, sizeof(ce.virtual_path), "%s", vpath);
             snprintf(ce.local_path,   sizeof(ce.local_path),   "%s", local_path);
-            ce.sync_state = VW_SYNC_NEW_LOCAL;
-            ce.entry_type = VW_ENTRY_FILE;
+            ce.sync_state  = VW_SYNC_NEW_LOCAL;
+            ce.entry_type  = VW_ENTRY_FILE;
+            ce.local_mtime = get_mtime(local_path);
+            ce.local_size  = get_fsize(local_path);
         }
         err = vw_cache_upsert(ctx->cache, &ce);
         break;

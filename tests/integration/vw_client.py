@@ -109,6 +109,8 @@ VW_ERR_PERMISSION      = 7
 VW_ERR_AUTH_BAD_CREDS  = 300
 VW_ERR_AUTH_LOCKED     = 304
 VW_ERR_RATE_LIMITED    = 605
+VW_ERR_LINK_PASSWORD_REQUIRED = 607  # TASK-186
+VW_ERR_LINK_PASSWORD_WRONG    = 608  # TASK-186
 
 
 class VwProtocolError(RuntimeError):
@@ -536,9 +538,13 @@ class VwClient:
             })
         return entries
 
-    def link_create(self, session_token, file_id, permission, expires_at=0):
-        """Returns (share_id, link_token)."""
+    def link_create(self, session_token, file_id, permission, expires_at=0, password=None):
+        """Returns (share_id, link_token). password=None/""  (TASK-186) means
+        no password — omitting the trailing field entirely would also work
+        (it's optional), but sending an explicit empty string exercises the
+        same "has the field, it's just empty" path a real client sends."""
         payload = bytes(session_token) + struct.pack("<QBQ", file_id, permission, expires_at)
+        payload += _encode_str(password or "")
         self._send(MSG_LINK_CREATE, payload)
         mt, resp = self._recv()
         self._expect(MSG_LINK_CREATE_ACK, mt, resp)
@@ -572,26 +578,38 @@ class VwClient:
             permission = resp[off]; off += 1
             created_at, expires_at = struct.unpack_from("<qq", resp, off); off += 16
             revoked = resp[off]; off += 1
+            has_password = bool(resp[off]) if off < len(resp) else False  # TASK-186
+            off += 1 if off < len(resp) else 0
             entries.append({
                 "share_id": share_id, "file_id": file_id_, "name": name,
                 "permission": permission, "created_at": created_at,
                 "expires_at": expires_at, "revoked": bool(revoked),
+                "has_password": has_password,
             })
         return entries
 
-    def link_access(self, link_token):
+    def link_access(self, link_token, password=None):
         """
         Redeem a public link — unauthenticated, sent as the first message
         after HELLO/HELLO_OK instead of AUTH_REQUEST. Only valid immediately
         after connecting (mirrors login()'s position in the handshake).
 
+        password (TASK-186): None/"" omits it entirely — sending the bare
+        32-byte token with no trailing field at all, matching a pre-
+        TASK-186 client exactly, not just "an empty string." A real
+        password-carrying request does add the trailing string field.
+
         Returns the same shape as login(): session_token, expires_at,
         is_admin (always False), quota_bytes/used_bytes (always 0),
         user_id (always 0).
 
-        Raises VwAuthError on an unknown/revoked/expired token.
+        Raises VwAuthError on an unknown/revoked/expired token, or on a
+        missing/wrong password (VW_ERR_LINK_PASSWORD_REQUIRED/_WRONG).
         """
-        self._send(MSG_LINK_ACCESS, bytes(link_token))
+        payload = bytes(link_token)
+        if password:
+            payload += _encode_str(password)
+        self._send(MSG_LINK_ACCESS, payload)
         mt, resp = self._recv()
         if mt == MSG_AUTH_FAIL:
             code = struct.unpack_from("<I", resp, 0)[0] if len(resp) >= 4 else 0

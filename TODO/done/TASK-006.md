@@ -1,6 +1,6 @@
 ---
 id:          TASK-006
-title:       Implement vw_proto module (wire protocol framing)
+title:       "Implement vw_proto module (wire protocol framing)"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

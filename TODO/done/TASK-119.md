@@ -1,6 +1,6 @@
 ---
 id:          TASK-119
-title:       Resolve mbedTLS version mismatch between vendored submodule and FetchContent pin
+title:       "Resolve mbedTLS version mismatch between vendored submodule and FetchContent pin"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

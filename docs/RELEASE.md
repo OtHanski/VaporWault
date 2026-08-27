@@ -141,12 +141,32 @@ That's it — pushing the tag triggers the workflow. Watch it under the repo's
 auto-generated release notes (from commits/PRs since the previous tag, via
 `gh release create --generate-notes`).
 
-**Versioning**: tags follow `vMAJOR.MINOR.PATCH` (e.g. `v0.2.0`). There is no
-in-repo `VERSION` file or embedded version string yet — the git tag is the only
-source of truth for a release's version. Pre-release tags (e.g. `v0.2.0-rc1`) will
-build and publish like any other tag; the workflow does not currently mark them as
-a GitHub "pre-release" — treat that as a manual step (edit the release after
-publishing) until that's automated.
+**Versioning**: tags follow `vMAJOR.MINOR.PATCH` (e.g. `v0.2.0`). Pre-release tags
+(e.g. `v0.2.0-rc1`) will build and publish like any other tag; the workflow does
+not currently mark them as a GitHub "pre-release" — treat that as a manual step
+(edit the release after publishing) until that's automated.
+
+**Embedded version string (`TASK-203`)**: the checked-in `VERSION` file
+(repo root, plain `MAJOR.MINOR.PATCH`, no leading `v`) feeds
+`project(VaporWault VERSION ...)` and is `--version`'s fallback value for
+every built binary. It is **not** the source of truth for a release's
+actual version, though — `build-linux`/`build-windows` both pass
+`-DVW_VERSION="$PKG_VERSION"` (derived from the pushed tag, §7's
+script-injection-safe pattern), which overrides the `VERSION` file's
+contents for that build. This means a stale `VERSION` file cannot ship a
+wrong version in a real release archive/package — CPack's package version
+and every binary's `--version` output both come from the tag either way.
+
+What the `VERSION` file's contents actually control: a **local/dev
+build's** `--version` output (no `-DVW_VERSION` override there) and the
+CMake-internal `PROJECT_VERSION` variables. Keeping it in sync is a
+**manual bump-before-tagging step**, not a CI-enforced check — deliberately
+so, since a mismatch has no user-visible consequence on the actual release
+artifacts, and adding a hard CI gate for a value that can't ship wrong
+would be enforcing a constraint the release doesn't need. Bump `VERSION` to
+the next planned release number as part of the PR that precedes tagging (or
+whenever a new development cycle starts), not as part of the tag push
+itself.
 
 **Re-running for the same tag**: if a run fails partway through, fix the issue and
 re-run the workflow (or re-push the same tag after deleting and recreating it — not

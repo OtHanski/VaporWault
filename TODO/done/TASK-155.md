@@ -1,6 +1,6 @@
 ---
 id:          TASK-155
-title:       vw_proto_recv leaves unread bytes on the wire on VW_ERR_PROTO_TOO_LARGE, permanently desyncing the connection
+title:       "vw_proto_recv leaves unread bytes on the wire on VW_ERR_PROTO_TOO_LARGE, permanently desyncing the connection"
 status:      done
 assignee:    PRT.04
 created_by:  WEB.09

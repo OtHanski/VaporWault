@@ -112,6 +112,87 @@ int VwGuiIpc::send_folder_remove(uint32_t account_id, const char *local_root) {
     return simple_req_resp(VW_IPC_FOLDER_REMOVE_REQ, VW_IPC_FOLDER_REMOVE_RESP, buf, off);
 }
 
+bool VwGuiIpc::folder_list(uint32_t account_id, std::vector<VwGuiFolderEntry> *out) {
+    uint8_t req[4]; vw_write_u32le(req, account_id);
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    if (one_shot(VW_IPC_FOLDER_LIST_REQ, req, sizeof(req), VW_IPC_FOLDER_LIST_RESP,
+                 resp.data(), kRespCap, &rlen) != VW_OK)
+        return false;
+    if (rlen < 4) { out->clear(); return true; }
+
+    uint32_t count = read_u32_le(resp.data());
+    uint32_t off = 4;
+    std::vector<VwGuiFolderEntry> entries;
+    entries.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        VwGuiFolderEntry e;
+        const char *lroot = nullptr; uint16_t llen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &off, &lroot, &llen) != VW_OK) break;
+        e.local_root.assign(lroot, llen);
+        const char *vroot = nullptr; uint16_t vlen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &off, &vroot, &vlen) != VW_OK) break;
+        e.virtual_root.assign(vroot, vlen);
+
+        if (off + 1u + 1u + 8u + 2u > rlen) break;
+        e.paused        = resp[off++];
+        e.pause_reason  = resp[off++];
+        e.remote_dir_id = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+
+        uint16_t ecount = vw_read_u16le(resp.data() + off); off += 2;
+        for (uint16_t j = 0; j < ecount; j++) {
+            const char *pat = nullptr; uint16_t plen = 0;
+            if (vw_ipc_read_str(resp.data(), rlen, &off, &pat, &plen) != VW_OK) break;
+            e.excludes.emplace_back(pat, plen);
+        }
+        entries.push_back(std::move(e));
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
+int VwGuiIpc::folder_set_excludes(uint32_t account_id, const char *local_root,
+                                   const std::vector<std::string> &patterns) {
+    std::vector<uint8_t> buf(4u + 2u + 512u + 2u + 64u * 258u);
+    uint32_t off = 0;
+    vw_write_u32le(buf.data() + off, account_id); off += 4u;
+    vw_ipc_write_str(buf.data(), (uint32_t)buf.size(), &off, local_root,
+                      (uint16_t)strnlen(local_root, 511));
+    uint16_t count = (uint16_t)(patterns.size() < 64 ? patterns.size() : 64);
+    vw_write_u16le(buf.data() + off, count); off += 2u;
+    for (uint16_t i = 0; i < count; i++)
+        vw_ipc_write_str(buf.data(), (uint32_t)buf.size(), &off,
+                          patterns[i].c_str(), (uint16_t)patterns[i].size());
+    return simple_req_resp(VW_IPC_FOLDER_SET_EXCLUDES_REQ, VW_IPC_FOLDER_SET_EXCLUDES_RESP,
+                            buf.data(), off);
+}
+
+bool VwGuiIpc::notify_prefs_get(uint32_t account_id, uint32_t *out_prefs) {
+    uint8_t req[4]; vw_write_u32le(req, account_id);
+    uint8_t resp[8]; uint32_t plen;
+    if (one_shot(VW_IPC_NOTIFY_PREFS_GET_REQ, req, sizeof(req), VW_IPC_NOTIFY_PREFS_GET_RESP,
+                 resp, sizeof(resp), &plen) != VW_OK || plen < 8)
+        return false;
+    if (read_u32_le(resp) != 0) return false; /* error_code */
+    *out_prefs = read_u32_le(resp + 4);
+    return true;
+}
+
+int VwGuiIpc::notify_prefs_set(uint32_t account_id, uint32_t prefs, uint32_t *out_prefs) {
+    uint8_t req[8]; vw_write_u32le(req, account_id); vw_write_u32le(req + 4, prefs);
+    uint8_t resp[8]; uint32_t plen;
+    vw_err_t err = one_shot(VW_IPC_NOTIFY_PREFS_SET_REQ, req, sizeof(req),
+                             VW_IPC_NOTIFY_PREFS_SET_ACK, resp, sizeof(resp), &plen);
+    if (err != VW_OK) return (int)err;
+    if (plen < 8) return (int)VW_ERR_IO;
+    uint32_t code = read_u32_le(resp);
+    if (code == 0 && out_prefs) *out_prefs = read_u32_le(resp + 4);
+    return (int)code;
+}
+
 bool VwGuiIpc::account_list(std::vector<VwGuiAccountEntry> *out) {
     static const uint32_t kRespCap = 65536;
     std::vector<uint8_t> resp(kRespCap);
@@ -275,6 +356,54 @@ bool VwGuiIpc::file_list(uint32_t account_id, const char *prefix, std::vector<Vw
     return true;
 }
 
+bool VwGuiIpc::search(uint32_t account_id, const char *query, std::vector<VwGuiSearchEntry> *out,
+                       uint8_t *out_truncated, int *out_error_code) {
+    uint8_t req[4u + 2u + 256u]; uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    const char *q = query ? query : "";
+    vw_ipc_write_str(req, sizeof(req), &off, q, (uint16_t)strlen(q));
+
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_SEARCH_REQ, req, off, VW_IPC_SEARCH_RESP,
+                             resp.data(), kRespCap, &rlen);
+    if (err != VW_OK) { if (out_error_code) *out_error_code = (int)err; return false; }
+    if (rlen < 9) { if (out_error_code) *out_error_code = (int)VW_ERR_IO; return false; }
+
+    uint32_t ec = read_u32_le(resp.data());
+    if (out_error_code) *out_error_code = (int)ec;
+    if (ec != 0) return false;
+
+    uint32_t count = read_u32_le(resp.data() + 4);
+    uint8_t  truncated = resp[8];
+    if (out_truncated) *out_truncated = truncated;
+    uint32_t roff = 9;
+
+    std::vector<VwGuiSearchEntry> entries;
+    entries.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        if (roff + 8u > rlen) break;
+        VwGuiSearchEntry e;
+        e.file_id = (uint64_t)read_i64_le(resp.data() + roff); roff += 8;
+
+        const char *name = nullptr; uint16_t nlen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &roff, &name, &nlen) != VW_OK) break;
+        e.name.assign(name, nlen);
+
+        if (roff + 1u + 8u + 8u + 8u + 1u > rlen) break;
+        e.is_dir     = resp[roff++];
+        e.size_bytes = (uint64_t)read_i64_le(resp.data() + roff); roff += 8;
+        e.mtime_unix = read_i64_le(resp.data() + roff); roff += 8;
+        e.vault_id   = (uint64_t)read_i64_le(resp.data() + roff); roff += 8;
+        e.is_shared  = resp[roff++];
+        entries.push_back(std::move(e));
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
 int VwGuiIpc::share_grant(uint32_t account_id, const char *virtual_path, const char *target_username,
                            uint8_t permission, int64_t expires_at, uint64_t *out_share_id) {
     uint8_t req[4u + 2u + 4096u + 2u + 65u + 1u + 8u]; uint32_t off = 0;
@@ -352,12 +481,14 @@ bool VwGuiIpc::share_list(uint32_t account_id, uint8_t mode, std::vector<VwGuiSh
 }
 
 int VwGuiIpc::link_create(uint32_t account_id, const char *virtual_path, uint8_t permission, int64_t expires_at,
-                           uint64_t *out_share_id, uint8_t out_token[32]) {
-    uint8_t req[4u + 2u + 4096u + 1u + 8u]; uint32_t off = 0;
+                           const char *password, uint64_t *out_share_id, uint8_t out_token[32]) {
+    uint8_t req[4u + 2u + 4096u + 1u + 8u + 2u + 256u]; uint32_t off = 0;
     vw_write_u32le(req + off, account_id); off += 4u;
     vw_ipc_write_str(req, sizeof(req), &off, virtual_path, (uint16_t)strlen(virtual_path));
     req[off++] = permission;
     vw_write_u64le(req + off, (uint64_t)expires_at); off += 8;
+    vw_ipc_write_str(req, sizeof(req), &off, password ? password : "",
+                      (uint16_t)(password ? strlen(password) : 0));
 
     uint8_t resp[4u + 8u + 32u]; uint32_t rlen;
     vw_err_t err = one_shot(VW_IPC_LINK_CREATE_REQ, req, off, VW_IPC_LINK_CREATE_RESP,
@@ -404,16 +535,62 @@ bool VwGuiIpc::link_list(uint32_t account_id, std::vector<VwGuiLinkEntry> *out, 
         if (vw_ipc_read_str(resp.data(), rlen, &off, &name, &nlen) != VW_OK) break;
         e.name.assign(name, nlen);
 
-        if (off + 1u + 8u + 8u + 1u > rlen) break;
+        if (off + 1u + 8u + 8u + 1u + 1u > rlen) break;
         e.permission = resp[off++];
         e.created_at = read_i64_le(resp.data() + off); off += 8;
         e.expires_at = read_i64_le(resp.data() + off); off += 8;
         e.revoked    = resp[off++];
+        e.has_password = resp[off++]; /* TASK-186/189 */
         entries.push_back(std::move(e));
     }
 
     *out = std::move(entries);
     return true;
+}
+
+bool VwGuiIpc::version_list(uint32_t account_id, const char *virtual_path,
+                             std::vector<VwGuiVersionEntry> *out, int *out_error_code) {
+    uint8_t req[4u + 2u + 4096u]; uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    vw_ipc_write_str(req, sizeof(req), &off, virtual_path, (uint16_t)strlen(virtual_path));
+
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VERSION_LIST_REQ, req, off, VW_IPC_VERSION_LIST_RESP,
+                             resp.data(), kRespCap, &rlen);
+    if (err != VW_OK) { if (out_error_code) *out_error_code = (int)err; return false; }
+    if (rlen < 8) { if (out_error_code) *out_error_code = (int)VW_ERR_IO; return false; }
+
+    uint32_t ec = read_u32_le(resp.data());
+    if (out_error_code) *out_error_code = (int)ec;
+    if (ec != 0) return false;
+
+    uint32_t count = read_u32_le(resp.data() + 4);
+    uint32_t roff = 8;
+    std::vector<VwGuiVersionEntry> entries;
+    entries.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (roff + 24u > rlen) break;
+        VwGuiVersionEntry e;
+        e.version_id = (uint64_t)read_i64_le(resp.data() + roff); roff += 8;
+        e.created_at = read_i64_le(resp.data() + roff); roff += 8;
+        e.size_bytes = (uint64_t)read_i64_le(resp.data() + roff); roff += 8;
+        entries.push_back(e);
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
+int VwGuiIpc::version_restore(uint32_t account_id, const char *virtual_path, uint64_t version_id) {
+    uint8_t req[4u + 2u + 4096u + 8u]; uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    vw_ipc_write_str(req, sizeof(req), &off, virtual_path, (uint16_t)strlen(virtual_path));
+    vw_write_u64le(req + off, version_id); off += 8u;
+
+    return simple_req_resp(VW_IPC_VERSION_RESTORE_REQ, VW_IPC_VERSION_RESTORE_RESP, req, off);
 }
 
 int VwGuiIpc::file_mkdir(uint32_t account_id, uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id) {

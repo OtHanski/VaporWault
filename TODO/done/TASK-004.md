@@ -1,6 +1,6 @@
 ---
 id:          TASK-004
-title:       Implement vw_fs module
+title:       "Implement vw_fs module"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

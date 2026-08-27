@@ -513,6 +513,7 @@ typedef struct {
     int64_t  created_at;
     int64_t  expires_at;
     uint8_t  revoked;
+    uint8_t  has_password; /* TASK-186/188; never the password/hash itself */
 } vw_link_entry_t;
 
 /*
@@ -549,11 +550,16 @@ vw_err_t vw_client_share_list(vw_client_sess_t *sess,
  * token — the only time it is ever available; relay it to the user
  * immediately (e.g. print it once) and never persist it locally beyond
  * that, matching the server's own "never re-display" convention.
+ *
+ * password (TASK-186/188): NULL or empty = no password. Sent as-is to
+ * the server (not client-side hashed — see docs/PROTOCOL.md §7.5's
+ * rationale); never persisted or logged by this function.
  */
 vw_err_t vw_client_link_create(vw_client_sess_t *sess,
                                 uint64_t file_id,
                                 vw_perm_t permission,
                                 int64_t expires_at,
+                                const char *password,
                                 uint64_t *out_share_id,
                                 uint8_t out_link_token[32]);
 
@@ -583,12 +589,82 @@ vw_err_t vw_client_link_list(vw_client_sess_t *sess,
  * file-op functions to read/write within it, subject to the link's
  * permission level.
  *
+ * password (TASK-186): NULL/empty if the caller has none to offer.
+ *
  * Returns VW_ERR_AUTH_BAD_CREDS for an unknown, revoked, or expired token
- * (indistinguishable, by design — anti-enumeration).
+ * (indistinguishable, by design — anti-enumeration). Returns
+ * VW_ERR_LINK_PASSWORD_REQUIRED/_WRONG for a password-protected link
+ * with a missing/incorrect password — these ARE distinguishable from
+ * each other and from the token-validity codes above, since knowing a
+ * link needs a password isn't itself a meaningful enumeration primitive
+ * (docs/PROTOCOL.md §7.10's "password check ordering" note).
  */
 vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
                                 const uint8_t link_token[32],
+                                const char *password,
                                 vw_client_sess_t **out_sess);
+
+/* ── Search (TASK-196/197/198; docs/PROTOCOL.md §7.12) ────────────────────── */
+
+/*
+ * A SEARCH match. name is the leaf name only (display-only, same
+ * convention as vw_share_entry_t/vw_link_entry_t's own name field) — no
+ * virtual path is ever returned; see §7.12's rationale (file_id already
+ * round-trips through every file-id-addressed operation).
+ */
+typedef struct {
+    uint64_t file_id;
+    char     name[64];
+    uint8_t  is_dir;
+    uint64_t size_bytes;
+    int64_t  mtime_unix;
+    uint64_t vault_id;   /* 0 = unencrypted or a directory */
+    uint8_t  is_shared;  /* 1 = visible via a grant, not owned */
+} vw_search_entry_t;
+
+/*
+ * Case-insensitive substring search over filenames across everything the
+ * caller can see (owned + shared, per effective_permission()). Empty
+ * query matches everything visible, subject to the cap below.
+ *
+ * Returns a malloc'd array; caller frees (same convention as
+ * vw_client_share_list/vw_client_link_list). *out_truncated is set to 1
+ * if more matches existed than the server's 200-entry cap allowed — not
+ * an error; callers should suggest narrowing the query.
+ *
+ * Returns VW_ERR_INVALID_ARG for a query over 256 bytes, VW_ERR_PERMISSION
+ * for a scoped (LINK_ACCESS-redeemed anonymous) session — SEARCH has no
+ * scoped-session support (§7.12).
+ */
+vw_err_t vw_client_search(vw_client_sess_t *sess,
+                           const char *query,
+                           vw_search_entry_t **out,
+                           uint32_t *out_count,
+                           uint8_t *out_truncated);
+
+/* ── Notification preferences (TASK-206/207/209; docs/PROTOCOL.md §7.13) ─── */
+
+/*
+ * Fetch the caller's own notification preference bitmask (VW_NOTIFY_*
+ * bits, src/core/vw_proto.h). Account-scoped only — operates on
+ * whichever account sess itself is authenticated as, no user_id param
+ * exists anywhere in this call. Returns VW_ERR_PERMISSION for a scoped
+ * (LINK_ACCESS-redeemed anonymous) session, same as vw_client_search.
+ */
+vw_err_t vw_client_notify_prefs_get(vw_client_sess_t *sess, uint32_t *out_prefs);
+
+/*
+ * Replace the caller's own complete notification preference bitmask —
+ * not a per-bit toggle; callers that want to flip one category should
+ * vw_client_notify_prefs_get first, flip the bit locally, and call this
+ * with the full result (§7.13's own documented pattern). *out_prefs
+ * receives the stored value after the call (echoed back by
+ * NOTIFY_PREFS_SET_ACK) — identical to the request on success, unchanged
+ * on any error. Returns VW_ERR_INVALID_ARG for a reserved bit outside
+ * VW_NOTIFY_ALL_KNOWN.
+ */
+vw_err_t vw_client_notify_prefs_set(vw_client_sess_t *sess, uint32_t prefs,
+                                     uint32_t *out_prefs);
 
 #ifdef __cplusplus
 }

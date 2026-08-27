@@ -158,6 +158,18 @@ struct vw_store {
     uint64_t         *quota_free;     /* free-slot indices */
     size_t            quota_free_len;
     size_t            quota_free_cap;
+    vw_store_quota_hook_fn quota_hook_fn;  /* TASK-207; NULL = no hook */
+    void                   *quota_hook_ud;
+
+    /* Notification-preferences table (TASK-207) — guarded by notify_lock.
+     * Same shape as the quota table immediately above. */
+    vw_rwlock_t                notify_lock;
+    char                       notify_prefs_path[512];
+    vw_notify_prefs_record_t  *notify_prefs;
+    uint64_t                   notify_nslots;
+    uint64_t                  *notify_free;
+    size_t                     notify_free_len;
+    size_t                     notify_free_cap;
 };
 
 /* ── FNV-1a 64-bit hash ───────────────────────────────────────────────────── */
@@ -480,12 +492,15 @@ vw_err_t vw_store_open(const char *data_dir, vw_oplog_t *oplog,
     void       *ubuf = NULL;
     void       *sbuf = NULL;
     void       *qbuf = NULL;
+    void       *nbuf = NULL;
     size_t      ubuf_len = 0;
     size_t      sbuf_len = 0;
     size_t      qbuf_len = 0;
+    size_t      nbuf_len = 0;
     int         users_lock_init = 0;
     int         sessions_lock_init = 0;
     int         quota_lock_init = 0;
+    int         notify_lock_init = 0;
     uint64_t    max_user_id = 0;
     uint64_t    now = 0;
     uint64_t    i = 0;
@@ -494,6 +509,7 @@ vw_err_t vw_store_open(const char *data_dir, vw_oplog_t *oplog,
     char        users_path[512];
     char        sessions_path[512];
     char        quotas_path[512];
+    char        notify_prefs_path[512];
     uint8_t     guard[256];
 
     if (!data_dir || !oplog || !out_ctx) return VW_ERR_INVALID_ARG;
@@ -509,6 +525,9 @@ vw_err_t vw_store_open(const char *data_dir, vw_oplog_t *oplog,
     sn = snprintf(quotas_path, sizeof(quotas_path),
                   "%s/store/quotas.db", data_dir);
     if (sn < 0 || sn >= (int)sizeof(quotas_path)) return VW_ERR_INVALID_ARG;
+    sn = snprintf(notify_prefs_path, sizeof(notify_prefs_path),
+                  "%s/store/notify_prefs.db", data_dir);
+    if (sn < 0 || sn >= (int)sizeof(notify_prefs_path)) return VW_ERR_INVALID_ARG;
 
     err = vw_fs_ensure_dir(store_dir);
     if (err != VW_OK) return err;
@@ -538,6 +557,10 @@ vw_err_t vw_store_open(const char *data_dir, vw_oplog_t *oplog,
     if (rwlock_init(&ctx->quota_lock) != 0) { err = VW_ERR_IO; goto fail; }
     quota_lock_init = 1;
     memcpy(ctx->quotas_path, quotas_path, sizeof(quotas_path));
+
+    if (rwlock_init(&ctx->notify_lock) != 0) { err = VW_ERR_IO; goto fail; }
+    notify_lock_init = 1;
+    memcpy(ctx->notify_prefs_path, notify_prefs_path, sizeof(notify_prefs_path));
 
     ctx->username_ht = (uname_ht_entry_t *)calloc(64, sizeof(*ctx->username_ht));
     if (!ctx->username_ht) { err = VW_ERR_OOM; goto fail; }
@@ -663,6 +686,42 @@ vw_err_t vw_store_open(const char *data_dir, vw_oplog_t *oplog,
         }
     }
 
+    /* ── notify_prefs.db ── */
+    {
+        vw_notify_prefs_record_t nguard;
+        memset(&nguard, 0, sizeof(nguard));
+        if (!vw_fs_exists(ctx->notify_prefs_path)) {
+            err = vw_fs_atomic_write(ctx->notify_prefs_path, &nguard, sizeof(nguard));
+            if (err != VW_OK) goto fail;
+        }
+        err = vw_fs_read_file(ctx->notify_prefs_path, &nbuf, &nbuf_len);
+        if (err != VW_OK) goto fail;
+
+        ctx->notify_nslots = nbuf_len / sizeof(vw_notify_prefs_record_t);
+        ctx->notify_prefs = (vw_notify_prefs_record_t *)calloc(
+            ctx->notify_nslots ? ctx->notify_nslots : 1, sizeof(vw_notify_prefs_record_t));
+        if (!ctx->notify_prefs) { err = VW_ERR_OOM; free(nbuf); nbuf = NULL; goto fail; }
+        if (ctx->notify_nslots)
+            memcpy(ctx->notify_prefs, nbuf, ctx->notify_nslots * sizeof(vw_notify_prefs_record_t));
+        free(nbuf); nbuf = NULL;
+
+        /* Build free-list. Slot 0 is the guard. */
+        for (i = 1; i < ctx->notify_nslots; i++) {
+            if (ctx->notify_prefs[i].user_id == 0) {
+                uint64_t *p;
+                size_t nc;
+                if (ctx->notify_free_len >= ctx->notify_free_cap) {
+                    nc = ctx->notify_free_cap ? ctx->notify_free_cap * 2 : 8;
+                    p = (uint64_t *)realloc(ctx->notify_free, nc * sizeof(uint64_t));
+                    if (!p) { err = VW_ERR_OOM; goto fail; }
+                    ctx->notify_free = p;
+                    ctx->notify_free_cap = nc;
+                }
+                ctx->notify_free[ctx->notify_free_len++] = i;
+            }
+        }
+    }
+
     err = VW_OK;
     *out_ctx = ctx;
     ctx = NULL; /* ownership transferred; suppress cleanup below */
@@ -677,7 +736,9 @@ fail:
         free(sbuf);
     }
     if (qbuf) free(qbuf);
+    if (nbuf) free(nbuf);
     if (ctx) {
+        if (notify_lock_init)   rwlock_destroy(&ctx->notify_lock);
         if (quota_lock_init)    rwlock_destroy(&ctx->quota_lock);
         if (sessions_lock_init) rwlock_destroy(&ctx->sessions_lock);
         if (users_lock_init)    rwlock_destroy(&ctx->users_lock);
@@ -696,6 +757,8 @@ fail:
         free(ctx->session_free_slots);
         free(ctx->quotas);
         free(ctx->quota_free);
+        free(ctx->notify_prefs);
+        free(ctx->notify_free);
         free(ctx);
     }
     return err;
@@ -787,6 +850,9 @@ void vw_store_close(vw_store_t *ctx)
     rwlock_destroy(&ctx->quota_lock);
     free(ctx->quotas);
     free(ctx->quota_free);
+    rwlock_destroy(&ctx->notify_lock);
+    free(ctx->notify_prefs);
+    free(ctx->notify_free);
     free(ctx);
 }
 
@@ -1631,6 +1697,8 @@ vw_err_t vw_store_quota_add(vw_store_t *ctx, uint64_t user_id, int64_t delta)
 {
     vw_err_t err;
     uint64_t slot;
+    uint64_t used_after = 0, limit_after = 0;
+    int      report_hook = 0;
 
     if (!ctx || !user_id) return VW_ERR_INVALID_ARG;
 
@@ -1662,8 +1730,117 @@ vw_err_t vw_store_quota_add(vw_store_t *ctx, uint64_t user_id, int64_t delta)
     }
 
     err = quota_write_slot(ctx, slot);
+    if (err == VW_OK && ctx->quota_hook_fn) {
+        used_after  = ctx->quotas[slot].used_bytes;
+        limit_after = ctx->quotas[slot].quota_bytes;
+        report_hook = 1;
+    }
 
 unlock:
     rwlock_wrunlock(&ctx->quota_lock);
+    /* Invoked outside the lock — vw_notify.c's hook does its own I/O
+     * (SMTP send) and must not hold up every other quota-accounting call
+     * in the process while it runs. TASK-207. */
+    if (report_hook) ctx->quota_hook_fn(ctx->quota_hook_ud, user_id, used_after, limit_after);
+    return err;
+}
+
+/* ── vw_store_set_quota_hook ──────────────────────────────────────────────── */
+
+void vw_store_set_quota_hook(vw_store_t *ctx, vw_store_quota_hook_fn hook, void *userdata)
+{
+    if (!ctx) return;
+    ctx->quota_hook_fn = hook;
+    ctx->quota_hook_ud  = userdata;
+}
+
+/* ── Notification preferences (TASK-207) ─────────────────────────────────── */
+
+static uint64_t notify_find_slot(const vw_store_t *ctx, uint64_t user_id)
+{
+    uint64_t i;
+    for (i = 1; i < ctx->notify_nslots; i++) {
+        if (ctx->notify_prefs[i].user_id == user_id) return i;
+    }
+    return UINT64_MAX;
+}
+
+/* Write a notify_prefs record at slot to disk. Caller must hold
+ * notify_lock exclusive. */
+static vw_err_t notify_write_slot(vw_store_t *ctx, uint64_t slot)
+{
+    vw_err_t err = vw_fs_pwrite(ctx->notify_prefs_path,
+                                  slot * sizeof(vw_notify_prefs_record_t),
+                                  &ctx->notify_prefs[slot],
+                                  sizeof(vw_notify_prefs_record_t));
+    if (err != VW_OK) return err;
+    return vw_fs_sync_file(ctx->notify_prefs_path);
+}
+
+/* Allocate a new slot (from free list or append). Caller holds
+ * notify_lock exclusive. */
+static vw_err_t notify_alloc_slot(vw_store_t *ctx, uint64_t *out_slot)
+{
+    if (ctx->notify_free_len > 0) {
+        *out_slot = ctx->notify_free[--ctx->notify_free_len];
+        return VW_OK;
+    }
+
+    uint64_t new_nslots = ctx->notify_nslots + 1;
+    vw_notify_prefs_record_t *p = (vw_notify_prefs_record_t *)realloc(
+        ctx->notify_prefs, new_nslots * sizeof(vw_notify_prefs_record_t));
+    if (!p) return VW_ERR_OOM;
+    ctx->notify_prefs = p;
+    memset(&ctx->notify_prefs[ctx->notify_nslots], 0, sizeof(vw_notify_prefs_record_t));
+
+    vw_err_t err = vw_fs_pwrite(ctx->notify_prefs_path,
+                                  ctx->notify_nslots * sizeof(vw_notify_prefs_record_t),
+                                  &ctx->notify_prefs[ctx->notify_nslots],
+                                  sizeof(vw_notify_prefs_record_t));
+    if (err != VW_OK) return err;
+
+    *out_slot = ctx->notify_nslots;
+    ctx->notify_nslots = new_nslots;
+    return VW_OK;
+}
+
+/* ── vw_store_notify_prefs_get ────────────────────────────────────────────── */
+
+vw_err_t vw_store_notify_prefs_get(vw_store_t *ctx, uint64_t user_id,
+                                     uint32_t *out_prefs)
+{
+    if (!ctx || !user_id || !out_prefs) return VW_ERR_INVALID_ARG;
+
+    rwlock_rdlock(&ctx->notify_lock);
+    uint64_t slot = notify_find_slot(ctx, user_id);
+    *out_prefs = (slot != UINT64_MAX) ? ctx->notify_prefs[slot].prefs_bitmask : 0;
+    rwlock_rdunlock(&ctx->notify_lock);
+
+    return VW_OK;
+}
+
+/* ── vw_store_notify_prefs_set ────────────────────────────────────────────── */
+
+vw_err_t vw_store_notify_prefs_set(vw_store_t *ctx, uint64_t user_id,
+                                     uint32_t prefs)
+{
+    vw_err_t err;
+    uint64_t slot;
+
+    if (!ctx || !user_id) return VW_ERR_INVALID_ARG;
+
+    rwlock_wrlock(&ctx->notify_lock);
+
+    slot = notify_find_slot(ctx, user_id);
+    if (slot == UINT64_MAX) {
+        err = notify_alloc_slot(ctx, &slot);
+        if (err != VW_OK) goto unlock;
+        ctx->notify_prefs[slot].user_id = user_id;
+    }
+    ctx->notify_prefs[slot].prefs_bitmask = prefs;
+    err = notify_write_slot(ctx, slot);
+
+unlock:
+    rwlock_wrunlock(&ctx->notify_lock);
     return err;
 }

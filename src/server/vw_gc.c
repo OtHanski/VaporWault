@@ -15,6 +15,7 @@
 
 #include "vw_gc.h"
 #include "vw_cluster.h"
+#include "../core/vw_fs.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -73,6 +74,8 @@ struct vw_gc_ctx {
     vw_storage_t    *chunk_store; /* borrowed; NULL = skip file/chunk GC */
     vw_oplog_t      *oplog;       /* borrowed */
     vw_cluster_t    *cluster;     /* borrowed; NULL = single-node mode */
+    vw_notify_ctx_t *notify;      /* borrowed; NULL = admin health checks disabled (TASK-208) */
+    char             data_dir[4096]; /* for disk_capacity's statvfs/GetDiskFreeSpaceEx call */
 
     volatile int    shutdown; /* set to 1 to signal thread exit */
     int             running;  /* 1 after vw_gc_start */
@@ -192,6 +195,24 @@ vw_err_t vw_gc_run_once(vw_gc_ctx_t *ctx)
                     "watermark %llu, behind current oplog tail %llu",
                     (unsigned long long)safe_eid, (unsigned long long)current_eid);
         }
+        /* TASK-208: admin replica_lag alert — reuses this same lag
+         * computation rather than a second watermark query. Only
+         * meaningful with active replicas; an already-lagging *disabled*
+         * (no active replicas) cluster config never fires. */
+        if (ctx->notify)
+            vw_notify_replica_lag(ctx->notify, current_eid - safe_eid);
+    }
+
+    /* TASK-208: admin disk_capacity alert — same cadence as everything
+     * else in this GC pass. A failed disk-usage read is logged and
+     * skipped, never fatal to the rest of the GC cycle. */
+    if (ctx->notify && ctx->data_dir[0]) {
+        uint32_t pct = 0;
+        vw_err_t drc = vw_fs_disk_usage_pct(ctx->data_dir, &pct);
+        if (drc == VW_OK)
+            vw_notify_disk_capacity(ctx->notify, pct);
+        else
+            GC_WARN("disk_usage_pct(%s) failed: %d", ctx->data_dir, (int)drc);
     }
 
     if (ctx->file_store && ctx->chunk_store && !replica_lag_blocks_gc) {
@@ -356,6 +377,8 @@ vw_err_t vw_gc_create(const vw_gc_cfg_t *cfg,
                        vw_storage_t     *chunk_store,
                        vw_oplog_t       *oplog,
                        vw_cluster_t     *cluster,
+                       const char       *data_dir,
+                       vw_notify_ctx_t  *notify,
                        vw_gc_ctx_t     **out)
 {
     vw_gc_ctx_t *ctx;
@@ -371,6 +394,8 @@ vw_err_t vw_gc_create(const vw_gc_cfg_t *cfg,
     ctx->chunk_store = chunk_store;
     ctx->oplog       = oplog;
     ctx->cluster     = cluster; /* NULL = single-node mode */
+    ctx->notify      = notify;  /* NULL = admin replica_lag/disk_capacity checks disabled */
+    if (data_dir) snprintf(ctx->data_dir, sizeof(ctx->data_dir), "%s", data_dir);
 
     *out = ctx;
     return VW_OK;

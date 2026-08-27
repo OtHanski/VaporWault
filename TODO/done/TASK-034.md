@@ -1,6 +1,6 @@
 ---
 id:          TASK-034
-title:       Set up CI pipeline — GitHub Actions, ctest, cross-platform build
+title:       "Set up CI pipeline — GitHub Actions, ctest, cross-platform build"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

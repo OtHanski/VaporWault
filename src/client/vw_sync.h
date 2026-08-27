@@ -102,6 +102,29 @@ void vw_sync_get_progress(const vw_sync_ctx_t *ctx,
 uint32_t vw_sync_action_error_count(const vw_sync_ctx_t *ctx);
 
 /*
+ * Selective sync (TASK-192/193): set (replacing any previous set) the
+ * exclude patterns for one sync folder, identified by its local_root
+ * (must match a folder already registered via the cache — this function
+ * does not itself add/remove folders). Patterns are glob-style, matched
+ * against each entry's path relative to the folder's root: '*' matches
+ * any run of characters within one path segment, '?' matches exactly one
+ * character, and '**' as a whole path segment matches zero or more whole
+ * segments (so a pattern of "node_modules" followed by a trailing "**"
+ * segment excludes the node_modules directory itself and everything
+ * under it). No character classes, no negation —
+ * deliberately not full .gitignore semantics (TASK-192's design note).
+ * Matching is case-sensitive. Takes effect starting with the next
+ * vw_sync_run cycle. A path already synced locally when a rule newly
+ * excludes it is left on disk untouched — it simply stops being a
+ * source of further upload/download/delete actions in either direction.
+ * count == 0 clears any exclude rules for that folder. Not thread-safe
+ * relative to vw_sync_run (call it from the same thread that drives the
+ * sync loop, same as vw_sync_mark_local_modified).
+ */
+vw_err_t vw_sync_set_folder_excludes(vw_sync_ctx_t *ctx, const char *local_root,
+                                      const char *const *patterns, uint32_t count);
+
+/*
  * Return the number of permission-denied auto-mkdir attempts (TASK-113: a
  * shared folder's new local subdirectory has no server-side counterpart,
  * and the grantee lacks EDIT permission to create one) recorded during the

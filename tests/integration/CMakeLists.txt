@@ -20,6 +20,7 @@ add_executable(test_auth_handshake
     ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
     ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
 )
 
@@ -105,6 +106,7 @@ add_executable(test_file_list_vault_id
     ${CMAKE_SOURCE_DIR}/src/server/vw_conn_registry.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_vault.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
     ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
 )
 
@@ -208,6 +210,32 @@ if(UNIX)
 endif()
 if(WIN32)
     target_link_libraries(test_shared_sync PRIVATE ws2_32)
+endif()
+
+# test_search: TASK-198 SEARCH/SEARCH_RESP (docs/PROTOCOL.md §7.12),
+# end-to-end against a real already-running server with three real users
+# (owner, grantee, stranger). No vw_client_search() wrapper exists yet
+# (TASK-199) so this hand-drives the raw wire message via vw_client_conn()
+# + vw_proto_send/recv directly, rather than waiting for that wrapper —
+# same "needs a live server + created users" rationale as test_shared_sync
+# for using the pytest wrapper (test_search.py) instead of ctest add_test.
+
+add_executable(test_search
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_search.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+)
+
+target_include_directories(test_search PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+)
+
+target_link_libraries(test_search PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_search PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_search PRIVATE ws2_32)
 endif()
 
 # test_daemon_multi_account: TASK-161 daemon multi-account core. Replicates

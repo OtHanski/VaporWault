@@ -1,6 +1,6 @@
 ---
 id:          TASK-180
-title:       Server: chunk refcount is double-counted on every upload+commit, permanently leaking one ref per chunk
+title:       "Server - chunk refcount is double-counted on every upload+commit, permanently leaking one ref per chunk"
 status:      done
 assignee:    SRV.01
 created_by:  QA.06

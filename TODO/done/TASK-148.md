@@ -1,6 +1,6 @@
 ---
 id:          TASK-148
-title:       Windows client MSI (per-user install + scheduled-task custom action)
+title:       "Windows client MSI (per-user install + scheduled-task custom action)"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

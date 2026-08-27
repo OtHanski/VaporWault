@@ -1,6 +1,6 @@
 ---
 id:          TASK-130
-title:       Implement minimal JSON encode/decode for the web gateway (vw_json)
+title:       "Implement minimal JSON encode/decode for the web gateway (vw_json)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

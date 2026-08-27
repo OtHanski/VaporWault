@@ -1,6 +1,6 @@
 ---
 id:          TASK-016
-title:       vw_net — implement timeouts, fix CA store guard, add post-accept timeout setter
+title:       "vw_net — implement timeouts, fix CA store guard, add post-accept timeout setter"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

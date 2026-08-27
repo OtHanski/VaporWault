@@ -1,6 +1,6 @@
 ---
 id:          TASK-152
-title:       Verify installer install/uninstall/upgrade behavior end-to-end
+title:       "Verify installer install/uninstall/upgrade behavior end-to-end"
 status:      todo
 assignee:    QA.06
 created_by:  ARCH.00

@@ -148,6 +148,22 @@ static char        s_error_msg[128] = "";
 static std::set<uint64_t> s_shared_file_ids; /* file_ids with an active grant or link */
 static std::map<uint64_t, uint64_t> s_vault_ids; /* file_id -> vault_id (0 = unencrypted) */
 
+/* ── Search state (TASK-199/200; docs/PROTOCOL.md §7.12) ──────────────────
+ * Debounced: ipc_search() only fires kSearchDebounceSeconds after the
+ * InputText buffer last changed, not on every keystroke — see TASK-200's
+ * own corrections for why this, not a background thread, is what "doesn't
+ * block the UI thread" means in this GUI (no async IPC pattern exists
+ * anywhere else in it to follow instead).
+ */
+static constexpr double kSearchDebounceSeconds = 0.35;
+static char        s_search_query[257] = "";
+static double      s_search_last_edit_time = 0.0;
+static bool        s_search_pending = false;    /* an edit is debouncing */
+static bool        s_search_loading = false;    /* mid-ipc_search() call  */
+static std::vector<VwGuiSearchEntry> s_search_results;
+static uint8_t     s_search_truncated = 0;
+static std::string s_search_error;
+
 /* Decrypt & Download dialog (TASK-100) */
 static bool     s_decrypt_open = false;
 static uint64_t s_decrypt_vault_id = 0;
@@ -174,12 +190,26 @@ static char s_grant_status[160] = "";
 static int  s_link_perm_idx = 0;
 static bool s_link_has_expiry = false;
 static int  s_link_expiry_days = 30;
+static bool s_link_has_password = false;      /* TASK-186/189 */
+static char s_link_password[257] = "";
 static char s_link_status[160] = "";
 static bool s_link_token_valid = false;
 static char s_link_token_hex[65] = "";
 
 static std::vector<VwGuiShareEntry> s_dialog_shares;
 static std::vector<VwGuiLinkEntry>  s_dialog_links;
+
+/* ── Version history dialog state (TASK-183; daemon IPC: TASK-182) ──────── */
+static bool        s_history_open = false;
+static std::string s_history_path;
+static uint64_t     s_history_file_id = 0;
+static char         s_history_status[220] = "";
+static std::vector<VwGuiVersionEntry> s_history_entries;
+/* Restoring overwrites the current HEAD — require an explicit confirm
+ * step rather than acting on the first click (same reasoning the web
+ * frontend's window.confirm already applies to this same action). 0 =
+ * no pending confirmation. */
+static uint64_t s_history_pending_restore = 0;
 
 static const char *perm_label(uint8_t perm) {
     switch (perm) {
@@ -224,12 +254,51 @@ static void refresh(ClientApp &app) {
     s_needs_refresh = false;
 }
 
+static void clear_search() {
+    s_search_query[0] = '\0';
+    s_search_pending = false;
+    s_search_loading = false;
+    s_search_results.clear();
+    s_search_truncated = 0;
+    s_search_error.clear();
+}
+
 void vw_view_browser_invalidate() {
     s_needs_refresh = true;
     s_current_path = "/";
     s_entries.clear();
     s_shared_file_ids.clear();
     s_vault_ids.clear();
+    clear_search();
+}
+
+static void perform_search(ClientApp &app) {
+    s_search_loading = true;
+    int ec = 0;
+    std::vector<VwGuiSearchEntry> results;
+    uint8_t truncated = 0;
+    bool ok = app.ipc_search(s_search_query, &results, &truncated, &ec);
+    s_search_loading = false;
+    if (ok) {
+        s_search_results = std::move(results);
+        s_search_truncated = truncated;
+        s_search_error.clear();
+    } else {
+        s_search_results.clear();
+        s_search_truncated = 0;
+        s_search_error = "search failed (daemon/server error " + std::to_string(ec) + ")";
+    }
+}
+
+/* "Jump to location" (TASK-200): only resolvable for a result whose
+ * file_id is already known from the last ipc_file_list fetch — SEARCH
+ * itself never returns a virtual path (docs/PROTOCOL.md §7.12). Returns
+ * nullptr if this result isn't in a locally-known folder yet. */
+static const VwGuiFileEntry *find_local_entry_by_file_id(uint64_t file_id) {
+    if (file_id == 0) return nullptr;
+    for (const auto &e : s_entries)
+        if (e.file_id == file_id) return &e;
+    return nullptr;
 }
 
 static void navigate_up() {
@@ -252,9 +321,121 @@ static void open_share_dialog(const DisplayRow &row, ClientApp &app) {
     s_link_status[0]    = '\0';
     s_link_token_valid  = false;
     s_link_token_hex[0] = '\0';
+    s_link_has_password = false;
+    s_link_password[0]  = '\0';
     refresh_dialog_lists(app);
     s_share_open = true;
     ImGui::OpenPopup("Share##dialog");
+}
+
+static void refresh_history(ClientApp &app) {
+    int ec = 0;
+    if (!app.ipc_version_list(s_history_path.c_str(), &s_history_entries, &ec)) {
+        s_history_entries.clear();
+        char reason[160];
+        vw_gui_format_action_error(reason, sizeof(reason), "Loading version history", ec);
+        snprintf(s_history_status, sizeof(s_history_status), "%s", reason);
+    } else {
+        s_history_status[0] = '\0';
+    }
+}
+
+static void open_history_dialog(const DisplayRow &row, ClientApp &app) {
+    s_history_path       = row.virtual_path;
+    s_history_file_id    = row.file_id;
+    s_history_status[0]  = '\0';
+    s_history_pending_restore = 0;
+    s_history_entries.clear();
+    if (s_history_file_id != 0) refresh_history(app);
+    s_history_open = true;
+    ImGui::OpenPopup("Version History##dialog");
+}
+
+static void render_history_dialog(ClientApp &app) {
+    if (!s_history_open) return;
+
+    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Always);
+    if (!ImGui::BeginPopupModal("Version History##dialog", &s_history_open,
+                                 ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("%s", s_history_path.c_str());
+
+    if (s_history_file_id == 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+            "This item hasn't finished uploading yet — version history needs a server file_id.");
+        ImGui::Separator();
+        if (ImGui::Button("Close##history")) { s_history_open = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::Separator();
+
+    if (s_history_pending_restore != 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+            "Restore version %llu as the current version? This replaces the "
+            "file's current content — the content being replaced stays "
+            "recoverable as its own version afterward.",
+            (unsigned long long)s_history_pending_restore);
+        if (ImGui::Button("Confirm restore##history")) {
+            int rc = app.ipc_version_restore(s_history_path.c_str(), s_history_pending_restore);
+            if (rc == 0) {
+                snprintf(s_history_status, sizeof(s_history_status),
+                         "Restored version %llu.", (unsigned long long)s_history_pending_restore);
+                refresh_history(app);
+            } else {
+                vw_gui_format_action_error(s_history_status, sizeof(s_history_status), "Restore", rc);
+            }
+            s_history_pending_restore = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##history")) s_history_pending_restore = 0;
+        ImGui::Separator();
+    }
+
+    if (ImGui::BeginTable("##history_versions", 4,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Version");
+        ImGui::TableSetupColumn("Created");
+        ImGui::TableSetupColumn("Size");
+        ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+
+        /* Newest first — matches this dialog's at-a-glance "what do I
+         * probably want to restore" use case; the CLI lists oldest-first
+         * instead, which is fine — the two front ends don't need
+         * byte-identical presentation, only the same underlying data. */
+        for (auto it = s_history_entries.rbegin(); it != s_history_entries.rend(); ++it) {
+            const auto &v = *it;
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("#%llu", (unsigned long long)v.version_id);
+            ImGui::TableSetColumnIndex(1);
+            char ts[24]; format_ts(v.created_at, ts, sizeof(ts));
+            ImGui::TextUnformatted(ts);
+            ImGui::TableSetColumnIndex(2);
+            char sz[16]; human_size(v.size_bytes, sz, sizeof(sz));
+            ImGui::TextUnformatted(sz);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::PushID((int)v.version_id);
+            if (ImGui::SmallButton("Restore")) s_history_pending_restore = v.version_id;
+            ImGui::PopID();
+        }
+        if (s_history_entries.empty()) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextDisabled("(no versions yet)");
+        }
+        ImGui::EndTable();
+    }
+
+    if (s_history_status[0]) ImGui::TextUnformatted(s_history_status);
+
+    ImGui::Separator();
+    if (ImGui::Button("Close##history")) { s_history_open = false; ImGui::CloseCurrentPopup(); }
+    ImGui::EndPopup();
 }
 
 static void render_decrypt_dialog(ClientApp &app) {
@@ -372,13 +553,22 @@ static void render_share_dialog(ClientApp &app) {
         ImGui::InputInt("days from now##link", &s_link_expiry_days);
         if (s_link_expiry_days < 1) s_link_expiry_days = 1;
     }
+    ImGui::Checkbox("Password-protect##link", &s_link_has_password);
+    if (s_link_has_password) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200);
+        ImGui::InputText("##link_password", s_link_password, sizeof(s_link_password),
+                          ImGuiInputTextFlags_Password);
+    }
     if (ImGui::Button("Create link##link")) {
         int64_t expires_at = s_link_has_expiry
             ? (int64_t)std::time(nullptr) + (int64_t)s_link_expiry_days * 86400
             : 0;
         uint8_t perm = (uint8_t)(s_link_perm_idx == 1 ? 2 : 1);
+        const char *password = s_link_has_password ? s_link_password : nullptr;
         uint64_t share_id = 0; uint8_t token[32];
-        int rc = app.ipc_link_create(s_share_path.c_str(), perm, expires_at, &share_id, token);
+        int rc = app.ipc_link_create(s_share_path.c_str(), perm, expires_at, password, &share_id, token);
+        memset(s_link_password, 0, sizeof(s_link_password)); /* never let it linger */
         if (rc == 0) {
             static const char hex[] = "0123456789abcdef";
             for (int i = 0; i < 32; i++) {
@@ -436,7 +626,8 @@ static void render_share_dialog(ClientApp &app) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Link");
             ImGui::TableSetColumnIndex(1);
-            ImGui::Text("(anyone) (%s)", perm_label(l.permission));
+            ImGui::Text("(anyone) (%s)%s", perm_label(l.permission),
+                        l.has_password ? "  [password]" : "");
             ImGui::TableSetColumnIndex(2);
             char ts[24]; format_ts(l.expires_at, ts, sizeof(ts));
             ImGui::TextUnformatted(ts);
@@ -456,6 +647,92 @@ static void render_share_dialog(ClientApp &app) {
     ImGui::Separator();
     if (ImGui::Button("Close##share")) { s_share_open = false; ImGui::CloseCurrentPopup(); }
     ImGui::EndPopup();
+}
+
+/* Search results table (TASK-200) — shown in place of the normal
+ * directory listing while a query is active. */
+static void render_search_results(ClientApp &app) {
+    if (s_search_loading) {
+        ImGui::TextDisabled("Searching...");
+    } else if (!s_search_error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "%s", s_search_error.c_str());
+    } else if (s_search_results.empty()) {
+        ImGui::TextDisabled("(no matches)");
+    } else {
+        if (s_search_truncated)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                "More matches exist than shown — narrow the query.");
+
+        if (ImGui::BeginTable("##search_results", 4,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Name",     ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Size",     ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+            ImGui::TableSetupColumn("Shared",   ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableHeadersRow();
+
+            bool jump_requested = false;
+            std::string jump_target;
+
+            for (const auto &r : s_search_results) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                const char *icon = r.is_dir ? "[dir] " : "";
+                std::string label = std::string(icon) + r.name +
+                                     (r.vault_id != 0 ? "  [encrypted]" : "");
+                const VwGuiFileEntry *local = find_local_entry_by_file_id(r.file_id);
+                ImGui::PushID(std::to_string(r.file_id).c_str());
+                bool clicked = ImGui::Selectable(label.c_str(), false,
+                                                  ImGuiSelectableFlags_SpanAllColumns);
+                if (clicked && local && !jump_requested) {
+                    /* Jump to its actual location: navigate the normal
+                     * browser to its parent directory and leave search
+                     * mode. Deferred until after the table/loop finish —
+                     * clearing s_search_results (what leaving search mode
+                     * does) while this range-for is still iterating it
+                     * would be fragile to depend on. */
+                    const std::string &vp = local->virtual_path;
+                    size_t pos = vp.find_last_of('/');
+                    jump_target = (pos == std::string::npos || pos == 0) ? "/" : vp.substr(0, pos);
+                    jump_requested = true;
+                }
+                if (!local) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(not in a synced folder locally)");
+                }
+                ImGui::PopID();
+
+                ImGui::TableSetColumnIndex(1);
+                if (r.is_dir) {
+                    ImGui::TextUnformatted("--");
+                } else {
+                    char sz[16]; human_size(r.size_bytes, sz, sizeof(sz));
+                    ImGui::TextUnformatted(sz);
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                if (r.is_dir) {
+                    ImGui::TextUnformatted("--");
+                } else {
+                    char ts[24]; format_ts(r.mtime_unix, ts, sizeof(ts));
+                    ImGui::TextUnformatted(ts);
+                }
+
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(r.is_shared ? "yes" : "no");
+            }
+
+            ImGui::EndTable();
+
+            if (jump_requested) {
+                s_current_path = jump_target;
+                clear_search();
+            }
+        }
+    }
+    (void)app;
 }
 
 void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
@@ -482,6 +759,47 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
     ImGui::SameLine();
     ImGui::TextDisabled("%s", s_current_path.c_str());
     ImGui::Separator();
+
+    /* Search bar (TASK-199/200). Debounced: firing ipc_search() on every
+     * keystroke would mean one blocking round-trip per character typed;
+     * this codebase has no async IPC pattern to reach for instead (see
+     * this task's own corrections), so a short pause-in-typing is what
+     * keeps this from ever being felt as UI lag. */
+    ImGui::SetNextItemWidth(320.0f);
+    bool query_edited = ImGui::InputText("Search##browser_search", s_search_query, sizeof(s_search_query));
+    if (query_edited) {
+        s_search_last_edit_time = ImGui::GetTime();
+        s_search_pending = true;
+    }
+    bool query_active = s_search_query[0] != '\0';
+    if (query_active) {
+        ImGui::SameLine();
+        if (ImGui::Button("Clear##browser_search")) {
+            clear_search();
+            query_active = false;
+        }
+    }
+    if (query_active && s_search_pending &&
+            (ImGui::GetTime() - s_search_last_edit_time) >= kSearchDebounceSeconds) {
+        perform_search(app);
+        s_search_pending = false;
+    }
+    if (!query_active && !s_search_results.empty()) {
+        /* Query was cleared some other way than the Clear button (e.g.
+         * selecting-all-and-deleting) — drop stale results with it. */
+        s_search_results.clear();
+        s_search_error.clear();
+    }
+    ImGui::Separator();
+
+    if (query_active) {
+        render_search_results(app);
+        render_share_dialog(app);
+        render_history_dialog(app);
+        render_decrypt_dialog(app);
+        ImGui::End();
+        return;
+    }
 
     if (s_error_msg[0]) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "%s", s_error_msg);
@@ -525,6 +843,7 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
             }
             if (ImGui::BeginPopupContextItem("##ctx")) {
                 if (ImGui::MenuItem("Share...")) open_share_dialog(row, app);
+                if (!row.is_dir && ImGui::MenuItem("Version History...")) open_history_dialog(row, app);
                 if (encrypted && ImGui::MenuItem("Decrypt & Download...")) {
                     s_decrypt_vault_id = vault_it->second;
                     s_decrypt_file_id  = row.file_id;
@@ -566,6 +885,7 @@ void vw_view_browser_render(const VwIpcStatus &status, ClientApp &app) {
     }
 
     render_share_dialog(app);
+    render_history_dialog(app);
     render_decrypt_dialog(app);
 
     ImGui::End();

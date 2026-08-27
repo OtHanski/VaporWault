@@ -1,6 +1,6 @@
 ---
 id:          TASK-053
-title:       vw_server_gui — cluster status view
+title:       "vw_server_gui — cluster status view"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

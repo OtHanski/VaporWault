@@ -1,6 +1,6 @@
 ---
 id:          TASK-090
-title:       Real trash/recycle bin with a configurable retention window
+title:       "Real trash/recycle bin with a configurable retention window"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

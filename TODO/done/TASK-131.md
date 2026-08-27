@@ -1,6 +1,6 @@
 ---
 id:          TASK-131
-title:       Implement gateway session manager (per-browser vw_client_sess_t pool)
+title:       "Implement gateway session manager (per-browser vw_client_sess_t pool)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

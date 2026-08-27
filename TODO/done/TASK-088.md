@@ -1,6 +1,6 @@
 ---
 id:          TASK-088
-title:       Design and implement file/folder sharing between users
+title:       "Design and implement file/folder sharing between users"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

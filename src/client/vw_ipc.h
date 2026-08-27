@@ -137,6 +137,42 @@ typedef enum {
     VW_IPC_ACCOUNT_ADD_RESP    = 0x8034, /* D→C: error_code + account_id       */
     VW_IPC_ACCOUNT_REMOVE_REQ  = 0x8035, /* C→D: log out and forget an account */
     VW_IPC_ACCOUNT_REMOVE_RESP = 0x8036, /* D→C: error_code                    */
+
+    /* Version history (TASK-182). Server already supports VERSION_LIST/
+     * VERSION_RESTORE (docs/PROTOCOL.md §7.3) and vw_client_core.c already
+     * has working wrappers — this is the first daemon IPC exposure of
+     * either. VERSION_LIST is a read (allowed on a read-only fallback
+     * connection, same as SHARE_LIST/LINK_LIST above); VERSION_RESTORE is
+     * write-shaped and gets the same account_is_read_only() rejection as
+     * every other write-shaped request. */
+    VW_IPC_VERSION_LIST_REQ    = 0x8037, /* C→D: list versions of a path       */
+    VW_IPC_VERSION_LIST_RESP   = 0x8038, /* D→C: error_code + count + entries  */
+    VW_IPC_VERSION_RESTORE_REQ = 0x8039, /* C→D: restore a version as HEAD     */
+    VW_IPC_VERSION_RESTORE_RESP = 0x803A, /* D→C: error_code                   */
+
+    /* Selective sync (TASK-192/193): replace (wholesale, not incremental)
+     * one sync folder's exclude-pattern set. Entirely local to the
+     * daemon — never touches the server (docs/PROTOCOL.md is unaffected,
+     * see TASK-192's design). Persisted to account.conf and mirrored into
+     * the live vw_sync_ctx_t immediately. */
+    VW_IPC_FOLDER_SET_EXCLUDES_REQ  = 0x803B, /* C→D: local_root + new pattern list */
+    VW_IPC_FOLDER_SET_EXCLUDES_RESP = 0x803C, /* D→C: error_code                    */
+
+    /* TASK-199: filename search — thin passthrough to the server's
+     * SEARCH/SEARCH_RESP (docs/PROTOCOL.md §7.12) via vw_client_search(). */
+    VW_IPC_SEARCH_REQ  = 0x803D, /* C→D: account_id + query string     */
+    VW_IPC_SEARCH_RESP = 0x803E, /* D→C: error_code + count + truncated + entries */
+
+    /* TASK-209: notification preferences — thin passthrough to the
+     * server's NOTIFY_PREFS_GET/SET (docs/PROTOCOL.md §7.13) via
+     * vw_client_notify_prefs_get/_set(). _SET is write-shaped: rejected
+     * with VW_ERR_READ_ONLY_FALLBACK while the account is on read-only
+     * fallback, same as every other write-shaped request in this list;
+     * _GET is a read and always works on fallback. */
+    VW_IPC_NOTIFY_PREFS_GET_REQ  = 0x803F, /* C→D: account_id                    */
+    VW_IPC_NOTIFY_PREFS_GET_RESP = 0x8040, /* D→C: error_code + prefs_bitmask    */
+    VW_IPC_NOTIFY_PREFS_SET_REQ  = 0x8041, /* C→D: account_id + prefs_bitmask    */
+    VW_IPC_NOTIFY_PREFS_SET_ACK  = 0x8042, /* D→C: error_code + prefs_bitmask    */
 } vw_ipc_msg_t;
 
 /*
@@ -273,6 +309,8 @@ typedef enum {
  *   u64    remote_dir_id  TASK-106: 0 = owned, path-addressed folder;
  *                         nonzero = a shared folder rooted at this server
  *                         file_id.
+ *   u16    exclude_count  TASK-192/193, trailing field
+ *   exclude_count * string exclude_pattern
  *
 
  * VW_IPC_FILE_LIST_RESP per-entry:
@@ -343,6 +381,9 @@ typedef enum {
  *   string virtual_path
  *   u8     permission
  *   i64    expires_at
+ *   string password        TASK-186/188, optional trailing field — empty
+ *                           or absent (payload ends after expires_at) =
+ *                           no password.
  * VW_IPC_LINK_CREATE_RESP:
  *   u32       error_code
  *   u64       share_id       only meaningful if error_code == 0
@@ -363,7 +404,9 @@ typedef enum {
  *     i64    created_at
  *     i64    expires_at     0 = never
  *     u8     revoked
- *   }                       never includes the raw link_token
+ *     u8     has_password   TASK-186/188, trailing field
+ *   }                       never includes the raw link_token, the
+ *                           password, or its hash
  *
  * VW_IPC_FILE_MKDIR_REQ:
  *   u32    account_id
@@ -442,6 +485,61 @@ typedef enum {
  *                        session for that account (VW_ERR_AUTH_REQUIRED if
  *                        none), same as every other server-touching IPC
  *                        request.
+ *
+ * VW_IPC_VERSION_LIST_REQ:
+ *   u32    account_id
+ *   string virtual_path
+ * VW_IPC_VERSION_LIST_RESP:
+ *   u32 error_code
+ *   u32 count             0 if error_code != 0
+ *   count * {
+ *     u64 version_id
+ *     i64 created_at
+ *     u64 size_bytes
+ *   }
+ *
+ * VW_IPC_VERSION_RESTORE_REQ:
+ *   u32    account_id
+ *   string virtual_path
+ *   u64    version_id
+ * VW_IPC_VERSION_RESTORE_RESP:
+ *   u32 error_code        vw_err_t; 0 = VW_OK. VW_ERR_READ_ONLY_FALLBACK if
+ *                         the account is currently on its fallback
+ *                         connection (TASK-173) — restoring is a write.
+ *
+ * VW_IPC_FOLDER_SET_EXCLUDES_REQ:
+ *   u32    account_id
+ *   string local_root     must already be a registered sync folder
+ *                          (VW_ERR_NOT_FOUND if not)
+ *   u16    count           0 = clear all exclude rules for this folder
+ *   count * string pattern
+ * VW_IPC_FOLDER_SET_EXCLUDES_RESP:
+ *   u32 error_code        vw_err_t; 0 = VW_OK. VW_ERR_NOT_FOUND if
+ *                         local_root isn't a registered folder for this
+ *                         account. Entirely local to the daemon — never
+ *                         VW_ERR_AUTH_REQUIRED/READ_ONLY_FALLBACK, since
+ *                         this never touches the server.
+ *
+ * VW_IPC_SEARCH_REQ:
+ *   u32    account_id
+ *   string query           forwarded as-is to vw_client_search(); see
+ *                          docs/PROTOCOL.md §7.12 for its own limits
+ *                          (256-byte max, case-insensitive substring)
+ * VW_IPC_SEARCH_RESP:
+ *   u32 error_code         vw_err_t; 0 = VW_OK. Works while on fallback
+ *                          (read-only) since SEARCH is a read.
+ *   u32 count              0 if error_code != 0
+ *   u8  truncated          1 = more matches existed than the server's
+ *                          200-entry cap allowed; 0 if error_code != 0
+ *   count * {
+ *     u64    file_id
+ *     string name          leaf name, display-only
+ *     u8     is_dir
+ *     u64    size_bytes
+ *     i64    mtime_unix
+ *     u64    vault_id      0 = unencrypted or a directory
+ *     u8     is_shared     1 = visible via a grant, not owned
+ *   }
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

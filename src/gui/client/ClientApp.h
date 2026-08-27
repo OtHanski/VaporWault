@@ -113,16 +113,25 @@ public:
     bool ipc_shutdown();
     int  ipc_folder_add(const char *local, const char *virt);
     int  ipc_folder_remove(const char *local);
+    bool ipc_folder_list(std::vector<VwGuiFolderEntry> *out);
+    int  ipc_folder_set_excludes(const char *local, const std::vector<std::string> &patterns);
+    bool ipc_notify_prefs_get(uint32_t *out_prefs);
+    int  ipc_notify_prefs_set(uint32_t prefs, uint32_t *out_prefs);
     bool ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
+    bool ipc_search(const char *query, std::vector<VwGuiSearchEntry> *out,
+                     uint8_t *out_truncated, int *out_error_code);
 
     int  ipc_share_grant(const char *virtual_path, const char *target_username,
                           uint8_t permission, int64_t expires_at, uint64_t *out_share_id);
     int  ipc_share_revoke(uint64_t share_id);
     bool ipc_share_list(uint8_t mode, std::vector<VwGuiShareEntry> *out, int *out_error_code);
     int  ipc_link_create(const char *virtual_path, uint8_t permission, int64_t expires_at,
-                          uint64_t *out_share_id, uint8_t out_token[32]);
+                          const char *password, uint64_t *out_share_id, uint8_t out_token[32]);
     int  ipc_link_revoke(uint64_t share_id);
     bool ipc_link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code);
+
+    bool ipc_version_list(const char *virtual_path, std::vector<VwGuiVersionEntry> *out, int *out_error_code);
+    int  ipc_version_restore(const char *virtual_path, uint64_t version_id);
 
     int  ipc_file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id);
     int  ipc_vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id);

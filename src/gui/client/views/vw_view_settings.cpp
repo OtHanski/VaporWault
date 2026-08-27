@@ -3,12 +3,65 @@
 #include "imgui.h"
 #include <cstring>
 #include <cstdio>
+#include <string>
+#include <vector>
 
 /* Per-frame local state — persists via static (single window, always-open). */
 static char s_local_root[512]   = "";
 static char s_virtual_root[256] = "";
 static char s_status_msg[128]   = "";
 static bool s_confirm_shutdown  = false;
+
+/* Sync-folder listing + selective-sync rule editor (TASK-194). */
+static std::vector<VwGuiFolderEntry> s_folders;
+static bool        s_folders_loaded = false;
+static int         s_selected_folder = -1; /* index into s_folders, or -1 */
+static char        s_new_pattern[256] = "";
+static char        s_folder_rules_status[160] = "";
+
+static void refresh_folders(ClientApp &app) {
+    app.ipc_folder_list(&s_folders);
+    s_folders_loaded = true;
+    if (s_selected_folder >= (int)s_folders.size()) s_selected_folder = -1;
+}
+
+static void apply_excludes(ClientApp &app, int idx, const std::vector<std::string> &patterns) {
+    if (idx < 0 || idx >= (int)s_folders.size()) return;
+    int rc = app.ipc_folder_set_excludes(s_folders[idx].local_root.c_str(), patterns);
+    if (rc == 0) {
+        s_folder_rules_status[0] = '\0';
+        refresh_folders(app);
+    } else {
+        snprintf(s_folder_rules_status, sizeof(s_folder_rules_status),
+                 "Failed to update rules (err %d).", rc);
+    }
+}
+
+/* Notification preferences (TASK-206/207/209/210; docs/PROTOCOL.md §7.13).
+ * Single source of truth for name/bit/description, mirroring
+ * vapourwault-cli's own NOTIFY_CATEGORIES[] table so the two surfaces
+ * can't describe the categories differently. */
+static const struct { const char *label; uint32_t bit; const char *desc; } NOTIFY_CATEGORIES[] = {
+    { "Someone shares something with me",        VW_NOTIFY_SHARE_RECEIVED,          "A grant or link naming you was created" },
+    { "My storage usage crosses 90% of quota",   VW_NOTIFY_QUOTA_WARNING,            "Re-arms once usage drops back under the threshold" },
+    { "A new login succeeds on my account",      VW_NOTIFY_NEW_LOGIN,                "Never fires for a normal daemon reconnect" },
+    { "My password or 2FA setting changes",      VW_NOTIFY_ACCOUNT_SECURITY_CHANGE,  "Password change or 2FA enable/disable" },
+};
+#define NOTIFY_CATEGORIES_COUNT (sizeof(NOTIFY_CATEGORIES) / sizeof(NOTIFY_CATEGORIES[0]))
+
+static bool     s_notify_loaded = false;
+static uint32_t s_notify_prefs  = 0;
+static char     s_notify_status[128] = "";
+
+static void refresh_notify_prefs(ClientApp &app) {
+    uint32_t prefs = 0;
+    if (app.ipc_notify_prefs_get(&prefs)) {
+        s_notify_prefs = prefs;
+        s_notify_loaded = true;
+    } else {
+        snprintf(s_notify_status, sizeof(s_notify_status), "Failed to fetch notification preferences.");
+    }
+}
 
 void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     ImGuiIO &io = ImGui::GetIO();
@@ -53,6 +106,108 @@ void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     }
     if (s_status_msg[0])
         ImGui::TextUnformatted(s_status_msg);
+
+    /* Sync-folder listing + selective-sync rule editor (TASK-192/194). */
+    ImGui::Spacing();
+    ImGui::SeparatorText("Configured folders");
+    if (!s_folders_loaded) refresh_folders(app);
+    if (ImGui::Button("Refresh##folders")) refresh_folders(app);
+
+    if (ImGui::BeginTable("##folders_table", 4,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Local root");
+        ImGui::TableSetupColumn("Virtual root");
+        ImGui::TableSetupColumn("Paused");
+        ImGui::TableSetupColumn("Exclude rules");
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < (int)s_folders.size(); i++) {
+            const VwGuiFolderEntry &f = s_folders[i];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            bool selected = (i == s_selected_folder);
+            ImGui::PushID(i);
+            if (ImGui::Selectable(f.local_root.c_str(), selected,
+                                   ImGuiSelectableFlags_SpanAllColumns)) {
+                s_selected_folder = selected ? -1 : i;
+                s_new_pattern[0] = '\0';
+                s_folder_rules_status[0] = '\0';
+            }
+            ImGui::PopID();
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(f.virtual_root.c_str());
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(f.paused ? "yes" : "no");
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%d rule(s)", (int)f.excludes.size());
+        }
+        ImGui::EndTable();
+    }
+
+    if (s_selected_folder >= 0 && s_selected_folder < (int)s_folders.size()) {
+        const VwGuiFolderEntry &sel = s_folders[s_selected_folder];
+        ImGui::Spacing();
+        ImGui::Text("Selective sync rules for: %s", sel.local_root.c_str());
+        ImGui::TextDisabled(
+            "Files matching a rule are never uploaded or downloaded by this "
+            "folder. Already-synced local files are left alone — a rule only "
+            "stops further changes from syncing.");
+
+        for (size_t i = 0; i < sel.excludes.size(); i++) {
+            ImGui::PushID((int)i);
+            ImGui::BulletText("%s", sel.excludes[i].c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove##rule")) {
+                std::vector<std::string> updated = sel.excludes;
+                updated.erase(updated.begin() + (long)i);
+                apply_excludes(app, s_selected_folder, updated);
+                ImGui::PopID();
+                break; /* s_folders was just refreshed/invalidated */
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::SetNextItemWidth(300);
+        ImGui::InputText("##new_pattern", s_new_pattern, sizeof(s_new_pattern));
+        ImGui::SameLine();
+        if (ImGui::Button("Add pattern##rule")) {
+            if (s_new_pattern[0]) {
+                std::vector<std::string> updated = sel.excludes;
+                updated.push_back(s_new_pattern);
+                apply_excludes(app, s_selected_folder, updated);
+                s_new_pattern[0] = '\0';
+            }
+        }
+        if (s_folder_rules_status[0]) ImGui::TextUnformatted(s_folder_rules_status);
+    }
+
+    /* Notification preferences (TASK-206/207/209/210). */
+    ImGui::Spacing();
+    ImGui::SeparatorText("Email notifications");
+    if (!s_notify_loaded) refresh_notify_prefs(app);
+    ImGui::TextDisabled("Sent to your account's on-file email address. Off by default.");
+    for (size_t i = 0; i < NOTIFY_CATEGORIES_COUNT; i++) {
+        bool on = (s_notify_prefs & NOTIFY_CATEGORIES[i].bit) != 0;
+        ImGui::PushID((int)i);
+        if (ImGui::Checkbox(NOTIFY_CATEGORIES[i].label, &on)) {
+            uint32_t requested = on ? (s_notify_prefs | NOTIFY_CATEGORIES[i].bit)
+                                     : (s_notify_prefs & ~NOTIFY_CATEGORIES[i].bit);
+            uint32_t stored = 0;
+            int rc = app.ipc_notify_prefs_set(requested, &stored);
+            if (rc == 0) {
+                s_notify_prefs = stored;
+                s_notify_status[0] = '\0';
+            } else {
+                snprintf(s_notify_status, sizeof(s_notify_status),
+                         "Failed to update notification setting (err %d).", rc);
+                refresh_notify_prefs(app); /* re-sync with real server state */
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", NOTIFY_CATEGORIES[i].desc);
+        ImGui::PopID();
+    }
+    if (s_notify_status[0]) ImGui::TextUnformatted(s_notify_status);
 
     /* Shutdown */
     ImGui::Spacing();

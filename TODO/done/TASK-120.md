@@ -1,6 +1,6 @@
 ---
 id:          TASK-120
-title:       Verify docs/TUTORIAL.md is current; write a non-technical end-user client setup tutorial
+title:       "Verify docs/TUTORIAL.md is current; write a non-technical end-user client setup tutorial"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

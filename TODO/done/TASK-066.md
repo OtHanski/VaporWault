@@ -1,6 +1,6 @@
 ---
 id:          TASK-066
-title:       pytest.ini, test cert helper, and CMake integration-test target
+title:       "pytest.ini, test cert helper, and CMake integration-test target"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

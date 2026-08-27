@@ -5,10 +5,16 @@
   See CLAUDE.md's "TODO-List Protocol" for the todo/ vs review/ vs done/
   folder rules — the file must move folders every time status crosses a
   stage boundary.
+
+  Always write `title` as a double-quoted string ("like this"). A colon
+  followed by a space in a plain (unquoted) YAML scalar is ambiguous
+  with a nested mapping and can get the title silently rewritten;
+  quoting sidesteps that (and other stray-punctuation parsing issues)
+  entirely, so colons are fine once quoted.
 -->
 ---
 id:          TASK-NNN
-title:       Short imperative description of the work
+title:       "Short imperative description of the work"
 status:      todo
 assignee:    ARCH.00
 created_by:  ARCH.00

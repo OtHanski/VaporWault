@@ -1,6 +1,6 @@
 ---
 id:          TASK-146
-title:       CMake/CPack component scaffolding for installer packages
+title:       "CMake/CPack component scaffolding for installer packages"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

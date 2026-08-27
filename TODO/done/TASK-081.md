@@ -1,6 +1,6 @@
 ---
 id:          TASK-081
-title:       Review, test, and (if needed) fix the new release.yml build-and-release workflow
+title:       "Review, test, and (if needed) fix the new release.yml build-and-release workflow"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-109
-title:       FILE_LIST_RESP never carries version_id — remote-change detection silently relies on it anyway
+title:       "FILE_LIST_RESP never carries version_id — remote-change detection silently relies on it anyway"
 status:      done
 assignee:    CLI.02
 created_by:  CLI.02

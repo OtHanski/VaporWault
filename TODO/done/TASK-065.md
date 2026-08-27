@@ -1,6 +1,6 @@
 ---
 id:          TASK-065
-title:       Performance benchmark suite — upload/download throughput baselines
+title:       "Performance benchmark suite — upload/download throughput baselines"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

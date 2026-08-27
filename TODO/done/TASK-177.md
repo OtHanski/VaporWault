@@ -1,6 +1,6 @@
 ---
 id:          TASK-177
-title:       Docs - primary + replica + automatic fallback setup walkthrough
+title:       "Docs - primary + replica + automatic fallback setup walkthrough"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-061
-title:       Fix quota TOCTOU — move quota check under storage write lock
+title:       "Fix quota TOCTOU — move quota check under storage write lock"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

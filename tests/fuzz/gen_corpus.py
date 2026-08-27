@@ -33,6 +33,7 @@ VW_MSG_CHUNK_QUERY        = 0x0205
 VW_MSG_CHUNK_UPLOAD       = 0x0207
 VW_MSG_FILE_COMMIT        = 0x020B
 VW_MSG_FILE_DELETE        = 0x020D
+VW_MSG_SEARCH             = 0x0901
 
 # Admin message types (must match src/server/vw_admin.h)
 VW_ADMIN_USER_CREATE_REQ  = 0x9001
@@ -306,6 +307,30 @@ SEEDS = {
                             u8(0) + lenstr('u'))[:9],  # truncated mid-payload
 
         'unknown_type': admin_frame(0x9FFF, b'\x00' * 4),
+    },
+
+    # ── fuzz_search (TASK-198/202; docs/PROTOCOL.md §7.12) ───────────────────
+    'fuzz_search': {
+        'empty_query': frame(VW_MSG_SEARCH, token() + lenstr('')),
+
+        'simple_query': frame(VW_MSG_SEARCH, token() + lenstr('report')),
+
+        'query_at_cap': frame(VW_MSG_SEARCH, token() + lenstr('a' * 256)),
+
+        'query_over_cap': frame(VW_MSG_SEARCH, token() + lenstr('a' * 257)),
+
+        'query_with_mixed_case_and_symbols':
+            frame(VW_MSG_SEARCH, token() + lenstr('Report_Q3.PDF!@#')),
+
+        # Boundary seeds
+        'truncated_mid_token': frame(VW_MSG_SEARCH, token()[:10]),
+
+        'no_query_field': frame(VW_MSG_SEARCH, token()),
+
+        'declared_len_prefix_exceeds_actual_query_bytes':
+            frame(VW_MSG_SEARCH, token() + u16(65535) + b'short'),
+
+        'header_only': u32(8) + u16(VW_MSG_SEARCH) + u16(VW_PROTO_VERSION),
     },
 }
 

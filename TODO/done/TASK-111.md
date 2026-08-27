@@ -1,6 +1,6 @@
 ---
 id:          TASK-111
-title:       Harden shared-folder sync: narrow revocation detection, cap tree walk size
+title:       "Harden shared-folder sync: narrow revocation detection, cap tree walk size"
 status:      done
 assignee:    CLI.02
 created_by:  CLI.02

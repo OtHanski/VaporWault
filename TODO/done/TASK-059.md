@@ -1,6 +1,6 @@
 ---
 id:          TASK-059
-title:       CQR.08 full code quality audit and STYLE.md completion
+title:       "CQR.08 full code quality audit and STYLE.md completion"
 status:      done
 assignee:    CQR.08
 created_by:  ARCH.00

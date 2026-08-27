@@ -1,0 +1,187 @@
+---
+id:          TASK-215
+title:       "Investigate: single local write producing multiple version records"
+status:      done
+assignee:    CLI.02
+created_by:  CLI.02
+created:     2026-08-26
+priority:    normal
+depends_on:  []
+blocks:      []
+review_by:   [CQR.08]
+tags:        [client]
+---
+
+Discovered while writing a real end-to-end integration test for `TASK-182`
+(`tests/integration/test_cli_version_history.py`), observed against a
+freshly-built `vapourwault-daemon`/`vapourwaultd` pair (WSL/GCC,
+`build-gw-e2e`), not a stale binary.
+
+A single local file write, synced once, produced **two** version records
+with identical size/content on the server — observed twice independently
+in the same test run:
+
+1. Writing a brand-new file once (no prior versions) resulted in version
+   ids 1 and 2, both the same size, both apparently uploaded from the
+   same write.
+2. After a `VERSION_RESTORE`, the daemon's next sync cycle (which
+   downloads the restored content back to the local file) resulted in
+   **two** new version records, both matching the restored content's
+   size, instead of one.
+
+This looks like the watcher/change-detection path in `vw_sync.c`/
+`vw_watch_linux.c`/`vw_watch_windows.c` firing more than once for a
+single real change (e.g. two filesystem events for one write, or a
+download's own local-file write being re-detected as a new local edit
+and re-uploaded) — not something the version-history IPC/CLI work in
+`TASK-182` touches or could have caused. Left unfixed and unfiled-deeper
+there; this task is the actual investigation.
+
+## Why this matters
+
+Content-addressed dedup means the wasted bytes are likely just chunk
+*references*, not duplicated chunk storage — but it still means:
+extra version-history clutter a user has to page through, an extra
+oplog entry / server round-trip per real edit, and (worse) if this ever
+races with a genuinely different concurrent edit, it's the kind of
+double-fire that turns a benign duplicate into a real lost-update or
+false-conflict bug. Worth root-causing even though the observed instances
+so far were harmless.
+
+## Work
+
+- Reproduce deterministically (the existing observation is incidental,
+  not yet a targeted repro) — instrument or log-trace a single write
+  through `vw_watch_*`'s event delivery into `vw_sync.c`'s
+  `compute_actions`/`exec_action` to see whether it's two watcher events
+  for one write, a debounce-window race, or the restore-then-download
+  case specifically re-triggering upload detection on its own write.
+- Fix at the root cause (likely coalescing/debouncing watcher events for
+  the same path within one sync cycle, and/or marking a file the sync
+  engine itself just wrote via download as not needing re-upload
+  detection) rather than papering over it with a version-count check
+  somewhere.
+- Add a regression test once the mechanism is understood (this task's
+  own discovery test in `test_cli_version_history.py` should tighten its
+  assertions from "at least one new version" back to "exactly one" once
+  this is fixed — currently loosened specifically to not block on this
+  unrelated bug).
+
+## Acceptance criteria
+
+- A single local write of new/changed content produces exactly one new
+  version record, verified by a targeted regression test.
+- `test_cli_version_history.py`'s loosened assertions are tightened back
+  to an exact count once fixed.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+CLI.02 [2026-08-26]: Filed per standing QA/discovery policy while
+verifying `TASK-182` end-to-end rather than assuming the daemon's
+existing sync behavior was already correct.
+
+CLI.02 [2026-08-26]: Root-caused and fixed. Found the mechanism
+mid-investigation of `TASK-218` (a related but distinct sync-engine bug)
+— while tracing every `vw_cache_upsert` call for that task's own repro,
+a call from `vw_sync_mark_local_modified()` (the filesystem-watcher
+event dispatch, `vw_daemon.c` calls this directly and separately from
+`compute_actions`'s own periodic-walk Pass 1) stood out as unconditional
+and untraceable to either walk pass.
+
+**Root cause**: `vw_sync_mark_local_modified()` — called once per
+CREATED/MODIFIED/MOVED filesystem event — unconditionally set an
+existing cache entry's `sync_state` to `VW_SYNC_LOCAL_MOD` with no
+comparison against the file's actual current mtime/size, and never
+even updated `local_mtime`/`local_size` in that branch at all. Every
+watcher event for an already-cached path flipped it to "locally
+modified" regardless of whether anything really changed. This directly
+explains both original observations:
+- The version-restore case: `exec_action`'s `ACT_DOWNLOAD` synchronously
+  sets the entry to `SYNCED` with the real post-download mtime/size
+  right after downloading the restored content — but that same write
+  also triggers the filesystem watcher's own event for it, which
+  `vw_sync_mark_local_modified` (dispatched moments later, once drained)
+  then flipped straight back to `LOCAL_MOD` unconditionally. The very
+  next sync cycle re-uploaded the exact content it had just downloaded
+  — a spurious duplicate version, self-triggered by the daemon's own
+  write.
+- The single-new-file case: plausibly the same class of issue (a
+  filesystem/editor write producing more than one CREATE/MODIFY event
+  for one logical save, each independently marking the entry dirty) —
+  not independently re-confirmed with its own targeted repro (the
+  version-restore repro was reproducible and fixed directly via the
+  existing `test_cli_version_history.py` scenario; a duplicate-event
+  storm for a *brand-new* file is a timing-dependent watcher behavior,
+  harder to force deterministically, and the fix — compare against
+  cached state before transitioning — closes the exact same class of
+  gap regardless of which event pattern triggers it).
+
+**Fix**: `vw_sync_mark_local_modified()` now stats the real file
+(`get_mtime`/`get_fsize`, the same helpers the periodic walk's own Pass 1
+already uses) and only transitions `SYNCED`/`REMOTE_MOD` to `LOCAL_MOD`
+if the current mtime or size actually differ from what's cached —
+mirroring Pass 1's own comparison exactly. An already-dirty state
+(`NEW_LOCAL`/`LOCAL_MOD`/`CONFLICT`) is left untouched either way, same
+as Pass 1. `local_mtime`/`local_size` are now kept accurate on every
+call (previously only set for a brand-new entry, never updated for an
+existing one) — this alone is what makes the "did anything really
+change" comparison possible at all going forward, not just for this one
+call.
+
+**Acceptance criteria**: `test_cli_version_history.py`'s loosened
+assertions (`v1_ids`/`v2_ids` non-empty instead of exactly one version
+each; `len(versions_after) > count_before_restore` instead of exactly
+`+1`) are tightened back to exact equality, per this task's own stated
+criteria — re-ran 5 times in a row to rule out a lucky race, all passed.
+
+**Testing**:
+- `tests/unit/test_vw_sync.c`: 5 new cases exercising
+  `vw_sync_mark_local_modified` directly against real temp files (this
+  function needed real `stat()` results, unlike every other scenario in
+  this file, deliberately chosen to avoid that) — new file → `NEW_LOCAL`
+  with real size; unchanged file leaves `SYNCED` alone (the actual
+  regression guard for this bug); a genuine content change transitions
+  `SYNCED` → `LOCAL_MOD`; an already-dirty entry is left alone; a
+  directory path creates no entry (this function's other fix, from
+  `TASK-218`, re-verified directly here too).
+- `test_cli_version_history.py`'s existing scenario, tightened to exact
+  counts as above — real daemon + server, the actual originally-observed
+  repro, run 5× to confirm it's not a lucky pass.
+- Full regression: `ctest --test-dir build-gw-e2e` (19/19) and the full
+  non-cluster pytest suite, both green on both toolchains (WSL/GCC,
+  MSVC) after this change.
+
+Moving to `review`.
+
+CLI.02 [2026-08-26]: Full regression confirmed green before handing off
+to review — full non-cluster pytest integration suite: `111 passed, 15
+deselected`; `ctest` 19/19 on both toolchains (WSL/GCC `build-gw-e2e`,
+MSVC `build-msvc-105`).
+
+CQR.08 [2026-08-26]: Reviewed for code quality and consistency.
+
+- The fix mirrors `compute_actions`'s own Pass 1 comparison exactly
+  (same fields compared, same "only transition from SYNCED/REMOTE_MOD"
+  rule) — verified by re-reading Pass 1 side by side with the new code,
+  not assumed to match from memory.
+- Correctly identified and fixed the secondary gap in the same
+  function (`local_mtime`/`local_size` were never updated for an
+  existing entry at all, only set for a brand-new one) — without this,
+  the new "did anything really change" comparison would have nothing
+  real to compare against on a second call.
+- The root-cause narrative is honest about what was and wasn't
+  independently re-confirmed: the version-restore repro was actually
+  reproduced and fixed; the brand-new-file "two versions" case is
+  reasoned as the same class of bug rather than separately proven with
+  its own targeted repro, and the notes say so plainly rather than
+  overclaiming.
+- Tightening `test_cli_version_history.py`'s assertions back to exact
+  counts, then running 5× to rule out a lucky pass, is exactly what
+  this task's own acceptance criteria asked for.
+- New unit tests exercise the real function against real files
+  (necessary here, unlike every other scenario in this file) with a
+  minimal, clearly-scoped footprint (temp files cleaned up via the
+  existing `stack_close`/`rm_rf`).
+- No blocking findings. Approved.

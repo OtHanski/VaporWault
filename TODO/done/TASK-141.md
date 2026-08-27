@@ -1,6 +1,6 @@
 ---
 id:          TASK-141
-title:       In-browser vault crypto (WASM Argon2id + SubtleCrypto AES-256-GCM) and vault UI
+title:       "In-browser vault crypto (WASM Argon2id + SubtleCrypto AES-256-GCM) and vault UI"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

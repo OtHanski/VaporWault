@@ -1,6 +1,6 @@
 ---
 id:          TASK-018
-title:       vw_proto — bump wire format to widen lockout_remaining_secs to u16
+title:       "vw_proto — bump wire format to widen lockout_remaining_secs to u16"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

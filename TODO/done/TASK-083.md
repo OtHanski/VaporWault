@@ -1,6 +1,6 @@
 ---
 id:          TASK-083
-title:       Fix release.yml build failure — Dear ImGui has no CMakeLists.txt, SDL2 never wired into CMake
+title:       "Fix release.yml build failure — Dear ImGui has no CMakeLists.txt, SDL2 never wired into CMake"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

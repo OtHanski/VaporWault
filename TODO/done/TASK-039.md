@@ -1,6 +1,6 @@
 ---
 id:          TASK-039
-title:       Multi-threaded accept loop — thread pool in vapourwaultd
+title:       "Multi-threaded accept loop — thread pool in vapourwaultd"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

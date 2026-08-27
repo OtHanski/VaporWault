@@ -69,11 +69,18 @@ class Binaries:
 
     @staticmethod
     def _find(name):
-        for d in ("build/bin", "build-release/bin", "../build/bin"):
-            p = os.path.join(d, name)
-            if os.path.isfile(p):
-                return os.path.abspath(p)
-        return None
+        # TASK-217: delegates to _find_client_bin (defined below in this
+        # same module) rather than keeping its own, narrower copy of the
+        # search order. This copy had two real gaps _find_client_bin
+        # doesn't: no build-gw-e2e/bin (or build-wsl-werror/bin,
+        # build-wsl/bin), and no .exe suffix handling at all — on native
+        # Windows this looked for a literal "vapourwaultd" file, which
+        # never matches "vapourwaultd.exe", so auto-discovery here could
+        # never actually succeed there regardless of search order. Every
+        # test in this session that needed real auto-discovery of the
+        # server/admin-cli/gateway binaries worked around this by always
+        # passing --server-bin/--admin-cli/--gateway-bin explicitly.
+        return _find_client_bin(name)
 
     def require_server(self):
         if not self.server_bin or not os.path.isfile(self.server_bin):
@@ -109,7 +116,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _write_server_conf(path, data_dir, cert, key, admin_socket, port, max_workers=2):
+def _write_server_conf(path, data_dir, cert, key, admin_socket, port, max_workers=2, extra=""):
     with open(path, "w") as f:
         f.write(f"""\
 listen_host      = 127.0.0.1
@@ -122,13 +129,14 @@ max_connections  = 16
 max_workers      = {max_workers}
 admin_socket     = {admin_socket}
 smtp_host        =
+{extra}
 """)
 
 
 class ServerInstance:
     """A running vapourwaultd process with its admin socket and TLS port."""
 
-    def __init__(self, binaries: Binaries, tmpdir: str, max_workers: int = 2):
+    def __init__(self, binaries: Binaries, tmpdir: str, max_workers: int = 2, extra_conf: str = ""):
         self.binaries = binaries
         self.tmpdir = tmpdir
         self.data_dir     = os.path.join(tmpdir, "data")
@@ -143,7 +151,8 @@ class ServerInstance:
         _write_server_conf(
             self.conf_path, self.data_dir,
             self.cert, binaries.test_key,
-            self.admin_socket, self.port, max_workers=max_workers
+            self.admin_socket, self.port, max_workers=max_workers,
+            extra=extra_conf,
         )
 
     def start(self, timeout=20):
@@ -362,12 +371,18 @@ def admin_client(server):
     ac.close()
 
 
-# ── TASK-161/162 fixtures: vapourwault-daemon + vapourwault-cli ─────────────
+# ── TASK-161/162/217: shared binary-discovery helper ────────────────────────
 #
-# Shared by test_daemon_ipc_accounts.py and test_cli_account_commands.py —
-# both need a real running multi-account daemon, not the module-scoped
-# `server` fixture above (which is the VaporWault *server*, a different
-# binary entirely).
+# Originally added only for the daemon_bin/cli_bin fixtures below (needed
+# by test_daemon_ipc_accounts.py/test_cli_account_commands.py's real
+# multi-account daemon, not the module-scoped `server` fixture above, which
+# is the VaporWault *server*, a different binary entirely) — TASK-217 found
+# that nearly every other pytest wrapper in this directory had grown its
+# own near-identical copy of this same search order (for its own compiled
+# C test binary, or in Binaries._find below for the product binaries), and
+# most of those copies had silently drifted to miss build-gw-e2e/bin.
+# Generic over any binary/executable name for exactly this reason: one
+# search order, used everywhere a binary needs to be located by name.
 
 def _find_client_bin(name):
     # build-gw-e2e/bin first and deliberately: build-wsl-werror/bin and

@@ -1,0 +1,119 @@
+---
+id:          TASK-217
+title:       "Reconcile inconsistent build-dir search lists across integration test wrappers"
+status:      done
+assignee:    BLD.05
+created_by:  SRV.01
+created:     2026-08-26
+priority:    low
+depends_on:  []
+blocks:      []
+review_by:   [CQR.08]
+tags:        [test-infra]
+---
+
+Discovered while writing `TASK-198`'s `test_search.py`: each Python pytest
+wrapper for a C-level integration test binary hand-rolls its own binary
+search list (e.g. `test_shared_sync.py`'s `_find_shared_sync_bin`,
+`test_vault_e2ee.py`'s equivalent, and others), and most of these lists —
+unlike `conftest.py`'s own newer `_find_client_bin` helper, added for
+`TASK-161`'s daemon/CLI fixtures — never include `build-gw-e2e/bin`. On a
+machine where the WSL/GCC build lives only under `build-gw-e2e` (this
+session's own setup), every one of those older wrapper tests silently
+skips ("binary not found") instead of running, unless the caller happens
+to pass an explicit path or already has a `build/bin` populated from a
+different toolchain.
+
+This is a real coverage gap (tests silently skipping look identical to
+"nothing to test" in CI output) but not a correctness bug in any shipped
+behavior, and fixing it project-wide touches every wrapper file — out of
+scope for `TASK-198` itself, which only fixed its own new `test_search.py`.
+
+## Work
+
+- Either: add `build-gw-e2e/bin` to every wrapper's own search-list tuple
+  (mechanical, low-risk, matches `test_search.py`'s fix), or better:
+  replace each wrapper's hand-rolled `_find_*_bin` function with
+  `conftest.py`'s shared `_find_client_bin` (already exists, already
+  correct) so there is exactly one search-order convention instead of
+  N nearly-identical copies that can individually drift.
+- Audit whether `conftest.py`'s own `Binaries._find` (used for
+  `server_bin`/`admin_cli`/`gateway_bin`, `TODO/todo/TASK-198.md`'s
+  discovery didn't check this one) has the same gap.
+
+## Acceptance criteria
+
+- Every integration test wrapper's binary-discovery function checks the
+  same, single, documented search order.
+- Running the full non-cluster pytest suite against a `build-gw-e2e`-only
+  checkout (no `build/`) collects and runs every test that a `build/`-only
+  checkout would, rather than silently skipping a subset.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+SRV.01 [2026-08-26]: Filed per `CLAUDE.md`'s out-of-domain discovery rule
+while implementing `TASK-198` — fixed only `test_search.py`'s own list,
+did not touch any other wrapper file.
+
+BLD.05 [2026-08-26]: Fixed, taking the "better" option — every hand-rolled
+`_find_*_bin`/`_find_shared_sync_bin`/etc. function across
+`test_shared_sync.py`, `test_shared_sync_hardening.py`,
+`test_shared_sync_mkdir.py`, `test_vault_e2ee.py`, `test_vault_regression.py`,
+`test_daemon_multi_account.py`, and `test_search.py` (the last two already
+had `build-gw-e2e/bin` in their own lists, but were still separate copies
+that could individually drift — folded in too, matching the acceptance
+criteria's "same, single, documented search order," not just "same
+current contents") now delegate to `conftest.py`'s shared
+`_find_client_bin`. Each file's now-unused `import os` was removed where
+nothing else in that file still needed it (`test_vault_regression.py`
+keeps it — it's also used by that file's own server-storage marker scan).
+
+Also audited and fixed `Binaries._find` (`server_bin`/`admin_cli`/
+`gateway_bin` auto-discovery) per the Work section's second item — it had
+the same missing-`build-gw-e2e/bin` gap, plus a second, worse one:
+no `.exe` suffix handling at all, so on native Windows it looked for a
+literal `vapourwaultd` file, which can never match `vapourwaultd.exe` —
+auto-discovery there could never succeed on Windows regardless of search
+order. Now delegates to `_find_client_bin` too (defined later in the same
+module; safe, since it's only ever called once a `Binaries` instance is
+actually constructed, well after module load completes).
+
+**Verified concretely, not just by reading the code**:
+- `tests/integration/test_shared_sync.py`, `test_shared_sync_hardening.py`,
+  `test_shared_sync_mkdir.py`, `test_vault_e2ee.py`, `test_vault_regression.py`,
+  `test_daemon_multi_account.py`, `test_search.py` (7 tests) all pass with
+  no explicit binary path given to any of their C-test-binary fixtures —
+  auto-discovery via `_find_client_bin` alone, against a `build-gw-e2e`-only
+  checkout.
+- `test_auth.py`'s full suite (7 tests) passes with **no** `--server-bin`/
+  `--admin-cli` flags at all — `Binaries._find`'s auto-discovery alone,
+  proving that fix concretely rather than by inspection.
+- Full non-cluster pytest suite (110 tests) passes relying entirely on
+  auto-discovery — only `--test-cert`/`--test-key` passed, no binary path
+  flags of any kind. This is the acceptance criteria's own stated
+  end-to-end check, run for real.
+
+Moving to `review`.
+
+CQR.08 [2026-08-26]: Reviewed for code quality and consistency.
+
+- Choosing the "better" (delegate-to-shared-helper) option over the
+  mechanical (add-one-tuple-entry-everywhere) option was the right call
+  — the whole point of this task is that N independent copies of the
+  same list drift; a mechanical fix would have left N copies (now all
+  correct today, still N places to drift again tomorrow).
+- Folding in the two files that already happened to have
+  `build-gw-e2e/bin` in their own list (`test_daemon_multi_account.py`,
+  `test_search.py`) rather than leaving them as "already fine" copies is
+  the right read of the acceptance criteria ("the *same* search order,"
+  not "current contents that happen to match").
+- `Binaries._find`'s two real bugs (missing `build-gw-e2e/bin`, no
+  `.exe` handling at all) were found and fixed via the same audit this
+  task's own Work section asked for, not skipped as "someone else's
+  file."
+- Verification is concrete (real pytest runs relying on auto-discovery
+  alone) rather than just re-reading the new code, for both the
+  wrapper-file fix and the `Binaries._find` fix separately.
+- No blocking findings. Approved.

@@ -13,27 +13,18 @@ This file's only job is to spawn the server, create the owner/grantee users,
 and hand connection details to the subprocess.
 """
 
-import os
 import subprocess
 
 import pytest
 
-
-def _find_hardening_bin():
-    """Locate the compiled test_shared_sync_hardening binary. Mirrors
-    test_shared_sync.py's _find_shared_sync_bin search order."""
-    name = "test_shared_sync_hardening.exe" if os.name == "nt" else "test_shared_sync_hardening"
-    for d in ("build/bin", "build-release/bin", "../build/bin",
-              "build-wsl-werror/bin", "build-wsl/bin"):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return os.path.abspath(p)
-    return None
+from conftest import _find_client_bin
 
 
 @pytest.fixture(scope="module")
 def hardening_bin():
-    path = _find_hardening_bin()
+    # TASK-217: shared search-order helper, see test_shared_sync.py's
+    # own note on why (was a hand-rolled list missing build-gw-e2e/bin).
+    path = _find_client_bin("test_shared_sync_hardening")
     if not path:
         pytest.skip("test_shared_sync_hardening binary not found (build it first)")
     return path

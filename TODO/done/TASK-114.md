@@ -1,6 +1,6 @@
 ---
 id:          TASK-114
-title:       Add unit test coverage for the client sync engine (vw_sync.c)
+title:       "Add unit test coverage for the client sync engine (vw_sync.c)"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

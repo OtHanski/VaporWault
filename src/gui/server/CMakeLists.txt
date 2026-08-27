@@ -17,6 +17,7 @@ target_include_directories(vapourwault-server-gui PRIVATE
 
 target_link_libraries(vapourwault-server-gui PRIVATE
     vw_core
+    vw_version
     imgui
 )
 

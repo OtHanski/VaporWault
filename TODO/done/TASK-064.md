@@ -1,6 +1,6 @@
 ---
 id:          TASK-064
-title:       Admin deployment guide (docs/DEPLOYMENT.md)
+title:       "Admin deployment guide (docs/DEPLOYMENT.md)"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

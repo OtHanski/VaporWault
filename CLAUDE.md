@@ -254,7 +254,7 @@ moving the file, don't just edit the status. New tasks are created directly in
 ```yaml
 ---
 id:          TASK-NNN
-title:       Short imperative description
+title:       "Short imperative description"
 status:      todo          # todo | in_progress | review | done | blocked
 assignee:    SRV.01        # exactly one agent ID
 created_by:  ARCH.00
@@ -269,6 +269,13 @@ tags:        []            # free labels; use security-sensitive to trigger SEC.
 
 The body below the front-matter is free Markdown. Agents append notes with their ID
 and date; they never delete prior notes.
+
+**`title` must always be a double-quoted string.** A colon followed by a space inside a
+plain (unquoted) YAML scalar is ambiguous with a nested mapping — some parsers accept it,
+others don't, and at least one past task file (see `TASK-169`'s history) had its title
+silently rewritten because of this. Quoting the title sidesteps that entirely and is safe
+against other stray-punctuation issues too, so a colon inside the title is fine as long as
+the whole value is quoted (`title: "Server: replica hot-standby..."`).
 
 ### Status lifecycle
 

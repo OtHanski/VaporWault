@@ -10,6 +10,7 @@
 #include "vw_ipc.h"
 #include "vw_cache.h"         /* vw_sync_state_t, VW_ENTRY_FILE, VW_ENTRY_DIR */
 #include "../core/vw_proto.h" /* vw_read_u32le, vw_read_u64le, vw_err_t       */
+#include "vw_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -494,9 +495,50 @@ static int cmd_list_folders(vw_ipc_conn_t *conn, uint32_t account_id) {
 
         printf("%-8s  %-10s  %-12s  %-30s  %s\n",
                paused ? "yes" : "no", reason_str, kind_buf, lbuf, vbuf);
+
+        /* TASK-192/193: selective-sync exclude rules, trailing field. */
+        if (off + 2u > rlen) continue;
+        uint16_t ecount = vw_read_u16le(resp + off); off += 2u;
+        for (uint16_t j = 0; j < ecount; j++) {
+            const char *pat = NULL; uint16_t pl = 0;
+            if (vw_ipc_read_str(resp, rlen, &off, &pat, &pl) != VW_OK) break;
+            char pbuf[256]; size_t pc = pl < sizeof(pbuf)-1u ? pl : sizeof(pbuf)-1u;
+            memcpy(pbuf, pat, pc); pbuf[pc] = '\0';
+            printf("           exclude: %s\n", pbuf);
+        }
     }
 
     free(resp);
+    return 0;
+}
+
+/* ── Subcommand: set-folder-rules (TASK-192/193) ──────────────────────────
+ * Wholesale replace, not incremental — passing zero --exclude flags
+ * clears every existing rule for the folder. FOLDER_SET_EXCLUDES_REQ:
+ * u32 account_id, string local_root, u16 count, count*string pattern.
+ * FOLDER_SET_EXCLUDES_RESP: u32 error_code. */
+static int cmd_set_folder_excludes(vw_ipc_conn_t *conn, uint32_t account_id,
+                                    const char *local_root,
+                                    const char **patterns, uint16_t count) {
+    uint8_t req[4u + 2u + VW_MAX_PATH_BYTES + 2u + 64u * 258u];
+    uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    vw_ipc_write_str(req, sizeof(req), &off, local_root, (uint16_t)strlen(local_root));
+    vw_write_u16le(req + off, count); off += 2u;
+    for (uint16_t i = 0; i < count; i++)
+        vw_ipc_write_str(req, sizeof(req), &off, patterns[i], (uint16_t)strlen(patterns[i]));
+
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_FOLDER_SET_EXCLUDES_REQ, req, off,
+                             VW_IPC_FOLDER_SET_EXCLUDES_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "set-folder-rules: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "set-folder-rules")) return 1;
+
+    if (count == 0)
+        printf("cleared all exclude rules for %s\n", local_root);
+    else
+        printf("set %u exclude rule(s) for %s\n", (unsigned)count, local_root);
     return 0;
 }
 
@@ -852,13 +894,15 @@ static int cmd_list_shares(vw_ipc_conn_t *conn, uint32_t account_id, uint8_t mod
 /* LINK_CREATE_REQ: u32 account_id, string path, u8 permission, i64 expires_at.
  * LINK_CREATE_RESP: u32 error_code, u64 share_id, bytes[32] link_token. */
 static int cmd_create_link(vw_ipc_conn_t *conn, uint32_t account_id, const char *path,
-                            uint8_t permission, int64_t expires_at) {
-    uint8_t req[4u + 2u + VW_MAX_PATH_BYTES + 1u + 8u];
+                            uint8_t permission, int64_t expires_at, const char *password) {
+    uint8_t req[4u + 2u + VW_MAX_PATH_BYTES + 1u + 8u + 2u + 256u];
     uint32_t off = 0;
     vw_write_u32le(req + off, account_id); off += 4u;
     vw_ipc_write_str(req, sizeof(req), &off, path, (uint16_t)strlen(path));
     req[off++] = permission;
     vw_write_u64le(req + off, (uint64_t)expires_at); off += 8;
+    vw_ipc_write_str(req, sizeof(req), &off, password ? password : "",
+                      (uint16_t)(password ? strlen(password) : 0));
 
     uint8_t resp[4u + 8u + 32u];
     uint32_t rlen = 0;
@@ -896,8 +940,8 @@ static int cmd_list_links(vw_ipc_conn_t *conn, uint32_t account_id) {
     uint32_t count = vw_read_u32le(resp + 4u);
     uint32_t off = 8u;
 
-    printf("%-10s  %-6s  %-8s  %-19s  %-8s  %s\n",
-           "SHARE_ID", "FILE", "PERM", "EXPIRES (UTC)", "REVOKED", "NAME");
+    printf("%-10s  %-6s  %-8s  %-19s  %-8s  %-9s  %s\n",
+           "SHARE_ID", "FILE", "PERM", "EXPIRES (UTC)", "REVOKED", "PASSWORD", "NAME");
 
     for (uint32_t i = 0; i < count; i++) {
         if (off + 8u + 8u > rlen) break;
@@ -906,22 +950,242 @@ static int cmd_list_links(vw_ipc_conn_t *conn, uint32_t account_id) {
 
         const char *name = NULL; uint16_t name_len = 0;
         if (vw_ipc_read_str(resp, rlen, &off, &name, &name_len) != VW_OK) break;
-        if (off + 1u + 8u + 8u + 1u > rlen) break;
+        if (off + 1u + 8u + 8u + 1u + 1u > rlen) break;
         uint8_t permission = resp[off++];
         off += 8u; /* created_at, unused here */
         int64_t expires_at = (int64_t)vw_read_u64le(resp + off); off += 8;
         uint8_t revoked = resp[off++];
+        uint8_t has_password = resp[off++]; /* TASK-186/188 */
 
         char name_buf[65]; size_t nc = name_len < sizeof(name_buf) - 1u ? name_len : sizeof(name_buf) - 1u;
         memcpy(name_buf, name, nc); name_buf[nc] = '\0';
         char exp_buf[24]; format_ts(expires_at, exp_buf, sizeof(exp_buf), 1);
 
-        printf("%-10llu  %-6llu  %-8s  %-19s  %-8s  %s\n",
+        printf("%-10llu  %-6llu  %-8s  %-19s  %-8s  %-9s  %s\n",
                (unsigned long long)share_id, (unsigned long long)file_id,
-               perm_str(permission), exp_buf, revoked ? "yes" : "no", name_buf);
+               perm_str(permission), exp_buf, revoked ? "yes" : "no",
+               has_password ? "yes" : "no", name_buf);
     }
 
     free(resp);
+    return 0;
+}
+
+/* ── Subcommands: version list / version restore (TASK-182) ─────────────── */
+
+/* VERSION_LIST_REQ: u32 account_id, string virtual_path. VERSION_LIST_RESP:
+ * u32 error_code, u32 count, count * { u64 version_id, i64 created_at,
+ * u64 size_bytes }. */
+static int cmd_version_list(vw_ipc_conn_t *conn, uint32_t account_id, const char *path) {
+    uint8_t req[4u + 2u + VW_MAX_PATH_BYTES];
+    uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    vw_ipc_write_str(req, sizeof(req), &off, path, (uint16_t)strlen(path));
+
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "version list: out of memory\n"); return 1; }
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_VERSION_LIST_REQ, req, off,
+                             VW_IPC_VERSION_LIST_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) { fprintf(stderr, "version list: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "version list")) { free(resp); return 1; }
+    if (rlen < 8u) { free(resp); return 0; }
+
+    uint32_t count = vw_read_u32le(resp + 4u);
+    uint32_t roff = 8u;
+
+    printf("%-12s  %-19s  %s\n", "VERSION_ID", "CREATED (UTC)", "SIZE");
+    for (uint32_t i = 0; i < count; i++) {
+        if (roff + 24u > rlen) break;
+        uint64_t version_id  = vw_read_u64le(resp + roff); roff += 8;
+        int64_t  created_at  = (int64_t)vw_read_u64le(resp + roff); roff += 8;
+        uint64_t size_bytes  = vw_read_u64le(resp + roff); roff += 8;
+
+        char ts_buf[24]; format_ts(created_at, ts_buf, sizeof(ts_buf), 0);
+        printf("%-12llu  %-19s  %llu\n",
+               (unsigned long long)version_id, ts_buf, (unsigned long long)size_bytes);
+    }
+
+    free(resp);
+    return 0;
+}
+
+/* VERSION_RESTORE_REQ: u32 account_id, string virtual_path, u64 version_id.
+ * VERSION_RESTORE_RESP: u32 error_code. */
+static int cmd_version_restore(vw_ipc_conn_t *conn, uint32_t account_id,
+                                 const char *path, uint64_t version_id) {
+    uint8_t req[4u + 2u + VW_MAX_PATH_BYTES + 8u];
+    uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    vw_ipc_write_str(req, sizeof(req), &off, path, (uint16_t)strlen(path));
+    vw_write_u64le(req + off, version_id); off += 8u;
+
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_VERSION_RESTORE_REQ, req, off,
+                             VW_IPC_VERSION_RESTORE_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "version restore: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "version restore")) return 1;
+
+    printf("restored version %llu\n", (unsigned long long)version_id);
+    return 0;
+}
+
+/* ── Subcommand: search (TASK-199; docs/PROTOCOL.md §7.12) ───────────────── */
+
+/* SEARCH_REQ: u32 account_id, string query. SEARCH_RESP: u32 error_code,
+ * u32 count, u8 truncated, count * { u64 file_id, string name, u8 is_dir,
+ * u64 size_bytes, i64 mtime_unix, u64 vault_id, u8 is_shared }. */
+static int cmd_search(vw_ipc_conn_t *conn, uint32_t account_id, const char *query) {
+    uint8_t req[4u + 2u + 256u];
+    uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    vw_ipc_write_str(req, sizeof(req), &off, query, (uint16_t)strlen(query));
+
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "search: out of memory\n"); return 1; }
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_SEARCH_REQ, req, off,
+                             VW_IPC_SEARCH_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) { fprintf(stderr, "search: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "search")) { free(resp); return 1; }
+    if (rlen < 9u) { free(resp); return 0; }
+
+    uint32_t count     = vw_read_u32le(resp + 4u);
+    uint8_t  truncated = resp[8];
+    uint32_t roff      = 9u;
+
+    printf("%-10s  %-4s  %-8s  %-19s  %s\n", "FILE_ID", "TYPE", "SHARED", "MODIFIED (UTC)", "NAME");
+    for (uint32_t i = 0; i < count; i++) {
+        if (roff + 8u > rlen) break;
+        uint64_t file_id = vw_read_u64le(resp + roff); roff += 8u;
+
+        const char *name; uint16_t name_len;
+        if (vw_ipc_read_str(resp, rlen, &roff, &name, &name_len) != VW_OK) break;
+        char name_buf[64];
+        uint16_t nc = name_len < sizeof(name_buf) - 1u ? name_len : (uint16_t)(sizeof(name_buf) - 1u);
+        memcpy(name_buf, name, nc); name_buf[nc] = '\0';
+
+        if (roff + 1u + 8u + 8u + 8u + 1u > rlen) break;
+        uint8_t  is_dir     = resp[roff++];
+        roff += 8u; /* size_bytes: not shown in this column layout */
+        int64_t  mtime_unix = (int64_t)vw_read_u64le(resp + roff); roff += 8u;
+        roff += 8u; /* vault_id: not shown here; `stat`/`list-folders` surface encryption status */
+        uint8_t  is_shared  = resp[roff++];
+
+        char ts_buf[24]; format_ts(mtime_unix, ts_buf, sizeof(ts_buf), 0);
+        printf("%-10llu  %-4s  %-8s  %-19s  %s\n",
+               (unsigned long long)file_id, is_dir ? "dir" : "file",
+               is_shared ? "yes" : "no", ts_buf, name_buf);
+    }
+
+    if (truncated)
+        printf("(results truncated at the server's cap — narrow the query to see more)\n");
+
+    free(resp);
+    return 0;
+}
+
+/* ── Subcommand: notify (TASK-206/207/209; docs/PROTOCOL.md §7.13) ───────── */
+
+/* Human-readable category table — single source of truth for both `notify
+ * list`'s display names and `notify set <category>`'s name lookup, so the
+ * two can never drift apart. */
+static const struct { const char *name; uint32_t bit; const char *desc; } NOTIFY_CATEGORIES[] = {
+    { "share_received",         VW_NOTIFY_SHARE_RECEIVED,          "Someone shared a file or folder with you" },
+    { "quota_warning",          VW_NOTIFY_QUOTA_WARNING,           "Your storage usage crossed 90% of your quota" },
+    { "new_login",              VW_NOTIFY_NEW_LOGIN,               "A new (non-reconnect) login succeeded on your account" },
+    { "account_security_change", VW_NOTIFY_ACCOUNT_SECURITY_CHANGE, "Your password changed or 2FA was enabled/disabled" },
+};
+#define NOTIFY_CATEGORIES_COUNT (sizeof(NOTIFY_CATEGORIES) / sizeof(NOTIFY_CATEGORIES[0]))
+
+/* NOTIFY_PREFS_GET_REQ: u32 account_id. _GET_RESP: u32 error_code, u32 prefs_bitmask. */
+static int cmd_notify_list(vw_ipc_conn_t *conn, uint32_t account_id) {
+    uint8_t req[4];
+    vw_write_u32le(req, account_id);
+
+    uint8_t resp[8];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_NOTIFY_PREFS_GET_REQ, req, sizeof(req),
+                             VW_IPC_NOTIFY_PREFS_GET_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "notify list: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "notify list")) return 1;
+    if (rlen < 8u) { fprintf(stderr, "notify list: truncated response\n"); return 1; }
+
+    uint32_t prefs = vw_read_u32le(resp + 4);
+    printf("%-24s  %-4s  %s\n", "CATEGORY", "ON", "DESCRIPTION");
+    for (size_t i = 0; i < NOTIFY_CATEGORIES_COUNT; i++) {
+        printf("%-24s  %-4s  %s\n", NOTIFY_CATEGORIES[i].name,
+               (prefs & NOTIFY_CATEGORIES[i].bit) ? "yes" : "no",
+               NOTIFY_CATEGORIES[i].desc);
+    }
+    return 0;
+}
+
+/* NOTIFY_PREFS_SET_REQ: u32 account_id, u32 prefs_bitmask (the COMPLETE new
+ * value, per §7.13 — this reads the current value via GET first, flips
+ * only the one requested bit, then sends the full result). _SET_ACK:
+ * u32 error_code, u32 prefs_bitmask (stored value after the call).
+ *
+ * Takes ipc_port rather than a pre-opened conn (unlike every other
+ * cmd_* in this file) because it needs two separate request/response
+ * round trips (GET then SET) and this codebase's daemon IPC is strictly
+ * one-request-per-connection (vw_daemon.c's handle_ipc_client reads and
+ * dispatches exactly one message, then the connection is done) — reusing
+ * a single conn for a second request just hangs/errors on the daemon
+ * having already moved on. Two short-lived connections, same as two
+ * separate CLI invocations would each get. */
+static int cmd_notify_set(uint16_t ipc_port, uint32_t account_id,
+                           const char *category, const char *on_off) {
+    uint32_t bit = 0;
+    for (size_t i = 0; i < NOTIFY_CATEGORIES_COUNT; i++) {
+        if (strcmp(category, NOTIFY_CATEGORIES[i].name) == 0) { bit = NOTIFY_CATEGORIES[i].bit; break; }
+    }
+    if (bit == 0) {
+        fprintf(stderr, "notify set: unknown category '%s'\n", category);
+        fprintf(stderr, "Known categories:");
+        for (size_t i = 0; i < NOTIFY_CATEGORIES_COUNT; i++)
+            fprintf(stderr, " %s", NOTIFY_CATEGORIES[i].name);
+        fprintf(stderr, "\n");
+        return 1;
+    }
+    int turn_on;
+    if      (strcmp(on_off, "on")  == 0) turn_on = 1;
+    else if (strcmp(on_off, "off") == 0) turn_on = 0;
+    else { fprintf(stderr, "notify set: expected 'on' or 'off', got '%s'\n", on_off); return 1; }
+
+    vw_ipc_conn_t *c1 = cli_connect(ipc_port);
+    if (!c1) return 1;
+
+    uint8_t greq[4];
+    vw_write_u32le(greq, account_id);
+    uint8_t gresp[8];
+    uint32_t grlen = 0;
+    vw_err_t err = ipc_rpc(c1, VW_IPC_NOTIFY_PREFS_GET_REQ, greq, sizeof(greq),
+                             VW_IPC_NOTIFY_PREFS_GET_RESP, gresp, sizeof(gresp), &grlen);
+    vw_ipc_conn_close(c1);
+    if (err != VW_OK) { fprintf(stderr, "notify set: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(gresp, grlen, "notify set")) return 1;
+    if (grlen < 8u) { fprintf(stderr, "notify set: truncated response\n"); return 1; }
+
+    uint32_t prefs = vw_read_u32le(gresp + 4);
+    if (turn_on) prefs |= bit; else prefs &= ~bit;
+
+    vw_ipc_conn_t *c2 = cli_connect(ipc_port);
+    if (!c2) return 1;
+
+    uint8_t sreq[8];
+    vw_write_u32le(sreq, account_id);
+    vw_write_u32le(sreq + 4, prefs);
+    uint8_t sresp[8];
+    uint32_t srlen = 0;
+    err = ipc_rpc(c2, VW_IPC_NOTIFY_PREFS_SET_REQ, sreq, sizeof(sreq),
+                    VW_IPC_NOTIFY_PREFS_SET_ACK, sresp, sizeof(sresp), &srlen);
+    vw_ipc_conn_close(c2);
+    if (err != VW_OK) { fprintf(stderr, "notify set: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(sresp, srlen, "notify set")) return 1;
+
+    printf("%s: %s\n", category, turn_on ? "on" : "off");
     return 0;
 }
 
@@ -967,21 +1231,32 @@ static void print_usage(const char *prog) {
         "                                item's file_id (see list-shares)\n"
         "  remove-folder <local>         Remove a sync folder\n"
         "  list-folders                  List sync folders (owned + shared)\n"
+        "  set-folder-rules <local> [--exclude <glob> ...]\n"
+        "                                Replace a folder's selective-sync\n"
+        "                                exclude rules (no flags = clear all)\n"
         "  ls [<virtual_path>]           List synced files\n"
         "  conflicts                     List conflicted files only\n"
         "  share <path> <user> <view|edit> [expires_unix]\n"
         "                                Grant a user access to a file/folder\n"
         "  unshare <share_id>            Revoke a user-to-user grant\n"
         "  list-shares [--to-me]         List grants (created by me, or to me)\n"
-        "  create-link <path> <view|edit> [expires_unix]\n"
+        "  create-link <path> <view|edit> [expires_unix] [--password <pw>]\n"
         "                                Mint a public link; token shown once\n"
         "  revoke-link <share_id>        Revoke a public link\n"
         "  list-links                    List public links I've created\n"
+        "  version list <path>           List all versions of a file\n"
+        "  version restore <path> <version_id>\n"
+        "                                Restore an older version as HEAD\n"
+        "  search <query>                Search filenames across everything visible\n"
+        "                                (owned + shared); case-insensitive substring\n"
+        "  notify list                   Show your email notification preferences\n"
+        "  notify set <category> on|off  Toggle one notification category\n"
         "  shutdown                      Ask the daemon to stop\n"
         "\n"
         "Options:\n"
         "  --ipc-port <port>          Override IPC port (default: %u)\n"
         "  --account <label-or-id>    Account to use for an account-scoped command\n"
+        "  --version                  Print version and exit\n"
         "  --help, -h                 Show this help\n",
         prog, (unsigned)VW_IPC_DEFAULT_PORT);
 }
@@ -1015,6 +1290,9 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         } else if (strcmp(argv[argi], "--help") == 0 ||
                    strcmp(argv[argi], "-h") == 0) {
             print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(argv[argi], "--version") == 0) {
+            printf("vapourwault-cli %s\n", VW_VERSION_STRING);
             return 0;
         } else {
             break;
@@ -1141,6 +1419,39 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
         int rc = cmd_list_folders(c, account_id);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "set-folder-rules") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s set-folder-rules <local_root> [--exclude <glob> ...]\n"
+                            "  Replaces the whole rule set for this folder — pass no\n"
+                            "  --exclude flags to clear all existing rules.\n", argv[0]);
+            return 1;
+        }
+        const char *local_root = argv[argi++];
+        const char *patterns[64];
+        uint16_t npatterns = 0;
+        while (argi < argc) {
+            if (strcmp(argv[argi], "--exclude") == 0 && argi + 1 < argc) {
+                if (npatterns >= 64) {
+                    fprintf(stderr, "set-folder-rules: too many --exclude flags (max 64)\n");
+                    return 1;
+                }
+                patterns[npatterns++] = argv[argi + 1];
+                argi += 2;
+            } else {
+                fprintf(stderr, "set-folder-rules: unexpected argument '%s'\n", argv[argi]);
+                return 1;
+            }
+        }
+        uint32_t account_id = 0;
+        if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_set_folder_excludes(c, account_id, local_root, patterns, npatterns);
         vw_ipc_conn_close(c);
         return rc;
     }
@@ -1342,18 +1653,26 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
     if (strcmp(cmd, "create-link") == 0) {
         HELP_IF_REQUESTED();
         if (argi + 1 >= argc) {
-            fprintf(stderr, "Usage: %s create-link <path> <view|edit> [expires_unix]\n", argv[0]);
+            fprintf(stderr, "Usage: %s create-link <path> <view|edit> [expires_unix] [--password <pw>]\n", argv[0]);
             return 1;
         }
         const char *path = argv[argi++];
         uint8_t permission;
         if (parse_permission(argv[argi++], &permission)) return 1;
-        int64_t expires_at = (argi < argc) ? (int64_t)strtoll(argv[argi++], NULL, 10) : 0;
+        int64_t expires_at = 0;
+        const char *password = NULL;
+        while (argi < argc) {
+            if (strcmp(argv[argi], "--password") == 0 && argi + 1 < argc) {
+                password = argv[argi + 1]; argi += 2;
+            } else {
+                expires_at = (int64_t)strtoll(argv[argi++], NULL, 10);
+            }
+        }
         uint32_t account_id = 0;
         if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
-        int rc = cmd_create_link(c, account_id, path, permission, expires_at);
+        int rc = cmd_create_link(c, account_id, path, permission, expires_at, password);
         vw_ipc_conn_close(c);
         return rc;
     }
@@ -1383,6 +1702,95 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         int rc = cmd_list_links(c, account_id);
         vw_ipc_conn_close(c);
         return rc;
+    }
+
+    if (strcmp(cmd, "search") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s search <query>\n", argv[0]);
+            return 1;
+        }
+        const char *query = argv[argi++];
+        uint32_t account_id = 0;
+        if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_search(c, account_id, query);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "notify") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s notify list | notify set <category> on|off\n", argv[0]);
+            return 1;
+        }
+        const char *subcmd = argv[argi++];
+        uint32_t account_id = 0;
+        if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+
+        if (strcmp(subcmd, "list") == 0) {
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) return 1;
+            int rc = cmd_notify_list(c, account_id);
+            vw_ipc_conn_close(c);
+            return rc;
+        }
+        if (strcmp(subcmd, "set") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "Usage: %s notify set <category> on|off\n", argv[0]);
+                return 1;
+            }
+            const char *category = argv[argi++];
+            const char *on_off   = argv[argi++];
+            return cmd_notify_set(ipc_port, account_id, category, on_off);
+        }
+        fprintf(stderr, "Usage: %s notify list | notify set <category> on|off\n", argv[0]);
+        return 1;
+    }
+
+    if (strcmp(cmd, "version") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s version list <path> | version restore <path> <version_id>\n", argv[0]);
+            return 1;
+        }
+        const char *subcmd = argv[argi++];
+
+        if (strcmp(subcmd, "list") == 0) {
+            if (argi >= argc) {
+                fprintf(stderr, "Usage: %s version list <path>\n", argv[0]);
+                return 1;
+            }
+            const char *path = argv[argi++];
+            uint32_t account_id = 0;
+            if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) return 1;
+            int rc = cmd_version_list(c, account_id, path);
+            vw_ipc_conn_close(c);
+            return rc;
+        }
+
+        if (strcmp(subcmd, "restore") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "Usage: %s version restore <path> <version_id>\n", argv[0]);
+                return 1;
+            }
+            const char *path = argv[argi++];
+            uint64_t version_id = strtoull(argv[argi++], NULL, 10);
+            uint32_t account_id = 0;
+            if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) return 1;
+            int rc = cmd_version_restore(c, account_id, path, version_id);
+            vw_ipc_conn_close(c);
+            return rc;
+        }
+
+        fprintf(stderr, "error: unknown version subcommand '%s' (expected list|restore)\n", subcmd);
+        return 1;
     }
 
     if (strcmp(cmd, "shutdown") == 0) {

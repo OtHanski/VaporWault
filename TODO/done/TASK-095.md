@@ -1,6 +1,6 @@
 ---
 id:          TASK-095
-title:       Implement client library support for sharing (grants + links)
+title:       "Implement client library support for sharing (grants + links)"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

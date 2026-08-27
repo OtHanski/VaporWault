@@ -1,6 +1,6 @@
 ---
 id:          TASK-029
-title:       Implement vw_sync — client sync engine
+title:       "Implement vw_sync — client sync engine"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

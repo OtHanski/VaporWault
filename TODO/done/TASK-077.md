@@ -1,6 +1,6 @@
 ---
 id:          TASK-077
-title:       Use secure_zero (not plain memset) for secrets in vw_admin.c
+title:       "Use secure_zero (not plain memset) for secrets in vw_admin.c"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

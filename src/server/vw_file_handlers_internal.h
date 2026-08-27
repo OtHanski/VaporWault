@@ -36,6 +36,7 @@
 #include "vw_store.h"
 #include "vw_share.h"
 #include "../core/vw_proto.h"
+#include <stddef.h>
 
 #ifdef VW_FILE_HANDLERS_TEST_HOOKS
 
@@ -46,6 +47,14 @@ vw_perm_t effective_permission(vw_share_store_t *ss, vw_file_store_t *fs,
 vw_perm_t permission_on_dir_or_root(vw_share_store_t *ss, vw_file_store_t *fs,
                                      uint64_t dir_id, uint64_t root_owner_id,
                                      uint64_t user_id, uint64_t scope_share_id);
+
+/*
+ * TASK-198: SEARCH's case-insensitive substring matcher. Pure/stateless —
+ * unlike effective_permission()/permission_on_dir_or_root() above, it
+ * needs no store fixture to exercise directly.
+ */
+int search_name_matches(const char *name, size_t name_len,
+                         const char *needle_lc, size_t needle_len);
 
 #endif /* VW_FILE_HANDLERS_TEST_HOOKS */
 

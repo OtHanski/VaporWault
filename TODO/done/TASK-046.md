@@ -1,6 +1,6 @@
 ---
 id:          TASK-046
-title:       Password recovery email implementation
+title:       "Password recovery email implementation"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

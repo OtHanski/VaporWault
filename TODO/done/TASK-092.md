@@ -1,6 +1,6 @@
 ---
 id:          TASK-092
-title:       Granular admin roles (beyond boolean is_admin)
+title:       "Granular admin roles (beyond boolean is_admin)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

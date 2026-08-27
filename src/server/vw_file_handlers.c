@@ -7,6 +7,7 @@
 #include "vw_store.h"
 #include "vw_storage.h"
 #include "vw_oplog.h"
+#include "vw_notify.h"
 #include "vw_server_core.h"
 
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <stddef.h>
+#include <ctype.h>
 
 /* Defeat dead-store elimination on buffers holding session tokens. */
 static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
@@ -1384,9 +1386,18 @@ static vw_err_t handle_version_restore(vw_store_t       *store,
         return (send_error(conn, VW_ERR_PATH_INVALID), VW_ERR_PATH_INVALID);
     memcpy(path_buf, path, path_len);
     path_buf[path_len] = '\0';
-    err = vw_path_validate(path_buf, (uint32_t)path_len);
-    if (err != VW_OK)
-        return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+    /* PRT.04 TASK-214 (docs/PROTOCOL.md §7.3, rev 25): virtual_path is not
+     * actually used below to resolve or authorize the restore — that is
+     * done entirely via version_id -> file_id -> effective_permission().
+     * An empty string means "no meaningful path, resolve by version_id/
+     * file_id alone" (a grantee's own case, since a grantee cannot obtain
+     * an owner-namespaced path for a shared file) and skips shape
+     * validation; any non-empty path is still validated exactly as before. */
+    if (path_len > 0) {
+        err = vw_path_validate(path_buf, (uint32_t)path_len);
+        if (err != VW_OK)
+            return (send_error(conn, VW_ERR_PATH_INVALID), VW_OK);
+    }
 
     /* Look up the target version. */
     vw_version_record_t src_ver;
@@ -2253,7 +2264,8 @@ static int reject_if_scoped(vw_conn_t *conn, uint64_t scope_share_id)
 /* SHARE_GRANT: session_token[32] + file_id(u64) + target_username(string)
  * + permission(u8) + expires_at(i64). ACK: error_code(u32) + share_id(u64). */
 static vw_err_t handle_share_grant(vw_store_t *store, vw_file_store_t *fs,
-                                    vw_share_store_t *ss, vw_conn_t *conn,
+                                    vw_share_store_t *ss, vw_notify_ctx_t *notify,
+                                    vw_conn_t *conn,
                                     const uint8_t *payload, uint32_t plen)
 {
     uint64_t user_id, scope_share_id = 0;
@@ -2305,6 +2317,16 @@ static vw_err_t handle_share_grant(vw_store_t *store, vw_file_store_t *fs,
                                  (vw_perm_t)permission, expires_at, &share_id);
     if (err != VW_OK)
         return (send_error(conn, err), VW_OK);
+
+    /* TASK-207: share_received — a grant naming another user was just
+     * created (this is SHARE_GRANT, never LINK_CREATE — no addressable
+     * recipient there). Best-effort; never affects SHARE_GRANT_ACK. */
+    {
+        vw_user_record_t granter;
+        const char *sharer_name = (vw_store_user_get_by_id(store, user_id, &granter) == VW_OK)
+                                   ? (const char *)granter.username : NULL;
+        vw_notify_share_received(notify, target_user.user_id, sharer_name, file_rec.name);
+    }
 
     uint8_t ack[4 + 8];
     vw_write_u32le(ack, 0u);
@@ -2453,6 +2475,17 @@ static vw_err_t handle_link_create(vw_store_t *store, vw_file_store_t *fs,
     uint8_t  permission  = payload[VW_TOKEN_BYTES + 8u];
     int64_t  expires_at  = (int64_t)vw_read_u64le(payload + VW_TOKEN_BYTES + 9u);
 
+    /* TASK-186: optional trailing password field. Absent entirely (a
+     * caller built before this task existed) reads as "no password",
+     * same additive-trailing-field precedent as every other extension
+     * in this protocol. */
+    uint32_t poff = VW_TOKEN_BYTES + 9u + 8u;
+    const char *password = NULL; uint16_t password_len = 0;
+    if (poff < plen) {
+        if (vw_proto_read_str(payload, plen, &poff, &password, &password_len) != VW_OK)
+            return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_OK);
+    }
+
     if (permission != (uint8_t)VW_PERM_VIEW && permission != (uint8_t)VW_PERM_EDIT)
         return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
 
@@ -2469,7 +2502,7 @@ static vw_err_t handle_link_create(vw_store_t *store, vw_file_store_t *fs,
     uint8_t  link_token[32];
     uint64_t share_id = 0;
     err = vw_share_link_create(ss, file_id, file_rec.owner_id, (vw_perm_t)permission,
-                                expires_at, link_token, &share_id);
+                                expires_at, password, password_len, link_token, &share_id);
     if (err != VW_OK)
         return (send_error(conn, err), VW_OK);
 
@@ -2487,7 +2520,8 @@ static vw_err_t handle_link_create(vw_store_t *store, vw_file_store_t *fs,
  * LINK_LIST_RESP: count(u32) + count * {share_id(u64), file_id(u64),
  * name(string — leaf name, same display-only convention as
  * SHARE_LIST_RESP), permission(u8), created_at(i64), expires_at(i64),
- * revoked(u8)} — never the raw link_token. */
+ * revoked(u8), has_password(u8, TASK-186)} — never the raw link_token,
+ * never the password or its hash. */
 typedef struct {
     vw_file_store_t *fs;
     uint64_t          user_id;
@@ -2509,7 +2543,7 @@ static int link_list_cb(const vw_share_record_t *rec, void *ud)
         snprintf(name, sizeof(name), "%s", frec.name);
     uint16_t name_len = (uint16_t)strnlen(name, sizeof(name) - 1);
 
-    uint32_t entry_cap = 8u + 8u + 2u + name_len + 1u + 8u + 8u + 1u;
+    uint32_t entry_cap = 8u + 8u + 2u + name_len + 1u + 8u + 8u + 1u + 1u;
     if (c->len + entry_cap > c->cap) {
         uint32_t new_cap = c->cap ? c->cap * 2u : 4096u;
         while (c->len + entry_cap > new_cap) new_cap *= 2u;
@@ -2525,6 +2559,7 @@ static int link_list_cb(const vw_share_record_t *rec, void *ud)
     vw_write_u64le(c->buf + off, (uint64_t)rec->created_at); off += 8;
     vw_write_u64le(c->buf + off, (uint64_t)rec->expires_at); off += 8;
     c->buf[off++] = rec->revoked;
+    c->buf[off++] = rec->has_link_password; /* TASK-186, trailing field */
     c->len = off;
     c->count++;
     return 0;
@@ -2748,6 +2783,214 @@ static vw_err_t handle_vault_list(vw_store_t *store, vw_vault_store_t *vs,
     return err;
 }
 
+/* ── SEARCH (TASK-196/197/198; docs/PROTOCOL.md §7.12) ──────────────────────
+ * Filename-only substring search across everything the caller can see.
+ * There is no owner_id-indexed enumeration of "everything this user owns"
+ * to walk (file lookup is by exact path or one FILE_LIST directory level
+ * at a time) — this mirrors vw_store_file_scan_deleted's full-table-scan
+ * idiom instead (vw_store_file_scan_all, its non-deleted counterpart),
+ * calling the already-reviewed effective_permission() per candidate
+ * record rather than a parallel permission implementation. Same accepted
+ * O(n) complexity tradeoff already on record for vw_share_scan.
+ */
+
+#define VW_SEARCH_MAX_QUERY_BYTES 256u
+#define VW_SEARCH_MAX_RESULTS     200u
+
+typedef struct {
+    vw_file_store_t  *fs;
+    vw_share_store_t *ss;
+    uint64_t          user_id;
+    uint64_t          scope_share_id;
+    char              query_lc[VW_SEARCH_MAX_QUERY_BYTES];
+    uint16_t          query_len;
+    uint8_t          *buf;
+    uint32_t          cap, len, count;
+    uint8_t           truncated;
+} search_ctx_t;
+
+/* Case-insensitive substring match; needle_len == 0 matches everything.
+ * needle_lc must already be lower-cased by the caller. */
+VW_FH_TESTABLE int search_name_matches(const char *name, size_t name_len,
+                                        const char *needle_lc, size_t needle_len)
+{
+    if (needle_len == 0) return 1;
+    if (needle_len > name_len) return 0;
+    for (size_t i = 0; i + needle_len <= name_len; i++) {
+        size_t j;
+        for (j = 0; j < needle_len; j++) {
+            if ((size_t)tolower((unsigned char)name[i + j]) != (size_t)(unsigned char)needle_lc[j])
+                break;
+        }
+        if (j == needle_len) return 1;
+    }
+    return 0;
+}
+
+static int search_scan_cb(const vw_file_record_t *rec, void *ud)
+{
+    search_ctx_t *c = (search_ctx_t *)ud;
+
+    /* SEC.07: every candidate is permission-checked before its name is
+     * ever compared against the query — an invisible file is filtered
+     * the same way as if it simply weren't in the scan at all, so no
+     * comparison ever "almost matches" and leaks anything via result
+     * count or timing. */
+    vw_perm_t perm = effective_permission(c->ss, c->fs, rec, c->user_id, c->scope_share_id);
+    if (perm < VW_PERM_VIEW) return 0;
+
+    size_t name_len = strnlen(rec->name, sizeof(rec->name));
+    if (!search_name_matches(rec->name, name_len, c->query_lc, c->query_len))
+        return 0;
+
+    if (c->count >= VW_SEARCH_MAX_RESULTS) {
+        c->truncated = 1;
+        return 1; /* cap reached — stop scanning */
+    }
+
+    uint16_t name_out_len = (uint16_t)name_len;
+    uint32_t entry_cap = 8u + 2u + name_out_len + 1u + 8u + 8u + 8u + 1u;
+    if (c->len + entry_cap > c->cap) {
+        uint32_t new_cap = c->cap ? c->cap * 2u : 4096u;
+        while (c->len + entry_cap > new_cap) new_cap *= 2u;
+        uint8_t *p = (uint8_t *)realloc(c->buf, new_cap);
+        if (!p) return 1;
+        c->buf = p; c->cap = new_cap;
+    }
+
+    /* Same vault_id lookup FILE_STAT/FILE_LIST already do (TASK-100/156):
+     * one vw_store_version_get call for the current version, 0 for a
+     * directory, no current version, or a lookup failure (fail open to
+     * "unencrypted" rather than dropping the whole match). */
+    uint64_t vault_id = 0;
+    if (rec->entry_type != VW_ENTRY_DIR && rec->current_version_id != 0) {
+        vw_version_record_t ver;
+        if (vw_store_version_get(c->fs, rec->current_version_id, &ver) == VW_OK)
+            vault_id = ver.vault_id;
+    }
+
+    uint32_t off = c->len;
+    vw_write_u64le(c->buf + off, rec->file_id); off += 8u;
+    (void)vw_proto_write_str(c->buf, c->cap, &off, rec->name, name_out_len);
+    c->buf[off++] = (rec->entry_type == VW_ENTRY_DIR) ? 1u : 0u;
+    vw_write_u64le(c->buf + off, rec->size_bytes); off += 8u;
+    vw_write_u64le(c->buf + off, (uint64_t)rec->mtime_unix); off += 8u;
+    vw_write_u64le(c->buf + off, vault_id); off += 8u;
+    c->buf[off++] = (perm == VW_PERM_OWNER) ? 0u : 1u;
+    c->len = off;
+    c->count++;
+    return 0;
+}
+
+/* SEARCH: session_token[32] + query(string, max 256 bytes).
+ * SEARCH_RESP: error_code(u32) + count(u32) + truncated(u8) + count *
+ * {file_id(u64), name(string, leaf, display-only), is_dir(u8),
+ * size_bytes(u64), mtime_unix(i64), vault_id(u64), is_shared(u8)}. */
+static vw_err_t handle_search(vw_store_t *store, vw_file_store_t *fs,
+                               vw_share_store_t *ss, vw_conn_t *conn,
+                               const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+
+    /* §7.12: a scoped (LINK_ACCESS-redeemed anonymous) session already
+     * sees only the one subtree it was scoped to, directly browsable via
+     * FILE_LIST — "search everything visible" adds nothing for it, so
+     * it's rejected outright rather than given a second permission model
+     * to reason about (same posture as SHARE_GRANT/LINK_CREATE). */
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    const uint8_t *var = payload + VW_TOKEN_BYTES;
+    uint32_t var_len   = plen - VW_TOKEN_BYTES;
+    uint32_t off = 0;
+    const char *query; uint16_t query_len;
+    err = vw_proto_read_str(var, var_len, &off, &query, &query_len);
+    if (err != VW_OK)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    /* Reject an oversized query before any table scan, not after. */
+    if (query_len > VW_SEARCH_MAX_QUERY_BYTES)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    search_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.fs = fs; c.ss = ss; c.user_id = user_id; c.scope_share_id = scope_share_id;
+    c.query_len = query_len;
+    for (uint16_t i = 0; i < query_len; i++)
+        c.query_lc[i] = (char)tolower((unsigned char)query[i]);
+
+    err = vw_store_file_scan_all(fs, search_scan_cb, &c);
+    if (err != VW_OK) { free(c.buf); return (send_error(conn, err), VW_OK); }
+
+    uint8_t *resp = (uint8_t *)malloc(4u + 4u + 1u + c.len);
+    if (!resp) { free(c.buf); return (send_error(conn, VW_ERR_OOM), VW_OK); }
+    uint32_t roff = 0;
+    vw_write_u32le(resp + roff, 0u); roff += 4u; /* error_code: VW_OK */
+    vw_write_u32le(resp + roff, c.count); roff += 4u;
+    resp[roff++] = c.truncated;
+    if (c.len) memcpy(resp + roff, c.buf, c.len);
+    roff += c.len;
+    free(c.buf);
+
+    err = vw_proto_send(conn, VW_MSG_SEARCH_RESP, resp, roff);
+    free(resp);
+    return err;
+}
+
+/* ── NOTIFY_PREFS_GET / NOTIFY_PREFS_SET (TASK-206/207; §7.13) ───────────── */
+
+/* NOTIFY_PREFS_GET payload: session_token[32]. RESP: error_code(u32) +
+ * prefs_bitmask(u32). Account-scoped only — never another user's. */
+static vw_err_t handle_notify_prefs_get(vw_store_t *store, vw_conn_t *conn,
+                                         const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    /* A scoped (anonymous LINK_ACCESS) session has no "own account"
+     * preferences to fetch — same posture as SEARCH (§7.12). */
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    uint32_t prefs = 0;
+    err = vw_store_notify_prefs_get(store, user_id, &prefs);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+
+    uint8_t resp[8];
+    vw_write_u32le(resp, 0u); /* VW_OK */
+    vw_write_u32le(resp + 4, prefs);
+    return vw_proto_send(conn, VW_MSG_NOTIFY_PREFS_GET_RESP, resp, sizeof(resp));
+}
+
+/* NOTIFY_PREFS_SET payload: session_token[32] + prefs_bitmask(u32).
+ * SET_ACK: error_code(u32) + prefs_bitmask(u32) — the stored value after
+ * this call (unchanged-from-before on any error). Any bit outside the
+ * currently-defined range is rejected with VW_ERR_INVALID_ARG (§7.13),
+ * never silently accepted-and-stored. */
+static vw_err_t handle_notify_prefs_set(vw_store_t *store, vw_conn_t *conn,
+                                         const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    if (plen < VW_TOKEN_BYTES + 4u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    uint32_t requested = vw_read_u32le(payload + VW_TOKEN_BYTES);
+    if (requested & ~(uint32_t)VW_NOTIFY_ALL_KNOWN)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    err = vw_store_notify_prefs_set(store, user_id, requested);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+
+    uint8_t resp[8];
+    vw_write_u32le(resp, 0u); /* VW_OK */
+    vw_write_u32le(resp + 4, requested);
+    return vw_proto_send(conn, VW_MSG_NOTIFY_PREFS_SET_ACK, resp, sizeof(resp));
+}
+
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
 /*
@@ -2777,6 +3020,7 @@ static int is_write_shaped_msg(vw_msg_type_t type)
     case VW_MSG_LINK_CREATE:
     case VW_MSG_LINK_REVOKE:
     case VW_MSG_VAULT_CREATE:
+    case VW_MSG_NOTIFY_PREFS_SET:
         return 1;
     default:
         return 0;
@@ -2820,6 +3064,13 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_audit_query(store, oplog, conn, payload, plen);
     case VW_MSG_CLUSTER_STATUS:
         return handle_cluster_status(store, cluster, oplog, conn, payload, plen);
+    case VW_MSG_NOTIFY_PREFS_GET:
+        /* Account-only, no file/chunk store dependency (TASK-206/207) —
+         * dispatched here alongside the other store-only messages above
+         * rather than after the fs/cs readiness check below. */
+        return handle_notify_prefs_get(store, conn, payload, plen);
+    case VW_MSG_NOTIFY_PREFS_SET:
+        return handle_notify_prefs_set(store, conn, payload, plen);
     default:
         break;
     }
@@ -2856,7 +3107,7 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
     case VW_MSG_VERSION_CHUNKS:
         return handle_version_chunks(store, fs, ss, conn, payload, plen);
     case VW_MSG_SHARE_GRANT:
-        return handle_share_grant(store, fs, ss, conn, payload, plen);
+        return handle_share_grant(store, fs, ss, vw_server_ctx_notify(ctx), conn, payload, plen);
     case VW_MSG_SHARE_REVOKE:
         return handle_share_or_link_revoke(store, ss, conn, payload, plen, VW_MSG_SHARE_REVOKE_ACK);
     case VW_MSG_SHARE_LIST:
@@ -2873,6 +3124,8 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_vault_key_fetch(store, vs, conn, payload, plen);
     case VW_MSG_VAULT_LIST:
         return handle_vault_list(store, vs, conn, payload, plen);
+    case VW_MSG_SEARCH:
+        return handle_search(store, fs, ss, conn, payload, plen);
     default:
         /* TASK-105: an unrecognized/misplaced message type on an
          * authenticated connection (e.g. a pre-auth-phase type like

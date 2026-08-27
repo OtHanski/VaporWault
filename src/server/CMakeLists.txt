@@ -27,6 +27,7 @@ add_library(vw_server_lib STATIC
     vw_conn_registry.c
     vw_share.c
     vw_vault.c
+    vw_notify.c
 )
 
 target_include_directories(vw_server_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -44,7 +45,7 @@ add_executable(vapourwaultd
 )
 
 target_include_directories(vapourwaultd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vapourwaultd PRIVATE vw_server_lib)
+target_link_libraries(vapourwaultd PRIVATE vw_server_lib vw_version)
 
 # Admin CLI — always built when VW_BUILD_SERVER=ON
 add_executable(vapourwault-server-cli
@@ -53,7 +54,7 @@ add_executable(vapourwault-server-cli
 )
 
 target_include_directories(vapourwault-server-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vapourwault-server-cli PRIVATE vw_core)
+target_link_libraries(vapourwault-server-cli PRIVATE vw_core vw_version)
 
 if(WIN32)
     target_link_libraries(vapourwault-server-cli PRIVATE ws2_32)

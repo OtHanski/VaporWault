@@ -1,6 +1,6 @@
 ---
 id:          TASK-094
-title:       Implement server-side sharing (grants + public links)
+title:       "Implement server-side sharing (grants + public links)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

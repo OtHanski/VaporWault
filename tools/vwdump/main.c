@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "vw_version.h"
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -105,6 +106,9 @@ int main(int argc, char *argv[])
             printf("Usage: vwdump --data-dir <path>\n");
             printf("  Scan a VaporWault server data directory and report"
                    " storage statistics.\n");
+            return 0;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("vwdump %s\n", VW_VERSION_STRING);
             return 0;
         } else {
             fprintf(stderr, "vwdump: unknown argument: %s\n", argv[i]);

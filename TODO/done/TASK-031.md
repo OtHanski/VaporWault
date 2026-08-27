@@ -1,6 +1,6 @@
 ---
 id:          TASK-031
-title:       Implement vw_client_cli — client command-line interface
+title:       "Implement vw_client_cli — client command-line interface"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

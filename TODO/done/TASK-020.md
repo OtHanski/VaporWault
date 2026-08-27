@@ -1,6 +1,6 @@
 ---
 id:          TASK-020
-title:       Add user_id to AUTH_OK payload (protocol extension)
+title:       "Add user_id to AUTH_OK payload (protocol extension)"
 status:      done
 assignee:    PRT.04
 created_by:  CQR.08

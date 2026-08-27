@@ -16,6 +16,7 @@
 
 #include "../core/vw_proto.h"
 #include "../core/vw_net.h"
+#include "vw_notify.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -91,6 +92,14 @@ vw_err_t vw_acme_start(vw_acme_ctx_t *ctx, vw_net_ctx_t *net_ctx);
  * No-op if ctx is NULL.
  */
 void vw_acme_stop(vw_acme_ctx_t *ctx);
+
+/*
+ * Attach the notification dispatch context (TASK-208). Borrowed; caller
+ * keeps it alive until vw_acme_ctx_destroy. NULL disables the
+ * acme_renewal_failure admin alert. No-op if ctx is NULL (ACME disabled),
+ * and a no-op stub on Windows (ACME itself is POSIX-only).
+ */
+void vw_acme_ctx_set_notify(vw_acme_ctx_t *ctx, vw_notify_ctx_t *notify);
 
 #ifdef __cplusplus
 }

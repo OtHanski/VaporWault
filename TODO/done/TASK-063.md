@@ -1,6 +1,6 @@
 ---
 id:          TASK-063
-title:       Windows packaging — service wrapper and installer
+title:       "Windows packaging — service wrapper and installer"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

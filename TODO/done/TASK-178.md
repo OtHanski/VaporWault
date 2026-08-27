@@ -1,6 +1,6 @@
 ---
 id:          TASK-178
-title:       Integration tests - replica hot-standby, GC-safety, automatic fallback
+title:       "Integration tests - replica hot-standby, GC-safety, automatic fallback"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

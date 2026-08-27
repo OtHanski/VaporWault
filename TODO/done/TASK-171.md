@@ -1,6 +1,6 @@
 ---
 id:          TASK-171
-title:       Server: GC replica-safety gating (chunk deletion vs replica lag)
+title:       "Server - GC replica-safety gating (chunk deletion vs replica lag)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

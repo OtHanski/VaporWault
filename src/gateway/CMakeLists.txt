@@ -21,7 +21,7 @@ target_include_directories(vapourwault-web-gateway PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core
 )
 
-target_link_libraries(vapourwault-web-gateway PRIVATE vw_core)
+target_link_libraries(vapourwault-web-gateway PRIVATE vw_core vw_version)
 
 if(UNIX)
     target_link_libraries(vapourwault-web-gateway PRIVATE pthread)

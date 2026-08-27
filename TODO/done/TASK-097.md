@@ -1,6 +1,6 @@
 ---
 id:          TASK-097
-title:       Integration tests for sharing (grants, links, permission enforcement, quota)
+title:       "Integration tests for sharing (grants, links, permission enforcement, quota)"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

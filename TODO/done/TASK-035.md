@@ -1,6 +1,6 @@
 ---
 id:          TASK-035
-title:       Vendor and integrate Dear ImGui + windowing backend into CMake
+title:       "Vendor and integrate Dear ImGui + windowing backend into CMake"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

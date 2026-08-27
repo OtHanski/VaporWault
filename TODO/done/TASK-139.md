@@ -1,6 +1,6 @@
 ---
 id:          TASK-139
-title:       Frontend upload/download with per-file progress
+title:       "Frontend upload/download with per-file progress"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

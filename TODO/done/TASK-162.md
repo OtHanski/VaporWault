@@ -1,6 +1,6 @@
 ---
 id:          TASK-162
-title:       vapourwault-cli account subcommands + --account flag
+title:       "vapourwault-cli account subcommands + --account flag"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

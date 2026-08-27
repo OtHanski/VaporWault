@@ -1,6 +1,6 @@
 ---
 id:          TASK-089
-title:       Design and implement client-side (end-to-end) encryption
+title:       "Design and implement client-side (end-to-end) encryption"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

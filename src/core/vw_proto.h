@@ -92,6 +92,12 @@ typedef enum {
                                           sent over the wire, defense-in-depth
                                           alongside the daemon's own client-side
                                           VW_ERR_READ_ONLY_FALLBACK (800s, below) */
+    VW_ERR_LINK_PASSWORD_REQUIRED = 607, /* TASK-186: LINK_ACCESS against a
+                                          password-protected link, no password
+                                          supplied */
+    VW_ERR_LINK_PASSWORD_WRONG = 608,  /* TASK-186: LINK_ACCESS against a
+                                          password-protected link, wrong
+                                          password supplied */
 
     /* IPC */
     VW_ERR_IPC_NOT_RUNNING     = 700,  /* daemon not listening on IPC port           */
@@ -237,7 +243,41 @@ typedef enum {
     VW_MSG_VAULT_KEY_FETCH_RESP = 0x0804,
     VW_MSG_VAULT_LIST           = 0x0805,  /* list my vaults                       */
     VW_MSG_VAULT_LIST_RESP      = 0x0806,
+
+    /* Filename search (TASK-196/197; docs/PROTOCOL.md §7.12). Server-side,
+     * scoped to exactly what FILE_LIST/effective_permission() already let
+     * the caller see (owned + shared-with-me). Filename/leaf-name
+     * substring match only — no content search (vault contents are opaque
+     * ciphertext by design; non-vault content search would need an index
+     * this flat-file store doesn't have). */
+    VW_MSG_SEARCH      = 0x0901,
+    VW_MSG_SEARCH_RESP = 0x0902,
+
+    /* Notification preferences (TASK-205/206; docs/PROTOCOL.md §7.13).
+     * Account-scoped only — no user_id field, no VW_PERM_* concept, same
+     * trust bar as a session changing its own password. Covers only the
+     * four user-facing alert categories; admin-category alerts are
+     * vapourwaultd.conf-only, never wire-visible. */
+    VW_MSG_NOTIFY_PREFS_GET      = 0x0A01,
+    VW_MSG_NOTIFY_PREFS_GET_RESP = 0x0A02,
+    VW_MSG_NOTIFY_PREFS_SET      = 0x0A03,
+    VW_MSG_NOTIFY_PREFS_SET_ACK  = 0x0A04,
 } vw_msg_type_t;
+
+/* ── Notification preference bitmask (TASK-205/206) ──────────────────────── */
+/* One bit per user-facing alert category; bits 4-31 reserved for future
+ * categories. A NOTIFY_PREFS_SET carrying any reserved bit is rejected
+ * with VW_ERR_INVALID_ARG — see docs/PROTOCOL.md §7.13 for the rationale
+ * and the note on revisiting this the day a second wave of categories
+ * ships. */
+#define VW_NOTIFY_SHARE_RECEIVED         ((uint32_t)0x00000001u)
+#define VW_NOTIFY_QUOTA_WARNING          ((uint32_t)0x00000002u)
+#define VW_NOTIFY_NEW_LOGIN              ((uint32_t)0x00000004u)
+#define VW_NOTIFY_ACCOUNT_SECURITY_CHANGE ((uint32_t)0x00000008u)
+#define VW_NOTIFY_ALL_KNOWN              (VW_NOTIFY_SHARE_RECEIVED | \
+                                           VW_NOTIFY_QUOTA_WARNING | \
+                                           VW_NOTIFY_NEW_LOGIN | \
+                                           VW_NOTIFY_ACCOUNT_SECURITY_CHANGE)
 
 /* ── Permission levels ───────────────────────────────────────────────────── */
 

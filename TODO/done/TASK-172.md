@@ -1,6 +1,6 @@
 ---
 id:          TASK-172
-title:       Server: replica hot-standby data replication (record + chunk sync)
+title:       "Server: replica hot-standby data replication (record + chunk sync)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

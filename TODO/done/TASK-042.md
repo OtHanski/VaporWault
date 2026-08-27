@@ -1,6 +1,6 @@
 ---
 id:          TASK-042
-title:       Background GC thread — session expiry and oplog truncation
+title:       "Background GC thread — session expiry and oplog truncation"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

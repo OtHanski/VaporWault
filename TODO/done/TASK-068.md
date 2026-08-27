@@ -1,6 +1,6 @@
 ---
 id:          TASK-068
-title:       Client daemon Windows packaging — startup task and installer
+title:       "Client daemon Windows packaging — startup task and installer"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-025
-title:       Implement client-side file transfer in vw_client_core (Phase 2)
+title:       "Implement client-side file transfer in vw_client_core (Phase 2)"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

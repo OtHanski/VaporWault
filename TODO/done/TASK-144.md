@@ -1,6 +1,6 @@
 ---
 id:          TASK-144
-title:       Security review pass — web gateway + browser client
+title:       "Security review pass — web gateway + browser client"
 status:      done
 assignee:    SEC.07
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-043
-title:       Version and chunk GC — free soft-deleted files and zero-ref chunks
+title:       "Version and chunk GC — free soft-deleted files and zero-ref chunks"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

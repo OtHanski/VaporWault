@@ -1,6 +1,6 @@
 ---
 id:          TASK-137
-title:       Frontend login view (+ 2FA) against gateway auth endpoints
+title:       "Frontend login view (+ 2FA) against gateway auth endpoints"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

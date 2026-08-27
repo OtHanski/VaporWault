@@ -1,6 +1,6 @@
 ---
 id:          TASK-085
-title:       Make cluster/replica setup actually operable — admin CLI + two pre-existing cluster bugs
+title:       "Make cluster/replica setup actually operable — admin CLI + two pre-existing cluster bugs"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

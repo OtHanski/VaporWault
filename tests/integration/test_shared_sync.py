@@ -13,27 +13,20 @@ this directory that needs two, since shared-folder sync is inherently a
 two-party scenario), and hand connection details to the subprocess.
 """
 
-import os
 import subprocess
 
 import pytest
 
-
-def _find_shared_sync_bin():
-    """Locate the compiled test_shared_sync binary. Mirrors
-    test_vault_e2ee.py's _find_vault_e2ee_bin search order."""
-    name = "test_shared_sync.exe" if os.name == "nt" else "test_shared_sync"
-    for d in ("build/bin", "build-release/bin", "../build/bin",
-              "build-wsl-werror/bin", "build-wsl/bin"):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return os.path.abspath(p)
-    return None
+from conftest import _find_client_bin
 
 
 @pytest.fixture(scope="module")
 def shared_sync_bin():
-    path = _find_shared_sync_bin()
+    # TASK-217: was a hand-rolled search list missing build-gw-e2e/bin;
+    # now the one shared helper conftest.py's daemon_bin/cli_bin fixtures
+    # already use, so this and every other wrapper drift the same way if
+    # the search order ever needs to change again.
+    path = _find_client_bin("test_shared_sync")
     if not path:
         pytest.skip("test_shared_sync binary not found (build it first)")
     return path

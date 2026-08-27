@@ -1,6 +1,6 @@
 ---
 id:          TASK-007
-title:       Implement vw_oplog — append-only operation log
+title:       "Implement vw_oplog — append-only operation log"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

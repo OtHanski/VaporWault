@@ -216,6 +216,29 @@ number of files around and don't want it fighting with you), click
 **Pause** on the Files screen. Click **Resume** when you're done. Nothing
 is lost while paused — VaporWault just picks up where it left off.
 
+### Email notifications
+
+VaporWault can send you an email for a few things worth knowing about
+right away, instead of only finding out next time you open the app.
+**Every one of these is off until you turn it on** — turning nothing on
+means you'll never get an email from VaporWault at all.
+
+To turn one on, go to **Settings** and find **Email notifications** (this
+looks the same whether you're using the desktop app or the web version at
+your admin's VaporWault address — just check the box for whichever ones
+you want):
+
+| Turn this on to get an email when... |
+|---|
+| **Someone shares something with me** — someone gives you access to one of their files or folders. |
+| **My storage usage crosses 90% of quota** — you're close to running out of space. You won't get another email about it until your usage drops back down and crosses 90% again. |
+| **A new login succeeds on my account** — useful as a heads-up in case it wasn't you. This never fires just from your own app reconnecting after a network hiccup, only an actual new login. |
+| **My password or 2FA setting changes** — a heads-up in case you didn't make that change yourself. |
+
+These are emailed to whatever address is on file for your account — the
+same one your admin used when they set your account up. If you're not
+sure what that address is, ask your admin.
+
 ---
 
 ## Troubleshooting

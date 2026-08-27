@@ -1,6 +1,6 @@
 ---
 id:          TASK-156
-title:       FILE_LIST_RESP never populates vault_id per entry (only FILE_STAT/VERSION_CHUNKS do)
+title:       "FILE_LIST_RESP never populates vault_id per entry (only FILE_STAT/VERSION_CHUNKS do)"
 status:      done
 assignee:    PRT.04
 created_by:  WEB.09

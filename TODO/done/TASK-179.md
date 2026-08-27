@@ -1,6 +1,6 @@
 ---
 id:          TASK-179
-title:       Server - reject normal-client writes on a replica (defense-in-depth)
+title:       "Server - reject normal-client writes on a replica (defense-in-depth)"
 status:      done
 assignee:    SRV.01
 created_by:  CLI.02

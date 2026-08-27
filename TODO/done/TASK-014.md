@@ -1,6 +1,6 @@
 ---
 id:          TASK-014
-title:       vw_fs — add pwrite, directory listing, fix atomic_write .tmp leak
+title:       "vw_fs — add pwrite, directory listing, fix atomic_write .tmp leak"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

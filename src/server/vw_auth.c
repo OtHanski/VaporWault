@@ -103,6 +103,8 @@ struct vw_auth_ctx {
     lockout_entry_t   lockout_table[LOCKOUT_TABLE_SIZE];
     vw_auth_mutex_t   lockout_mu;
     int               lockout_mu_init;
+
+    vw_notify_ctx_t  *notify; /* borrowed; NULL = lockout_spike alert disabled (TASK-208) */
 };
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
@@ -141,6 +143,12 @@ void vw_auth_close(vw_auth_ctx_t *ctx)
     if (!ctx) return;
     if (ctx->lockout_mu_init) auth_mutex_destroy(&ctx->lockout_mu);
     free(ctx);
+}
+
+void vw_auth_ctx_set_notify(vw_auth_ctx_t *ctx, vw_notify_ctx_t *notify)
+{
+    if (!ctx) return;
+    ctx->notify = notify;
 }
 
 /* ── Password ────────────────────────────────────────────────────────────── */
@@ -362,6 +370,13 @@ static void lockout_record_failure(vw_auth_ctx_t *ctx, uint64_t user_id, time_t 
     e->fail_count++;
     if (e->fail_count >= LOCKOUT_MAX_ATTEMPTS) {
         e->locked_until = now + (time_t)LOCKOUT_WINDOW_SECS;
+        /* TASK-208: this call site is only ever reached while NOT already
+         * locked — vw_auth_begin_login's caller returns VW_ERR_AUTH_LOCKED
+         * (via lockout_remaining) before ever calling this function again
+         * for an account with an active lockout, so every time control
+         * reaches here it's a genuinely new lockout, never a repeat. */
+        if (ctx->notify)
+            vw_notify_lockout_spike(ctx->notify);
     }
 }
 

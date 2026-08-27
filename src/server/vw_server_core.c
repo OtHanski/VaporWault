@@ -3,6 +3,7 @@
 #include "vw_invite.h"
 #include "vw_recovery.h"
 #include "vw_smtp.h"
+#include "vw_notify.h"
 #include "../core/vw_crypto.h"
 
 #include <stdio.h>
@@ -42,6 +43,7 @@ struct vw_server_ctx {
     vw_share_store_t    *share_store;     /* NULL = sharing disabled            */
     vw_vault_store_t    *vault_store;     /* NULL = vaults disabled             */
     uint32_t             auth_timeout_ms;
+    vw_notify_ctx_t     *notify;          /* owned; NULL until vw_server_ctx_set_notify */
 };
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
@@ -150,6 +152,10 @@ static vw_err_t handle_auth_request(vw_server_ctx_t *ctx, vw_conn_t *conn,
             (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
             return sess_err;
         }
+        /* TASK-207: new_login fires on a fresh AUTH_REQUEST only — never
+         * SESSION_RESUME (handle_session_resume never calls this
+         * function). Best-effort; never affects the AUTH_OK response. */
+        vw_notify_new_login(vw_server_ctx_notify(ctx), uid, peer_ip);
         return build_and_send_auth_ok(ctx, conn, token, uid, out_info);
 
     } else if (err == VW_ERR_AUTH_2FA_REQUIRED) {
@@ -195,6 +201,7 @@ static vw_err_t handle_auth_request(vw_server_ctx_t *ctx, vw_conn_t *conn,
             (void)send_auth_fail(conn, (uint32_t)v2fa_err, lockout);
             return v2fa_err;
         }
+        vw_notify_new_login(vw_server_ctx_notify(ctx), uid, peer_ip);
         return build_and_send_auth_ok(ctx, conn, token, uid, out_info);
 
     } else if (err == VW_ERR_AUTH_LOCKED) {
@@ -516,6 +523,12 @@ static vw_err_t handle_recover_confirm(vw_server_ctx_t *ctx, vw_conn_t *conn,
     /* 6. Invalidate all existing sessions for this user. */
     (void)vw_store_sessions_revoke_by_user(ctx->store, user_rec.user_id, NULL);
 
+    /* TASK-207: account_security_change — a completed password recovery
+     * really did just change the account's password. Best-effort; never
+     * affects the AUTH_RECOVER_OK response either way. */
+    vw_notify_account_security_change(vw_server_ctx_notify(ctx), user_rec.user_id,
+                                       "your password was changed");
+
     return send_recover_ok(conn);
 }
 
@@ -685,7 +698,7 @@ static vw_err_t handle_link_access(vw_server_ctx_t *ctx, vw_conn_t *conn,
         return VW_ERR_AUTH_REQUIRED;
     }
 
-    if (plen != 32u) {
+    if (plen < 32u) {
         (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
         if (peer_ip[0]) vw_share_link_access_record_failure(ctx->share_store, peer_ip);
         return VW_ERR_PROTO_INVALID;
@@ -697,6 +710,33 @@ static vw_err_t handle_link_access(vw_server_ctx_t *ctx, vw_conn_t *conn,
         (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
         if (peer_ip[0]) vw_share_link_access_record_failure(ctx->share_store, peer_ip);
         return err;
+    }
+
+    /* TASK-186: optional trailing password field — only meaningful for a
+     * token that already passed the expiry/revoked/unknown gate above
+     * (docs/PROTOCOL.md §7.10's "password check ordering" note). A
+     * wrong/missing password is a real LINK_ACCESS failure for
+     * rate-limiting purposes too: record_failure here, and — critically —
+     * do NOT reset_on_success until the password (if any is required)
+     * also checks out, or a wrong-password guess against an
+     * already-known-valid token would reset the limiter on every
+     * attempt and never actually throttle the guesser. */
+    uint32_t poff = 32u;
+    const char *password = NULL; uint16_t password_len = 0;
+    if (poff < plen && vw_proto_read_str(payload, plen, &poff, &password, &password_len) != VW_OK) {
+        (void)send_auth_fail(conn, (uint32_t)VW_ERR_AUTH_BAD_CREDS, 0);
+        if (peer_ip[0]) vw_share_link_access_record_failure(ctx->share_store, peer_ip);
+        return VW_ERR_PROTO_INVALID;
+    }
+
+    vw_err_t pw_err = vw_share_link_verify_password(&share, password, password_len);
+    if (pw_err != VW_OK) {
+        /* Distinguishable from the generic AUTH_FAIL above on purpose —
+         * see the protocol doc's note on why this isn't an enumeration
+         * concern the way token validity is. */
+        (void)send_auth_fail(conn, (uint32_t)pw_err, 0);
+        if (peer_ip[0]) vw_share_link_access_record_failure(ctx->share_store, peer_ip);
+        return pw_err;
     }
 
     if (peer_ip[0]) vw_share_link_access_reset_on_success(ctx->share_store, peer_ip);
@@ -790,6 +830,38 @@ void vw_server_ctx_set_recovery(vw_server_ctx_t       *ctx,
     ctx->smtp_cfg       = smtp_cfg;
 }
 
+/*
+ * TASK-207: create (or replace) the notification dispatch context.
+ * Unlike every other vw_server_ctx_set_* attachment above, the
+ * vw_notify_ctx_t itself is OWNED by this vw_server_ctx_t (created here,
+ * freed in vw_server_ctx_close) rather than borrowed from the caller —
+ * its only purpose is to be this ctx's own internal wiring between
+ * vw_store's quota hook and vw_smtp, so there is no reason to make
+ * vw_server_main.c manage its lifetime separately. smtp_cfg itself is
+ * still only ever borrowed (vw_notify_ctx_open never copies it).
+ */
+void vw_server_ctx_set_notify(vw_server_ctx_t *ctx, const vw_smtp_cfg_t *smtp_cfg)
+{
+    if (!ctx) return;
+
+    if (ctx->notify) {
+        vw_store_set_quota_hook(ctx->store, NULL, NULL);
+        vw_notify_ctx_close(ctx->notify);
+        ctx->notify = NULL;
+    }
+
+    if (vw_notify_ctx_open(ctx->store, smtp_cfg, &ctx->notify) != VW_OK) {
+        ctx->notify = NULL;
+        return;
+    }
+    vw_store_set_quota_hook(ctx->store, vw_notify_quota_hook, ctx->notify);
+}
+
+vw_notify_ctx_t *vw_server_ctx_notify(const vw_server_ctx_t *ctx)
+{
+    return ctx ? ctx->notify : NULL;
+}
+
 vw_store_t *vw_server_ctx_store(const vw_server_ctx_t *ctx)
 {
     return ctx ? ctx->store : NULL;
@@ -862,6 +934,15 @@ vw_vault_store_t *vw_server_ctx_vault_store(const vw_server_ctx_t *ctx)
 
 void vw_server_ctx_close(vw_server_ctx_t *ctx)
 {
+    if (!ctx) return;
+    if (ctx->notify) {
+        /* Clear the hook before freeing what it points to — ctx->store
+         * outlives ctx (borrowed, closed separately by the caller), so a
+         * later vw_store_quota_add must never call into a freed notify
+         * context. */
+        vw_store_set_quota_hook(ctx->store, NULL, NULL);
+        vw_notify_ctx_close(ctx->notify);
+    }
     free(ctx);
 }
 

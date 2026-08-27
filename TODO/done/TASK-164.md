@@ -1,6 +1,6 @@
 ---
 id:          TASK-164
-title:       Gateway multi-slot sessions (per-slot cookies, X-Vw-Slot header, /api/accounts)
+title:       "Gateway multi-slot sessions (per-slot cookies, X-Vw-Slot header, /api/accounts)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

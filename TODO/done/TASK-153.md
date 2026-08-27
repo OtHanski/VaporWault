@@ -1,6 +1,6 @@
 ---
 id:          TASK-153
-title:       Security review — installer packaging surface
+title:       "Security review — installer packaging surface"
 status:      done
 assignee:    SEC.07
 created_by:  ARCH.00

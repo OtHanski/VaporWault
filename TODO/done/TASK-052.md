@@ -1,6 +1,6 @@
 ---
 id:          TASK-052
-title:       vw_server_gui — user management and audit log views
+title:       "vw_server_gui — user management and audit log views"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

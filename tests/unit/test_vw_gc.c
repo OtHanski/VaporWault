@@ -132,7 +132,7 @@ static void gc_stack_open(gc_stack_t *s, const char *label,
     VW_ASSERT_OK(vw_gc_create(&cfg, s->store,
                                NULL, /* file_store  — skips file GC pass */
                                NULL, /* chunk_store — skips chunk GC pass */
-                               s->oplog, cluster, &s->gc));
+                               s->oplog, cluster, NULL, NULL, &s->gc));
 }
 
 static void gc_stack_close(gc_stack_t *s)
@@ -384,7 +384,7 @@ VW_TEST_SUITE("vw_gc") {
 
         cfg.interval_secs        = 0;
         cfg.trash_retention_secs = 3600; /* 1 hour */
-        VW_ASSERT_OK(vw_gc_create(&cfg, store, file_store, chunk_store, oplog, NULL, &gc));
+        VW_ASSERT_OK(vw_gc_create(&cfg, store, file_store, chunk_store, oplog, NULL, NULL, NULL, &gc));
         VW_ASSERT_OK(vw_gc_run_once(gc));
 
         /* Still recoverable — restore succeeding proves GC didn't hard-delete it. */
@@ -431,7 +431,7 @@ VW_TEST_SUITE("vw_gc") {
 
         cfg.interval_secs        = 0;
         cfg.trash_retention_secs = 1;
-        VW_ASSERT_OK(vw_gc_create(&cfg, store, file_store, chunk_store, oplog, NULL, &gc));
+        VW_ASSERT_OK(vw_gc_create(&cfg, store, file_store, chunk_store, oplog, NULL, NULL, NULL, &gc));
         VW_ASSERT_OK(vw_gc_run_once(gc));
 
         /* Gone for good — restore now fails because hard-delete already ran. */

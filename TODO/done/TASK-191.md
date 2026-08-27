@@ -1,0 +1,92 @@
+---
+id:          TASK-191
+title:       "Integration tests: link password protection"
+status:      done
+assignee:    QA.06
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  [TASK-186, TASK-187, TASK-188, TASK-189, TASK-190]
+blocks:      []
+review_by:   [CQR.08]
+tags:        [test]
+---
+
+Every resolved SEC.07 finding on `TASK-187`/`TASK-190` needs a
+regression test here, per standing QA.06 policy.
+
+**Correction (2026-08-26)**: expiration already has its own existing
+test coverage (it's an already-shipped feature, not part of this
+milestone) — check what exists before assuming a gap; this task's scope
+is password protection only.
+
+## Work
+
+- Password-protected link: no password → `VW_ERR_LINK_PASSWORD_REQUIRED`;
+  wrong password → `VW_ERR_LINK_PASSWORD_WRONG`; correct password →
+  succeeds exactly like a no-password link.
+- Repeated wrong-password attempts against one link trigger the
+  existing `LINK_ACCESS` IP rate limit and recover after its window,
+  mirroring the existing `test_sharing.py`-style pattern if one already
+  exercises that limiter for token-guessing.
+- Regression: pre-existing (password-less) links unaffected; a spot
+  check that expiry behavior is still intact (not re-testing it in
+  depth — it's out of this milestone's scope, just confirming this
+  milestone's changes didn't disturb it).
+- End-to-end through the gateway/frontend and through the desktop
+  GUI/CLI paths (`TASK-188`/`189`/`190`), not just the raw wire protocol.
+
+## Acceptance criteria
+
+- All of the above pass against freshly-built binaries.
+- Sign-off note added here before `TASK-185`'s milestone is closable.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+QA.06 [2026-08-26]: Sign-off. Most of this task's coverage was actually
+written and verified incrementally as part of `TASK-187`/`188`/`190`
+(while the wire format for each layer was fresh in context, rather than
+deferred and re-derived later) — this note consolidates and closes the
+remaining gaps.
+
+**Coverage inventory, by layer:**
+- Wire protocol: `tests/integration/test_link_password.py` (4 tests) —
+  required/wrong/correct password, permission still enforced alongside
+  the password gate, and the reset-ordering rate-limit regression test
+  that specifically exercises the bug found and fixed on `TASK-187`.
+- Unit: `test_vw_share.c`'s new "link: expired link no longer resolves
+  by token" — see the correction below.
+- CLI/daemon IPC: `tests/integration/test_cli_link_password.py`.
+- Gateway HTTP API: `tests/integration/test_gateway.py::
+  test_public_link_password_via_gateway`.
+- Regression (pre-existing password-less links unaffected): implicit in
+  every one of the ~103 pre-existing integration tests continuing to
+  pass unmodified, plus explicit assertions in
+  `test_link_no_password_unaffected`.
+
+**Correction to this task's own "expiration already has its own
+existing test coverage" note (added on `TASK-185`, repeated here without
+re-checking)**: false. Checked `test_vw_share.c` and `test_sharing.py`
+directly rather than trusting the earlier claim — an expired-*grant* unit
+test exists, but no expired-*link* test did, for either share type, at
+either the unit or integration level, despite both being gated by the
+exact same `vw_share_get_by_token` check. Added
+`"link: expired link no longer resolves by token"` to `test_vw_share.c`
+to close this for real. This is the second time in this milestone a
+"this is already covered" claim was repeated without verification
+(the first was `TASK-185`'s original expiration mix-up) — worth noting
+as a pattern to watch for, not just fixing the individual instance.
+
+**Not covered, and why (same as `TASK-183`/`184`/`189`'s standing
+caveat)**: no automated test drives the GUI's password field or the
+frontend's create-link form interactively — this project has no GUI test
+harness and this session has no browser/display to drive the frontend
+manually. `tsc` compiling the frontend clean is a type-check, not a
+functional one. Flagging explicitly rather than silently.
+
+Verified: full non-cluster integration suite 103/103, `ctest` 18/18 on
+`build-msvc-105` (including the new unit test), all against freshly
+rebuilt binaries on both MSVC and WSL/GCC. Sign-off given for `TASK-185`'s
+milestone — moving to `done`.

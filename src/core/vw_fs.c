@@ -14,6 +14,7 @@
 #   include <dirent.h>
 #   include <unistd.h>
 #   include <sys/stat.h>
+#   include <sys/statvfs.h>
 #   include <sys/types.h>
 #   include <fcntl.h>
 #   define VW_PATH_SEP '/'
@@ -207,6 +208,34 @@ int vw_fs_exists(const char *path) {
 #else
     struct stat st;
     return (stat(path, &st) == 0) ? 1 : 0;
+#endif
+}
+
+vw_err_t vw_fs_disk_usage_pct(const char *path, uint32_t *out_pct) {
+    if (!path || !out_pct) return VW_ERR_INVALID_ARG;
+    if (!vw_fs_exists(path)) return VW_ERR_NOT_FOUND;
+
+#ifdef _WIN32
+    ULARGE_INTEGER total_bytes, free_bytes;
+    if (!GetDiskFreeSpaceExA(path, NULL, &total_bytes, &free_bytes))
+        return VW_ERR_IO;
+    if (total_bytes.QuadPart == 0) { *out_pct = 0; return VW_OK; }
+    uint64_t used = total_bytes.QuadPart - free_bytes.QuadPart;
+    *out_pct = (uint32_t)((used * 100ULL) / total_bytes.QuadPart);
+    return VW_OK;
+#else
+    struct statvfs vfs;
+    if (statvfs(path, &vfs) != 0) return VW_ERR_IO;
+    uint64_t total = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+    if (total == 0) { *out_pct = 0; return VW_OK; }
+    /* f_bavail (available to an unprivileged user) rather than f_bfree
+     * (raw free including root-reserved blocks) — matches what `df`
+     * reports and what actually matters operationally: space this
+     * server process can really still write into. */
+    uint64_t avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+    uint64_t used  = (total > avail) ? (total - avail) : 0;
+    *out_pct = (uint32_t)((used * 100ULL) / total);
+    return VW_OK;
 #endif
 }
 

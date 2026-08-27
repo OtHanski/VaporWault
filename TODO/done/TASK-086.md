@@ -1,6 +1,6 @@
 ---
 id:          TASK-086
-title:       Cluster follow-ups — real integration test, minor hardening/consistency items
+title:       "Cluster follow-ups — real integration test, minor hardening/consistency items"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

@@ -286,9 +286,30 @@ int ClientApp::ipc_folder_remove(const char *local) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.send_folder_remove(active_account_id_, local);
 }
+bool ClientApp::ipc_folder_list(std::vector<VwGuiFolderEntry> *out) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.folder_list(active_account_id_, out);
+}
+int ClientApp::ipc_folder_set_excludes(const char *local, const std::vector<std::string> &patterns) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.folder_set_excludes(active_account_id_, local, patterns);
+}
+bool ClientApp::ipc_notify_prefs_get(uint32_t *out_prefs) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.notify_prefs_get(active_account_id_, out_prefs);
+}
+int ClientApp::ipc_notify_prefs_set(uint32_t prefs, uint32_t *out_prefs) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.notify_prefs_set(active_account_id_, prefs, out_prefs);
+}
 bool ClientApp::ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.file_list(active_account_id_, prefix, out);
+}
+bool ClientApp::ipc_search(const char *query, std::vector<VwGuiSearchEntry> *out,
+                            uint8_t *out_truncated, int *out_error_code) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.search(active_account_id_, query, out, out_truncated, out_error_code);
 }
 int ClientApp::ipc_share_grant(const char *virtual_path, const char *target_username,
                                 uint8_t permission, int64_t expires_at, uint64_t *out_share_id) {
@@ -304,9 +325,9 @@ bool ClientApp::ipc_share_list(uint8_t mode, std::vector<VwGuiShareEntry> *out, 
     return ipc_.share_list(active_account_id_, mode, out, out_error_code);
 }
 int ClientApp::ipc_link_create(const char *virtual_path, uint8_t permission, int64_t expires_at,
-                                uint64_t *out_share_id, uint8_t out_token[32]) {
+                                const char *password, uint64_t *out_share_id, uint8_t out_token[32]) {
     std::lock_guard<std::mutex> lk(status_mutex_);
-    return ipc_.link_create(active_account_id_, virtual_path, permission, expires_at, out_share_id, out_token);
+    return ipc_.link_create(active_account_id_, virtual_path, permission, expires_at, password, out_share_id, out_token);
 }
 int ClientApp::ipc_link_revoke(uint64_t share_id) {
     std::lock_guard<std::mutex> lk(status_mutex_);
@@ -315,6 +336,15 @@ int ClientApp::ipc_link_revoke(uint64_t share_id) {
 bool ClientApp::ipc_link_list(std::vector<VwGuiLinkEntry> *out, int *out_error_code) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.link_list(active_account_id_, out, out_error_code);
+}
+
+bool ClientApp::ipc_version_list(const char *virtual_path, std::vector<VwGuiVersionEntry> *out, int *out_error_code) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.version_list(active_account_id_, virtual_path, out, out_error_code);
+}
+int ClientApp::ipc_version_restore(const char *virtual_path, uint64_t version_id) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.version_restore(active_account_id_, virtual_path, version_id);
 }
 
 int ClientApp::ipc_file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id) {

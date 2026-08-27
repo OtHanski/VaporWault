@@ -1,6 +1,6 @@
 ---
 id:          TASK-127
-title:       Design web gateway + browser client architecture
+title:       "Design web gateway + browser client architecture"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

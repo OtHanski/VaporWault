@@ -236,6 +236,15 @@ vw_err_t vw_oplog_truncate_before(vw_oplog_t *ctx, uint64_t min_entry_id);
 uint64_t vw_oplog_last_entry_id(const vw_oplog_t *ctx);
 
 /*
+ * TASK-208: returns non-zero if vw_oplog_open's recovery scan had to
+ * truncate a corrupt/unconfirmed tail entry from the active segment —
+ * i.e. the server did not shut down cleanly last time. Reflects the
+ * state captured at open time; query once at startup. Always 0 for a
+ * brand-new log (nothing to recover from).
+ */
+int vw_oplog_did_recover_from_crash(const vw_oplog_t *ctx);
+
+/*
  * Read confirmed oplog entries with entry_id > from_entry_id, up to
  * max_entries entries.  Each entry is serialised as its raw on-disk bytes
  * (header + payload, confirmed byte set to 1) and concatenated into a single

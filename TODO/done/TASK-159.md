@@ -1,6 +1,6 @@
 ---
 id:          TASK-159
-title:       Web gateway file listing: use FILE_LIST_RESP's new per-entry vault_id instead of the folder-level workaround
+title:       "Web gateway file listing - use FILE_LIST_RESP's new per-entry vault_id instead of the folder-level workaround"
 status:      done
 assignee:    WEB.09
 created_by:  PRT.04

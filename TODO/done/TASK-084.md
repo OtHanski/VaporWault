@@ -1,6 +1,6 @@
 ---
 id:          TASK-084
-title:       GUI application-code bugs found while unblocking the v0.1.0 release build
+title:       "GUI application-code bugs found while unblocking the v0.1.0 release build"
 status:      done
 assignee:    GUI.03
 created_by:  BLD.05

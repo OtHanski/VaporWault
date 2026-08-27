@@ -1,6 +1,6 @@
 ---
 id:          TASK-108
-title:       GUI client file browser — wire to real synced-file listing
+title:       "GUI client file browser — wire to real synced-file listing"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

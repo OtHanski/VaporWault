@@ -1,6 +1,6 @@
 ---
 id:          TASK-165
-title:       Gateway persistent remember-me (on-disk resumable-token store, resume-on-cookie-miss)
+title:       "Gateway persistent remember-me (on-disk resumable-token store, resume-on-cookie-miss)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

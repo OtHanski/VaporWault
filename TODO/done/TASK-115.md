@@ -1,6 +1,6 @@
 ---
 id:          TASK-115
-title:       Add unit test coverage for server file-operation handlers (vw_file_handlers.c)
+title:       "Add unit test coverage for server file-operation handlers (vw_file_handlers.c)"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

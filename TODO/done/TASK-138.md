@@ -1,6 +1,6 @@
 ---
 id:          TASK-138
-title:       Frontend file browser view (list/stat/mkdir/move/delete)
+title:       "Frontend file browser view (list/stat/mkdir/move/delete)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

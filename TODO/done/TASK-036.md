@@ -1,6 +1,6 @@
 ---
 id:          TASK-036
-title:       Implement GUI — Dear ImGui file browser, transfer queue, login, settings
+title:       "Implement GUI — Dear ImGui file browser, transfer queue, login, settings"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-163
-title:       GUI account switcher: thread account_id through ClientApp/VwGuiIpc/views
+title:       "GUI account switcher - thread account_id through ClientApp/VwGuiIpc/views"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

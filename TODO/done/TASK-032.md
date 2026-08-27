@@ -1,6 +1,6 @@
 ---
 id:          TASK-032
-title:       Add per-user quota enforcement — quota record table and CHUNK_UPLOAD check
+title:       "Add per-user quota enforcement — quota record table and CHUNK_UPLOAD check"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

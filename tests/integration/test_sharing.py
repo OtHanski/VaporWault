@@ -409,7 +409,7 @@ def test_link_list_never_includes_raw_token(server, admin_client, unique_usernam
         for e in links:
             assert set(e.keys()) == {
                 "share_id", "file_id", "name", "permission",
-                "created_at", "expires_at", "revoked",
+                "created_at", "expires_at", "revoked", "has_password",
             }
     finally:
         owner.close()

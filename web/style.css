@@ -51,6 +51,36 @@ body {
   text-align: center;
 }
 
+#link-view {
+  display: flex;
+  justify-content: center;
+  padding-top: 4rem;
+}
+
+#link-access-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
+  max-width: 320px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2rem;
+}
+
+#link-access-form h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+  text-align: center;
+}
+
+#link-access-status {
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+}
+
 input, button {
   font-size: 1rem;
   padding: 0.5rem 0.75rem;
@@ -76,6 +106,12 @@ button:hover {
 
 .error {
   color: var(--error);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.note {
+  color: var(--muted);
   font-size: 0.9rem;
   margin: 0;
 }
@@ -135,7 +171,7 @@ button:hover {
   border-style: dashed;
 }
 
-#browser-view header, #history-view header, #share-view header {
+#browser-view header, #history-view header, #share-view header, #settings-view header {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -158,10 +194,20 @@ button:hover {
   gap: 0.5rem;
 }
 
-#history-view h3, #share-view h3 {
+#history-view h3, #share-view h3, #settings-view h3 {
   font-size: 0.95rem;
   color: var(--muted);
   margin: 1.5rem 0 0.5rem;
+}
+
+#notify-prefs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+#notify-prefs-list .checkbox-field .note {
+  margin-left: 0.3rem;
 }
 
 .inline-form {

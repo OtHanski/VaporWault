@@ -1,6 +1,6 @@
 ---
 id:          TASK-118
-title:       Refresh ARCHITECTURE.md and resolve protocol/doc version drift
+title:       "Refresh ARCHITECTURE.md and resolve protocol/doc version drift"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

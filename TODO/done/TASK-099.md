@@ -1,6 +1,6 @@
 ---
 id:          TASK-099
-title:       Client vault module (passphrase/KEK/DEK, encrypt-before-upload)
+title:       "Client vault module (passphrase/KEK/DEK, encrypt-before-upload)"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

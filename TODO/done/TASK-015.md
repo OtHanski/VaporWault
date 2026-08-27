@@ -1,6 +1,6 @@
 ---
 id:          TASK-015
-title:       vw_proto — add auth payload encode/decode, fix empty structs, add error encode
+title:       "vw_proto — add auth payload encode/decode, fix empty structs, add error encode"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

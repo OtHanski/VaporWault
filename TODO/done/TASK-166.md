@@ -1,6 +1,6 @@
 ---
 id:          TASK-166
-title:       Web frontend: remember-me checkbox, account switcher, session-check-on-load
+title:       "Web frontend - remember-me checkbox, account switcher, session-check-on-load"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

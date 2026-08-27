@@ -1,6 +1,6 @@
 ---
 id:          TASK-136
-title:       Scaffold web/ TypeScript frontend build + nginx reverse-proxy config
+title:       "Scaffold web/ TypeScript frontend build + nginx reverse-proxy config"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

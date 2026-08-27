@@ -1,6 +1,6 @@
 ---
 id:          TASK-100
-title:       Vault UI (setup wizard, passphrase prompts, encrypted indicators)
+title:       "Vault UI (setup wizard, passphrase prompts, encrypted indicators)"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

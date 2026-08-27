@@ -1,6 +1,6 @@
 ---
 id:          TASK-140
-title:       Frontend version history + sharing/public-link management views
+title:       "Frontend version history + sharing/public-link management views"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

@@ -394,6 +394,22 @@ vw_err_t vw_daemon_cfg_write_defaults(const char *state_dir,
  * written by account_ctx_create() below in response to
  * VW_IPC_ACCOUNT_ADD_REQ. */
 
+/* TASK-192/193: one sync folder's selective-sync exclude patterns, as
+ * persisted in account.conf (repeatable "exclude = <local_root>|<pattern>"
+ * lines — see account_cfg_apply_kv/_save below) and mirrored into the
+ * live vw_sync_ctx_t (vw_sync_set_folder_excludes) whenever this account
+ * comes up or the rules change. account.conf, unlike sync_folders.db, is
+ * a plain re-serialized-in-full text file, so this can be a genuinely
+ * variable-length list with no on-disk-format/migration concern — see
+ * TASK-193's implementation notes for why that rules out storing this on
+ * vw_sync_folder_t itself (a fixed 1040-byte record with zero reserved
+ * bytes to spare). */
+typedef struct {
+    char      local_root[512];
+    char    **patterns;
+    uint32_t  count;
+} vw_folder_excludes_cfg_t;
+
 typedef struct {
     uint32_t account_id;
     char     label[64];
@@ -408,7 +424,60 @@ typedef struct {
     char     fallback_host[256];
     uint16_t fallback_port;
     char     fallback_ca_cert_pem_path[512];
+    vw_folder_excludes_cfg_t *folder_excludes;
+    uint32_t                  folder_excludes_count;
 } vw_account_cfg_t;
+
+static vw_folder_excludes_cfg_t *account_cfg_find_excludes(vw_account_cfg_t *c,
+                                                            const char *local_root) {
+    for (uint32_t i = 0; i < c->folder_excludes_count; i++)
+        if (strcmp(c->folder_excludes[i].local_root, local_root) == 0)
+            return &c->folder_excludes[i];
+    return NULL;
+}
+
+/* Frees every pattern/array owned by c->folder_excludes and resets it to
+ * empty — call exactly once per vw_account_cfg_t before it goes out of
+ * scope or is overwritten wholesale (e.g. `existing->cfg = acfg;` in
+ * ACCOUNT_ADD_REQ — see that handler's own carry-over comment for why
+ * re-auth must copy the pointer across first rather than free it). */
+static void account_cfg_free_excludes(vw_account_cfg_t *c) {
+    for (uint32_t i = 0; i < c->folder_excludes_count; i++) {
+        vw_folder_excludes_cfg_t *fe = &c->folder_excludes[i];
+        for (uint32_t j = 0; j < fe->count; j++) free(fe->patterns[j]);
+        free(fe->patterns);
+    }
+    free(c->folder_excludes);
+    c->folder_excludes = NULL;
+    c->folder_excludes_count = 0;
+}
+
+/* Appends pattern to local_root's rule list, creating the list if this is
+ * the first rule for that folder. Used only while loading account.conf
+ * line-by-line (account_cfg_apply_kv) — the live "replace this folder's
+ * whole rule set" operation (VW_IPC_FOLDER_SET_EXCLUDES_REQ) clears any
+ * existing entry first via account_cfg_free_excludes on just that one
+ * folder's slot, see the handler itself. */
+static vw_err_t account_cfg_add_exclude(vw_account_cfg_t *c, const char *local_root,
+                                         const char *pattern) {
+    vw_folder_excludes_cfg_t *fe = account_cfg_find_excludes(c, local_root);
+    if (!fe) {
+        vw_folder_excludes_cfg_t *tmp = realloc(c->folder_excludes,
+            (c->folder_excludes_count + 1u) * sizeof(*tmp));
+        if (!tmp) return VW_ERR_OOM;
+        c->folder_excludes = tmp;
+        fe = &c->folder_excludes[c->folder_excludes_count++];
+        memset(fe, 0, sizeof(*fe));
+        snprintf(fe->local_root, sizeof(fe->local_root), "%s", local_root);
+    }
+    char **tmp = realloc(fe->patterns, (fe->count + 1u) * sizeof(char *));
+    if (!tmp) return VW_ERR_OOM;
+    fe->patterns = tmp;
+    fe->patterns[fe->count] = strdup(pattern);
+    if (!fe->patterns[fe->count]) return VW_ERR_OOM;
+    fe->count++;
+    return VW_OK;
+}
 
 static void account_cfg_apply_kv(vw_account_cfg_t *c, const char *key, const char *val) {
     if (strcmp(key, "label") == 0)
@@ -427,6 +496,23 @@ static void account_cfg_apply_kv(vw_account_cfg_t *c, const char *key, const cha
         c->fallback_port = (uint16_t)strtoul(val, NULL, 10);
     else if (strcmp(key, "fallback_ca_cert_pem_path") == 0)
         snprintf(c->fallback_ca_cert_pem_path, sizeof(c->fallback_ca_cert_pem_path), "%s", val);
+    else if (strcmp(key, "exclude") == 0) {
+        /* "exclude = <local_root>|<pattern>" — split on the first '|'.
+         * local_root itself is a filesystem path and may legitimately
+         * contain many characters but never '|' in practice on any
+         * platform this project targets; a malformed line (no '|') is
+         * silently ignored rather than corrupting some other field,
+         * matching this function's existing "unknown key -> no-op"
+         * posture for the rest of this parser. */
+        const char *bar = strchr(val, '|');
+        if (bar && bar != val) {
+            char root[512];
+            size_t rl = (size_t)(bar - val);
+            if (rl >= sizeof(root)) rl = sizeof(root) - 1u;
+            memcpy(root, val, rl); root[rl] = '\0';
+            (void)account_cfg_add_exclude(c, root, bar + 1);
+        }
+    }
 }
 
 /* accounts_dir is {state_dir}/accounts/<account_id> (no trailing slash). */
@@ -471,6 +557,11 @@ static vw_err_t account_cfg_save(const char *account_dir, const vw_account_cfg_t
     fprintf(fp, "fallback_host              = %s\n", cfg->fallback_host);
     fprintf(fp, "fallback_port              = %u\n", (unsigned)cfg->fallback_port);
     fprintf(fp, "fallback_ca_cert_pem_path  = %s\n", cfg->fallback_ca_cert_pem_path);
+    for (uint32_t i = 0; i < cfg->folder_excludes_count; i++) {
+        const vw_folder_excludes_cfg_t *fe = &cfg->folder_excludes[i];
+        for (uint32_t j = 0; j < fe->count; j++)
+            fprintf(fp, "exclude          = %s|%s\n", fe->local_root, fe->patterns[j]);
+    }
     fclose(fp);
     return VW_OK;
 }
@@ -923,6 +1014,14 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
                 vw_client_close(existing->sess); /* old token already superseded */
                 existing->sess       = new_sess;
                 existing->conn_mode  = VW_ACCOUNT_CONN_PRIMARY;
+                /* TASK-192/193: ACCOUNT_ADD_REQ never carries exclude
+                 * rules (they're set via a dedicated IPC message) — carry
+                 * the existing heap-owned list across the whole-struct
+                 * assignment below rather than let it leak (acfg's own
+                 * slot is still zeroed/empty at this point) or silently
+                 * wipe every configured rule on a routine re-auth. */
+                acfg.folder_excludes       = existing->cfg.folder_excludes;
+                acfg.folder_excludes_count = existing->cfg.folder_excludes_count;
                 existing->cfg        = acfg;
                 if (have_login_tok) {
                     memcpy(existing->login_token, login_tok, VW_TOKEN_BYTES);
@@ -989,6 +1088,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         vw_sync_close(a->sync_ctx);
         if (a->sess) vw_client_logout(a->sess);
         vw_cache_close(a->cache);
+        account_cfg_free_excludes(&a->cfg);
         delete_account_dir(a->account_dir);
         /* Shift the tail down over the removed slot — order doesn't matter,
          * this array is only ever iterated in full, never indexed by
@@ -1144,10 +1244,11 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         vw_sync_folder_t *folders = NULL; uint32_t nf = 0;
         (void)vw_cache_folder_list(a->cache, &folders, &nf);
         /* Encode: u32 count + per-entry (str local_root, str virtual_root,
-         * u8 paused, u8 pause_reason [TASK-111], u64 remote_dir_id [TASK-106]) */
+         * u8 paused, u8 pause_reason [TASK-111], u64 remote_dir_id [TASK-106],
+         * u16 exclude_count + exclude_count*str pattern [TASK-192/193]) */
         uint8_t rbuf[65536]; uint32_t roff = 0;
         vw_write_u32le(rbuf + roff, nf); roff += 4;
-        for (uint32_t i = 0; i < nf && roff < sizeof(rbuf) - 1050; i++) {
+        for (uint32_t i = 0; i < nf && roff < sizeof(rbuf) - 3072; i++) {
             uint16_t llen = (uint16_t)strnlen(folders[i].local_root,
                                                sizeof(folders[i].local_root));
             uint16_t vlen = (uint16_t)strnlen(folders[i].virtual_root,
@@ -1159,9 +1260,83 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
             rbuf[roff++] = folders[i].paused;
             rbuf[roff++] = folders[i].pause_reason;
             vw_write_u64le(rbuf + roff, folders[i].remote_dir_id); roff += 8u;
+
+            vw_folder_excludes_cfg_t *fe =
+                account_cfg_find_excludes(&a->cfg, folders[i].local_root);
+            uint16_t ecount = fe ? (uint16_t)(fe->count < 64u ? fe->count : 64u) : 0u;
+            vw_write_u16le(rbuf + roff, ecount); roff += 2u;
+            for (uint16_t j = 0; j < ecount && roff < sizeof(rbuf) - 600; j++) {
+                uint16_t plen2 = (uint16_t)strlen(fe->patterns[j]);
+                vw_ipc_write_str(rbuf, sizeof(rbuf), &roff, fe->patterns[j], plen2);
+            }
         }
         free(folders);
         vw_ipc_send(conn, VW_IPC_FOLDER_LIST_RESP, rbuf, roff);
+        break;
+    }
+
+    case VW_IPC_FOLDER_SET_EXCLUDES_REQ: {
+        uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a) { ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
+
+        const char *lroot = NULL; uint16_t ll = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &lroot, &ll);
+        if (err != VW_OK || off + 2u > plen) {
+            ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED);
+            break;
+        }
+        uint16_t count = vw_read_u16le(buf + off); off += 2u;
+
+        char root_buf[512];
+        size_t rl = ll < sizeof(root_buf) - 1u ? ll : sizeof(root_buf) - 1u;
+        memcpy(root_buf, lroot, rl); root_buf[rl] = '\0';
+
+        /* count is capped at 64 patterns — same personal-scale ceiling
+         * FOLDER_LIST_RESP's own encode loop above already applies when
+         * reading these back. */
+        if (count > 64u) { ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)VW_ERR_INVALID_ARG); break; }
+        char pat_bufs[64][256];
+        const char *pat_ptrs[64];
+        vw_err_t perr = VW_OK;
+        for (uint16_t i = 0; i < count && perr == VW_OK; i++) {
+            const char *p = NULL; uint16_t plen2 = 0;
+            perr = vw_ipc_read_str(buf, plen, &off, &p, &plen2);
+            if (perr == VW_OK) {
+                size_t cl = plen2 < sizeof(pat_bufs[i]) - 1u ? plen2 : sizeof(pat_bufs[i]) - 1u;
+                memcpy(pat_bufs[i], p, cl); pat_bufs[i][cl] = '\0';
+                pat_ptrs[i] = pat_bufs[i];
+            }
+        }
+        if (perr != VW_OK) { ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)perr); break; }
+
+        vw_sync_folder_t *folders2 = NULL; uint32_t nf2 = 0;
+        (void)vw_cache_folder_list(a->cache, &folders2, &nf2);
+        int found = 0;
+        for (uint32_t i = 0; i < nf2; i++)
+            if (strcmp(folders2[i].local_root, root_buf) == 0) { found = 1; break; }
+        free(folders2);
+        if (!found) { ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)VW_ERR_NOT_FOUND); break; }
+
+        /* Wholesale replace, not incremental append: clear this one
+         * folder's existing rules (keeping its slot, so the add loop
+         * below re-populates it fresh) before adding the new set. */
+        vw_folder_excludes_cfg_t *fe = account_cfg_find_excludes(&a->cfg, root_buf);
+        if (fe) {
+            for (uint32_t i = 0; i < fe->count; i++) free(fe->patterns[i]);
+            free(fe->patterns);
+            fe->patterns = NULL;
+            fe->count = 0;
+        }
+        vw_err_t rc = VW_OK;
+        for (uint16_t i = 0; i < count && rc == VW_OK; i++)
+            rc = account_cfg_add_exclude(&a->cfg, root_buf, pat_ptrs[i]);
+        if (rc == VW_OK) rc = account_cfg_save(a->account_dir, &a->cfg);
+        if (rc == VW_OK)
+            rc = vw_sync_set_folder_excludes(a->sync_ctx, root_buf, pat_ptrs, count);
+        ipc_send_u32(conn, VW_IPC_FOLDER_SET_EXCLUDES_RESP, (uint32_t)rc);
         break;
     }
 
@@ -1347,6 +1522,10 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         } else if (err == VW_OK) {
             err = VW_ERR_PROTO_TRUNCATED;
         }
+        /* TASK-186/188: optional trailing password field. */
+        const char *password = NULL; uint16_t password_len = 0;
+        if (err == VW_OK && off < plen)
+            err = vw_ipc_read_str(buf, plen, &off, &password, &password_len);
         if (err != VW_OK || !a || !a->sess) {
             uint8_t rbuf[44] = {0};
             vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : !a->sess ? VW_ERR_AUTH_REQUIRED : err));
@@ -1363,13 +1542,20 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         size_t pcopy = path_len < sizeof(path_buf) - 1u ? path_len : sizeof(path_buf) - 1u;
         memcpy(path_buf, path, pcopy); path_buf[pcopy] = '\0';
 
+        char password_buf[257];
+        size_t wcopy = password_len < sizeof(password_buf) - 1u ? password_len : sizeof(password_buf) - 1u;
+        if (password && wcopy) memcpy(password_buf, password, wcopy);
+        password_buf[wcopy] = '\0';
+
         vw_file_entry_t entry;
         vw_err_t rc = vw_client_file_stat(a->sess, path_buf, &entry);
         uint64_t share_id = 0;
         uint8_t link_token[32] = {0};
         if (rc == VW_OK)
             rc = vw_client_link_create(a->sess, entry.file_id, (vw_perm_t)permission,
-                                        expires_at, &share_id, link_token);
+                                        expires_at, wcopy ? password_buf : NULL,
+                                        &share_id, link_token);
+        memset(password_buf, 0, sizeof(password_buf));
         uint8_t rbuf[4u + 8u + 32u];
         vw_write_u32le(rbuf, (uint32_t)rc);
         vw_write_u64le(rbuf + 4u, share_id);
@@ -1408,6 +1594,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
                 vw_write_u64le(rbuf + roff, (uint64_t)entries[i].created_at); roff += 8;
                 vw_write_u64le(rbuf + roff, (uint64_t)entries[i].expires_at); roff += 8;
                 rbuf[roff++] = entries[i].revoked;
+                rbuf[roff++] = entries[i].has_password; /* TASK-186/188 */
             }
         }
         free(entries);
@@ -1633,6 +1820,166 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_VERSION_LIST_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_VERSION_LIST_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t off = 0;
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        const char *path = NULL; uint16_t path_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &path, &path_len);
+        if (err != VW_OK || !a || !a->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : !a->sess ? VW_ERR_AUTH_REQUIRED : err));
+            vw_ipc_send(conn, VW_IPC_VERSION_LIST_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        char path_buf[VW_MAX_PATH_BYTES + 1];
+        size_t pcopy = path_len < sizeof(path_buf) - 1u ? path_len : sizeof(path_buf) - 1u;
+        memcpy(path_buf, path, pcopy); path_buf[pcopy] = '\0';
+
+        vw_version_entry_t *entries = NULL; uint32_t count = 0;
+        vw_err_t rc = vw_client_version_list(a->sess, path_buf, &entries, &count);
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_VERSION_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4;
+        vw_write_u32le(rbuf + roff, (rc == VW_OK) ? count : 0u); roff += 4;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count && roff + 24u <= 65536u; i++) {
+                vw_write_u64le(rbuf + roff, entries[i].version_id); roff += 8;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].created_at); roff += 8;
+                vw_write_u64le(rbuf + roff, entries[i].size_bytes); roff += 8;
+            }
+        }
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_VERSION_LIST_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
+    case VW_IPC_VERSION_RESTORE_REQ: {
+        uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        const char *path = NULL; uint16_t path_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &path, &path_len);
+        uint64_t version_id = 0;
+        if (err == VW_OK && off + 8u <= plen) {
+            version_id = vw_read_u64le(buf + off); off += 8u;
+        } else if (err == VW_OK) {
+            err = VW_ERR_PROTO_TRUNCATED;
+        }
+        if (err != VW_OK || !a || !a->sess) {
+            ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_RESP,
+                         (uint32_t)(!a ? VW_ERR_INVALID_ARG : !a->sess ? VW_ERR_AUTH_REQUIRED : err));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_RESP, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            break;
+        }
+        char path_buf[VW_MAX_PATH_BYTES + 1];
+        size_t pcopy = path_len < sizeof(path_buf) - 1u ? path_len : sizeof(path_buf) - 1u;
+        memcpy(path_buf, path, pcopy); path_buf[pcopy] = '\0';
+
+        vw_err_t rc = vw_client_version_restore(a->sess, path_buf, version_id);
+        ipc_send_u32(conn, VW_IPC_VERSION_RESTORE_RESP, (uint32_t)rc);
+        break;
+    }
+
+    case VW_IPC_SEARCH_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_SEARCH_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t off = 0;
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        const char *query = NULL; uint16_t query_len = 0;
+        err = vw_ipc_read_str(buf, plen, &off, &query, &query_len);
+        if (err != VW_OK || !a || !a->sess) {
+            uint8_t rbuf[9] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : !a->sess ? VW_ERR_AUTH_REQUIRED : err));
+            vw_ipc_send(conn, VW_IPC_SEARCH_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        char query_buf[257];
+        size_t qcopy = query_len < sizeof(query_buf) - 1u ? query_len : sizeof(query_buf) - 1u;
+        memcpy(query_buf, query, qcopy); query_buf[qcopy] = '\0';
+
+        vw_search_entry_t *entries = NULL; uint32_t count = 0; uint8_t truncated = 0;
+        vw_err_t rc = vw_client_search(a->sess, query_buf, &entries, &count, &truncated);
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_SEARCH_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4u;
+        vw_write_u32le(rbuf + roff, (rc == VW_OK) ? count : 0u); roff += 4u;
+        rbuf[roff++] = (rc == VW_OK) ? truncated : 0u;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count; i++) {
+                uint16_t name_len = (uint16_t)strlen(entries[i].name);
+                uint32_t entry_cap = 8u + 2u + name_len + 1u + 8u + 8u + 8u + 1u;
+                if (roff + entry_cap > 65536u) break; /* defensive; server's own 200-cap keeps this well under */
+                vw_write_u64le(rbuf + roff, entries[i].file_id); roff += 8u;
+                (void)vw_ipc_write_str(rbuf, 65536u, &roff, entries[i].name, name_len);
+                rbuf[roff++] = entries[i].is_dir;
+                vw_write_u64le(rbuf + roff, entries[i].size_bytes); roff += 8u;
+                vw_write_u64le(rbuf + roff, (uint64_t)entries[i].mtime_unix); roff += 8u;
+                vw_write_u64le(rbuf + roff, entries[i].vault_id); roff += 8u;
+                rbuf[roff++] = entries[i].is_shared;
+            }
+        }
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_SEARCH_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
+    case VW_IPC_NOTIFY_PREFS_GET_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_NOTIFY_PREFS_GET_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_NOTIFY_PREFS_GET_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        /* Read-only fallback restricts writes, not reads (§7.13/TASK-209's
+         * own acceptance criterion) — always dispatched, even on fallback. */
+        uint32_t prefs = 0;
+        vw_err_t rc = vw_client_notify_prefs_get(a->sess, &prefs);
+        uint8_t rbuf[8];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u32le(rbuf + 4, (rc == VW_OK) ? prefs : 0u);
+        vw_ipc_send(conn, VW_IPC_NOTIFY_PREFS_GET_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
+    case VW_IPC_NOTIFY_PREFS_SET_REQ: {
+        if (plen < 8u) { ipc_send_u32(conn, VW_IPC_NOTIFY_PREFS_SET_ACK, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        uint32_t requested  = vw_read_u32le(buf + 4);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_NOTIFY_PREFS_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[8] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            vw_ipc_send(conn, VW_IPC_NOTIFY_PREFS_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint32_t stored = 0;
+        vw_err_t rc = vw_client_notify_prefs_set(a->sess, requested, &stored);
+        uint8_t rbuf[8];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        vw_write_u32le(rbuf + 4, stored);
+        vw_ipc_send(conn, VW_IPC_NOTIFY_PREFS_SET_ACK, rbuf, sizeof(rbuf));
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }
@@ -1782,7 +2129,17 @@ static vw_err_t account_ctx_open_existing(const char *account_dir, uint32_t acco
     if (err != VW_OK) {
         if (out->sess) vw_client_close(out->sess);
         vw_cache_close(out->cache);
+        account_cfg_free_excludes(&out->cfg);
         return err;
+    }
+    /* TASK-192/193: mirror the persisted rules into the freshly-opened
+     * live sync engine — account.conf is the durable source of truth,
+     * vw_sync_ctx_t's own copy (see vw_sync_set_folder_excludes) is what
+     * vw_sync_run actually consults each cycle. */
+    for (uint32_t i = 0; i < out->cfg.folder_excludes_count; i++) {
+        const vw_folder_excludes_cfg_t *fe = &out->cfg.folder_excludes[i];
+        (void)vw_sync_set_folder_excludes(out->sync_ctx, fe->local_root,
+                                           (const char *const *)fe->patterns, fe->count);
     }
     if (out->conn_mode == VW_ACCOUNT_CONN_FALLBACK)
         vw_sync_set_read_only(out->sync_ctx, 1);
@@ -1819,6 +2176,7 @@ static int scan_accounts_cb(const char *name, void *userdata) {
         if (tmp.sess) vw_client_close(tmp.sess);
         vw_sync_close(tmp.sync_ctx);
         vw_cache_close(tmp.cache);
+        account_cfg_free_excludes(&tmp.cfg);
         return 0;
     }
     *slot = tmp;
@@ -1889,6 +2247,7 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
             vw_sync_close(a->sync_ctx);
             if (a->sess) vw_client_close(a->sess);
             vw_cache_close(a->cache);
+            account_cfg_free_excludes(&a->cfg);
         }
         free(accounts.accounts);
         return err;
@@ -1903,6 +2262,7 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
             vw_sync_close(a->sync_ctx);
             if (a->sess) vw_client_close(a->sess);
             vw_cache_close(a->cache);
+            account_cfg_free_excludes(&a->cfg);
         }
         free(accounts.accounts);
         return err;
@@ -2091,6 +2451,7 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
         vw_sync_close(a->sync_ctx);
         if (a->sess) vw_client_logout(a->sess);
         vw_cache_close(a->cache);
+        account_cfg_free_excludes(&a->cfg);
     }
     free(accounts.accounts);
     vw_watcher_close(watcher);

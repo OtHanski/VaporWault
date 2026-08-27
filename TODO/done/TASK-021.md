@@ -1,6 +1,6 @@
 ---
 id:          TASK-021
-title:       Extend wire protocol spec for file transfer messages (Phase 2)
+title:       "Extend wire protocol spec for file transfer messages (Phase 2)"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

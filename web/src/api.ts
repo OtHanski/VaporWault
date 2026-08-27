@@ -74,6 +74,7 @@ export interface LinkEntry {
   created_at: number;
   expires_at: number;
   revoked: boolean;
+  has_password: boolean;
 }
 
 /*
@@ -140,6 +141,25 @@ export function logout(slot: number = activeSlot): Promise<ApiResult<StatusRespo
   return apiPost("/api/logout", { slot });
 }
 
+// Redeems a public link (TASK-134/186; frontend: TASK-216). Establishes a
+// real gateway session cookie for a new slot, exactly like login - the
+// browser then uses every other /api/* endpoint completely unchanged,
+// scoped server-side to whatever the link's own permission allows.
+// password: omit/empty if the link has none. slot: explicit target slot,
+// or omit to let the gateway pick the next free one (the only mode the
+// frontend's own redemption flow actually uses - see enterLinkView).
+export interface LinkAccessOpts {
+  password?: string;
+  slot?: number;
+}
+
+export function linkAccess(
+  linkToken: string,
+  opts: LinkAccessOpts = {},
+): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/links/access", { link_token: linkToken, ...opts });
+}
+
 export interface AccountSlot {
   slot: number;
   username: string; // "" for a redeemed public-link session (no real user)
@@ -170,6 +190,45 @@ export async function getAccounts(): Promise<ApiResult<AccountsResponse>> {
 
 export function listFiles(path: string, recursive = false): Promise<ApiResult<FileEntry[]>> {
   return apiPost("/api/files/list", { path, recursive });
+}
+
+// Filename search (TASK-198/199/201; docs/PROTOCOL.md §7.12). No virtual
+// path field - see that section's own rationale (a match's path isn't
+// always meaningful, e.g. a shared item outside the caller's namespace).
+export interface SearchEntry {
+  name: string;
+  file_id: number;
+  is_dir: number; // 0 = file, 1 = folder - same convention as FileEntry.entry_type
+  size_bytes: number;
+  mtime_unix: number;
+  vault_id: number;
+  is_shared: number; // 1 = visible via a grant, not owned
+}
+
+export interface SearchResponse {
+  truncated: boolean;
+  results: SearchEntry[];
+}
+
+export function search(query: string): Promise<ApiResult<SearchResponse>> {
+  return apiPost("/api/search", { query });
+}
+
+// Notification preferences (TASK-206/207/211; docs/PROTOCOL.md §7.13).
+// Thin passthrough, matching the gateway's own posture: `prefs` is the
+// raw VW_NOTIFY_* bitmask, decoded/re-encoded client-side against
+// NOTIFY_CATEGORIES below (mirrors vapourwault-cli's and the desktop
+// GUI's own local category tables - see main.ts).
+export interface NotifyPrefsResponse {
+  prefs: number;
+}
+
+export function getNotifyPrefs(): Promise<ApiResult<NotifyPrefsResponse>> {
+  return apiPost("/api/notify/prefs", {});
+}
+
+export function setNotifyPrefs(prefs: number): Promise<ApiResult<NotifyPrefsResponse>> {
+  return apiPost("/api/notify/prefs/set", { prefs });
 }
 
 export function mkdir(name: string, parentDirId = 0): Promise<ApiResult<{ dir_id: number }>> {
@@ -394,8 +453,11 @@ export function createLink(
   fileId: number,
   permission: number,
   expiresAt = 0,
+  password = "",
 ): Promise<ApiResult<{ share_id: number; link_token: string }>> {
-  return apiPost("/api/links/create", { file_id: fileId, permission, expires_at: expiresAt });
+  return apiPost("/api/links/create", {
+    file_id: fileId, permission, expires_at: expiresAt, password,
+  });
 }
 
 export function revokeLink(shareId: number): Promise<ApiResult<StatusResponse>> {

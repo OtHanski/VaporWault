@@ -1,6 +1,6 @@
 ---
 id:          TASK-072
-title:       Fix TLS 1.3 handshake failure against real server (SSLV3_ALERT_HANDSHAKE_FAILURE)
+title:       "Fix TLS 1.3 handshake failure against real server (SSLV3_ALERT_HANDSHAKE_FAILURE)"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

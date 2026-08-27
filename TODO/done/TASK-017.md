@@ -1,6 +1,6 @@
 ---
 id:          TASK-017
-title:       vw_smtp — fix from_addr CRLF injection, add RFC 5322 headers, add validate_cfg
+title:       "vw_smtp — fix from_addr CRLF injection, add RFC 5322 headers, add validate_cfg"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

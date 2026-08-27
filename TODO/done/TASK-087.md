@@ -1,6 +1,6 @@
 ---
 id:          TASK-087
-title:       Implement client-side login (first-time authentication)
+title:       "Implement client-side login (first-time authentication)"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

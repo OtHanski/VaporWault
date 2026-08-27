@@ -341,6 +341,13 @@ struct vw_oplog {
     size_t             pending_len;
 
     vw_mutex_t     mu;
+
+    /* TASK-208: set during vw_oplog_open's recovery branch if seg_scan
+     * had to truncate an unconfirmed/corrupt tail — i.e. the server did
+     * not shut down cleanly last time. Never set on a brand-new log
+     * (nothing to recover from). Queried once at startup via
+     * vw_oplog_did_recover_from_crash. */
+    int            crash_recovered;
 };
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
@@ -386,13 +393,18 @@ static vw_err_t segs_insert(vw_oplog_t *ctx, uint64_t first_id)
  *
  * Sets *out_last_id to the last valid entry_id (0 if the segment is empty).
  * Sets *out_end_offset to the file offset just after the last valid entry.
+ * Sets *out_truncated (TASK-208; may be NULL) to 1 if a corrupt/unconfirmed
+ * tail actually had to be truncated — i.e. this segment shows signs of an
+ * unclean shutdown — 0 otherwise.
  */
 static vw_err_t seg_scan(const char *path,
                           uint64_t *out_last_id,
-                          int64_t  *out_end_offset)
+                          int64_t  *out_end_offset,
+                          int      *out_truncated)
 {
     *out_last_id   = 0;
     *out_end_offset = 0;
+    if (out_truncated) *out_truncated = 0;
 
     vw_fd_t fd = fd_open_read(path);
     if (fd == VW_FD_INVALID) return VW_ERR_IO;
@@ -470,6 +482,7 @@ static vw_err_t seg_scan(const char *path,
         vw_err_t vw_rc = vw_fs_file_size(path, (uint64_t *)&sz);
         if (vw_rc != VW_OK) return vw_rc;
         if (last_good_offset < sz) {
+            if (out_truncated) *out_truncated = 1;
             /* fd_open_readwrite: GENERIC_WRITE needed for SetEndOfFile on Win32 */
             vw_fd_t wfd = fd_open_readwrite(path);
             if (wfd == VW_FD_INVALID || fd_truncate(wfd, last_good_offset) != 0) {
@@ -643,10 +656,12 @@ vw_err_t vw_oplog_open(const char *data_dir, vw_oplog_t **out_ctx)
 
         uint64_t last_id       = 0;
         int64_t  end_offset    = 0;
-        rc = seg_scan(path, &last_id, &end_offset);
+        int      truncated     = 0;
+        rc = seg_scan(path, &last_id, &end_offset, &truncated);
         if (rc != VW_OK) {
             mutex_destroy(&ctx->mu); free(ctx->segs); free(ctx); return rc;
         }
+        ctx->crash_recovered = truncated;
 
         ctx->last_entry_id = last_id;
         ctx->next_entry_id = last_id + 1;
@@ -1060,6 +1075,15 @@ uint64_t vw_oplog_last_entry_id(const vw_oplog_t *ctx)
     uint64_t id = ctx->last_entry_id;
     mutex_unlock((vw_mutex_t *)&ctx->mu);
     return id;
+}
+
+/* ── vw_oplog_did_recover_from_crash ──────────────────────────────────────── */
+
+int vw_oplog_did_recover_from_crash(const vw_oplog_t *ctx)
+{
+    if (!ctx) return 0;
+    /* Set once at open() and never mutated afterward — no lock needed. */
+    return ctx->crash_recovered;
 }
 
 /* ── vw_oplog_read_range ────────────────────────────────────────────────── */

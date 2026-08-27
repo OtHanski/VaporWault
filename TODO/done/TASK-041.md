@@ -1,6 +1,6 @@
 ---
 id:          TASK-041
-title:       ACME v2 automatic TLS certificate renewal (Let's Encrypt, DNS-01)
+title:       "ACME v2 automatic TLS certificate renewal (Let's Encrypt, DNS-01)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-005
-title:       Implement vw_net module
+title:       "Implement vw_net module"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

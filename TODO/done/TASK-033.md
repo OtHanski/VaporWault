@@ -1,6 +1,6 @@
 ---
 id:          TASK-033
-title:       Implement vw_server_main — server entry point and main loop
+title:       "Implement vw_server_main — server entry point and main loop"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

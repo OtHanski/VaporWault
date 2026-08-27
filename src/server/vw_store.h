@@ -202,6 +202,37 @@ typedef struct {
 _Static_assert(sizeof(vw_quota_record_t) == 32,
                "vw_quota_record_t must be 32 bytes");
 
+/*
+ * On-disk notification-preferences record (TASK-205/206/207). Exactly 16
+ * bytes; _Static_assert enforced. user_id == 0 marks a free slot.
+ * prefs_bitmask == 0 (every category off) is both the default and what a
+ * user who never called NOTIFY_PREFS_SET reads back as.
+ * Lives in {data_dir}/store/notify_prefs.db.
+ *
+ * A separate side table rather than a vw_user_record_t field for the same
+ * reason quota accounting already lives in quotas.db rather than in
+ * vw_user_record_t: that record is exactly 256 bytes with zero spare
+ * padding (see admin_caps's own field comment above).
+ *
+ * Not part of TASK-172's hot-standby replication file-tag list
+ * (docs/PROTOCOL.md §7.7) — a replica's copy of this file is always its
+ * own fresh, empty-defaults instance. A `NOTIFY_PREFS_GET` served from a
+ * fallback-connected replica therefore always reads back 0 (every
+ * category off) regardless of the real value on the primary; filed as a
+ * follow-up (see TASK-207's notes) rather than silently folded into this
+ * task, since fixing it means extending the fixed, wire-documented 8-tag
+ * table — a protocol change, PRT.04's call, not SRV.01's to make
+ * unilaterally.
+ */
+typedef struct {
+    uint64_t user_id;
+    uint32_t prefs_bitmask;   /* VW_NOTIFY_* bits, src/core/vw_proto.h */
+    uint8_t  _reserved[4];
+} vw_notify_prefs_record_t;
+
+_Static_assert(sizeof(vw_notify_prefs_record_t) == 16,
+               "vw_notify_prefs_record_t must be 16 bytes");
+
 /* ── Opaque context ──────────────────────────────────────────────────────── */
 
 typedef struct vw_store vw_store_t;
@@ -531,6 +562,52 @@ vw_err_t vw_store_quota_set(vw_store_t *ctx, uint64_t user_id,
  */
 vw_err_t vw_store_quota_add(vw_store_t *ctx, uint64_t user_id, int64_t delta);
 
+/*
+ * Callback invoked after every successful vw_store_quota_add (both
+ * directions — increase and decrease), reporting the user's current
+ * used_bytes/quota_bytes (quota_bytes == 0 means unlimited). Invoked
+ * outside vw_store's own lock.
+ *
+ * TASK-207: lets vw_notify.c detect a quota_warning threshold
+ * crossing (and re-arm once usage drops back under it) without vw_store
+ * depending on vw_notify/vw_smtp at link time — same opaque-callback
+ * idiom vw_store_user_scan already uses elsewhere in this header. The
+ * edge-trigger/debounce decision itself lives entirely in the hook's own
+ * implementation; vw_store only ever reports the raw current numbers.
+ */
+typedef void (*vw_store_quota_hook_fn)(void *userdata, uint64_t user_id,
+                                        uint64_t used_bytes, uint64_t quota_bytes);
+
+/*
+ * Register (or, passing hook=NULL, clear) the quota hook. Only one hook
+ * may be registered at a time; a second call replaces the first.
+ */
+void vw_store_set_quota_hook(vw_store_t *ctx, vw_store_quota_hook_fn hook,
+                              void *userdata);
+
+/* ── Notification preferences (TASK-205/206/207) ─────────────────────────── */
+
+/*
+ * Fetch user_id's notification preference bitmask. Unlike
+ * vw_store_quota_get, never returns VW_ERR_NOT_FOUND for "no record yet" —
+ * an account that has never called vw_store_notify_prefs_set reads back
+ * VW_OK with *out_prefs == 0 (every category off), matching TASK-205's
+ * "default off everywhere" requirement without every caller needing its
+ * own NOT_FOUND-means-default special case.
+ */
+vw_err_t vw_store_notify_prefs_get(vw_store_t *ctx, uint64_t user_id,
+                                     uint32_t *out_prefs);
+
+/*
+ * Replace user_id's complete notification preference bitmask. Creates a
+ * new record if absent; updates in place if present. Flushes to disk
+ * before returning. Does not validate individual bits — the
+ * NOTIFY_PREFS_SET wire handler (vw_server_core.c) rejects any reserved
+ * bit with VW_ERR_INVALID_ARG before ever calling this.
+ */
+vw_err_t vw_store_notify_prefs_set(vw_store_t *ctx, uint64_t user_id,
+                                     uint32_t prefs);
+
 /* ── File GC helpers (used by vw_gc) ─────────────────────────────────────── */
 
 /*
@@ -543,6 +620,16 @@ vw_err_t vw_store_quota_add(vw_store_t *ctx, uint64_t user_id, int64_t delta);
 vw_err_t vw_store_file_scan_deleted(vw_file_store_t *fs,
                                      int (*cb)(const vw_file_record_t *, void *),
                                      void *userdata);
+
+/*
+ * TASK-198: iterate all live (non-deleted) file slots — the counterpart scan
+ * to vw_store_file_scan_deleted, used by SEARCH (docs/PROTOCOL.md §7.12)
+ * since there is no owner_id-indexed enumeration to walk instead. Same
+ * locking/callback contract as vw_store_file_scan_deleted above.
+ */
+vw_err_t vw_store_file_scan_all(vw_file_store_t *fs,
+                                 int (*cb)(const vw_file_record_t *, void *),
+                                 void *userdata);
 
 /*
  * Permanently remove a file record: zeroes the slot in meta.dat and clears

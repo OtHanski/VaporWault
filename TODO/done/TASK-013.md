@@ -1,6 +1,6 @@
 ---
 id:          TASK-013
-title:       vw_crypto — add CRC32, fix thread-safety, fix argon2id null-deref
+title:       "vw_crypto — add CRC32, fix thread-safety, fix argon2id null-deref"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

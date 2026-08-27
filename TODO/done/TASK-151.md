@@ -1,6 +1,6 @@
 ---
 id:          TASK-151
-title:       Wire installer packages into the release CI workflow
+title:       "Wire installer packages into the release CI workflow"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

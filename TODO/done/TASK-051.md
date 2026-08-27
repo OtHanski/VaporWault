@@ -1,6 +1,6 @@
 ---
 id:          TASK-051
-title:       Implement vw_server_gui — SDL2/OpenGL/Dear ImGui window and main loop
+title:       "Implement vw_server_gui — SDL2/OpenGL/Dear ImGui window and main loop"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-078
-title:       Lockout table evicts by slot index, not by soonest-expiry — unfair eviction under load
+title:       "Lockout table evicts by slot index, not by soonest-expiry — unfair eviction under load"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

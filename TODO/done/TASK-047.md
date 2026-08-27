@@ -1,6 +1,6 @@
 ---
 id:          TASK-047
-title:       Publish cluster protocol spec — NODE_HELLO, OPLOG_ACK, CLUSTER_STATUS payloads
+title:       "Publish cluster protocol spec — NODE_HELLO, OPLOG_ACK, CLUSTER_STATUS payloads"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-011
-title:       Implement auth handshake in wire protocol (vw_server_core + vw_client_core stubs)
+title:       "Implement auth handshake in wire protocol (vw_server_core + vw_client_core stubs)"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

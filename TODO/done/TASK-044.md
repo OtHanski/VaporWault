@@ -1,6 +1,6 @@
 ---
 id:          TASK-044
-title:       Protocol spec — invite token and password recovery wire payloads
+title:       "Protocol spec — invite token and password recovery wire payloads"
 status:      done
 assignee:    PRT.04
 created_by:  ARCH.00

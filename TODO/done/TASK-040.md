@@ -1,6 +1,6 @@
 ---
 id:          TASK-040
-title:       Server admin CLI — vw_admin IPC server and vapourwault-server-cli
+title:       "Server admin CLI — vw_admin IPC server and vapourwault-server-cli"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

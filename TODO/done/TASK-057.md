@@ -1,6 +1,6 @@
 ---
 id:          TASK-057
-title:       SEC.07 full security audit of complete codebase
+title:       "SEC.07 full security audit of complete codebase"
 status:      done
 assignee:    SEC.07
 created_by:  ARCH.00

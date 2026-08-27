@@ -1,6 +1,6 @@
 ---
 id:          TASK-107
-title:       GUI client login (real form, no more CLI redirect)
+title:       "GUI client login (real form, no more CLI redirect)"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

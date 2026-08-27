@@ -17,32 +17,23 @@ the same client), create one user on each, and hand both connection specs
 to the subprocess.
 """
 
-import os
 import subprocess
 
 import pytest
 
-from conftest import ServerInstance
-
-
-def _find_multi_account_bin():
-    """Locate the compiled test_daemon_multi_account binary. Mirrors
-    test_shared_sync.py's _find_shared_sync_bin search order."""
-    # build-gw-e2e/bin first: see test_daemon_ipc_accounts.py's
-    # _find_daemon_bin for why a stale binary elsewhere in this search list
-    # must never silently win over this session's own known-current build.
-    name = "test_daemon_multi_account.exe" if os.name == "nt" else "test_daemon_multi_account"
-    for d in ("build-gw-e2e/bin", "build/bin", "build-release/bin", "../build/bin",
-              "build-wsl-werror/bin", "build-wsl/bin"):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return os.path.abspath(p)
-    return None
+from conftest import ServerInstance, _find_client_bin
 
 
 @pytest.fixture(scope="module")
 def multi_account_bin():
-    path = _find_multi_account_bin()
+    # TASK-217: folded into the one shared search-order helper
+    # (conftest.py's daemon_bin/cli_bin fixtures already use it) instead
+    # of this file's own copy of the list — a stale binary elsewhere
+    # winning silently over this session's own known-current build is
+    # exactly the failure mode a single shared helper avoids by
+    # construction, rather than by every copy remembering to order
+    # build-gw-e2e/bin first on its own.
+    path = _find_client_bin("test_daemon_multi_account")
     if not path:
         pytest.skip("test_daemon_multi_account binary not found (build it first)")
     return path

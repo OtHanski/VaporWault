@@ -1,6 +1,6 @@
 ---
 id:          TASK-126
-title:       Client GUI's "Conflict" popup is dead code and cites a CLI command that doesn't exist
+title:       "Client GUI's \"Conflict\" popup is dead code and cites a CLI command that doesn't exist"
 status:      done
 assignee:    GUI.03
 created_by:  GUI.03

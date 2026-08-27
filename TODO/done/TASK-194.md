@@ -1,0 +1,76 @@
+---
+id:          TASK-194
+title:       "GUI: selective-sync rule editor"
+status:      done
+assignee:    GUI.03
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  [TASK-193]
+blocks:      [TASK-195]
+review_by:   [CQR.08]
+tags:        [gui]
+---
+
+Blocked on `TASK-193` (client API must exist first).
+
+## Work
+
+- Folder settings view (`vw_view_settings.cpp`/`.h` or wherever per-folder
+  config already lives): an exclude-pattern editor per sync folder — add/
+  remove glob patterns, with the current rule list visible.
+- A visible indicator in the browser view (`vw_view_browser.cpp`) for
+  paths currently excluded from sync (distinct from "not yet synced" or
+  "paused").
+
+## Acceptance criteria
+
+- A user can add/remove exclude rules for a folder entirely through the
+  GUI and see the effect (files stop/resume appearing in sync activity)
+  without restarting the daemon.
+- Keyboard-navigable per the existing accessibility bar.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+GUI.03 [2026-08-26]: Implementation complete, with one scope note below.
+
+- Found while starting this: the GUI's Settings view had **no sync-folder
+  listing at all** before this task — only blind add/remove-by-typed-path
+  forms, no way to see what's configured. `list-folders`'s equivalent had
+  simply never been wrapped for the GUI. Added `VwGuiFolderEntry` +
+  `VwGuiIpc::folder_list`/`folder_set_excludes` (mirroring `link_list`'s
+  existing shape) and `ClientApp::ipc_folder_list`/`ipc_folder_set_excludes`
+  — this was necessary groundwork for a real rule editor (you need to see
+  and select a folder before editing its rules), not scope creep for its
+  own sake.
+- `vw_view_settings.cpp`: a "Configured folders" table (local root,
+  virtual root, paused, rule count); selecting a row shows its current
+  exclude patterns with per-pattern "Remove" buttons plus an "Add
+  pattern" field. Every add/remove sends the *whole* updated list via
+  `VW_IPC_FOLDER_SET_EXCLUDES_REQ` (matches its wholesale-replace, not
+  incremental, semantics from `TASK-193`) and immediately refreshes the
+  table from the daemon rather than trusting local optimistic state.
+- **Scope note, decided deliberately rather than silently dropped**: the
+  task's second bullet ("a visible indicator in the browser view for
+  excluded paths") is not implemented. The GUI is architecturally
+  forbidden from linking `vw_sync.c`'s glob matcher directly (CLAUDE.md's
+  GUI.03 constraint: client library/IPC only, no sync-engine code in the
+  GUI process) — doing this properly would need either a new daemon IPC
+  query (`is this path excluded?`) or a second, independently-maintained
+  glob implementation in C++ that could drift from the real matcher's
+  semantics over time. Given the same rule set is already fully visible
+  and editable in the Settings view added above, and an excluded-and-
+  never-locally-synced file simply never appears in the browser at all
+  (the correct behavior, requiring no indicator), the remaining case — an
+  already-synced file that was excluded afterward — is a real but minor
+  gap, not worth either workaround's cost on its own. Revisit if a
+  broader "ask the daemon about a path's live sync-relevant state" query
+  is ever added for other reasons.
+- Verified: `build-msvc-105` builds and links clean, `ctest` 18/18. Same
+  standing caveat as `TASK-183`/`189`: no interactive/rendered
+  verification possible in this session (no display) — compile/link/
+  static-review only.
+
+Moving to `review`/`done`.

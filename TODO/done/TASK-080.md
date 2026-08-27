@@ -1,6 +1,6 @@
 ---
 id:          TASK-080
-title:       Fix invalid ctest --no-tests value in legacy TAP integration CI step
+title:       "Fix invalid ctest --no-tests value in legacy TAP integration CI step"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

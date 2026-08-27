@@ -1,6 +1,6 @@
 ---
 id:          TASK-060
-title:       Micro-hardening — address Phase 8 advisory findings
+title:       "Micro-hardening — address Phase 8 advisory findings"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

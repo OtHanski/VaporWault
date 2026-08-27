@@ -11,6 +11,7 @@
 #include "vw_admin.h"
 #include "vw_cluster.h"
 #include "../core/vw_crypto.h"
+#include "vw_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -793,6 +794,7 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  --admin-socket <path>  Admin Unix socket path (default: %s)\n"
+        "  --version              Print version and exit\n"
         "  --help, -h             Show this help\n",
         prog, VW_ADMIN_DEFAULT_SOCKET);
 }
@@ -814,6 +816,9 @@ int vw_server_cli_main(int argc, char *argv[])
         } else if (strcmp(argv[argi], "--help") == 0 ||
                    strcmp(argv[argi], "-h") == 0) {
             usage(argv[0]); rc = 0; goto done;
+        } else if (strcmp(argv[argi], "--version") == 0) {
+            printf("vapourwault-server-cli %s\n", VW_VERSION_STRING);
+            rc = 0; goto done;
         } else {
             break;
         }

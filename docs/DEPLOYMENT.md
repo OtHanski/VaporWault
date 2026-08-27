@@ -160,6 +160,54 @@ Lines beginning with `#` are comments. The default location is:
 | `smtp_verify_cert` | 0/1 | `1` | Verify the SMTP server's TLS certificate. Set to `0` only for testing. |
 | `smtp_ca_cert_path` | path | _(empty)_ | Custom CA certificate for SMTP TLS verification. |
 
+### Admin operational email alerts
+
+Opt-in email alerts for five server-operational conditions (`TASK-205`/
+`208`), sent to a single admin recipient over the SMTP relay configured
+above. These are **config-only** — set once when provisioning the server,
+never toggled live over the wire. They are a separate surface from the
+four per-user notification categories (`share_received`, `quota_warning`,
+`new_login`, `account_security_change`) that each user manages themselves
+via `vapourwault-cli notify`, the desktop GUI's Settings panel, or the
+web frontend's Settings page — see
+`docs/CLIENT_GETTING_STARTED.md` for those.
+
+**Every category defaults off.** SMTP must also be configured (`smtp_host`
+non-empty) above, or no email of any kind — admin or user — is ever sent.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notify.admin_email` | string | _(empty)_ | Recipient for every admin alert category below. **Required** if any category is enabled — see "Fail-loud misconfiguration" below. |
+| `notify.replica_lag` | 0/1 | `0` | Alert when a paired replica falls behind by more than the threshold below. Re-arms (no repeat email) once the replica catches back up. |
+| `notify.acme_renewal_failure` | 0/1 | `0` | Alert on every failed automatic ACME certificate renewal attempt. Not debounced — each failed attempt sends its own email, since renewal itself only runs on its own slow schedule (§ ACME above), not continuously. |
+| `notify.disk_capacity` | 0/1 | `0` | Alert when the storage disk (the filesystem holding `data_dir`) crosses the usage threshold below. Re-arms once usage drops back under it. |
+| `notify.lockout_spike` | 0/1 | `0` | Alert when the rate of account lockouts in a rolling window exceeds the threshold below — a possible brute-force indicator. Re-arms once the rate drops back under it. |
+| `notify.crash_recovery` | 0/1 | `0` | Alert once at startup if the oplog's crash-recovery replay had to run — meaning the server did not shut down cleanly last time (a crash, `kill -9`, power loss, etc.). One-shot per startup, not debounced. |
+| `notify.replica_lag_threshold_entries` | integer | `1000` | How many oplog entries a replica may lag behind before `notify.replica_lag` fires. `0` (or omitting the key) uses this default. |
+| `notify.disk_capacity_threshold_pct` | integer | `90` | Disk usage percentage (0-100) that triggers `notify.disk_capacity`. `0`/omitted uses this default. |
+| `notify.lockout_spike_threshold_count` | integer | `10` | Number of lockouts within the window below that triggers `notify.lockout_spike`. `0`/omitted uses this default. |
+| `notify.lockout_spike_window_secs` | integer | `300` | Rolling window (seconds) the lockout count above is measured over. `0`/omitted uses this default. |
+
+**Fail-loud misconfiguration**: setting any `notify.*` category to `1`
+while `notify.admin_email` is left empty is a startup configuration
+error, not a silent no-op — the server refuses to start
+(`vapourwaultd --check-config` reports it too) with a clear log message
+naming the problem. This is deliberate: an admin who enables an alert
+almost certainly wants it delivered somewhere, and a category that's
+silently never actually sent anywhere is worse than an obvious startup
+failure that gets fixed immediately.
+
+Example — alert on disk capacity and an unclean shutdown, everything else
+left off:
+
+```ini
+smtp_host        = smtp.example.com
+smtp_from_addr   = vaporwault@example.com
+notify.admin_email    = admin@example.com
+notify.disk_capacity  = 1
+notify.crash_recovery = 1
+```
+
 ### Cluster (replication)
 
 | Key | Type | Default | Description |

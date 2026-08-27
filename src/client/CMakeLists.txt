@@ -20,7 +20,7 @@ add_executable(vapourwault-daemon
 )
 
 target_include_directories(vapourwault-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vapourwault-daemon PRIVATE vw_core)
+target_link_libraries(vapourwault-daemon PRIVATE vw_core vw_version)
 
 if(UNIX)
     target_link_libraries(vapourwault-daemon PRIVATE pthread)
@@ -38,7 +38,7 @@ add_executable(vapourwault-cli
 )
 
 target_include_directories(vapourwault-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vapourwault-cli PRIVATE vw_core)
+target_link_libraries(vapourwault-cli PRIVATE vw_core vw_version)
 
 if(WIN32)
     target_link_libraries(vapourwault-cli PRIVATE ws2_32)

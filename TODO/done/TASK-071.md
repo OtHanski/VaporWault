@@ -1,6 +1,6 @@
 ---
 id:          TASK-071
-title:       MSVC /WX build fails on vendored mbedTLS PSA header (C4200 zero-sized array)
+title:       "MSVC /WX build fails on vendored mbedTLS PSA header (C4200 zero-sized array)"
 status:      done
 assignee:    BLD.05
 created_by:  SRV.01

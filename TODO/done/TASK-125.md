@@ -1,6 +1,6 @@
 ---
 id:          TASK-125
-title:       Argon2 has the same dead-submodule/FetchContent mismatch as TASK-119's mbedTLS
+title:       "Argon2 has the same dead-submodule/FetchContent mismatch as TASK-119's mbedTLS"
 status:      done
 assignee:    BLD.05
 created_by:  BLD.05

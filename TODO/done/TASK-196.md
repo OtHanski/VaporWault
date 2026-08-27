@@ -1,0 +1,79 @@
+---
+id:          TASK-196
+title:       "ARCH.00 design - server-side filename search"
+status:      done
+assignee:    ARCH.00
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  []
+blocks:      [TASK-197, TASK-198, TASK-199, TASK-200, TASK-201, TASK-202]
+review_by:   [CQR.08]
+tags:        [design]
+---
+
+No search exists anywhere in the product today (checked GUI, CLI, and web
+frontend — the only "search" hit in the whole client/web tree is the
+server admin GUI's audit-log view). For a file-hosting product past a
+few hundred files this is a real usability gap.
+
+## Decisions
+
+1. **Filename/path search only, not content search.** Vault contents are
+   opaque ciphertext to the server by design (`ARCHITECTURE.md`'s E2EE
+   decision) and non-vault content search would require an index the
+   flat-file store doesn't have — both are out of scope. This searches
+   the same metadata `FILE_LIST` already exposes (name, path), just
+   across the whole tree instead of one directory at a time.
+2. **Server-side, not client-side.** Pulling a user's entire file tree
+   metadata to the client to filter locally doesn't scale and duplicates
+   the permission-filtering logic `FILE_LIST` already does correctly.
+   New request type, same trust model as `FILE_LIST`.
+3. **Scope of results**: files/folders the caller owns, plus anything
+   shared with them (grant or link-redeemed scope) — exactly the same
+   visibility rule `FILE_LIST`/`effective_permission()` already enforce.
+   A match on a file the caller can't see must never be observable in
+   any form (count, existence, timing) — same SEC-ADV posture as the
+   original chunk-endpoint constraints recorded early in this project.
+4. **Match semantics**: case-insensitive substring match on filename
+   (not full path) by default; a glob option can be added later if asked
+   for, kept out of v1 to keep the parser small.
+5. ~~**Pagination**: cursor-based, same shape as any other paginated list
+   response in this protocol...~~ **Struck (2026-08-26, found while
+   starting `TASK-197`)**: checked `docs/PROTOCOL.md` for the cursor
+   convention this decision claimed to mirror — it doesn't exist.
+   `FILE_LIST_RESP`/`SHARE_LIST_RESP`/`LINK_LIST_RESP` all return their
+   entire result set in one response, bounded only by a hard entry cap
+   (`FILE_LIST`'s BFS caps at 65535, per `vw_file_handlers.c`). There is
+   no cursor precedent anywhere in this protocol to be "the same shape
+   as." Replaced with the actual existing convention: a hard result cap
+   (`TASK-197` picks the number) plus a `truncated` boolean, matching
+   every other list response instead of introducing pagination as a new
+   paradigm this protocol has never used. The underlying goal (bound
+   worst-case response size) is fully satisfied by a cap; real
+   pagination was solving a consistency problem that didn't exist.
+
+## Decisions recorded (`ARCHITECTURE.md`, Decision Log table)
+
+- New row: `Filename search` — see `ARCHITECTURE.md`.
+
+## Task breakdown
+
+| Task | Assignee | Depends on | review_by | tags |
+|------|----------|------------|-----------|------|
+| `TASK-197` — Protocol: `SEARCH`/`SEARCH_RESP` wire spec | PRT.04 | 196 | CQR.08 | protocol |
+| `TASK-198` — Server: permission-safe recursive search implementation | SRV.01 | 197 | SEC.07, CQR.08 | security-sensitive, server |
+| `TASK-199` — Client: daemon IPC + `vapourwault-cli search` | CLI.02 | 198 | CQR.08 | client |
+| `TASK-200` — GUI: search bar in the file browser | GUI.03 | 199 | CQR.08 | gui |
+| `TASK-201` — Web gateway/frontend: search bar | WEB.09 | 198 | SEC.07, CQR.08 | security-sensitive, gateway |
+| `TASK-202` — Integration + fuzz tests: permission safety, pagination, malformed query | QA.06 | 197-201 | CQR.08 | test |
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+ARCH.00 [2026-08-25]: Design complete, `ARCHITECTURE.md` updated, task
+breakdown created directly in `TODO/todo/`. `TASK-198`/`201` tagged
+`security-sensitive` because this is a new query surface over
+potentially-foreign-owned data, same posture as the original chunk
+endpoint constraints.

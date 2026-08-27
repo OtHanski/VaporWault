@@ -24,23 +24,17 @@ import subprocess
 
 import pytest
 
+from conftest import _find_client_bin
+
 # Must match test_vault_regression.c's MARKER macro exactly.
 MARKER = b"VW_E2EE_REGRESSION_MARKER_98237456_do_not_change_without_updating_the_py_wrapper"
 
 
-def _find_regression_bin():
-    name = "test_vault_regression.exe" if os.name == "nt" else "test_vault_regression"
-    for d in ("build/bin", "build-release/bin", "../build/bin",
-              "build-wsl-werror/bin", "build-wsl/bin"):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return os.path.abspath(p)
-    return None
-
-
 @pytest.fixture(scope="module")
 def regression_bin():
-    path = _find_regression_bin()
+    # TASK-217: shared search-order helper, see test_shared_sync.py's
+    # own note on why (was a hand-rolled list missing build-gw-e2e/bin).
+    path = _find_client_bin("test_vault_regression")
     if not path:
         pytest.skip("test_vault_regression binary not found (build it first)")
     return path

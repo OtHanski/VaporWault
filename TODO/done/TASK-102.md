@@ -1,6 +1,6 @@
 ---
 id:          TASK-102
-title:       Admin handler hygiene: zero fetched user records, fix cluster-status error code
+title:       "Admin handler hygiene: zero fetched user records, fix cluster-status error code"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

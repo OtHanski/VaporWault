@@ -1,6 +1,6 @@
 ---
 id:          TASK-113
-title:       Shared-folder sync cannot self-heal a locally-created subdirectory with no remote counterpart
+title:       "Shared-folder sync cannot self-heal a locally-created subdirectory with no remote counterpart"
 status:      done
 assignee:    CLI.02
 created_by:  CLI.02

@@ -1,6 +1,6 @@
 ---
 id:          TASK-176
-title:       Gateway: read-only fallback to a replica
+title:       "Gateway - read-only fallback to a replica"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

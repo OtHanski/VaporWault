@@ -1,6 +1,6 @@
 ---
 id:          TASK-135
-title:       Implement gateway vault registry endpoints (create/key-fetch/list)
+title:       "Implement gateway vault registry endpoints (create/key-fetch/list)"
 status:      done
 assignee:    WEB.09
 created_by:  ARCH.00

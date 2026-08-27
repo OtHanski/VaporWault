@@ -1,6 +1,6 @@
 ---
 id:          TASK-116
-title:       Improve the server GUI's audit log view (filter, search, export)
+title:       "Improve the server GUI's audit log view (filter, search, export)"
 status:      done
 assignee:    GUI.03
 created_by:  ARCH.00

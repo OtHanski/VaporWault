@@ -1,0 +1,90 @@
+---
+id:          TASK-186
+title:       "Protocol: link password field"
+status:      done
+assignee:    PRT.04
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  [TASK-185]
+blocks:      [TASK-187, TASK-190]
+review_by:   [CQR.08]
+tags:        [protocol]
+---
+
+Publish the wire-level side of `TASK-185`'s design in `docs/PROTOCOL.md`
+before `TASK-187`/`TASK-190` start implementation (CLAUDE.md routing rule
+3).
+
+## Work
+
+- `LINK_CREATE` payload (§7.5/§7.10): add an optional trailing `password`
+  field (length-prefixed bytes, empty = no password). Purely additive,
+  no version bump — same precedent as `FILE_LIST`'s `dir_file_id`
+  addition (`TASK-106`). (`expires_at` already exists on this message —
+  do not re-add it; see this task's correction note below.)
+- `LINK_ACCESS` payload: add optional trailing `password` field (empty if
+  none supplied). Currently `plen != 32u` is a strict-equality check
+  (`vw_server_core.c`'s `handle_link_access`) — becomes `plen < 32u` so a
+  longer payload (token + password) is accepted, old 32-byte-only
+  callers unaffected.
+- New error codes in §10.1: `VW_ERR_LINK_PASSWORD_REQUIRED`,
+  `VW_ERR_LINK_PASSWORD_WRONG`. Document that these are distinguishable
+  so a client can tell "prompt for a password" apart from "wrong
+  password."
+- Note in the share-record layout table that public-link rows
+  additionally carry an Argon2id password hash (never plaintext) —
+  server-side-only field, never serialized into `LINK_LIST_RESP`.
+- Version-history table entry (§ Protocol Version History) recording this
+  as an additive, non-breaking change.
+
+## Acceptance criteria
+
+- `docs/PROTOCOL.md` section is unambiguous enough that SRV.01 and WEB.09
+  can implement against it without further clarification from PRT.04.
+- No existing message's byte layout for a client that omits the new
+  trailing fields changes.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+PRT.04 [2026-08-26]: **Correction before starting implementation** —
+`docs/PROTOCOL.md`'s existing §7.5/§7.10 text already documents
+`LINK_CREATE`'s `expires_at` field and it is already enforced
+server-side (`vw_share.c:505`). This task's original Work section
+duplicated it as if new; struck it and narrowed scope to the password
+field only. See `TASK-185`'s Notes for the full correction. Proceeding
+with password-only.
+
+PRT.04 [2026-08-26]: Design/spec complete.
+
+- Checked `vw_share_record_t` before designing the wire fields: it's a
+  fixed 128-byte record with exactly 40 `_reserved` bytes, by design, so
+  additive fields can land without an on-disk migration — a full
+  Argon2id hash+salt (32+16=48 bytes) doesn't fit. Resolved by deriving
+  the salt from `link_token` (`HMAC-SHA256(key=link_token,
+  "vw-link-pw-salt")[0:16]`) instead of storing one — `link_token` is
+  already unique/unpredictable per link, which is all a salt actually
+  needs (salts have never needed to be secret). This uses
+  `vw_crypto_argon2id_hash`/`_verify` completely unmodified — no new
+  hashing or comparison code, only a salt-derivation step ahead of the
+  existing calls, which is what the security note's "do not roll a new
+  comparison" guidance actually cared about. Fits in 33 of the 40
+  reserved bytes (`link_password_hash[32]` + `has_link_password[1]`).
+- `docs/PROTOCOL.md`: `LINK_CREATE`/`LINK_ACCESS` payload additions,
+  `LINK_LIST_RESP`'s `has_password` field, the share-record field
+  additions with the salt-derivation rationale written out in full (so
+  a future reader doesn't wonder why there's no stored salt), two new
+  error codes (607/608, §10.1), password-check-ordering prose (checked
+  after the existing token-validity gate, confirmed the existing
+  per-IP `LINK_ACCESS` rate limiter needs to additionally fire on a
+  wrong-password rejection — flagged as real wiring work for `TASK-187`,
+  not something already done), and a new Version History row (22).
+- `vw_proto.h`: `VW_ERR_LINK_PASSWORD_REQUIRED`/`_WRONG` (607/608) added
+  to the shared `vw_err_t` enum.
+- Verified: full project still builds clean (`build-msvc-105`) after the
+  enum addition — no other code references these two new constants yet,
+  as expected at this stage.
+- Moving to `review`/`done`: this is a documentation+header task with no
+  behavior yet to test; `TASK-187` implements against it next.

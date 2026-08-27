@@ -1,6 +1,6 @@
 ---
 id:          TASK-008
-title:       Implement vw_store — users and sessions tables
+title:       "Implement vw_store — users and sessions tables"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

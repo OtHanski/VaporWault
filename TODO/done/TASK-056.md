@@ -1,6 +1,6 @@
 ---
 id:          TASK-056
-title:       Protocol parser fuzz testing
+title:       "Protocol parser fuzz testing"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

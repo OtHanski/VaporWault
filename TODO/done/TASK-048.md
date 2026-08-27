@@ -1,6 +1,6 @@
 ---
 id:          TASK-048
-title:       Implement vw_cluster — node store and NODE_HELLO handshake
+title:       "Implement vw_cluster — node store and NODE_HELLO handshake"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

@@ -79,6 +79,7 @@ struct VwGuiLinkEntry {
     int64_t     created_at = 0;
     int64_t     expires_at = 0;
     uint8_t     revoked = 0;
+    uint8_t     has_password = 0; /* TASK-186/189; never the password/hash itself */
 };
 
 /* Vault / E2EE (TASK-100; library: TASK-099, docs/PROTOCOL.md §7.11).
@@ -87,6 +88,45 @@ struct VwGuiVaultEntry {
     uint64_t vault_id = 0;
     uint64_t folder_file_id = 0;
     int64_t  created_at = 0;
+};
+
+/* Sync folders (TASK-194; daemon IPC pre-existing, never wrapped for the
+ * GUI before — the Settings view previously only had blind add/remove-
+ * by-typed-path forms, no listing at all). Mirrors
+ * VW_IPC_FOLDER_LIST_RESP's per-entry fields exactly, same shape
+ * vapourwault-cli's `list-folders` decodes. */
+struct VwGuiFolderEntry {
+    std::string local_root;
+    std::string virtual_root;
+    uint8_t     paused = 0;
+    uint8_t     pause_reason = 0;
+    uint64_t    remote_dir_id = 0; /* 0 = owned, nonzero = shared (TASK-106) */
+    std::vector<std::string> excludes; /* TASK-192/193 */
+};
+
+/* Version history (TASK-183; daemon IPC: TASK-182). Mirrors
+ * VW_IPC_VERSION_LIST_RESP's per-entry fields exactly, same shape
+ * vapourwault-cli's `version list` decodes. */
+struct VwGuiVersionEntry {
+    uint64_t version_id = 0;
+    int64_t  created_at = 0;
+    uint64_t size_bytes = 0;
+};
+
+/* Search (TASK-199/200; docs/PROTOCOL.md §7.12). Mirrors
+ * VW_IPC_SEARCH_RESP's per-entry fields exactly, same shape
+ * vapourwault-cli's `search` decodes. No virtual path — see §7.12's own
+ * rationale; the browser view resolves a "jump to location" only for a
+ * result whose file_id it already has a path for via the normal
+ * VW_IPC_FILE_LIST_RESP-derived entries. */
+struct VwGuiSearchEntry {
+    uint64_t    file_id = 0;
+    std::string name;
+    uint8_t     is_dir = 0;
+    uint64_t    size_bytes = 0;
+    int64_t     mtime_unix = 0;
+    uint64_t    vault_id = 0;  /* 0 = unencrypted or a directory */
+    uint8_t     is_shared = 0; /* 1 = visible via a grant, not owned */
 };
 
 /* Multi-account (TASK-161/163). Mirrors VW_IPC_ACCOUNT_LIST_RESP's
@@ -139,6 +179,32 @@ public:
     /* Send FOLDER_REMOVE_REQ. Account-scoped (TASK-161). */
     int send_folder_remove(uint32_t account_id, const char *local_root);
 
+    /* List configured sync folders, including each one's selective-sync
+     * exclude rules (TASK-192/193/194). Returns true on success (out is
+     * cleared and repopulated); false on IPC failure. */
+    bool folder_list(uint32_t account_id, std::vector<VwGuiFolderEntry> *out);
+
+    /* Replace (wholesale, not incremental) local_root's exclude rules.
+     * patterns/count == nullptr/0 clears all rules for that folder.
+     * Returns vw_err_t encoded as int; VW_ERR_NOT_FOUND if local_root
+     * isn't a registered folder for this account. */
+    int folder_set_excludes(uint32_t account_id, const char *local_root,
+                             const std::vector<std::string> &patterns);
+
+    /* Notification preferences (TASK-206/207/209/210; docs/PROTOCOL.md
+     * §7.13). Fetch the account's current VW_NOTIFY_* bitmask. Returns
+     * true on success (*out_prefs set); false on IPC failure or a
+     * non-zero error_code (a scoped session, which no GUI account ever
+     * is in practice). */
+    bool notify_prefs_get(uint32_t account_id, uint32_t *out_prefs);
+
+    /* Replace the account's COMPLETE preference bitmask — not a per-bit
+     * toggle; callers read the current value via notify_prefs_get first,
+     * flip the one bit they care about, and pass the full result here
+     * (§7.13's own documented pattern). Returns vw_err_t encoded as int;
+     * *out_prefs (if non-null) receives the stored value on success. */
+    int notify_prefs_set(uint32_t account_id, uint32_t prefs, uint32_t *out_prefs);
+
     /*
      * Multi-account (TASK-161/163).
      */
@@ -189,6 +255,16 @@ public:
     bool file_list(uint32_t account_id, const char *prefix, std::vector<VwGuiFileEntry> *out);
 
     /*
+     * Filename search (TASK-199/200; docs/PROTOCOL.md §7.12). Returns
+     * true on success (out/out_truncated set; out is cleared and
+     * repopulated, possibly empty — an empty result is not a failure);
+     * false on IPC failure or a nonzero error_code (out_error_code set
+     * either way, mirroring share_list's convention).
+     */
+    bool search(uint32_t account_id, const char *query, std::vector<VwGuiSearchEntry> *out,
+                uint8_t *out_truncated, int *out_error_code);
+
+    /*
      * Sharing (TASK-096). All take a virtual_path — the daemon resolves it
      * to a file_id via vw_client_file_stat before calling through (same
      * as vapourwault-cli's share/create-link commands). Account-scoped
@@ -203,7 +279,7 @@ public:
      * the return value is 0; never re-fetchable afterward (server never
      * re-discloses it), matching the CLI's own one-time-display handling. */
     int link_create(uint32_t account_id, const char *virtual_path, uint8_t permission, int64_t expires_at,
-                     uint64_t *out_share_id, uint8_t out_token[32]);
+                     const char *password, uint64_t *out_share_id, uint8_t out_token[32]);
     int link_revoke(uint32_t account_id, uint64_t share_id);
     bool link_list(uint32_t account_id, std::vector<VwGuiLinkEntry> *out, int *out_error_code);
 
@@ -248,6 +324,18 @@ public:
 
     /* Download and decrypt file_id's current version to local_path. */
     int vault_download(uint32_t account_id, uint64_t vault_id, uint64_t file_id, const char *local_path);
+
+    /*
+     * Version history (TASK-182/183). virtual_path-based, same as
+     * vapourwault-cli's `version list`/`version restore` — see that
+     * daemon IPC's own doc comment in vw_ipc.h for the known limitation
+     * (shared/grant-accessed files aren't reachable this way yet,
+     * TASK-214) and read-only-fallback behavior (version_restore is
+     * write-shaped and gets VW_ERR_READ_ONLY_FALLBACK there).
+     */
+    bool version_list(uint32_t account_id, const char *virtual_path,
+                       std::vector<VwGuiVersionEntry> *out, int *out_error_code);
+    int version_restore(uint32_t account_id, const char *virtual_path, uint64_t version_id);
 
 private:
     uint16_t port_      = VW_IPC_DEFAULT_PORT;

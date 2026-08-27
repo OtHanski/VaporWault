@@ -1,6 +1,6 @@
 ---
 id:          TASK-075
-title:       Implement account lockout after repeated failed login attempts (VW_ERR_AUTH_LOCKED never returned)
+title:       "Implement account lockout after repeated failed login attempts (VW_ERR_AUTH_LOCKED never returned)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

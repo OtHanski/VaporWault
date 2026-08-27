@@ -1,6 +1,6 @@
 ---
 id:          TASK-024
-title:       Implement server-side file transfer request handlers in vw_server_core
+title:       "Implement server-side file transfer request handlers in vw_server_core"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

@@ -1,0 +1,155 @@
+---
+id:          TASK-202
+title:       "Integration + fuzz tests: filename search"
+status:      done
+assignee:    QA.06
+created_by:  ARCH.00
+created:     2026-08-25
+priority:    normal
+depends_on:  [TASK-197, TASK-198, TASK-199, TASK-200, TASK-201]
+blocks:      []
+review_by:   [CQR.08]
+tags:        [test]
+---
+
+**Correction (2026-08-26)**: this task's own "pagination correctness"
+bullet inherited `TASK-196`'s struck cursor-pagination assumption —
+`SEARCH` has no pagination (§7.12: a hard 200-entry cap + `truncated`
+flag instead, same as every other multi-entry response in this
+protocol). Replaced below with the cap-boundary check that actually
+exists to test.
+
+Also found while starting this task: `TASK-198`/`199`/`201` each already
+wrote real, passing cross-user and end-to-end tests as part of their own
+acceptance criteria (not deferred to this task) — `tests/integration/
+test_search.c`/`.py` (wire-level: owner/grantee/stranger visibility, the
+200-vs-201 cap boundary, a scoped-session rejection), `test_cli_search.py`
+(daemon IPC + CLI, same three-party scoping), and `test_gateway.py`'s two
+new tests (gateway HTTP passthrough, same scoping, plus the HTML-special-
+character round-trip). Re-deriving the same cross-user assertions a
+fourth time at this task's layer would be redundant coverage, not
+additional confidence — this task's actual net-new contribution is the
+one item nothing upstream did yet: fuzzing the wire parser.
+
+## Work
+
+- Fuzz the `SEARCH` query-string parser (this project's standing
+  per-phase fuzz policy for protocol parsers) — `tests/fuzz/fuzz_search.c`
+  + `gen_corpus.py` seeds, following this directory's existing pattern.
+- Confirm (by reading, not re-testing from scratch) that the cross-user
+  visibility and end-to-end GUI/CLI/gateway coverage `TASK-198`/`199`/
+  `201` already shipped is real and passing, and note any gap found.
+
+## Acceptance criteria
+
+- The fuzz harness builds and runs clean against the existing corpus and
+  a large randomized smoke run, with no crash or assertion failure.
+- Cross-user visibility (owner/grantee/stranger) and end-to-end GUI/CLI/
+  gateway coverage confirmed to already exist and pass — not re-derived
+  here — with the specific test files and functions named as evidence.
+
+## Notes
+
+<!-- Agents append notes below with their ID and date. Do not delete prior notes. -->
+
+QA.06 [2026-08-26]: Completed per the corrected Work section above.
+
+**Confirmed existing coverage** (read and re-ran, not re-derived):
+
+- `tests/integration/test_search.c` (`test_search.py` wrapper) — 29 TAP
+  checks: owner sees both own matches; grantee (VIEW grant) sees only
+  the shared one with `is_shared=1`; stranger gets `count=0`/
+  `error_code=VW_OK`/`truncated=0` (invisible, not merely denied); a
+  real 201-vs-200 cap-boundary check; an oversized (300-byte) query
+  rejected with `VW_ERR_INVALID_ARG`; a real `LINK_ACCESS`-redeemed
+  scoped session rejected with `VW_ERR_PERMISSION`.
+- `tests/integration/test_cli_search.py` — daemon IPC + real
+  `vapourwault-cli search` subcommand, same three-party scoping, plus
+  case-insensitivity through that whole stack.
+- `tests/integration/test_gateway.py::test_search_permission_scoped_results`
+  and `::test_search_html_special_characters_survive_as_literal_data` —
+  same scoping through the real gateway HTTP/JSON layer, plus the
+  XSS-relevant character round-trip.
+- GUI: `src/gui/client/views/vw_view_browser.cpp`'s search bar — no
+  automated test exists (this GUI has none at all, `TASK-200`'s own
+  notes), so "end-to-end through the desktop GUI" for this feature rests
+  on that task's two-toolchain compile + code review, same disclosed
+  limit as every other GUI feature in this codebase; re-stated here
+  rather than silently treated as fully covered.
+
+Re-ran all of the above just now: `ctest --test-dir build-gw-e2e`
+(19/19) and the full non-cluster pytest integration suite (110 passed,
+15 deselected) — still green, no drift since those tasks closed.
+
+**New fuzz target**: `tests/fuzz/fuzz_search.c` + 9 `gen_corpus.py` seeds
+(`fuzz_search` section — empty/simple/at-cap/over-cap/mixed-case queries,
+a truncated token, a missing query field, a length-prefix lying about
+the bytes that follow, and a header-only frame).
+
+- `search_name_matches()` is gated behind `VW_FH_TESTABLE`/
+  `VW_FILE_HANDLERS_TEST_HOOKS`, which resolves to `static` in the
+  production `vw_server_lib` this directory's `fuzz_target()` macro
+  links — unreachable from a Fuzz-build target, same situation
+  `fuzz_admin_dispatch.c`/`fuzz_cluster_hello.c` already document their
+  own precedent for. Followed that precedent: the matcher's algorithm is
+  reproduced byte-for-byte in the harness (already correctness-tested
+  directly, via `search_name_matches`'s own unit tests in
+  `test_vw_file_handlers.c` — the fuzz copy exists purely to look for
+  crashes on adversarial lengths, not to re-verify behavior). The
+  wire-parsing half (token check, `vw_proto_read_str`, the 256-byte cap)
+  uses the real `vw_proto_read_str()` — a plain public `vw_core`
+  function, no gating involved.
+- **Could not actually run this as a real libFuzzer target in this
+  session**: the `Fuzz` build type requires Clang (`CMakeLists.txt`'s
+  own check), and this environment has neither Clang nor passwordless
+  `sudo` to install it — stated explicitly rather than silently skipped,
+  same as `TASK-200`'s disclosed "no display available" gap. What was
+  actually done instead: compiled `fuzz_search.c` directly with
+  `gcc -fsanitize=address,undefined` against a small hand-written driver
+  (not checked in — a throwaway smoke harness, since the real libFuzzer
+  target is the checked-in artifact) that fed it every seed from
+  `gen_corpus.py`'s new `fuzz_search` section plus 200,000 fully random
+  byte buffers of random length — all completed with no ASan/UBSan
+  report and no assertion failure. This is a real if partial signal
+  (no coverage-guided exploration, unlike genuine libFuzzer), not a
+  substitute for actually running the fuzz target for real; whoever
+  next has Clang available should point it at
+  `tests/fuzz/corpus/fuzz_search/` for a proper run.
+- Confirmed `tests/fuzz/CMakeLists.txt`'s new `fuzz_target(fuzz_search)`
+  line is syntactically correct by configuring `-DCMAKE_BUILD_TYPE=Fuzz`
+  without a C compiler override — it fails at the expected place (the
+  "requires Clang" check), not from a CMake syntax error, proving the
+  registration itself is sound even though the actual fuzz binary
+  couldn't be built here.
+- `gen_corpus.py`: ran it standalone and confirmed all 9 new
+  `fuzz_search` seeds are written correctly (also fed each one through
+  the ASan smoke driver above — all clean).
+
+Moving to `review`.
+
+CQR.08 [2026-08-26]: Reviewed for code quality and consistency.
+
+- `fuzz_search.c` correctly follows this directory's established
+  "inline replication when the real internal function isn't linkable"
+  pattern (`fuzz_admin_dispatch.c`/`fuzz_cluster_hello.c`'s own
+  precedent) rather than inventing a new convention or, worse, quietly
+  fuzzing something less faithful to the real code.
+- The postcondition assertions (`off <= var_len`; the 256-byte cap
+  actually gates the matcher) are genuine invariants worth checking, not
+  filler — matches this directory's own stated rationale for why
+  fuzz targets assert instead of relying purely on the sanitizers.
+- `gen_corpus.py`'s new `fuzz_search` section reuses the existing
+  `frame()`/`token()`/`lenstr()` helpers rather than hand-rolling byte
+  arrays — consistent with every other section in that file.
+- The disclosed inability to run a real libFuzzer target here (no Clang,
+  no passwordless `sudo`) is handled the right way: a real, if partial,
+  substitute verification (ASan/UBSan smoke run over the seeds plus
+  200,000 random buffers) rather than either skipping verification
+  silently or falsely claiming the real thing was run.
+- Correctly avoided re-deriving cross-user/end-to-end tests that
+  `TASK-198`/`199`/`201` already shipped and that still pass — named the
+  specific files/functions as evidence rather than a vague "already
+  covered."
+- No blocking findings. Approved, with the same carried-forward note
+  `TASK-200` set: a human with Clang available should still run the real
+  fuzz target for a proper coverage-guided pass.

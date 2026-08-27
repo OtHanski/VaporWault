@@ -1,6 +1,6 @@
 ---
 id:          TASK-128
-title:       Scaffold vapourwault-web-gateway CMake target
+title:       "Scaffold vapourwault-web-gateway CMake target"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

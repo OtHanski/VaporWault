@@ -166,6 +166,15 @@ class GatewayClient:
     def version_restore(self, path, version_id):
         return self.post("/api/versions/restore", {"path": path, "version_id": version_id})
 
+    def search(self, query):
+        return self.post("/api/search", {"query": query})
+
+    def notify_prefs(self):
+        return self.post("/api/notify/prefs", {})
+
+    def notify_prefs_set(self, prefs):
+        return self.post("/api/notify/prefs/set", {"prefs": prefs})
+
     def share_grant(self, file_id, target_username, permission, expires_at=0):
         return self.post("/api/shares/grant", {
             "file_id": file_id, "target_username": target_username,
@@ -178,9 +187,10 @@ class GatewayClient:
     def share_list(self, mode):
         return self.post("/api/shares/list", {"mode": mode})
 
-    def link_create(self, file_id, permission, expires_at=0):
+    def link_create(self, file_id, permission, expires_at=0, password=""):
         return self.post("/api/links/create", {
             "file_id": file_id, "permission": permission, "expires_at": expires_at,
+            "password": password,
         })
 
     def link_revoke(self, share_id):
@@ -189,10 +199,12 @@ class GatewayClient:
     def link_list(self, file_id_filter=0):
         return self.post("/api/links/list", {"file_id_filter": file_id_filter})
 
-    def link_access(self, link_token_hex, slot=None):
+    def link_access(self, link_token_hex, slot=None, password=None):
         body = {"link_token": link_token_hex}
         if slot is not None:
             body["slot"] = slot
+        if password is not None:
+            body["password"] = password
         r = self.post("/api/links/access", body)
         self._strip_secure_flag()
         if r.status_code == 200 and r.json().get("status") == "ok":
@@ -488,6 +500,172 @@ def test_share_grant_list_revoke(server, clients, unique_username):
     assert matching and matching[0]["revoked"] is True
 
 
+def test_search_permission_scoped_results(server, clients, unique_username):
+    """
+    TASK-201's gateway passthrough of SEARCH/SEARCH_RESP (docs/PROTOCOL.md
+    §7.12), verified at the actual HTTP/JSON layer web/src/api.ts's
+    search() calls — not re-proving the server's own permission logic
+    from scratch (that's TASK-198's test_search.py, at the wire level);
+    this proves the gateway's /api/search correctly carries the same
+    property through: owner sees both of their files, a grantee sees
+    only the one shared with them, and a stranger's search succeeds with
+    zero results rather than an error (the match must be invisible, not
+    merely denied).
+    """
+    # Logged in and out one at a time, never more than one concurrently:
+    # the shared server/gateway fixtures' test server only has 2 workers,
+    # and each logged-in gateway session holds its own persistent
+    # connection to it for the session's lifetime (CLAUDE.md's WEB.09
+    # charter) - three held open at once here previously hung the third
+    # login outright (same worker-pool-exhaustion class of issue TASK-198/
+    # 199's own tests each hit and fixed the same way).
+    grantee_name = f"{unique_username}_grantee"
+    stranger_name = f"{unique_username}_stranger"
+    # Created via the admin socket directly (cheap; not a live gateway
+    # session, so it doesn't tie up one of the test server's 2 workers)
+    # so share_grant below has a real target_username to resolve, without
+    # actually logging the grantee in until owner is done with it.
+    server.create_user(grantee_name, PASSWORD)
+    server.create_user(stranger_name, PASSWORD)
+
+    owner = clients.login(f"{unique_username}_owner", server=server)
+    _upload_plaintext(owner, "/findme_owned.txt", b"owner only")
+    _upload_plaintext(owner, "/findme_shared.txt", b"shared with grantee")
+    shared_file_id = owner.stat("/findme_shared.txt").json()["file_id"]
+    r = owner.share_grant(shared_file_id, grantee_name, VW_PERM_VIEW)
+    assert r.status_code == 200, r.text
+
+    r = owner.search("findme")
+    assert r.status_code == 200, r.text
+    owner_names = {e["name"] for e in r.json()["results"]}
+    assert {"findme_owned.txt", "findme_shared.txt"} <= owner_names
+    owner.logout()
+
+    grantee = clients.login(grantee_name, create_user=False)
+    r = grantee.search("findme")
+    assert r.status_code == 200, r.text
+    grantee_results = {e["name"]: e for e in r.json()["results"]}
+    assert "findme_shared.txt" in grantee_results
+    assert grantee_results["findme_shared.txt"]["is_shared"] == 1
+    assert "findme_owned.txt" not in grantee_results
+    grantee.logout()
+
+    stranger = clients.login(stranger_name, create_user=False)
+    r = stranger.search("findme")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["results"] == []
+    assert body["truncated"] is False
+
+
+def test_search_html_special_characters_survive_as_literal_data(server, clients, unique_username):
+    """
+    Security note on TASK-201: a filename is attacker-controllable (it's
+    whatever the uploader named it, and search surfaces matches across
+    everyone who's shared something with you) and must never be
+    interpreted as markup by the frontend. This test proves the half of
+    that guarantee an HTTP/JSON test actually can: the gateway's JSON
+    encoding (vw_json_write_string) round-trips HTML-special characters
+    byte-for-byte, neither corrupting nor stripping them — `response.json()`
+    decoding this into the exact original string is what makes the other
+    half true. The other half — that web/src/main.ts's renderSearchRow
+    only ever assigns this string to `.textContent`, never `.innerHTML` or
+    any other markup-interpreting sink — isn't something a JSON-only test
+    can observe (there's no browser DOM here); it's verified by code
+    review instead (see TASK-201's own notes), the same way this
+    project's pre-existing renderFileRow already documents doing for
+    every other filename-displaying code path.
+    """
+    client = clients.login(unique_username, server=server)
+    # No '/' in this name deliberately - '/' is this protocol's path
+    # separator (same as any hierarchical filesystem), not an
+    # HTML-special character, and a name containing one would be parsed
+    # as a nested path rather than a literal filename (confirmed while
+    # first writing this test: an HTML closing tag like "</b>" contains
+    # a '/', which made FILE_COMMIT treat everything before it as a
+    # parent directory to resolve - genuinely correct behavior for a
+    # path-based API, not a bug, but the wrong test string for what this
+    # test is actually checking). <, >, &, ", ' below cover the actual
+    # HTML-special characters relevant to the XSS concern.
+    tricky_name = "<img src=x onerror=alert('xss')>&\".txt"
+    _upload_plaintext(client, f"/{tricky_name}", b"gotcha")
+
+    r = client.search("onerror")
+    assert r.status_code == 200, r.text
+    names = [e["name"] for e in r.json()["results"]]
+    assert tricky_name in names
+
+
+# ── Notification preferences (TASK-206/207/211; docs/PROTOCOL.md §7.13) ─────
+
+VW_NOTIFY_SHARE_RECEIVED = 0x0001
+VW_NOTIFY_QUOTA_WARNING = 0x0002
+
+
+def test_notify_prefs_default_off_and_roundtrip(server, clients, unique_username):
+    """
+    TASK-211's gateway passthrough of NOTIFY_PREFS_GET/SET
+    (docs/PROTOCOL.md §7.13), verified at the actual HTTP/JSON layer
+    web/src/api.ts's getNotifyPrefs()/setNotifyPrefs() calls — the
+    server-side bitmask semantics themselves (default off, per-bit
+    gating) are TASK-207's own already-tested territory
+    (tests/unit/test_vw_notify.c); this proves the gateway carries that
+    state through correctly: a fresh account reads back 0, a SET is
+    reflected by a subsequent independent GET (not just the SET
+    response's own echo), and toggling one bit leaves the others alone.
+    """
+    client = clients.login(unique_username, server=server)
+
+    r = client.notify_prefs()
+    assert r.status_code == 200, r.text
+    assert r.json()["prefs"] == 0, "a fresh account must default to every category off"
+
+    r = client.notify_prefs_set(VW_NOTIFY_QUOTA_WARNING)
+    assert r.status_code == 200, r.text
+    assert r.json()["prefs"] == VW_NOTIFY_QUOTA_WARNING
+
+    # Independent fetch, not the SET call's own echoed response — proves
+    # this is real server-side state, not something only the one
+    # connection that set it would see.
+    r = client.notify_prefs()
+    assert r.status_code == 200, r.text
+    assert r.json()["prefs"] == VW_NOTIFY_QUOTA_WARNING
+
+    # Setting a second category must not disturb the first (the gateway
+    # is a thin passthrough — this is exercising the same
+    # read-modify-write discipline web/src/main.ts's toggleNotifyCategory
+    # performs, not a new server-side merge behavior).
+    r = client.notify_prefs_set(VW_NOTIFY_QUOTA_WARNING | VW_NOTIFY_SHARE_RECEIVED)
+    assert r.status_code == 200, r.text
+    assert r.json()["prefs"] == (VW_NOTIFY_QUOTA_WARNING | VW_NOTIFY_SHARE_RECEIVED)
+
+    client.logout()
+
+
+def test_notify_prefs_scoped_to_the_calling_session_only(server, clients, unique_username):
+    """
+    Security note on TASK-211: neither endpoint accepts any account/user
+    identifier in its request body — require_session() derives the
+    account entirely from the caller's own session cookie (same as every
+    other gateway endpoint). This test proves that by construction rather
+    than by inspecting source: two different logged-in accounts each set
+    a distinct preference, and neither observes the other's value.
+    """
+    other_username = f"{unique_username}_other"
+    server.create_user(other_username, PASSWORD)
+
+    a = clients.login(unique_username, server=server)
+    a_result = a.notify_prefs_set(VW_NOTIFY_QUOTA_WARNING)
+    assert a_result.status_code == 200, a_result.text
+    a.logout()
+
+    b = clients.login(other_username, create_user=False)
+    r = b.notify_prefs()
+    assert r.status_code == 200, r.text
+    assert r.json()["prefs"] == 0, "a different account must never see another account's preference"
+    b.logout()
+
+
 def test_public_link_create_redeem_revoke(server, clients, unique_username):
     owner = clients.login(unique_username, server=server)
     r = owner.mkdir("link_test_dir")
@@ -515,6 +693,45 @@ def test_public_link_create_redeem_revoke(server, clients, unique_username):
     r = anon_client.list_files("/")
     assert r.status_code == 401
     assert r.json()["status"] == "auth_required"
+
+
+def test_public_link_password_via_gateway(server, clients, unique_username):
+    """
+    TASK-190: the gateway's own passthrough of TASK-186/187's password
+    protection — distinct from test_link_password.py, which drives the
+    raw wire protocol directly and already covers the server-side
+    enforcement itself.
+    """
+    owner = clients.login(unique_username, server=server)
+    r = owner.mkdir("link_pw_test_dir")
+    dir_id = r.json()["dir_id"]
+
+    r = owner.link_create(dir_id, VW_PERM_VIEW, password="hunter2")
+    assert r.status_code == 200, r.text
+    link_data = r.json()
+
+    r = owner.link_list()
+    entry = next(e for e in r.json() if e["share_id"] == link_data["share_id"])
+    assert entry["has_password"] is True
+
+    # No password at all.
+    anon_no_pw = clients.bare()
+    r = anon_no_pw.link_access(link_data["link_token"])
+    assert r.status_code == 401, r.text
+    assert r.json()["status"] == "link_password_required"
+
+    # Wrong password.
+    anon_wrong = clients.bare()
+    r = anon_wrong.link_access(link_data["link_token"], password="wrong")
+    assert r.status_code == 401, r.text
+    assert r.json()["status"] == "link_password_wrong"
+
+    # Correct password — succeeds exactly like a no-password link.
+    anon_ok = clients.bare()
+    r = anon_ok.link_access(link_data["link_token"], password="hunter2")
+    assert r.status_code == 200, r.text
+    r = anon_ok.list_files("/")
+    assert r.status_code == 200
 
 
 # ── 2. Vault zero-knowledge structural verification ─────────────────────────

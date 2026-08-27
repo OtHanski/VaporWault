@@ -1,6 +1,6 @@
 ---
 id:          TASK-167
-title:       Packaging/deployment docs: gateway state-dir permissions, multi-account daemon layout
+title:       "Packaging/deployment docs - gateway state-dir permissions, multi-account daemon layout"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

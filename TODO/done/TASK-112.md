@@ -1,6 +1,6 @@
 ---
 id:          TASK-112
-title:       Surface per-action sync failures (e.g. quota rejection) into daemon status error_count
+title:       "Surface per-action sync failures (e.g. quota rejection) into daemon status error_count"
 status:      done
 assignee:    CLI.02
 created_by:  QA.06

@@ -1,6 +1,6 @@
 ---
 id:          TASK-069
-title:       End-to-end client-server sync integration test
+title:       "End-to-end client-server sync integration test"
 status:      done
 assignee:    QA.06
 created_by:  ARCH.00

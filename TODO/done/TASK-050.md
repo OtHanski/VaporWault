@@ -1,6 +1,6 @@
 ---
 id:          TASK-050
-title:       GC cluster integration and CLUSTER_STATUS admin handler
+title:       "GC cluster integration and CLUSTER_STATUS admin handler"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

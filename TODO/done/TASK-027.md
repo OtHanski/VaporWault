@@ -1,6 +1,6 @@
 ---
 id:          TASK-027
-title:       Implement vw_ipc — daemon IPC protocol (localhost TCP)
+title:       "Implement vw_ipc — daemon IPC protocol (localhost TCP)"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

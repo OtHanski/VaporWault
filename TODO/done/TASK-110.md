@@ -1,6 +1,6 @@
 ---
 id:          TASK-110
-title:       Fix flaky IT-7 quota-enforcement legacy integration test
+title:       "Fix flaky IT-7 quota-enforcement legacy integration test"
 status:      done
 assignee:    QA.06
 created_by:  CLI.02

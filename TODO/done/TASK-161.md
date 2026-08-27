@@ -1,6 +1,6 @@
 ---
 id:          TASK-161
-title:       Daemon multi-account core: account contexts, per-account state layout, round-robin sync loop, ACCOUNT_* IPC
+title:       "Daemon multi-account core - account contexts, per-account state layout, round-robin sync loop, ACCOUNT_* IPC"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

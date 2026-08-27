@@ -1,6 +1,6 @@
 ---
 id:          TASK-026
-title:       Implement vw_cache — local file metadata cache and sync-state tracker
+title:       "Implement vw_cache — local file metadata cache and sync-state tracker"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

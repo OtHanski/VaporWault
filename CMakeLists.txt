@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.18)
-project(VaporWault C CXX)
+
+# TASK-203: a checked-in VERSION file is the single source of truth for the
+# project version — unlike `git describe`, it works identically for local
+# builds, CI, and a source tarball with no tag/commit history at all.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" VW_VERSION_FILE_CONTENTS LIMIT_COUNT 1)
+string(STRIP "${VW_VERSION_FILE_CONTENTS}" VW_VERSION_FILE_CONTENTS)
+
+project(VaporWault VERSION ${VW_VERSION_FILE_CONTENTS} LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -73,11 +80,49 @@ option(VW_BUILD_TOOLS  "Build admin tools (vwdump)" ON)
 option(VW_BUILD_TESTS  "Build unit and integration tests" ON)
 option(VW_BUILD_WEB_GATEWAY "Build vapourwault-web-gateway (TASK-127/128)" OFF)
 
-# Release version for installer packages (TASK-145/146). Local/dev builds
-# default to a clearly-non-release value; CI passes the real tag with the
-# leading "v" stripped (e.g. -DVW_VERSION=0.2.0 for tag v0.2.0), since
-# .deb/.rpm/MSI version fields don't accept an arbitrary leading letter.
-set(VW_VERSION "0.0.0-dev" CACHE STRING "VaporWault release version (no leading 'v')")
+# Release version for installer packages (TASK-145/146). Defaults to the
+# checked-in VERSION file's contents (TASK-203) so a local/dev build reports
+# a real, meaningful version instead of a placeholder; CI passes the real
+# tag with the leading "v" stripped (e.g. -DVW_VERSION=0.2.0 for tag v0.2.0),
+# since .deb/.rpm/MSI version fields don't accept an arbitrary leading letter.
+set(VW_VERSION "${VW_VERSION_FILE_CONTENTS}" CACHE STRING "VaporWault release version (no leading 'v')")
+
+# ── Embedded version string for `--version` output (TASK-203) ───────────────
+# Best-effort short git hash appended when this is a git checkout and `git`
+# is on PATH; must not fail configure otherwise (e.g. a source tarball with
+# no .git directory, or a machine with no git installed).
+set(VW_GIT_HASH "")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE VW_GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE VW_GIT_HASH_RC
+    )
+    if(NOT VW_GIT_HASH_RC EQUAL 0)
+        set(VW_GIT_HASH "")
+    endif()
+endif()
+
+if(VW_GIT_HASH)
+    set(VW_VERSION_STRING "${VW_VERSION}+${VW_GIT_HASH}")
+else()
+    set(VW_VERSION_STRING "${VW_VERSION}")
+endif()
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vw_version.h.in"
+    "${CMAKE_BINARY_DIR}/generated/vw_version.h"
+    @ONLY
+)
+
+# INTERFACE-only: every binary links this for the generated header's include
+# path, not for any actual object code.
+add_library(vw_version INTERFACE)
+target_include_directories(vw_version INTERFACE "${CMAKE_BINARY_DIR}/generated")
 
 # Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

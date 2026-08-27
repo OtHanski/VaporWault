@@ -1,6 +1,6 @@
 ---
 id:          TASK-105
-title:       Server silently hangs (no error, no close) on an unexpected message type after auth instead of responding with an error
+title:       "Server silently hangs (no error, no close) on an unexpected message type after auth instead of responding with an error"
 status:      done
 assignee:    SRV.01
 created_by:  SRV.01

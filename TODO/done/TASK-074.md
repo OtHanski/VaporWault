@@ -1,6 +1,6 @@
 ---
 id:          TASK-074
-title:       Admin socket handles only one request per connection; AdminClient (and possibly future admin tooling) expects a persistent multi-RPC connection
+title:       "Admin socket handles only one request per connection; AdminClient (and possibly future admin tooling) expects a persistent multi-RPC connection"
 status:      done
 assignee:    QA.06
 created_by:  SRV.01

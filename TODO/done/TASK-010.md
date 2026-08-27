@@ -1,6 +1,6 @@
 ---
 id:          TASK-010
-title:       Implement vw_smtp — SMTP relay client
+title:       "Implement vw_smtp — SMTP relay client"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

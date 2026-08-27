@@ -1,6 +1,6 @@
 ---
 id:          TASK-145
-title:       Design proper installer packages for server & client (CPack DEB/RPM/MSI)
+title:       "Design proper installer packages for server & client (CPack DEB/RPM/MSI)"
 status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00

@@ -1,6 +1,6 @@
 ---
 id:          TASK-103
-title:       Real peer-UID verification for the daemon IPC channel on Windows
+title:       "Real peer-UID verification for the daemon IPC channel on Windows"
 status:      done
 assignee:    CLI.02
 created_by:  ARCH.00

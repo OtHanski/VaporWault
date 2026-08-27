@@ -1,6 +1,6 @@
 ---
 id:          TASK-157
-title:       FILE_MOVE never updates the path_ht index — renamed/moved files become permanently unresolvable by path
+title:       "FILE_MOVE never updates the path_ht index — renamed/moved files become permanently unresolvable by path"
 status:      done
 assignee:    SRV.01
 created_by:  WEB.09

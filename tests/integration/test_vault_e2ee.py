@@ -19,30 +19,23 @@ details to something that speaks the wire protocol — except here that
 "something" is a subprocess, not an in-process VwClient.
 """
 
-import os
 import subprocess
 
 import pytest
 
-
-def _find_vault_e2ee_bin():
-    """
-    Locate the compiled test_vault_e2ee binary. Mirrors conftest.py's
-    Binaries._find() search order; not folded into that shared helper since
-    it resolves a test-only binary, not a product binary.
-    """
-    name = "test_vault_e2ee.exe" if os.name == "nt" else "test_vault_e2ee"
-    for d in ("build/bin", "build-release/bin", "../build/bin",
-              "build-wsl-werror/bin", "build-wsl/bin"):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return os.path.abspath(p)
-    return None
+from conftest import _find_client_bin
 
 
 @pytest.fixture(scope="module")
 def vault_e2ee_bin():
-    path = _find_vault_e2ee_bin()
+    # TASK-217: this used to hand-roll its own search list with the
+    # stated rationale "not folded into conftest.py's shared helper since
+    # it resolves a test-only binary, not a product binary" — that
+    # distinction doesn't actually matter for a directory *search order*
+    # (the helper is already generic over the binary name), and the
+    # separate copy is exactly what let this list drift and miss
+    # build-gw-e2e/bin while conftest.py's own copy got it. Folded in.
+    path = _find_client_bin("test_vault_e2ee")
     if not path:
         pytest.skip("test_vault_e2ee binary not found (build it first)")
     return path

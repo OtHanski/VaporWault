@@ -1,6 +1,6 @@
 ---
 id:          TASK-117
-title:       Server runs single-threaded on Windows (thread pool unimplemented)
+title:       "Server runs single-threaded on Windows (thread pool unimplemented)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

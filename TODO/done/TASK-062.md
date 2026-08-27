@@ -1,6 +1,6 @@
 ---
 id:          TASK-062
-title:       Linux packaging — systemd service unit and install script
+title:       "Linux packaging — systemd service unit and install script"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

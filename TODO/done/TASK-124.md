@@ -1,6 +1,6 @@
 ---
 id:          TASK-124
-title:       Wire oplog v17 timestamp + FILE_* discriminators into the audit log view
+title:       "Wire oplog v17 timestamp + FILE_* discriminators into the audit log view"
 status:      done
 assignee:    GUI.03
 created_by:  PRT.04

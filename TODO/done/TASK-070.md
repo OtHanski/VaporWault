@@ -1,6 +1,6 @@
 ---
 id:          TASK-070
-title:       Call vw_crypto_init() during server startup (CI fully red)
+title:       "Call vw_crypto_init() during server startup (CI fully red)"
 status:      done
 assignee:    SRV.01
 created_by:  ARCH.00

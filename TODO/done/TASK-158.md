@@ -1,6 +1,6 @@
 ---
 id:          TASK-158
-title:       GUI file browser: use FILE_LIST_RESP's new per-entry vault_id instead of the capped per-file IPC lookup
+title:       "GUI file browser - use FILE_LIST_RESP's new per-entry vault_id instead of the capped per-file IPC lookup"
 status:      done
 assignee:    GUI.03
 created_by:  PRT.04

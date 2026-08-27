@@ -12,9 +12,11 @@ set(CPACK_PACKAGE_NAME "vaporwault")
 set(CPACK_PACKAGE_VENDOR "VaporWault")
 set(CPACK_PACKAGE_CONTACT "vapourwault@example.invalid")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "VaporWault self-hosted cloud file sync")
-# No PROJECT_VERSION exists (top-level project() call has no VERSION arg),
-# so CPack needs this set explicitly. VW_VERSION defaults to "0.0.0-dev"
-# for local builds; CI passes the real (leading-"v"-stripped) tag.
+# Set explicitly rather than relying on CPack's PROJECT_VERSION default
+# (TASK-203 added a VERSION arg to the top-level project() call, but that's
+# sourced from the checked-in VERSION file, not the release tag). VW_VERSION
+# defaults to the VERSION file's contents for local builds; CI passes the
+# real (leading-"v"-stripped) tag, which is what actually ships.
 set(CPACK_PACKAGE_VERSION "${VW_VERSION}")
 
 # Component-based packaging: one package per component (TASK-145 design).

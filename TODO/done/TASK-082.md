@@ -1,6 +1,6 @@
 ---
 id:          TASK-082
-title:       Harden release pipeline follow-ups (GUI CI coverage, smoke test, action SHA-pinning)
+title:       "Harden release pipeline follow-ups (GUI CI coverage, smoke test, action SHA-pinning)"
 status:      done
 assignee:    BLD.05
 created_by:  ARCH.00

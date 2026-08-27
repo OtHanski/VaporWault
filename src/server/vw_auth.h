@@ -21,6 +21,7 @@
 #include "../core/vw_proto.h"
 #include "vw_smtp.h"
 #include "vw_store.h"
+#include "vw_notify.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -77,6 +78,13 @@ vw_err_t vw_auth_open(vw_store_t *store, const vw_smtp_cfg_t *smtp_cfg,
                        const vw_auth_cfg_t *cfg, vw_auth_ctx_t **out_ctx);
 
 void vw_auth_close(vw_auth_ctx_t *ctx);
+
+/*
+ * Attach the notification dispatch context (TASK-208). Borrowed; caller
+ * keeps it alive until vw_auth_close. NULL disables the lockout_spike
+ * admin alert.
+ */
+void vw_auth_ctx_set_notify(vw_auth_ctx_t *ctx, vw_notify_ctx_t *notify);
 
 /* ── Password ────────────────────────────────────────────────────────────── */
 
