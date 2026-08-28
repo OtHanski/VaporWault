@@ -181,6 +181,12 @@ class GatewayClient:
     def account_email_set(self, email):
         return self.post("/api/account/email/set", {"email": email})
 
+    def account_2fa(self):
+        return self.post("/api/account/2fa", {})
+
+    def account_2fa_set(self, password, enable):
+        return self.post("/api/account/2fa/set", {"password": password, "enable": enable})
+
     def share_grant(self, file_id, target_username, permission, expires_at=0):
         return self.post("/api/shares/grant", {
             "file_id": file_id, "target_username": target_username,
@@ -733,6 +739,64 @@ def test_account_email_scoped_to_the_calling_session_only(server, clients, uniqu
     dup = b.account_email_set(address)
     assert dup.status_code == 409, dup.text
     b.logout()
+
+
+def test_account_2fa_requires_email_and_correct_password(server, clients, unique_username):
+    """
+    TASK-219's gateway passthrough of ACCOUNT_2FA_GET/SET
+    (docs/PROTOCOL.md §7.15), verified at the actual HTTP/JSON layer
+    web/src/api.ts's getAccount2fa()/setAccount2fa() calls use. This is
+    also the regression test for two real bugs review caught before this
+    shipped: (1) the gateway originally read "enable" via a numeric-only
+    JSON field reader, which would have rejected every real call from the
+    frontend (JS sends a JSON boolean, not a number); (2) VW_ERR_AUTH_BAD_
+    CREDS (wrong current password) fell through to send_file_op_error's
+    default case, which evicts the session and returns a generic 500 -
+    both fixed to return a clean 401 without touching the session.
+    """
+    client = clients.login(unique_username, server=server)
+
+    r = client.account_2fa()
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is False, "a fresh account must default to 2FA off"
+
+    # No email on file yet - enabling must be refused, and the session
+    # must still be usable afterward (proves no eviction happened).
+    r = client.account_2fa_set(PASSWORD, True)
+    assert r.status_code == 400, r.text
+    r2 = client.account_2fa()
+    assert r2.status_code == 200, "session must survive a rejected 2FA-enable attempt"
+
+    address = f"{unique_username}@example.com"
+    r = client.account_email_set(address)
+    assert r.status_code == 200, f"account email set failed: {r.text}"
+
+    # Wrong password: refused with a clean 401, session still usable
+    # afterward (the regression this test exists for).
+    r = client.account_2fa_set("wrong-password", True)
+    assert r.status_code == 401, r.text
+    r2 = client.account_2fa()
+    assert r2.status_code == 200, "session must survive a wrong-password 2FA attempt, not be evicted"
+    assert r2.json()["enabled"] is False
+
+    # Correct password + email on file: enabling succeeds for real.
+    r = client.account_2fa_set(PASSWORD, True)
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is True
+
+    r = client.account_2fa()
+    assert r.status_code == 200
+    assert r.json()["enabled"] is True
+
+    # Disabling requires the correct password too.
+    r = client.account_2fa_set("wrong-password", False)
+    assert r.status_code == 401, r.text
+
+    r = client.account_2fa_set(PASSWORD, False)
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is False
+
+    client.logout()
 
 
 def test_public_link_create_redeem_revoke(server, clients, unique_username):

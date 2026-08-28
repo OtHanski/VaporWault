@@ -248,6 +248,24 @@ export function setAccountEmail(email: string): Promise<ApiResult<AccountEmailRe
   return apiPost("/api/account/email/set", { email });
 }
 
+// Account self-service two-factor enrollment (TASK-219; docs/PROTOCOL.md
+// §7.15). Enabling/disabling requires the current password - a
+// security-sensitive toggle, not a preference.
+export interface Account2faResponse {
+  enabled: boolean;
+}
+
+export function getAccount2fa(): Promise<ApiResult<Account2faResponse>> {
+  return apiPost("/api/account/2fa", {});
+}
+
+export function setAccount2fa(
+  password: string,
+  enable: boolean,
+): Promise<ApiResult<Account2faResponse>> {
+  return apiPost("/api/account/2fa/set", { password, enable });
+}
+
 export function mkdir(name: string, parentDirId = 0): Promise<ApiResult<{ dir_id: number }>> {
   return apiPost("/api/files/mkdir", { name, parent_dir_id: parentDirId });
 }

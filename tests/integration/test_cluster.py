@@ -81,6 +81,15 @@ _VW_MSG_CLUSTER_FILE_SYNC_LIST = 0x0708
 _VW_MSG_CLUSTER_FILE_SYNC_LIST_RESP = 0x0709
 _VW_ERR_PROTO_INVALID = 200
 
+# TASK-220: notify_prefs.db replication (docs/PROTOCOL.md §7.13/§7.7).
+_VW_MSG_NOTIFY_PREFS_GET = 0x0A01
+_VW_MSG_NOTIFY_PREFS_GET_RESP = 0x0A02
+_VW_MSG_NOTIFY_PREFS_SET = 0x0A03
+_VW_MSG_NOTIFY_PREFS_SET_ACK = 0x0A04
+_VW_NOTIFY_SHARE_RECEIVED = 0x0001
+_VW_NOTIFY_QUOTA_WARNING = 0x0002
+_VW_NOTIFY_NEW_LOGIN = 0x0004
+
 
 def _vw_connect_authed(host, port, username, password, timeout=10):
     """Like _vw_auth, but returns the live, authenticated TLS socket
@@ -428,6 +437,109 @@ def test_file_sync_replicates_users_dat(cluster_pair):
     assert matched, (
         "replica's store/users.dat never converged with the primary's — "
         f"primary log:\n{primary.log_contents()}\nreplica log:\n{replica.log_contents()}"
+    )
+
+
+def test_file_sync_replicates_notify_prefs_db(cluster_pair):
+    """
+    TASK-220: store/notify_prefs.db is file tag 9 in the fixed
+    CLUSTER_FILE_SYNC_LIST table (docs/PROTOCOL.md §7.7) — before this
+    task it wasn't synced at all, so a replica's copy was always a fresh,
+    all-defaults-off file regardless of what the primary had on record.
+    Same convergence proof as test_file_sync_replicates_users_dat above,
+    for the newly-added tag.
+    """
+    primary, replica = cluster_pair
+    _pair_nodes(primary, replica)
+    time.sleep(2)
+
+    primary.create_user("notifysynctest", "TestP@ssw0rd!")
+    tls, token = _vw_connect_authed(primary.host, primary.port, "notifysynctest", "TestP@ssw0rd!")
+    try:
+        _vw_send(tls, _VW_MSG_NOTIFY_PREFS_SET, token + struct.pack("<I", _VW_NOTIFY_QUOTA_WARNING))
+        msg_type, payload = _vw_recv(tls)
+        assert msg_type == _VW_MSG_NOTIFY_PREFS_SET_ACK, f"unexpected response 0x{msg_type:04x}"
+        assert struct.unpack("<I", payload[0:4])[0] == 0, "NOTIFY_PREFS_SET did not return VW_OK"
+    finally:
+        tls.close()
+
+    primary_db = os.path.join(primary.data_dir, "store", "notify_prefs.db")
+    replica_db = os.path.join(replica.data_dir, "store", "notify_prefs.db")
+
+    deadline = time.monotonic() + 20
+    matched = False
+    while time.monotonic() < deadline:
+        try:
+            with open(primary_db, "rb") as f:
+                primary_bytes = f.read()
+            with open(replica_db, "rb") as f:
+                replica_bytes = f.read()
+            if primary_bytes == replica_bytes and len(primary_bytes) > 0:
+                matched = True
+                break
+        except FileNotFoundError:
+            pass
+        time.sleep(0.5)
+
+    assert matched, (
+        "replica's store/notify_prefs.db never converged with the primary's — "
+        f"primary log:\n{primary.log_contents()}\nreplica log:\n{replica.log_contents()}"
+    )
+
+
+@pytest.mark.slow
+def test_replica_serves_synced_notify_prefs(cluster_pair):
+    """
+    TASK-220 acceptance criterion: NOTIFY_PREFS_GET served from a
+    fallback-connected replica must return the real, current preference
+    value, not always-default — proving the replica's own
+    vw_store_notify_prefs_get sees the synced notify_prefs.db through
+    vw_store_reload_users_and_quotas's rebuilt notify_prefs/notify_free
+    in-memory state, not just a byte-identical file nobody queries (same
+    proof shape as test_replica_authenticates_synced_user above, and the
+    same bug class it would have caught: file-tag sync alone is not
+    enough if the in-memory reload doesn't also pick up the new table).
+    """
+    primary, replica = cluster_pair
+    _pair_nodes(primary, replica)
+    time.sleep(2)
+
+    primary.create_user("notifyreplicatest", "TestP@ssw0rd!")
+    tls, token = _vw_connect_authed(primary.host, primary.port, "notifyreplicatest", "TestP@ssw0rd!")
+    try:
+        _vw_send(tls, _VW_MSG_NOTIFY_PREFS_SET,
+                 token + struct.pack("<I", _VW_NOTIFY_SHARE_RECEIVED | _VW_NOTIFY_NEW_LOGIN))
+        msg_type, payload = _vw_recv(tls)
+        assert msg_type == _VW_MSG_NOTIFY_PREFS_SET_ACK
+        assert struct.unpack("<I", payload[0:4])[0] == 0
+    finally:
+        tls.close()
+
+    expected = _VW_NOTIFY_SHARE_RECEIVED | _VW_NOTIFY_NEW_LOGIN
+    deadline = time.monotonic() + 20
+    observed = None
+    last_err = None
+    while time.monotonic() < deadline:
+        try:
+            rtls, rtoken = _vw_connect_authed(replica.host, replica.port,
+                                               "notifyreplicatest", "TestP@ssw0rd!")
+            try:
+                _vw_send(rtls, _VW_MSG_NOTIFY_PREFS_GET, rtoken)
+                msg_type, payload = _vw_recv(rtls)
+                if msg_type == _VW_MSG_NOTIFY_PREFS_GET_RESP and struct.unpack("<I", payload[0:4])[0] == 0:
+                    observed = struct.unpack("<I", payload[4:8])[0]
+                    if observed == expected:
+                        break
+            finally:
+                rtls.close()
+        except (ConnectionError, OSError, AssertionError) as exc:
+            last_err = exc
+        time.sleep(0.5)
+
+    assert observed == expected, (
+        f"replica served notify_prefs={observed!r} (want {expected}) — "
+        f"last_err={last_err}; primary log:\n{primary.log_contents()}\n"
+        f"replica log:\n{replica.log_contents()}"
     )
 
 

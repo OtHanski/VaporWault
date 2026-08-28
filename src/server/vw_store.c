@@ -854,21 +854,32 @@ fail:
 /* ── vw_store_reload_users_and_quotas (TASK-172) ─────────────────────────── */
 
 /*
- * Rebuild `live`'s username_ht/email_ht/uid_to_slot/quotas/quota_free from
- * the current on-disk users.dat/quotas.db under data_dir, in place —
- * without ever closing/reopening `live` itself, since other threads
- * already hold that exact pointer (this server's own client-facing
- * request handlers, on a replica that's also serving normal reads while
- * a sync pass is replacing these files). Reuses vw_store_open()'s own
- * (already-reviewed) parsing/hash-table-building logic verbatim by
- * building a completely separate scratch vw_store_t from it, then
- * stealing only the users/quota fields out of it under `live`'s own
- * users_lock/quota_lock, rather than duplicating that logic into a
- * second, parallel code path that could silently drift from the
+ * Rebuild `live`'s username_ht/email_ht/uid_to_slot/quotas/quota_free/
+ * notify_prefs/notify_free from the current on-disk users.dat/quotas.db/
+ * notify_prefs.db under data_dir, in place — without ever closing/
+ * reopening `live` itself, since other threads already hold that exact
+ * pointer (this server's own client-facing request handlers, on a
+ * replica that's also serving normal reads while a sync pass is
+ * replacing these files). Reuses vw_store_open()'s own (already-
+ * reviewed) parsing/hash-table-building logic verbatim by building a
+ * completely separate scratch vw_store_t from it, then stealing only
+ * the users/quota/notify_prefs fields out of it under `live`'s own
+ * users_lock/quota_lock/notify_lock, rather than duplicating that logic
+ * into a second, parallel code path that could silently drift from the
  * original. sessions.dat is deliberately never touched here (see
  * docs/PROTOCOL.md §7.7's own "deliberately never synced this way" note
  * — scratch's freshly-built session fields are simply discarded along
  * with the rest of scratch via vw_store_close()).
+ *
+ * notify_prefs (TASK-220) joined this reload — rather than getting its
+ * own function — for the same reason quotas already shares this one
+ * with users: it is per-account state living in the same vw_store_t,
+ * synced by the same cluster file-sync pass, with the identical
+ * build-scratch/steal-fields/discard-scratch hazard (this function's own
+ * name predates that addition and was kept rather than renamed, since
+ * there is exactly one real caller — vw_cluster.c — and every mention of
+ * it elsewhere is a doc-comment cross-reference, not a second call site
+ * that would need updating).
  *
  * Returns whatever vw_store_open() on the scratch instance returns; on
  * failure `live` is left completely unchanged (scratch never opened
@@ -907,6 +918,16 @@ vw_err_t vw_store_reload_users_and_quotas(vw_store_t *live, const char *data_dir
     live->quota_free_len  = scratch->quota_free_len;
     live->quota_free_cap  = scratch->quota_free_cap;
     rwlock_wrunlock(&live->quota_lock);
+
+    rwlock_wrlock(&live->notify_lock);
+    free(live->notify_prefs);
+    free(live->notify_free);
+    live->notify_prefs     = scratch->notify_prefs;     scratch->notify_prefs     = NULL;
+    live->notify_nslots    = scratch->notify_nslots;
+    live->notify_free      = scratch->notify_free;      scratch->notify_free      = NULL;
+    live->notify_free_len  = scratch->notify_free_len;
+    live->notify_free_cap  = scratch->notify_free_cap;
+    rwlock_wrunlock(&live->notify_lock);
 
     /* Frees scratch's own (unused, freshly-built, discarded) session
      * fields and the now-NULL stolen fields harmlessly. */

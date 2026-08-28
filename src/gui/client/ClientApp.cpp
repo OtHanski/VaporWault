@@ -234,6 +234,7 @@ void ClientApp::switch_active_account(uint32_t account_id) {
     vw_view_browser_invalidate();
     vw_view_shared_invalidate();
     vw_view_vault_invalidate();
+    vw_view_settings_invalidate();
 }
 
 bool ClientApp::ipc_account_list(std::vector<VwGuiAccountEntry> *out) {
@@ -274,6 +275,7 @@ int ClientApp::ipc_account_remove(uint32_t account_id) {
         vw_view_browser_invalidate();
         vw_view_shared_invalidate();
         vw_view_vault_invalidate();
+        vw_view_settings_invalidate();
     }
     return rc;
 }
@@ -309,6 +311,14 @@ bool ClientApp::ipc_account_email_get(std::string *out_email) {
 int ClientApp::ipc_account_email_set(const std::string &email, std::string *out_email) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.account_email_set(active_account_id_, email, out_email);
+}
+bool ClientApp::ipc_account_2fa_get(uint8_t *out_enabled) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.account_2fa_get(active_account_id_, out_enabled);
+}
+int ClientApp::ipc_account_2fa_set(const std::string &password, bool enable, uint8_t *out_enabled) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.account_2fa_set(active_account_id_, password, enable, out_enabled);
 }
 bool ClientApp::ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out) {
     std::lock_guard<std::mutex> lk(status_mutex_);

@@ -1298,6 +1298,48 @@ static int cmd_account_email_set(vw_ipc_conn_t *conn, uint32_t account_id, const
     return 0;
 }
 
+/* ── Subcommand: account 2fa (TASK-219; docs/PROTOCOL.md §7.15) ──────────── */
+
+/* ACCOUNT_2FA_GET_REQ: u32 account_id. _GET_RESP: u32 error_code, u8 otp_enabled. */
+static int cmd_account_2fa_get(vw_ipc_conn_t *conn, uint32_t account_id) {
+    uint8_t req[4];
+    vw_write_u32le(req, account_id);
+
+    uint8_t resp[5];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_ACCOUNT_2FA_GET_REQ, req, sizeof(req),
+                             VW_IPC_ACCOUNT_2FA_GET_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "account 2fa: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "account 2fa")) return 1;
+
+    printf("%s\n", (rlen >= 5u && resp[4]) ? "on" : "off");
+    return 0;
+}
+
+/* ACCOUNT_2FA_SET_REQ: u32 account_id, string password, u8 enable.
+ * _SET_ACK: u32 error_code, u8 otp_enabled (stored value after the call). */
+static int cmd_account_2fa_set(vw_ipc_conn_t *conn, uint32_t account_id,
+                                const char *password, int enable) {
+    uint8_t req[4u + 2u + 256u + 1u];
+    uint32_t off = 0;
+    vw_write_u32le(req + off, account_id); off += 4u;
+    if (vw_ipc_write_str(req, sizeof(req), &off, password, (uint16_t)strlen(password)) != VW_OK) {
+        fprintf(stderr, "account 2fa: password too long\n");
+        return 1;
+    }
+    req[off++] = (uint8_t)(enable ? 1 : 0);
+
+    uint8_t resp[5];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_ACCOUNT_2FA_SET_REQ, req, off,
+                             VW_IPC_ACCOUNT_2FA_SET_ACK, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) { fprintf(stderr, "account 2fa: IPC error %d\n", (int)err); return 1; }
+    if (check_u32_resp(resp, rlen, "account 2fa")) return 1;
+
+    printf("2fa: %s\n", (rlen >= 5u && resp[4]) ? "on" : "off");
+    return 0;
+}
+
 /* ── Usage ───────────────────────────────────────────────────────────────── */
 
 static void print_usage(const char *prog) {
@@ -1332,6 +1374,11 @@ static void print_usage(const char *prog) {
         "  account email set <address>   Set (or change) the current account's\n"
         "                                email address — required for password\n"
         "                                recovery and email alerts (see \"notify\")\n"
+        "  account 2fa                   Show whether 2FA is currently on\n"
+        "  account 2fa on|off <password|-|--stdin-password>\n"
+        "                                Enable/disable email-OTP two-factor login\n"
+        "                                (requires your current password; \"on\"\n"
+        "                                requires an account email already set)\n"
         "\n"
         "Commands (account-scoped ones use --account, or the sole configured\n"
         "account if only one exists):\n"
@@ -1745,7 +1792,62 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
             return 1;
         }
 
-        fprintf(stderr, "error: unknown account subcommand '%s' (expected add|list|remove|email)\n", subcmd);
+        if (strcmp(subcmd, "2fa") == 0) {
+            uint32_t status_account_id = 0;
+            if (argi >= argc) {
+                if (resolve_account_id(ipc_port, account_arg, &status_account_id)) return 1;
+                vw_ipc_conn_t *c = cli_connect(ipc_port);
+                if (!c) return 1;
+                int rc = cmd_account_2fa_get(c, status_account_id);
+                vw_ipc_conn_close(c);
+                return rc;
+            }
+            if (argi + 1 >= argc) {
+                fprintf(stderr,
+                    "Usage: %s account 2fa | account 2fa on|off <password|-|--stdin-password>\n"
+                    "  Requires your current password — same bar a real password\n"
+                    "  change should have. 'on' requires an account email to already\n"
+                    "  be set (account email set <address>) — 2FA codes are emailed,\n"
+                    "  so enabling it without one would lock you out of every future\n"
+                    "  login.\n",
+                    argv[0]);
+                return 1;
+            }
+            int enable;
+            if      (strcmp(argv[argi], "on")  == 0) enable = 1;
+            else if (strcmp(argv[argi], "off") == 0) enable = 0;
+            else { fprintf(stderr, "account 2fa: expected 'on' or 'off', got '%s'\n", argv[argi]); return 1; }
+            argi++;
+            const char *pw_arg = argv[argi++];
+
+            static char stdin_pw[256];
+            const char *pw;
+            if (strcmp(pw_arg, "-") == 0 || strcmp(pw_arg, "--stdin-password") == 0) {
+                if (!fgets(stdin_pw, (int)sizeof(stdin_pw), stdin)) {
+                    fprintf(stderr, "error: failed to read password from stdin\n");
+                    return 1;
+                }
+                size_t slen = strlen(stdin_pw);
+                if (slen > 0 && stdin_pw[slen - 1] == '\n') stdin_pw[--slen] = '\0';
+                pw = stdin_pw;
+            } else {
+                pw = pw_arg;
+            }
+
+            uint32_t account_id = 0;
+            if (resolve_account_id(ipc_port, account_arg, &account_id)) {
+                memset(stdin_pw, 0, sizeof(stdin_pw));
+                return 1;
+            }
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) { memset(stdin_pw, 0, sizeof(stdin_pw)); return 1; }
+            int rc = cmd_account_2fa_set(c, account_id, pw, enable);
+            vw_ipc_conn_close(c);
+            memset(stdin_pw, 0, sizeof(stdin_pw));
+            return rc;
+        }
+
+        fprintf(stderr, "error: unknown account subcommand '%s' (expected add|list|remove|email|2fa)\n", subcmd);
         return 1;
     }
 

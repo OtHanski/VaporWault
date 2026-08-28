@@ -231,6 +231,37 @@ int VwGuiIpc::account_email_set(uint32_t account_id, const std::string &email,
     return (int)code;
 }
 
+bool VwGuiIpc::account_2fa_get(uint32_t account_id, uint8_t *out_enabled) {
+    uint8_t req[4]; vw_write_u32le(req, account_id);
+    uint8_t resp[5]; uint32_t plen;
+    if (one_shot(VW_IPC_ACCOUNT_2FA_GET_REQ, req, sizeof(req), VW_IPC_ACCOUNT_2FA_GET_RESP,
+                 resp, sizeof(resp), &plen) != VW_OK || plen < 5)
+        return false;
+    if (read_u32_le(resp) != 0) return false; /* error_code */
+    *out_enabled = resp[4];
+    return true;
+}
+
+int VwGuiIpc::account_2fa_set(uint32_t account_id, const std::string &password,
+                               bool enable, uint8_t *out_enabled) {
+    uint8_t req[4 + 2 + 256 + 1];
+    uint32_t off = 0;
+    vw_write_u32le(req, account_id); off += 4;
+    if (vw_ipc_write_str(req, sizeof(req), &off, password.c_str(),
+                          (uint16_t)password.size()) != VW_OK)
+        return (int)VW_ERR_INVALID_ARG;
+    req[off++] = enable ? 1 : 0;
+
+    uint8_t resp[5]; uint32_t plen;
+    vw_err_t err = one_shot(VW_IPC_ACCOUNT_2FA_SET_REQ, req, off,
+                             VW_IPC_ACCOUNT_2FA_SET_ACK, resp, sizeof(resp), &plen);
+    if (err != VW_OK) return (int)err;
+    if (plen < 5) return (int)VW_ERR_IO;
+    uint32_t code = read_u32_le(resp);
+    if (code == 0 && out_enabled) *out_enabled = resp[4];
+    return (int)code;
+}
+
 bool VwGuiIpc::account_list(std::vector<VwGuiAccountEntry> *out) {
     static const uint32_t kRespCap = 65536;
     std::vector<uint8_t> resp(kRespCap);

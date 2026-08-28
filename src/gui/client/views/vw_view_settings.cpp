@@ -82,6 +82,34 @@ static void refresh_account_email(ClientApp &app) {
     }
 }
 
+/* Two-factor login (TASK-219; docs/PROTOCOL.md §7.15). */
+static bool    s_2fa_loaded  = false;
+static uint8_t s_2fa_enabled = 0;
+static char    s_2fa_password[256] = "";
+static char    s_2fa_status[160]   = "";
+
+static void refresh_2fa(ClientApp &app) {
+    uint8_t enabled = 0;
+    if (app.ipc_account_2fa_get(&enabled)) {
+        s_2fa_enabled = enabled;
+        s_2fa_loaded = true;
+    } else {
+        snprintf(s_2fa_status, sizeof(s_2fa_status), "Failed to fetch 2FA status.");
+    }
+}
+
+void vw_view_settings_invalidate() {
+    s_folders_loaded = false;
+    s_folders.clear();
+    s_selected_folder = -1;
+    s_folder_rules_status[0] = '\0';
+    s_notify_loaded = false;
+    s_email_loaded = false;
+    s_2fa_loaded = false;
+    s_2fa_password[0] = '\0';
+    s_2fa_status[0] = '\0';
+}
+
 void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     ImGuiIO &io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 28));
@@ -229,6 +257,37 @@ void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
     }
     ImGui::TextDisabled("Current: %s", s_email_current[0] ? s_email_current : "(none)");
     if (s_email_status[0]) ImGui::TextUnformatted(s_email_status);
+
+    /* Two-factor login (TASK-219; docs/PROTOCOL.md §7.15). */
+    ImGui::Spacing();
+    ImGui::SeparatorText("Two-factor login");
+    if (!s_2fa_loaded) refresh_2fa(app);
+    ImGui::TextDisabled(
+        "Requires your current password to change. Turning this on requires "
+        "an account email above — 2FA codes are emailed.");
+    ImGui::Text("Currently: %s", s_2fa_enabled ? "on" : "off");
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputText("##2fa_password", s_2fa_password, sizeof(s_2fa_password),
+                      ImGuiInputTextFlags_Password);
+    ImGui::SameLine();
+    ImGui::TextDisabled("current password");
+    if (ImGui::Button(s_2fa_enabled ? "Turn off##2fa" : "Turn on##2fa")) {
+        uint8_t stored = 0;
+        int rc = app.ipc_account_2fa_set(s_2fa_password, !s_2fa_enabled, &stored);
+        memset(s_2fa_password, 0, sizeof(s_2fa_password));
+        if (rc == 0) {
+            s_2fa_enabled = stored;
+            s_2fa_status[0] = '\0';
+        } else if (rc == (int)VW_ERR_AUTH_BAD_CREDS) {
+            snprintf(s_2fa_status, sizeof(s_2fa_status), "Incorrect password.");
+        } else if (rc == (int)VW_ERR_INVALID_ARG) {
+            snprintf(s_2fa_status, sizeof(s_2fa_status),
+                     "Set an account email above first — 2FA codes are emailed.");
+        } else {
+            snprintf(s_2fa_status, sizeof(s_2fa_status), "Failed to update 2FA (err %d).", rc);
+        }
+    }
+    if (s_2fa_status[0]) ImGui::TextUnformatted(s_2fa_status);
 
     /* Notification preferences (TASK-206/207/209/210). */
     ImGui::Spacing();

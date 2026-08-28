@@ -9,6 +9,7 @@
 #include "vw_oplog.h"
 #include "vw_notify.h"
 #include "vw_server_core.h"
+#include "../core/vw_crypto.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -3073,6 +3074,97 @@ static vw_err_t handle_account_email_set(vw_store_t *store, vw_conn_t *conn,
     return vw_proto_send(conn, VW_MSG_ACCOUNT_EMAIL_SET_ACK, resp, roff);
 }
 
+/* ── ACCOUNT_2FA_GET / _SET (TASK-219; docs/PROTOCOL.md §7.15) ───────────── */
+
+/* ACCOUNT_2FA_GET payload: session_token[32]. No re-auth needed — a
+ * read of the caller's own status, same posture as ACCOUNT_EMAIL_GET.
+ * _GET_RESP: error_code(u32) + otp_enabled(u8). */
+static vw_err_t handle_account_2fa_get(vw_store_t *store, vw_conn_t *conn,
+                                        const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    vw_user_record_t rec;
+    err = vw_store_user_get_by_id(store, user_id, &rec);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+
+    uint8_t resp[5];
+    vw_write_u32le(resp, 0u); /* VW_OK */
+    resp[4] = rec.otp_enabled;
+    return vw_proto_send(conn, VW_MSG_ACCOUNT_2FA_GET_RESP, resp, sizeof(resp));
+}
+
+/* ── ACCOUNT_2FA_SET (TASK-219; docs/PROTOCOL.md §7.15) ──────────────────── */
+
+/* ACCOUNT_2FA_SET payload: session_token[32] + password_token[32]
+ * (re-proof of the current password, shaped identically to AUTH_REQUEST's
+ * auth_token — Phase-0 SHA-256(password), §8.1) + enable(u8, 0 or 1).
+ * _SET_ACK: error_code(u32) + otp_enabled(u8) — the stored value after
+ * this call (unchanged-from-before on any error), echoed back so a
+ * client never has to issue a follow-up fetch to confirm what it just
+ * set (same pattern as NOTIFY_PREFS_SET_ACK/ACCOUNT_EMAIL_SET_ACK).
+ * error_code is VW_ERR_AUTH_BAD_CREDS if password_token doesn't match
+ * the account's current password, or VW_ERR_INVALID_ARG if enabling
+ * with no email on file — 2FA here is delivered by emailing a one-time
+ * code (vw_auth.c's existing AUTH_CHALLENGE flow), so enabling it for an
+ * account with no email on file would lock that account out of every
+ * future login the moment it tried to send a code nowhere. */
+static vw_err_t handle_account_2fa_set(vw_store_t *store, vw_notify_ctx_t *notify,
+                                        vw_conn_t *conn,
+                                        const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+
+    if (plen < VW_TOKEN_BYTES + VW_TOKEN_BYTES + 1u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+
+    const uint8_t *password_token = payload + VW_TOKEN_BYTES;
+    uint8_t enable = payload[VW_TOKEN_BYTES + VW_TOKEN_BYTES];
+    if (enable != 0 && enable != 1)
+        return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+
+    /* Re-prove the current password before touching this security-
+     * sensitive flag — session-token authority alone is not enough,
+     * same bar a real password change should have. */
+    uint8_t real_hash[32], real_salt[16];
+    err = vw_store_user_get_credentials(store, user_id, real_hash, real_salt);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+    vw_err_t pw_rc = vw_crypto_argon2id_verify(real_hash, real_salt,
+                                                password_token, VW_TOKEN_BYTES);
+    secure_zero(real_hash, sizeof(real_hash));
+    secure_zero(real_salt, sizeof(real_salt));
+    if (pw_rc != VW_OK)
+        return (send_error(conn, VW_ERR_AUTH_BAD_CREDS), VW_OK);
+
+    if (enable) {
+        vw_user_record_t rec;
+        err = vw_store_user_get_by_id(store, user_id, &rec);
+        if (err != VW_OK) return (send_error(conn, err), VW_OK);
+        if (rec.email[0] == '\0')
+            return (send_error(conn, VW_ERR_INVALID_ARG), VW_OK);
+    }
+
+    err = vw_store_user_update_field(store, user_id,
+                                      (uint32_t)offsetof(vw_user_record_t, otp_enabled),
+                                      &enable, 1);
+    if (err != VW_OK) return (send_error(conn, err), VW_OK);
+
+    vw_notify_account_security_change(notify, user_id,
+        enable ? "two-factor authentication was enabled"
+               : "two-factor authentication was disabled");
+
+    uint8_t resp[5];
+    vw_write_u32le(resp, 0u); /* VW_OK */
+    resp[4] = enable;
+    return vw_proto_send(conn, VW_MSG_ACCOUNT_2FA_SET_ACK, resp, sizeof(resp));
+}
+
 /* ── Dispatcher ──────────────────────────────────────────────────────────── */
 
 /*
@@ -3104,6 +3196,7 @@ static int is_write_shaped_msg(vw_msg_type_t type)
     case VW_MSG_VAULT_CREATE:
     case VW_MSG_NOTIFY_PREFS_SET:
     case VW_MSG_ACCOUNT_EMAIL_SET:
+    case VW_MSG_ACCOUNT_2FA_SET:
         return 1;
     default:
         return 0;
@@ -3160,6 +3253,14 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_account_email_get(store, conn, payload, plen);
     case VW_MSG_ACCOUNT_EMAIL_SET:
         return handle_account_email_set(store, conn, payload, plen);
+    case VW_MSG_ACCOUNT_2FA_GET:
+        return handle_account_2fa_get(store, conn, payload, plen);
+    case VW_MSG_ACCOUNT_2FA_SET:
+        /* Account-only, no file/chunk store dependency (TASK-219) — same
+         * dispatch placement as the other account self-service messages
+         * above. Needs vw_notify_ctx_t (account_security_change), unlike
+         * the email handlers, so it's not a straight copy-paste of them. */
+        return handle_account_2fa_set(store, vw_server_ctx_notify(ctx), conn, payload, plen);
     default:
         break;
     }

@@ -313,7 +313,7 @@ static vw_err_t cluster_send_error(vw_conn_t *conn, vw_err_t code)
     return vw_proto_send(conn, VW_MSG_ERROR, buf, len);
 }
 
-#define VW_CLUSTER_FILE_TAG_COUNT 8u
+#define VW_CLUSTER_FILE_TAG_COUNT 9u
 
 /* Fixed, non-negotiated file-tag -> path mapping (docs/PROTOCOL.md §7.7's
  * table). Deliberately never a free-form path string on the wire — see the
@@ -329,6 +329,7 @@ static const char *cluster_file_tag_rel_path(uint8_t tag)
     case 6: return "shares/shares.db";
     case 7: return "vaults/vaults.db";
     case 8: return "vaults/vaults.blob";
+    case 9: return "store/notify_prefs.db"; /* TASK-220 */
     default: return NULL;
     }
 }
@@ -972,7 +973,7 @@ static vw_err_t replica_run_file_sync_pass(vw_cluster_t *ctx, vw_conn_t *conn,
         if (rc != VW_OK) return rc;
 
         switch (tag) {
-        case 1: case 2:       store_dirty      = 1; break;
+        case 1: case 2: case 9: store_dirty      = 1; break;
         case 3: case 4: case 5: file_store_dirty = 1; break;
         case 6:                share_dirty      = 1; break;
         case 7: case 8:        vault_dirty       = 1; break;

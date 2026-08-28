@@ -2089,6 +2089,62 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_ACCOUNT_2FA_SET_REQ: {
+        uint32_t off = 0;
+        if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_ACCOUNT_2FA_SET_ACK, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        const char *pw = NULL; uint16_t pw_len = 0;
+        vw_err_t perr = vw_ipc_read_str(buf, plen, &off, &pw, &pw_len);
+        uint8_t enable = 0;
+        if (perr == VW_OK && off + 1u <= plen) {
+            enable = buf[off]; off += 1u;
+        } else if (perr == VW_OK) {
+            perr = VW_ERR_PROTO_TRUNCATED;
+        }
+        if (perr != VW_OK || pw_len == 0 || !a || !a->sess) {
+            uint8_t rbuf[5] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(perr != VW_OK ? perr :
+                                             pw_len == 0 ? VW_ERR_INVALID_ARG :
+                                             !a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_ACCOUNT_2FA_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            uint8_t rbuf[5] = {0};
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            vw_ipc_send(conn, VW_IPC_ACCOUNT_2FA_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint8_t stored = 0;
+        vw_err_t rc = vw_client_account_2fa_set(a->sess, pw, pw_len,
+                                                 enable ? 1 : 0, &stored);
+        uint8_t rbuf[5];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        rbuf[4] = (rc == VW_OK) ? stored : 0;
+        vw_ipc_send(conn, VW_IPC_ACCOUNT_2FA_SET_ACK, rbuf, sizeof(rbuf));
+        break;
+    }
+
+    case VW_IPC_ACCOUNT_2FA_GET_REQ: {
+        if (plen < 4u) { ipc_send_u32(conn, VW_IPC_ACCOUNT_2FA_GET_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            uint8_t rbuf[5] = {0};
+            vw_write_u32le(rbuf, (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            vw_ipc_send(conn, VW_IPC_ACCOUNT_2FA_GET_RESP, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint8_t enabled = 0;
+        vw_err_t rc = vw_client_account_2fa_get(a->sess, &enabled);
+        uint8_t rbuf[5];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        rbuf[4] = (rc == VW_OK) ? enabled : 0;
+        vw_ipc_send(conn, VW_IPC_ACCOUNT_2FA_GET_RESP, rbuf, sizeof(rbuf));
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }

@@ -196,6 +196,16 @@ typedef enum {
     VW_IPC_VERSION_LIST_BY_ID_RESP    = 0x8048, /* D→C: error_code + count + entries */
     VW_IPC_VERSION_RESTORE_BY_ID_REQ  = 0x8049, /* C→D: account_id + version_id  */
     VW_IPC_VERSION_RESTORE_BY_ID_RESP = 0x804A, /* D→C: error_code               */
+
+    /* TASK-219: account self-service 2FA enrollment — thin passthrough to
+     * the server's ACCOUNT_2FA_SET (docs/PROTOCOL.md §7.15) via
+     * vw_client_account_2fa_set(). Write-shaped: rejected with
+     * VW_ERR_READ_ONLY_FALLBACK while the account is on read-only
+     * fallback, same as every other account-mutating request above. */
+    VW_IPC_ACCOUNT_2FA_SET_REQ  = 0x804B, /* C→D: account_id + password + enable */
+    VW_IPC_ACCOUNT_2FA_SET_ACK  = 0x804C, /* D→C: error_code + otp_enabled       */
+    VW_IPC_ACCOUNT_2FA_GET_REQ  = 0x804D, /* C→D: account_id                    */
+    VW_IPC_ACCOUNT_2FA_GET_RESP = 0x804E, /* D→C: error_code + otp_enabled      */
 } vw_ipc_msg_t;
 
 /*
@@ -596,6 +606,29 @@ typedef enum {
  *   u32 error_code         vw_err_t; 0 = VW_OK. VW_ERR_READ_ONLY_FALLBACK
  *                          if the account is currently on its fallback
  *                          connection (TASK-173) — restoring is a write.
+ *
+ * VW_IPC_ACCOUNT_2FA_SET_REQ:
+ *   u32    account_id
+ *   string password        plaintext current password — hashed to the
+ *                          wire's password_token shape inside
+ *                          vw_client_account_2fa_set(), same as
+ *                          ACCOUNT_ADD_REQ's own plaintext password field
+ *                          above; never touches disk or logs
+ *   u8     enable           1 = enable, 0 = disable
+ * VW_IPC_ACCOUNT_2FA_SET_ACK:
+ *   u32 error_code         vw_err_t; 0 = VW_OK. VW_ERR_READ_ONLY_FALLBACK
+ *                          if the account is currently on its fallback
+ *                          connection (TASK-173). VW_ERR_AUTH_BAD_CREDS
+ *                          if password didn't match. VW_ERR_INVALID_ARG
+ *                          if enabling with no email on file.
+ *   u8  otp_enabled        the stored value after this call
+ *
+ * VW_IPC_ACCOUNT_2FA_GET_REQ:
+ *   u32    account_id
+ * VW_IPC_ACCOUNT_2FA_GET_RESP:
+ *   u32 error_code         vw_err_t; 0 = VW_OK. Works while on fallback
+ *                          (read-only) since this is a read.
+ *   u8  otp_enabled
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

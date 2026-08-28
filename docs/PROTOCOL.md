@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 26 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 28 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -1271,6 +1271,7 @@ already admin-trusted per §7.9's existing trust model):
 | 6 | `shares.db` | User-to-user share grants |
 | 7 | `vaults.db` | Vault registry records |
 | 8 | `vaults.blob` | Vault registry blob storage (wrapped VKs, KDF params) |
+| 9 | `store/notify_prefs.db` | Per-user notification-preference bitmasks (TASK-207/220) |
 
 `files/versions.dat` and `files/versions.blob` are always synced as a
 pair — `versions.dat`'s `blob_offset` field is only meaningful relative
@@ -1895,6 +1896,74 @@ the desktop GUI's Settings view, and the web gateway's
 
 ---
 
+## 7.15 Account Self-Service: Two-Factor Enrollment (TASK-219)
+
+Before this section, there was no self-service **or** admin-driven way
+to change a user's 2FA (email-OTP, §8.3) enrollment after account
+creation at all — `otp_enabled` was write-once at zero (`vw_store_user_
+create` zeroes a fresh record; nothing else ever set it to 1 anywhere in
+the codebase). `TASK-207`'s `account_security_change` alert category was
+designed to fire on "password changed, or 2FA enabled/disabled," but
+until this section shipped, the 2FA half of that had no real trigger to
+fire from — see §7.14's password-recovery analog for the sibling gap
+(email) this same milestone closed.
+
+Single dedicated message pair, same account-scoped shape as §7.13/§7.14
+above (no `user_id` field, no `VW_PERM_*` concept) — but additionally
+requiring the caller to re-prove their current password, since this is
+a security-sensitive toggle, not a preference (same bar a real password
+change should have; recommended and implemented per this task's own
+design note). A single parameterized `SET` was chosen over the two
+separate `2FA_ENABLE`/`2FA_DISABLE` opcodes this task's own filed design
+question raised as an option — both directions need identical re-auth
+handling and payload shape, differing only in the stored boolean, so one
+message covers both without the duplication two near-identical opcodes
+would add; this still avoids the rejected alternative (reviving the
+reserved, unimplemented `USER_MODIFY` as a generic field-patch message)
+for the same reason that task gave: a security-sensitive, single-purpose
+action should not become a general field-patch operation just because
+its payload happens to include one flag.
+
+| Opcode | Message              | Direction | Purpose |
+|--------|-----------------------|-----------|---------|
+| 0x0B05 | ACCOUNT_2FA_SET       | C → S     | Enable or disable the caller's own 2FA enrollment |
+| 0x0B06 | ACCOUNT_2FA_SET_ACK   | S → C     | New `otp_enabled` value, echoed back for confirmation |
+
+**ACCOUNT_2FA_SET payload:**
+
+| Field          | Type      | Notes |
+|----------------|-----------|-------|
+| session_token  | bytes[32] | Must be a real, non-scoped session. |
+| password_token | bytes[32] | Re-proof of the current password — `SHA-256(password)`, identical shape and derivation to `AUTH_REQUEST`'s own `auth_token` (§8.1 Phase 0). Verified server-side against the account's stored Argon2id hash via the same primitive `AUTH_REQUEST` itself uses. |
+| enable         | uint8     | `1` = enable, `0` = disable. Any other value is rejected with `VW_ERR_INVALID_ARG`. |
+
+**ACCOUNT_2FA_SET_ACK payload:**
+
+| Field       | Type   | Notes |
+|-------------|--------|-------|
+| error_code  | uint32 | `VW_OK`, `VW_ERR_AUTH_REQUIRED`, `VW_ERR_PERMISSION` (scoped session), `VW_ERR_INVALID_ARG` (malformed `enable` byte, **or** enabling with no email on file — see below), or `VW_ERR_AUTH_BAD_CREDS` (`password_token` does not match the account's current password) |
+| otp_enabled | uint8  | The stored value after this call — identical to the request's `enable` value on `VW_OK`, unchanged-from-before on any error. |
+
+**Enabling requires an email on file.** 2FA here is delivered by
+emailing a one-time code (the existing `AUTH_CHALLENGE`/`AUTH_OTP` flow,
+§8.3 — this section adds no new delivery mechanism). Enabling it for an
+account with no email on file (§7.14 — still the default state for any
+account that hasn't run `ACCOUNT_EMAIL_SET`) would lock that account out
+of every future login the instant it tried to send a code nowhere, so
+`ACCOUNT_2FA_SET` with `enable=1` and an empty `rec.email` is rejected
+with `VW_ERR_INVALID_ARG` rather than silently creating an unrecoverable
+account. Disabling has no such precondition.
+
+**Storage**: reuses the existing `otp_enabled` field on `vw_user_
+record_t` (`vw_store.h`) — already explicitly supported by `vw_store_
+user_update_field`'s generic single-field setter (its own doc comment
+lists `otp_enabled` as an intended use, alongside `is_active`), so no
+new store-layer function was needed here (unlike email in §7.14, which
+required a bespoke setter for its uniqueness-index side effects —
+`otp_enabled` has no index of its own).
+
+---
+
 ## 8. Authentication Design
 
 ### 8.1 Password transport
@@ -2015,6 +2084,8 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 28      | 2026-08-27 | PRT.04  | Account self-service two-factor enrollment (§7.15), resolving `TASK-219`: new `ACCOUNT_2FA_SET`/`_SET_ACK` (0x0B05–0x0B06). Before this, there was no self-service or admin-driven way to change a user's 2FA enrollment after creation at all, so `TASK-207`'s `account_security_change` alert had no real trigger for its "2FA enabled/disabled" half. Requires re-proving the current password (same shape as `AUTH_REQUEST`'s `auth_token`) before touching the flag — a security-sensitive toggle, not a preference. Enabling with no email on file is rejected (`VW_ERR_INVALID_ARG`): 2FA codes are emailed, so enabling without one would lock the account out of every future login. Chose one parameterized `SET` over this task's own alternative of two separate `2FA_ENABLE`/`2FA_DISABLE` opcodes (identical re-auth handling and shape on both directions, differing only in one stored bit) while still avoiding its rejected alternative (reviving `USER_MODIFY` as a generic field-patch message) for the reason that task itself gave. Storage reuses the existing `otp_enabled` field via `vw_store_user_update_field` — already an explicitly-supported use per that function's own doc comment — no new store-layer setter needed. Entirely new message pair, no existing byte layout changed; no protocol version bump required. |
+| 27      | 2026-08-27 | PRT.04  | Hot-standby replication of `notify_prefs.db` (§7.7), resolving `TASK-220`: new file tag 9 (`store/notify_prefs.db`) added to the fixed `CLUSTER_FILE_SYNC_LIST`/`_FETCH` file-tag table (`vw_cluster_file_tag_t`), `VW_CLUSTER_FILE_TAG_COUNT` 8→9. Before this, a replica's own `notify_prefs.db` was always a fresh, all-defaults-off copy, never synced from the primary — a `NOTIFY_PREFS_GET` served from a fallback-connected replica (TASK-173) always read back 0 regardless of the real preference on file at the primary (stale-but-safe: under-reports opt-in, never over-reports, so no security issue, but a real correctness gap). Also fixed in the same pass, found while implementing rather than deferred: `vw_store_reload_users_and_quotas` (the function the replica's sync pass calls to refresh in-memory state after fetching new files) didn't reload `notify_prefs`/`notify_free` at all — so even with the file tag fixed, a long-running replica process's in-memory preference table would still have gone stale until its next restart. `notify_prefs` reload folded into that existing function rather than a new one, same reasoning already used for quotas sharing it with users. `CLUSTER_FILE_SYNC_LIST_RESP`'s entry count is purely additive (driven entirely by the `VW_CLUSTER_FILE_TAG_COUNT` constant in both the primary and replica implementations); no protocol version bump required. |
 | 26      | 2026-08-27 | PRT.04  | Account self-service email address (§7.14), resolving `TASK-222`: new `ACCOUNT_EMAIL_GET`/`_GET_RESP`/`SET`/`_SET_ACK` (0x0B01–0x0B04). The first real wire path that can ever put a non-empty email on a user record — neither `USER_CREATE_REQ` nor `INVITE_REDEEM` carry one, which silently made the already-shipped `TASK-046` password recovery and `TASK-207`'s notify-preferences system unreachable for every real account. Server-side format validation (`vw_email_validate`) is a hard security requirement, not cosmetic: `vw_smtp.c`'s `MAIL FROM`/`RCPT TO` lines do no escaping of their own, so this is the sole gate against SMTP command injection into the outbound relay. Also fixed in the same pass: `email_ht_insert`'s pre-existing bug where every empty-email account (i.e. every account, until this task) still counted against the index's growth threshold. Entirely new message pair-of-pairs, no existing byte layout changed; no protocol version bump required. |
 | 25      | 2026-08-27 | PRT.04  | Shared-file version history (§7.3), resolving `TASK-214` — **corrects `TASK-182`'s own filed assumption** that `VERSION_RESTORE` resolves by path server-side the same owner-namespaced way `FILE_STAT` does; reading `handle_version_restore` in full found it already resolves `version_id → file_id` and requires `VW_PERM_EDIT` via `effective_permission()`, never using `virtual_path` for anything but shape validation. `VERSION_LIST` was already fully correct too (`file_id` + `VW_PERM_VIEW`). The one real, small gap: `virtual_path` was a *mandatory* non-empty field even though unused — now may be an empty string, meaning "no meaningful path, resolve by `version_id`/`file_id` alone" (a grantee's own case). A caller supplying a real path is completely unaffected; this is a pure server-side permissive relaxation (a previously-always-rejected zero-length string is now accepted), not a new field — no protocol version bump required. The server-side relaxation itself was small enough to land directly in `TASK-214` rather than a separate SRV.01 follow-up; filed the remaining CLI.02 follow-up (`TASK-223`) for the client-core/daemon-IPC/CLI/GUI work needed to actually reach it. |
 | 24      | 2026-08-26 | PRT.04  | Notification preferences (§7.13), resolving `TASK-206`: new `NOTIFY_PREFS_GET`/`_GET_RESP`/`SET`/`_SET_ACK` (0x0A01–0x0A04). Account-scoped only (no `user_id` field, no `VW_PERM_*` concept — same trust bar as a session changing its own password), covering the four user-facing alert categories from `TASK-205`'s design (`share_received`/`quota_warning`/`new_login`/`account_security_change`) as bits 0–3 of a `uint32` bitmask, bits 4–31 reserved. `SET` replaces the whole bitmask rather than toggling one bit, and rejects any reserved bit with `VW_ERR_INVALID_ARG`. Admin-category alerts (`replica_lag` etc.) are deliberately **not** part of this wire protocol — `vapourwaultd.conf`-only per `TASK-205`. Entirely new message pair-of-pairs, no existing byte layout changed; no protocol version bump required. |

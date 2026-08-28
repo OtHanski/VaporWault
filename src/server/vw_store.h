@@ -260,15 +260,15 @@ void vw_store_close(vw_store_t *ctx);
 
 /*
  * TASK-172 (replica hot-standby data replication, docs/PROTOCOL.md §7.7):
- * rebuild `live`'s users/quotas in-memory indexes from the CURRENT
- * on-disk users.dat/quotas.db under data_dir, in place — for when a
- * replica's sync pass has just atomically replaced those files out from
- * under an already-open, already-in-use store context (never close/
- * reopen `live` itself for this: other threads already hold that exact
- * pointer). sessions.dat is never touched by this call (per §7.7's own
- * "deliberately never synced this way" — this store's session table is
- * always this node's own local sessions). On failure, `live` is left
- * completely unchanged.
+ * rebuild `live`'s users/quotas/notify_prefs (TASK-220) in-memory
+ * indexes from the CURRENT on-disk users.dat/quotas.db/notify_prefs.db
+ * under data_dir, in place — for when a replica's sync pass has just
+ * atomically replaced those files out from under an already-open,
+ * already-in-use store context (never close/reopen `live` itself for
+ * this: other threads already hold that exact pointer). sessions.dat is
+ * never touched by this call (per §7.7's own "deliberately never synced
+ * this way" — this store's session table is always this node's own
+ * local sessions). On failure, `live` is left completely unchanged.
  */
 vw_err_t vw_store_reload_users_and_quotas(vw_store_t *live, const char *data_dir);
 

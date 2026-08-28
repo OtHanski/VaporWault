@@ -1965,6 +1965,72 @@ vw_err_t vw_client_account_email_set(vw_client_sess_t *sess, const char *email,
     return VW_OK;
 }
 
+vw_err_t vw_client_account_2fa_get(vw_client_sess_t *sess, uint8_t *out_enabled)
+{
+    vw_err_t err;
+    if (!sess || !out_enabled) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    err = vw_proto_send(sess->conn, VW_MSG_ACCOUNT_2FA_GET,
+                         sess->session_token, VW_TOKEN_BYTES);
+    if (err != VW_OK) return err;
+
+    /* 32 bytes of slack beyond the 5-byte success shape: recv_expect's
+     * VW_MSG_ERROR fallback (vw_proto_encode_error) always carries at
+     * least error_code(u32) + msg_len(u16) = 6 bytes even for an empty
+     * message, which is already bigger than this call's own 5-byte
+     * success ACK — a too-small buffer here doesn't just truncate, it
+     * makes vw_proto_recv report VW_ERR_PROTO_TOO_LARGE (its own
+     * buffer-too-small signal) INSTEAD of the real underlying error the
+     * server actually sent (TASK-219 review finding). */
+    uint8_t rbuf[64];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_ACCOUNT_2FA_GET_RESP, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+    if (rplen < 5u) return VW_ERR_PROTO_TRUNCATED;
+
+    *out_enabled = rbuf[4];
+    return VW_OK;
+}
+
+vw_err_t vw_client_account_2fa_set(vw_client_sess_t *sess,
+                                    const void *password, size_t pw_len,
+                                    int enable, uint8_t *out_enabled)
+{
+    vw_err_t err;
+    if (!sess || !password) return VW_ERR_INVALID_ARG;
+    if ((err = sess_check_valid(sess)) != VW_OK) return err;
+
+    /* Derive password_token = SHA-256(password) — same shape/derivation
+     * as AUTH_REQUEST's own auth_token (PROTOCOL.md §8.1 Phase 1). */
+    uint8_t password_token[VW_TOKEN_BYTES];
+    err = vw_crypto_sha256(password, pw_len, password_token);
+    if (err != VW_OK) return err;
+
+    uint8_t pbuf[VW_TOKEN_BYTES + VW_TOKEN_BYTES + 1u];
+    memcpy(pbuf, sess->session_token, VW_TOKEN_BYTES);
+    memcpy(pbuf + VW_TOKEN_BYTES, password_token, VW_TOKEN_BYTES);
+    pbuf[VW_TOKEN_BYTES + VW_TOKEN_BYTES] = (uint8_t)(enable ? 1 : 0);
+    secure_zero(password_token, VW_TOKEN_BYTES);
+
+    err = vw_proto_send(sess->conn, VW_MSG_ACCOUNT_2FA_SET, pbuf, sizeof(pbuf));
+    secure_zero(pbuf, sizeof(pbuf));
+    if (err != VW_OK) return err;
+
+    /* See vw_client_account_2fa_get's identical comment: a buffer sized
+     * to only this call's own 5-byte success ACK is too small for
+     * recv_expect's VW_MSG_ERROR fallback (>= 6 bytes even empty),
+     * which silently replaces the real error with VW_ERR_PROTO_TOO_LARGE. */
+    uint8_t rbuf[64];
+    uint32_t rplen;
+    err = recv_expect(sess->conn, VW_MSG_ACCOUNT_2FA_SET_ACK, rbuf, sizeof(rbuf), &rplen);
+    if (err != VW_OK) return err;
+    if (rplen < 5u) return VW_ERR_PROTO_TRUNCATED;
+
+    if (out_enabled) *out_enabled = rbuf[4];
+    return VW_OK;
+}
+
 /* ── Vault registry (TASK-099; server side: TASK-098) ────────────────────── */
 
 vw_err_t vw_client_vault_create(vw_client_sess_t *sess, uint64_t folder_file_id,

@@ -273,6 +273,19 @@ typedef enum {
     VW_MSG_ACCOUNT_EMAIL_GET_RESP = 0x0B02,
     VW_MSG_ACCOUNT_EMAIL_SET      = 0x0B03,
     VW_MSG_ACCOUNT_EMAIL_SET_ACK  = 0x0B04,
+
+    /* Account self-service: 2FA enrollment (TASK-219; docs/PROTOCOL.md
+     * §7.15). Same account-scoped trust bar as ACCOUNT_EMAIL_SET above,
+     * but additionally requires re-proving the current password (same
+     * bar a real password change should have — this is a security-
+     * sensitive toggle, not a preference) via password_token, shaped
+     * identically to AUTH_REQUEST's own auth_token field. */
+    VW_MSG_ACCOUNT_2FA_SET      = 0x0B05,
+    VW_MSG_ACCOUNT_2FA_SET_ACK  = 0x0B06,
+    /* Read-only status check — no re-auth needed, same as reading your
+     * own email address; only *changing* the flag requires the password. */
+    VW_MSG_ACCOUNT_2FA_GET      = 0x0B07,
+    VW_MSG_ACCOUNT_2FA_GET_RESP = 0x0B08,
 } vw_msg_type_t;
 
 /* ── Notification preference bitmask (TASK-205/206) ──────────────────────── */

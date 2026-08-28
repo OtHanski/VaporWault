@@ -661,6 +661,15 @@ static void send_file_op_error(vw_gateway_session_pool_t *pool, const char *cook
         case VW_ERR_RATE_LIMITED:
             send_error(conn, 429, "rate_limited");
             return;
+        case VW_ERR_AUTH_BAD_CREDS:
+            /* TASK-219: ACCOUNT_2FA_SET's re-auth check failed (wrong
+             * current password) - an ordinary, expected outcome of a
+             * security-sensitive toggle, not a sign this session/cookie
+             * itself is invalid. Deliberately does NOT evict the session
+             * (unlike the default case below and VW_ERR_AUTH_REQUIRED) -
+             * the caller mistyped their password, not lost their login. */
+            send_error(conn, 401, "bad_credentials");
+            return;
         case VW_ERR_AUTH_REQUIRED:
             /* A perfectly ordinary outcome, not a "connection might be
              * broken" signal - e.g. a scoped (link) session whose
@@ -1147,6 +1156,80 @@ static void handle_account_email_set(vw_gateway_session_pool_t *pool,
     vw_json_write_object_start(&w);
     vw_json_write_key(&w, "email");
     vw_json_write_string(&w, stored, strlen(stored));
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
+/*
+ * Account self-service 2FA enrollment (TASK-219; docs/PROTOCOL.md §7.15).
+ * Same thin-passthrough shape as the email/notify-prefs endpoints above.
+ */
+static void handle_account_2fa_get(vw_gateway_session_pool_t *pool,
+                                    const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+
+    uint8_t enabled = 0;
+    vw_err_t err = vw_client_account_2fa_get(sess, &enabled);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[48];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "enabled");
+    vw_json_write_bool(&w, enabled != 0);
+    vw_json_write_object_end(&w);
+    size_t len = 0;
+    vw_json_writer_result(&w, &len);
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+}
+
+static void handle_account_2fa_set(vw_gateway_session_pool_t *pool,
+                                    const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    char password[256];
+    if (get_json_string_field(req, "password", password, sizeof(password)) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+    /* "enable" is a real JSON boolean (JS sends `true`/`false`), not a
+     * number — read it the same way handle_login's "remember" field does,
+     * not via get_json_uint_field (which only accepts VW_JSON_NUMBER and
+     * would reject every real call from the frontend). */
+    vw_json_value_t enable_v;
+    if (vw_json_object_get((const char *)req->body, req->body_len, "enable", &enable_v) != VW_OK ||
+        enable_v.kind != VW_JSON_BOOL) {
+        vw_crypto_secure_zero(password, sizeof(password));
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint8_t stored = 0;
+    vw_err_t err = vw_client_account_2fa_set(sess, password, strlen(password),
+                                              enable_v.bool_val, &stored);
+    vw_crypto_secure_zero(password, sizeof(password));
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    char buf[48];
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, sizeof(buf));
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "enabled");
+    vw_json_write_bool(&w, stored != 0);
     vw_json_write_object_end(&w);
     size_t len = 0;
     vw_json_writer_result(&w, &len);
@@ -2141,6 +2224,14 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/account/email/set") == 0) {
         handle_account_email_set(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/account/2fa") == 0) {
+        handle_account_2fa_get(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/account/2fa/set") == 0) {
+        handle_account_2fa_set(pool, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/stat") == 0) {

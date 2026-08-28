@@ -49,7 +49,8 @@ Coverage map against TASK-213's own acceptance criteria:
   - Default-off regression:            test_default_off_no_email_for_any_user_category
   - Each user category, opted in:      test_user_category_share_received,
                                         test_user_category_new_login_never_fires_on_session_resume,
-                                        test_user_category_quota_warning_edge_triggers_and_rearms
+                                        test_user_category_quota_warning_edge_triggers_and_rearms,
+                                        test_user_category_account_security_change_via_2fa_toggle
   - Content safety (no secrets):       test_no_email_body_ever_contains_a_secret
   - Admin: disk_capacity:              test_admin_disk_capacity
   - Admin: lockout_spike:              test_admin_lockout_spike
@@ -59,14 +60,15 @@ Coverage map against TASK-213's own acceptance criteria:
                                         through the real vapourwault-cli
                                         binary, never a raw wire call.
 
-Four things are NOT covered here, disclosed rather than silently skipped:
-  - `account_security_change`'s real trigger (password recovery confirm)
-    needs AUTH_RECOVER_REQUEST/CONFIRM support that vw_client.py's
-    VwClient has never implemented (no existing test anywhere in this
-    suite exercises password recovery at all - confirmed by grepping).
-    Building that raw protocol support is a real chunk of new test
-    infrastructure on its own; deferred rather than rushed. Unit-covered
-    (test_vw_notify.c) at the dispatch-logic level.
+Three things are NOT covered here, disclosed rather than silently skipped
+(a fourth, `account_security_change`'s real trigger, WAS covered once
+TASK-219 shipped a trigger simple enough to drive from the CLI — see
+test_user_category_account_security_change_via_2fa_toggle below; the
+password-recovery-confirm trigger specifically remains untested for the
+reason originally given here: it needs AUTH_RECOVER_REQUEST/CONFIRM
+support vw_client.py's VwClient has never implemented, and account_
+security_change firing on ANY of its real triggers is now proven, which
+is what this file's coverage map actually promises):
   - `crash_recovery`'s real trigger needs an oplog file left with a
     genuinely unconfirmed tail entry at the moment of an unclean
     shutdown. Forcing that from outside the process is either a real
@@ -472,6 +474,90 @@ def test_user_category_quota_warning_edge_triggers_and_rearms(
                 assert _wait_until(lambda: len(smtp.messages) >= 2, timeout=20), (
                     "quota_warning did not re-fire after dropping back under threshold and crossing again"
                 )
+            finally:
+                daemon_proc.terminate()
+                try:
+                    daemon_proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    daemon_proc.kill()
+                    daemon_proc.wait(timeout=5)
+        finally:
+            server.stop()
+
+
+def test_user_category_account_security_change_via_2fa_toggle(
+        binaries, tmp_path_factory, daemon_bin, cli_bin, unique_username):
+    """
+    account_security_change's real trigger, closing the gap this file's
+    own module docstring originally disclosed as untested: at the time
+    TASK-213 shipped, the only real trigger for this category was
+    password-recovery confirm, and building raw AUTH_RECOVER_REQUEST/
+    CONFIRM test support was deferred as "a real chunk of new test
+    infrastructure on its own." TASK-219 shipped a second, much simpler
+    real trigger — self-service 2FA enable/disable — reachable through
+    the already-compiled CLI like every other test in this file, no new
+    raw-protocol test infrastructure needed. Uses the real `account
+    email set` mechanism (TASK-222) rather than this file's own
+    `_set_user_email_raw` test-only patcher, since 2FA enable itself
+    requires a real, server-validated email on file.
+    """
+    binaries.require_server()
+    binaries.require_tls()
+
+    with MockSmtpServer() as smtp:
+        server = ServerInstance(
+            binaries, str(tmp_path_factory.mktemp("vw_notify_2fa_server")),
+            extra_conf=_notify_conf(smtp),
+        )
+        server.start()
+        try:
+            user_email = f"{unique_username}@example.com"
+            server.create_user(unique_username, PASSWORD)
+
+            state_dir = tmp_path_factory.mktemp("vw_notify_2fa_daemon")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                ipc_port = s.getsockname()[1]
+            daemon_proc = _spawn_daemon(daemon_bin, state_dir, ipc_port)
+            try:
+                rc, out, err = _cli(cli_bin, ipc_port, "account", "add",
+                                     server.host, str(server.port), unique_username, PASSWORD,
+                                     "--ca-cert", server.cert)
+                assert rc == 0, f"account add failed: {out}\n{err}"
+
+                rc, out, err = _cli(cli_bin, ipc_port, "--account", unique_username,
+                                     "account", "email", "set", user_email)
+                assert rc == 0, f"account email set failed: {out}\n{err}"
+
+                rc, out, err = _cli(cli_bin, ipc_port, "--account", unique_username,
+                                     "notify", "set", "account_security_change", "on")
+                assert rc == 0, f"notify set failed: {out}\n{err}"
+
+                # Enabling 2FA is itself a security-relevant change.
+                rc, out, err = _cli(cli_bin, ipc_port, "--account", unique_username,
+                                     "account", "2fa", "on", PASSWORD)
+                assert rc == 0, f"2fa on failed: {out}\n{err}"
+
+                assert _wait_until(lambda: len(smtp.messages) >= 1), (
+                    "account_security_change email never arrived after enabling 2FA"
+                )
+                time.sleep(0.5)
+                assert len(smtp.messages) == 1, "must fire exactly once per real trigger"
+                msg = smtp.messages[0]
+                assert user_email in msg.to
+                assert "enabled" in msg.body
+
+                # Disabling is a second, distinct security-relevant change.
+                rc, out, err = _cli(cli_bin, ipc_port, "--account", unique_username,
+                                     "account", "2fa", "off", PASSWORD)
+                assert rc == 0, f"2fa off failed: {out}\n{err}"
+
+                assert _wait_until(lambda: len(smtp.messages) >= 2), (
+                    "account_security_change email never arrived after disabling 2FA"
+                )
+                time.sleep(0.5)
+                assert len(smtp.messages) == 2, "must fire exactly once per real trigger"
+                assert "disabled" in smtp.messages[1].body
             finally:
                 daemon_proc.terminate()
                 try:

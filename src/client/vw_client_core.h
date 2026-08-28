@@ -720,6 +720,34 @@ vw_err_t vw_client_account_email_get(vw_client_sess_t *sess, char *out_email,
 vw_err_t vw_client_account_email_set(vw_client_sess_t *sess, const char *email,
                                       char *out_email, size_t out_email_size);
 
+/*
+ * Fetch whether the caller's own 2FA (email OTP) enrollment is currently
+ * enabled. No re-auth needed — a status read, same posture as
+ * vw_client_account_email_get.
+ */
+vw_err_t vw_client_account_2fa_get(vw_client_sess_t *sess, uint8_t *out_enabled);
+
+/*
+ * Enable or disable the caller's own two-factor (email OTP) enrollment
+ * (TASK-219; docs/PROTOCOL.md §7.15). Requires re-proving the current
+ * password (`password`/`pw_len`, plaintext — hashed to the wire's
+ * auth_token shape internally, same as vw_client_connect_and_login's own
+ * SHA-256(password) derivation, PROTOCOL.md §8.1) — session-token
+ * authority alone is not enough for this security-sensitive toggle.
+ *
+ * Returns VW_ERR_AUTH_BAD_CREDS if password doesn't match the account's
+ * current password. Returns VW_ERR_INVALID_ARG when enabling with no
+ * email on file — 2FA here is delivered by emailing a one-time code, so
+ * enabling it without an email would lock the account out of every
+ * future login; set one first via vw_client_account_email_set.
+ * *out_enabled (if non-NULL) receives the stored value after the call
+ * (echoed back by ACCOUNT_2FA_SET_ACK) — identical to the request on
+ * success, unchanged on any error.
+ */
+vw_err_t vw_client_account_2fa_set(vw_client_sess_t *sess,
+                                    const void *password, size_t pw_len,
+                                    int enable, uint8_t *out_enabled);
+
 #ifdef __cplusplus
 }
 #endif

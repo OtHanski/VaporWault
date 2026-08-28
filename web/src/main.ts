@@ -37,6 +37,8 @@ import {
   setNotifyPrefs,
   getAccountEmail,
   setAccountEmail,
+  getAccount2fa,
+  setAccount2fa,
   type FileEntry,
   type VersionEntry,
   type ShareEntry,
@@ -102,6 +104,9 @@ const settingsError = el<HTMLElement>("settings-error");
 const accountEmailInput = el<HTMLInputElement>("account-email-input");
 const accountEmailSaveBtn = el<HTMLButtonElement>("account-email-save-btn");
 const accountEmailCurrent = el<HTMLElement>("account-email-current");
+const account2faPassword = el<HTMLInputElement>("account-2fa-password");
+const account2faToggleBtn = el<HTMLButtonElement>("account-2fa-toggle-btn");
+const account2faCurrent = el<HTMLElement>("account-2fa-current");
 
 const shareView = el<HTMLElement>("share-view");
 const shareFileLabel = el<HTMLElement>("share-file-label");
@@ -1152,7 +1157,45 @@ async function enterSettingsView(): Promise<void> {
   browserView.hidden = true;
   settingsView.hidden = false;
   await refreshAccountEmail();
+  await refreshAccount2fa();
   await refreshNotifyPrefs();
+}
+
+// ── Settings view: two-factor login (TASK-219; docs/PROTOCOL.md §7.15) ─────
+
+let account2faEnabled = false;
+
+async function refreshAccount2fa(): Promise<void> {
+  clearError(settingsError);
+  const result = await getAccount2fa();
+  if (!result.ok) {
+    showError(settingsError, `Could not load 2FA status: ${result.data.status ?? "error"}`);
+    return;
+  }
+  renderAccount2fa(result.data.enabled);
+}
+
+function renderAccount2fa(enabled: boolean): void {
+  account2faEnabled = enabled;
+  account2faCurrent.textContent = `Currently: ${enabled ? "on" : "off"}`;
+  account2faToggleBtn.textContent = enabled ? "Turn off" : "Turn on";
+}
+
+account2faToggleBtn.addEventListener("click", () => { void toggleAccount2fa(); });
+
+async function toggleAccount2fa(): Promise<void> {
+  clearError(settingsError);
+  const result = await setAccount2fa(account2faPassword.value, !account2faEnabled);
+  account2faPassword.value = "";
+  if (!result.ok) {
+    let reason = result.data.status ?? "error";
+    if (result.status === 401) reason = "incorrect password";
+    else if (result.status === 400) reason = "no account email set (2FA codes are emailed)";
+    showError(settingsError, `Could not update 2FA: ${reason}`);
+    await refreshAccount2fa(); // re-sync with real server state
+    return;
+  }
+  renderAccount2fa(result.data.enabled);
 }
 
 // ── Settings view: account email (TASK-222; docs/PROTOCOL.md §7.14) ────────

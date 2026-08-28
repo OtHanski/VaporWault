@@ -218,6 +218,21 @@ public:
     int account_email_set(uint32_t account_id, const std::string &email,
                            std::string *out_email);
 
+    /* Fetch whether the account's 2FA is currently enabled. Returns true
+     * on success (*out_enabled set); false on IPC failure or a non-zero
+     * error_code. No re-auth needed — a status read. */
+    bool account_2fa_get(uint32_t account_id, uint8_t *out_enabled);
+
+    /* Enable or disable the account's own 2FA (email-OTP) enrollment
+     * (TASK-219; docs/PROTOCOL.md §7.15). Requires the current password —
+     * a security-sensitive toggle, not a preference. Returns vw_err_t
+     * encoded as int: VW_ERR_AUTH_BAD_CREDS if password is wrong,
+     * VW_ERR_INVALID_ARG if enabling with no email on file (set one via
+     * account_email_set first). *out_enabled (if non-null) receives the
+     * stored value on success. */
+    int account_2fa_set(uint32_t account_id, const std::string &password,
+                         bool enable, uint8_t *out_enabled);
+
     /*
      * Multi-account (TASK-161/163).
      */

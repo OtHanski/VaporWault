@@ -252,6 +252,20 @@ you want):
 These are emailed to whatever address you set under **Account email**,
 above.
 
+### Two-factor login (2FA)
+
+You can turn on email-based two-factor login for your own account, no
+admin needed — go to **Settings** and find **Two-factor login**, enter
+your current password, and turn it on. Once it's on, logging in will
+also ask you for a one-time code emailed to your account email — which
+is why turning it on requires you to have already set one (above): the
+code has to go somewhere.
+
+Turning it off works the same way — your current password, then off.
+Either direction also sends you a "your account security changed" email
+if you've turned that notification on (above), as a heads-up in case it
+wasn't actually you.
+
 ---
 
 ## Troubleshooting
