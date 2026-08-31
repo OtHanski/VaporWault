@@ -1227,7 +1227,8 @@ static vw_err_t replica_run_chunk_sync_pass(vw_cluster_t *ctx, vw_conn_t *conn,
         free(missing);
     }
 
-    rc = replica_reconcile_chunk_refcounts(ctx->chunks, hashes, count);
+    rc = replica_reconcile_chunk_refcounts(ctx->chunks,
+                                            (const uint8_t (*)[VW_HASH_BYTES])hashes, count);
     free(hashes);
     return rc;
 }

@@ -1379,7 +1379,13 @@ static void print_usage(const char *prog) {
         "                                Enable/disable email-OTP two-factor login\n"
         "                                (requires your current password; \"on\"\n"
         "                                requires an account email already set)\n"
-        "\n"
+        "\n",
+        prog);
+    /* Split across multiple fprintf calls (ISO C99 caps a single, fully
+     * concatenated string literal at 4095 bytes, -Werror=overlength-strings
+     * under -Wpedantic — this help text grew past that as commands were
+     * added; splitting the literal, not shortening the text, is the fix). */
+    fprintf(stderr,
         "Commands (account-scoped ones use --account, or the sole configured\n"
         "account if only one exists):\n"
         "  status                        Show daemon status (all accounts)\n"
@@ -1425,7 +1431,7 @@ static void print_usage(const char *prog) {
         "  --account <label-or-id>    Account to use for an account-scoped command\n"
         "  --version                  Print version and exit\n"
         "  --help, -h                 Show this help\n",
-        prog, (unsigned)VW_IPC_DEFAULT_PORT);
+        (unsigned)VW_IPC_DEFAULT_PORT);
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */

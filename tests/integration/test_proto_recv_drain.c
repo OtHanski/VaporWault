@@ -200,7 +200,11 @@ VW_TEST_SUITE("proto_recv_drain") {
 
     char tmpdir[512];
     make_tmpdir(tmpdir, sizeof(tmpdir));
-    char cert_path[520], key_path[520];
+    /* 600, not 520: tmpdir is a char[512], so GCC's Release-mode
+     * -Wformat-truncation can (correctly) see that path_join's "%s/%s"
+     * could in the worst case need 512 + "/" + filename + NUL, which
+     * exceeds 520 for either filename here. */
+    char cert_path[600], key_path[600];
     path_join(cert_path, sizeof(cert_path), tmpdir, "test_cert.pem");
     path_join(key_path,  sizeof(key_path),  tmpdir, "test_key.pem");
     VW_ASSERT(write_file(cert_path, TEST_CERT_PEM) == 0);

@@ -277,7 +277,12 @@ static vw_err_t tok_save(const char *state_dir, const uint8_t tok[VW_TOKEN_BYTES
  * token, not a password, by then). */
 
 static vw_err_t login_token_load(const char *account_dir, uint8_t out_tok[VW_TOKEN_BYTES]) {
-    char path[512];
+    /* 700, not 512: account_dir is a char[600] in every real caller (see
+     * scan_accounts_cb/account_ctx_open_existing) — GCC's Release-mode
+     * -Wformat-truncation can see that bound through inlining and correctly
+     * flags 512 as too small for account_dir's worst case (599) + "/" +
+     * the longest filename constant + NUL. */
+    char path[700];
     snprintf(path, sizeof(path), "%s/%s", account_dir, LOGIN_TOKEN_FILE);
 
 #ifndef _WIN32
@@ -300,7 +305,8 @@ static vw_err_t login_token_load(const char *account_dir, uint8_t out_tok[VW_TOK
 }
 
 static vw_err_t login_token_save(const char *account_dir, const uint8_t tok[VW_TOKEN_BYTES]) {
-    char path[512];
+    /* See login_token_load's identical comment on why 700, not 512. */
+    char path[700];
     snprintf(path, sizeof(path), "%s/%s", account_dir, LOGIN_TOKEN_FILE);
 #ifdef _WIN32
     return vw_fs_atomic_write(path, tok, VW_TOKEN_BYTES);
@@ -517,7 +523,8 @@ static void account_cfg_apply_kv(vw_account_cfg_t *c, const char *key, const cha
 
 /* accounts_dir is {state_dir}/accounts/<account_id> (no trailing slash). */
 static vw_err_t account_cfg_load(const char *account_dir, vw_account_cfg_t *out) {
-    char path[600];
+    /* See login_token_load's comment (this file) on why 700, not 600. */
+    char path[700];
     snprintf(path, sizeof(path), "%s/%s", account_dir, ACCOUNT_CONFIG_FILE);
     FILE *fp = fopen(path, "r");
     if (!fp) return VW_ERR_NOT_FOUND;
@@ -544,7 +551,8 @@ static vw_err_t account_cfg_load(const char *account_dir, vw_account_cfg_t *out)
 }
 
 static vw_err_t account_cfg_save(const char *account_dir, const vw_account_cfg_t *cfg) {
-    char path[600];
+    /* See login_token_load's comment (this file) on why 700, not 600. */
+    char path[700];
     snprintf(path, sizeof(path), "%s/%s", account_dir, ACCOUNT_CONFIG_FILE);
     FILE *fp = fopen(path, "w");
     if (!fp) return VW_ERR_IO;
@@ -2009,7 +2017,7 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         uint32_t account_id = vw_read_u32le(buf + off); off += 4u;
         vw_account_ctx_t *a = account_find(dc->accounts, account_id);
         const char *email = NULL; uint16_t email_len = 0;
-        vw_err_t err = vw_ipc_read_str(buf, plen, &off, &email, &email_len);
+        err = vw_ipc_read_str(buf, plen, &off, &email, &email_len);
         if (err != VW_OK || !a || !a->sess) {
             uint8_t rbuf[4u + 2u] = {0};
             vw_write_u32le(rbuf, (uint32_t)(err != VW_OK ? VW_ERR_PROTO_TRUNCATED :
