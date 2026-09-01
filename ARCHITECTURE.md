@@ -1,10 +1,13 @@
 # VaporWault — System Architecture
 
 **Owner**: ARCH.00  
-**Last updated**: 2026-08-26 (`TASK-204` — re-audited the Implementation Phases
-table against every `TODO/` task file's status field (all 218 checked, not
-sampled) rather than against memory; see the 2026-08-26 audit-note follow-up
-under Implementation Phases for what was found and fixed. Prior entry,
+**Last updated**: 2026-08-31 (`TASK-224` — added the Android client design: module
+map, approved-deps addendum, and Architectural Decisions rows for the wire-protocol
+integration, sync model, credential storage, transfer storage/execution, UI toolkit,
+and team-ownership choices. Prior entry, 2026-08-26 (`TASK-204`) — re-audited the
+Implementation Phases table against every `TODO/` task file's status field (all 218
+checked, not sampled) rather than against memory; see the 2026-08-26 audit-note
+follow-up under Implementation Phases for what was found and fixed. Prior entry,
 2026-08-05 (`TASK-118`), covered `TASK-001`–`TASK-125` at that level of
 detail; superseded here rather than kept verbatim, since `TODO/` is the
 trustworthy record of what shipped, not this header.)
@@ -23,8 +26,15 @@ VaporWault is a self-hosted cloud file hosting system. It consists of:
   standalone executable that speaks `vw/1` directly to the server as its own authenticated
   client (a sibling of the client daemon, not a bridge over its IPC), translating it to an
   HTTP/JSON API for a static HTML/TypeScript frontend served by nginx. Owned by `WEB.09`.
+- **Android client** (design published 2026-08-31, `TASK-224`): a Gradle/NDK app that
+  speaks `vw/1` directly to the server as its own authenticated client — another sibling
+  of the client daemon and gateway, not a bridge over either's IPC/HTTP surface — by
+  cross-compiling `vw_client_core`/`vw_vault` (unmodified C, plus `libvw_core`) for
+  Android and driving them from Kotlin over a thin JNI bridge. Does on-demand
+  browse/upload/download (Drive-app style), not continuous background folder-mirroring —
+  `vw_sync`/`vw_daemon`/`vw_ipc`/`vw_watch_*` are out of scope for it. Owned by `MOB.10`.
 
-All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure C except the Dear ImGui GUIs (C++) and the web frontend (TypeScript/HTML/CSS).
+All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure C except the Dear ImGui GUIs (C++), the web frontend (TypeScript/HTML/CSS), and the Android client (C via JNI + Kotlin).
 
 ---
 
@@ -38,6 +48,20 @@ All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure
 | Argon2 reference | 20190702, pinned via CMake `FetchContent` (not a submodule, see `TASK-125`) — ~600 lines, public domain | Password hashing (Argon2id) |
 
 **No SQLite. No other external libraries.**
+
+**Android-only additions** (`TASK-224`, apply only to the `android/` Gradle project;
+none of these are linked into the server/client/gateway binaries above):
+
+| Dependency | Version/Vendoring | Purpose |
+|---|---|---|
+| Android Gradle Plugin + Gradle | Pinned in `android/gradle/wrapper` | The platform's only build path — not optional the way a vendored library is |
+| Android NDK + CMake | Pinned `ndkVersion` in `android/app/build.gradle` | Cross-compiles `vw_core`/`vw_client_core.c`/`vw_vault.c`/mbedTLS/Argon2 per ABI; reuses the existing portable CMake, does not fork it |
+| `androidx.core`, `androidx.appcompat` | Latest stable at time of `TASK-225` | Minimum viable set for a Views-based app on current API levels; there is no "zero AndroidX" option on modern Android |
+| `androidx.documentfile` | Latest stable | Thin wrapper over raw Storage-Access-Framework `ContentResolver` calls, for on-demand file/folder transfers |
+
+No Jetpack Compose, no `androidx.security-crypto` (deprecated 2025; superseded by
+raw `AndroidKeyStore` usage, see Architectural Decisions below), no WorkManager/Room
+for this milestone (no continuous background sync to schedule).
 
 *(2026-08-05, `TASK-118`: corrected — this table previously said mbedTLS/Argon2 were "vendored"/submodules, matching the Repository Structure listing below, but `TASK-119`/`TASK-125` found and removed dead `third_party/mbedtls` and `third_party/argon2` submodules that had drifted from what `FetchContent` actually pulls in; only Dear ImGui is a true submodule today.)*
 
@@ -88,6 +112,13 @@ All network transport uses TLS 1.3 via mbedTLS. All other implementation is pure
 | Selective-sync rules | Per-sync-folder glob-style exclude patterns, stored on `vw_sync_folder_t`/`account.conf`, enforced entirely client-side in `vw_sync.c`'s BFS collect step — no server/protocol change. Excluding an already-locally-synced path never deletes the local copy; it only stops pulling further remote changes into it. Not available on vault-rooted sync folders | Corrects a fictional claim: this document previously attributed "selective-sync rules" to `vw_cache`, but no such code, in `vw_cache` or anywhere else, ever existed (flagged by the 2026-08-05 audit note, designed for real 2026-08-25, `TASK-192`–`195`) |
 | Filename search | New `SEARCH`/`SEARCH_RESP` messages: server-side, case-insensitive substring match on filename, scoped to exactly what `effective_permission()`/`FILE_LIST` already let the caller see (owned + shared-with-me). A single linear scan of the whole file table (no owner-indexed enumeration exists to walk instead), hard-capped at 200 entries with a `truncated` flag — **not paginated**: `docs/PROTOCOL.md` was checked for a cursor convention to reuse and none exists anywhere in it (this row originally, incorrectly, said "paginated" — corrected here, `TASK-196`/`197`). Content search is out of scope — vault contents are opaque ciphertext by design, and non-vault content search would need an index the flat-file store doesn't have. No scoped (`LINK_ACCESS`-redeemed) session support — such a session already sees only its one directly-browsable subtree. GUI/web results with no locally-known path (SEARCH never returns one, by design) are read-only/action-limited rather than reusing the normal browser's path- or version_id-addressed actions | Feature-gap review (2026-08-25) found no search anywhere in the product (GUI, CLI, or web frontend) past the server admin GUI's audit-log view. Server-side (not client-side full-tree-pull-then-filter) to reuse `FILE_LIST`'s existing permission-scoping logic rather than duplicating it (`TASK-196`–`202`, closed 2026-08-26). Follow-ups filed during implementation, not fixed inline: `TASK-217` (several integration test wrappers' binary-search lists predate and don't include `build-gw-e2e/bin`) and `TASK-218` (a locally-created new subdirectory never syncs up through the ordinary background watcher at all — unrelated pre-existing gap in `vw_sync.c`, found while writing `TASK-199`'s CLI test) |
 | Opt-in email alerts (admin + user) | Two separate preference surfaces reusing the existing `vw_smtp.c` relay: user categories (`share_received`, `quota_warning`, `new_login`, `account_security_change`) are per-user, opt-in, settable live via a new additive `NOTIFY_PREFS_GET`/`_SET` wire message pair — same shape as the existing "2FA optional per-user" precedent. Admin categories (`replica_lag`, `acme_renewal_failure`, `disk_capacity`, `lockout_spike`, `crash_recovery`) are `vapourwaultd.conf`-only, no protocol change — operational knobs an operator sets once, not per-session user state. Default off everywhere; threshold-style categories are edge-triggered with re-arm, not repeated, to avoid mail floods | Identified as a real gap while discussing `TASK-169`'s fallback feature: it has no alerting layer, so a degraded/lagging replica or a stuck primary outage can go unnoticed. `replica_lag` is the closest server-observable proxy for that specific concern but is explicitly not the same signal as "clients are on fallback" — the primary has no visibility into a client connecting directly to a replica — recorded here so a future "true fallback-usage" alert isn't assumed already covered (`TASK-205`–`213`) |
+| Android wire-protocol integration | Native JNI reuse of `vw_client_core.c`/`vw_vault.c` (unmodified) + `vw_core`, cross-compiled per-ABI via NDK/CMake — not a Kotlin reimplementation of `vw/1`, not routing through the web gateway's HTTP/JSON API | Matches the established "every native client compiles the same C source" pattern (CLI, daemon, gateway); unlike a browser, Android *can* link C code, so the constraint that justified the gateway's existence doesn't apply here. A Kotlin reimplementation would duplicate protocol/crypto logic in a second language with no precedent elsewhere in the project; routing through the gateway would require a gateway instance reachable from mobile devices as new infrastructure, for no benefit an Android client can't get natively (`TASK-224`) |
+| Android sync model | On-demand browse/upload/download only (Drive/Proton-Drive-app style) — no continuous background folder-mirroring | Android has no equivalent of a persistent POSIX daemon; `WorkManager`/`JobScheduler`/foreground services are the only mechanisms, each with real time/battery limits the desktop daemon doesn't face. The user's own framing ("in likeness to Google Drive/Proton Drive") already describes an on-demand model, not continuous mirroring, so `vw_sync`/`vw_daemon`/`vw_ipc`/`vw_watch_*` are out of scope — there is no separate daemon process for the app to be, or to talk IPC to (`TASK-224`) |
+| Android credential/session storage | Raw `AndroidKeyStore` (`KeyGenParameterSpec`, hardware-backed where available), no wrapper library | Genuinely new capability, not a port — the desktop/native client has no OS-keychain integration anywhere (session/login tokens are plain mode-0600 files). `androidx.security-crypto`'s `EncryptedSharedPreferences` convenience wrapper was deprecated in 2025 in favor of a heavier Tink+DataStore combo; raw `AndroidKeyStore` is the actual minimal-dependency choice, not the deprecated wrapper (`TASK-224`) |
+| Android on-demand transfer storage | Storage Access Framework (`ACTION_OPEN_DOCUMENT`/`_TREE`/`ACTION_CREATE_DOCUMENT`) for user-visible source/destination files, staged through the app's private cache dir for chunking; `vw_fs.c` unmodified | Scoped storage gives no path-based access to arbitrary user-chosen locations outside the app sandbox — the native layer gets a raw fd for the user-visible file, never a resolved path, so `vw_fs.c`'s path-based API only ever touches the app's own private (real POSIX path) staging area, which needs no change (`TASK-224`) |
+| Android transfer execution | User-Initiated Data Transfer job (`JobScheduler.setUserInitiated()`, API 34+) with a `dataSync`-typed foreground-service fallback pre-API-34; no periodic `WorkManager` job | UIDT is Google's purpose-built mechanism for exactly this case (explicit user-triggered upload/download), exempt from standard job-quota throttling and supporting long/resumable transfers. No periodic background job is needed since this milestone does on-demand transfers only, which also avoids pulling in `WorkManager`'s transitive `Room` dependency (`TASK-224`) |
+| Android UI toolkit | Classic Views (RecyclerView-based), not Jetpack Compose | Closest philosophical match to "Dear ImGui, not Qt" — smallest first-commit dependency graph, most direct control — at the deliberate cost of being Google's less actively-pushed option going forward; both still require some AndroidX, there is no "zero framework" option on Android the way Dear ImGui provides on desktop (`TASK-224`) |
+| Android team ownership | One role, `MOB.10`, owns both the native JNI layer and the Kotlin/UI layer | Unlike desktop's CLI.02/GUI.03 split (a genuinely separate GUI process talking IPC to a daemon), the Android app is one Gradle project with no separate GUI process — forcing an artificial two-agent split doesn't map the way "no protocol code in the GUI" does for a real second process (`TASK-224`) |
 | Web frontend: public-link redemption page | A query parameter (`?link=<64-hex-char token>`), not a path segment — nginx serves this frontend as a static, SPA-less page with no server-side routing (`WEB.09`'s own charter), so a query param needs no nginx change while a path segment would (a fallback rewrite to `index.html` that doesn't exist today). The token is stripped from the URL via `history.replaceState` before any redemption attempt, purely as hygiene. A password (when the link needs one) is only ever collected via the redemption view's own password field, sent as a POST body — never the URL, browser history, or a referrer header. **Scope decision**: once redemption succeeds, the existing logged-in browser view is reused completely unmodified for both VIEW- and EDIT-permission links — no client-side hiding/graying of actions by permission level, since no such pattern exists anywhere else in this frontend either (an ordinary VIEW-only share grant already relies entirely on server-side `effective_permission()` enforcement plus a clean error message on a disallowed action, e.g. `handleDelete`'s `showError` path) | `TASK-190` (password support for public links) discovered the redemption page itself didn't exist at all — checked `main.ts`/`index.html` in full: no route ever called `POST /api/links/access`, despite the server side (`TASK-134`/`140`, gateway session-cookie issuance for a redeemed anonymous scoped session) having supported it all along, already end-to-end tested (`test_gateway.py::test_public_link_create_redeem_revoke`/`test_public_link_password_via_gateway`). Filed as `TASK-216`, closed 2026-08-26 — building the page needed no backend change at all, only wiring the frontend to an already-complete, already-tested API |
 
 ---
@@ -106,6 +137,13 @@ VaporWault/
     gateway/        # vapourwault-web-gateway (C) — new independent vw/1 client + HTTP/JSON API (TASK-127)
   web/              # Static TypeScript/HTML/CSS frontend, built to plain JS, served by nginx (TASK-127)
     dist/           # npm run build output (gitignored; not checked in)
+  android/          # Android client: Gradle project + JNI bridge, another independent
+                    # vw/1 client (TASK-224)
+    app/
+      src/main/
+        cpp/        # vw_jni_bridge.c + CMakeLists.txt reusing vw_core/vw_client_core.c/
+                    # vw_vault.c from src/ unmodified, builds libvaporwault_jni.so
+        java/       # Kotlin: VwClient JNI wrapper, UI (Views), account/credential storage
   third_party/
     imgui/          # vendored (git submodule, docking branch)
     SDL2/           # vendored manually on Windows only (VENDOR_SETUP.md); Linux/macOS use the system package
@@ -216,6 +254,23 @@ VaporWault/
 > `vw_sync`/`vw_cache`/`vw_daemon` — the gateway is request/response per browser action,
 > not a persistent local-folder sync engine.
 
+### Android client modules (design, `TASK-224` — not yet implemented)
+
+| Module | File(s) | Owner | Language | Responsibility |
+|--------|---------|-------|----------|----------------|
+| `vw_jni_bridge` | `android/app/src/main/cpp/vw_jni_bridge.{h,c}` | MOB.10 | C | JNI shim over `vw_client_core`/`vw_vault`: session lifecycle, file ops/chunking, sharing, version history, vault, account self-service |
+| `VwClient` | `android/app/src/main/java/.../VwClient.kt` | MOB.10 | Kotlin | Thin 1:1 wrapper over the JNI bridge — the mobile analogue of desktop's `VwGuiIpc`, minus the socket (calls straight into linked-in native code) |
+| Credential/account store | `android/app/src/main/java/.../accounts/` | MOB.10 | Kotlin | `AndroidKeyStore`-backed credential storage; multi-profile account registry |
+| Transfer service | `android/app/src/main/java/.../transfer/` | MOB.10 | Kotlin | SAF-based on-demand upload/download staged through private cache; runs as a User-Initiated Data Transfer job / foreground-service fallback |
+| UI (Views) | `android/app/src/main/java/.../ui/` | MOB.10 | Kotlin | File browser, login/2FA, transfer queue, account/profile, sharing/links, vault create/unlock/browse |
+
+> Reuses `vw_core` and `src/client/vw_client_core.c`/`vw_vault.c` directly (compiled into
+> `libvaporwault_jni.so`'s source list), the same "no shared lib, reuse the source file"
+> pattern the gateway and CLI/GUI already use. Does **not** link `vw_sync`/`vw_cache`/
+> `vw_daemon`/`vw_ipc`/`vw_watch_*` — this client is on-demand transfers per user action,
+> not a persistent local-folder sync engine, and there is no separate daemon process on
+> Android for it to be, or to talk IPC to.
+
 ### Tools
 
 | Tool | File(s) | Owner | Purpose |
@@ -266,6 +321,9 @@ vw_gateway_session ← vw_net, vw_proto, vw_client_core   (one vw_client_sess_t 
 vw_gateway_api     ← vw_http, vw_json, vw_gateway_session, vw_client_core
 vw_gateway_core    ← vw_gateway_api, vw_gateway_session   (executable entry point)
 web/ frontend      ← (no C dependency; talks HTTP/JSON to vw_gateway_api over the network)
+
+vw_jni_bridge      ← vw_core, vw_client_core, vw_vault   (compiled directly into libvaporwault_jni.so)
+VwClient (Kotlin)  ← vw_jni_bridge   (JNI call, in-process — no socket/IPC)
 ```
 
 No circular dependencies are permitted. A module may not import from a module that depends on it.
@@ -524,6 +582,7 @@ See `TODO/` for the active task list. Phases in order:
 | 18 | Filename search | `SEARCH`/`SEARCH_RESP`, permission-scoped server-side substring match, CLI/GUI/web surfacing | ARCH.00 (design), PRT.04, SRV.01, CLI.02, GUI.03, WEB.09, QA.06 | **complete** (`TASK-196`–`202` done). Two out-of-domain gaps discovered while verifying this phase were filed under Phase 8 rather than fixed inline here — `TASK-217`/`218`, see that row. |
 | 19 | Build/version embedding + doc drift audit | Checked-in `VERSION` file, `--version` on every binary, this document's own accuracy | BLD.05, ARCH.00 | **complete** (`TASK-203` — embedded version strings — and `TASK-204` — this audit pass — both done). |
 | 20 | Opt-in email alerts (admin + user) | `NOTIFY_PREFS_GET`/`_SET`, `vw_notify` server dispatch/debounce helper, `vapourwaultd.conf` admin-category config, CLI/GUI/web preference UI, integration tests | PRT.04, SRV.01, CLI.02, GUI.03, WEB.09, QA.06 | **complete** — design in `TASK-205`; `TASK-206`–`213` (protocol, server user/admin-category triggers, client IPC/CLI, GUI panel, web gateway/frontend, docs, integration tests) all `done`, including SEC.07 sign-off on the three `security-sensitive` tasks (`TASK-207`, `208`, `211`). Two follow-up gaps surfaced during implementation and filed separately rather than blocking this milestone: `TASK-219` (no self-service 2FA toggle exists, so `account_security_change` only fires for password changes — still open) and `TASK-222` (no wire path set a user's email at all — closed 2026-08-27, `ACCOUNT_EMAIL_GET`/`SET`, §7.14 — this is what finally makes the notify categories above, and the pre-existing `TASK-046` password recovery, reachable for a real account). |
+| 21 | Android client | `vw_jni_bridge` (new), Gradle/NDK build, Kotlin `VwClient`/UI/account-store/transfer-service, on-demand upload/download via SAF, vault support | ARCH.00 (design), MOB.10 (impl), BLD.05 (CI), SEC.07 (review), QA.06 (tests) | **in progress** — design published 2026-08-31 (`TASK-224`, this row added at design-close time per the note below rather than left undocumented until the phase finishes). `TASK-225`-`235` scope scaffolding, JNI bridge, credential storage, on-demand transfers, UI, vault support, CI, security review, and integration tests; `TASK-236` closes the milestone. |
 
 > **2026-07-29 audit note**: this table (and the Module Map / on-disk-layout sections above) was found to contain at least one fabricated completion claim (Phase 4, corrected above) that cited unrelated task IDs and referenced a module (`vw_users`) that was never created. The rest of this document has not been re-audited line-by-line against the current codebase — treat "complete" markers here as unverified until spot-checked against `TODO/` and the actual source tree, the same way Phase 4's was. `TODO/` task files (which get appended-to, never rewritten wholesale) are more trustworthy than this document's prose for "did X actually happen."
 >

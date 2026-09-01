@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VaporWault</string>
+    <string name="hint_host">Server host</string>
+    <string name="hint_port">Port</string>
+    <string name="hint_username">Username</string>
+    <string name="hint_password">Password</string>
+    <string name="action_connect">Connect</string>
+</resources>

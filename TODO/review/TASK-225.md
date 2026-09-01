@@ -1,0 +1,81 @@
+---
+id:          TASK-225
+title:       "Android project scaffolding: Gradle/NDK build + JNI connect-login proof-of-life"
+status:      review
+assignee:    MOB.10
+created_by:  ARCH.00
+created:     2026-08-31
+priority:    high
+depends_on:  [TASK-224]
+blocks:      [TASK-226]
+review_by:   [CQR.08]
+tags:        []
+---
+
+Stand up the `android/` Gradle project and its NDK/CMake native build before
+building any real feature on top of it, so toolchain problems (mbedTLS
+cross-compiling per ABI, JNI linkage, etc.) surface early against a minimal
+target.
+
+Scope:
+- `android/` Gradle project (`app` module), pinned `ndkVersion` and CMake
+  version in `android/app/build.gradle`, ABI filter `arm64-v8a`,
+  `armeabi-v7a`, `x86_64`.
+- `android/app/src/main/cpp/CMakeLists.txt`: `add_subdirectory()` into
+  `src/core` to build the existing `vw_core` target unmodified; compile
+  `src/client/vw_client_core.c` and `src/client/vw_vault.c` directly as
+  sources (matching this repo's existing "no intermediate library" convention
+  — see `src/gateway/CMakeLists.txt`) into a new `SHARED` library
+  `libvaporwault_jni.so`, linked against `vw_core`.
+- A minimal `vw_jni_bridge.c` exposing exactly two calls: connect and
+  login (`AUTH_REQUEST`/`AUTH_OK`/`AUTH_FAIL`, no 2FA yet) — enough to prove
+  the whole pipeline (Gradle → NDK → CMake → mbedTLS/Argon2 FetchContent →
+  JNI → Kotlin) end-to-end against a real `vapourwaultd` instance before
+  TASK-226 builds the full bridge surface on top of it.
+- A throwaway single-Activity Kotlin app that calls this and shows
+  connected/authenticated or an error — not real UI, just a toolchain smoke
+  test.
+
+## Acceptance criteria
+
+- `./gradlew assembleDebug` succeeds and produces an installable APK
+  containing `libvaporwault_jni.so` for all three target ABIs.
+- Running on an emulator/device, the app can connect+login against a local
+  test `vapourwaultd` (reachable via `adb reverse`) and report success.
+
+## Notes
+
+- MOB.10, 2026-08-31: Toolchain stood up from scratch on the build machine
+  (no Android SDK/NDK/Gradle/JDK were present) — installed Temurin JDK 17,
+  Android cmdline-tools, platform 34, build-tools 34.0.0, CMake 3.22.1, NDK
+  27.2.12479018, and a manually-fetched Gradle 8.7 used once to generate this
+  project's own wrapper.
+- Found and fixed two latent portability bugs in the *shared* build files
+  while wiring the NDK build, both real bugs independent of Android (not
+  Android-specific hacks — see each fix's own comment):
+  - `third_party/CMakeLists.txt`: `MBEDTLS_CONFIG_FILE` was built from
+    `CMAKE_SOURCE_DIR` (the outermost project's source dir, fixed for the
+    whole configure) instead of `CMAKE_CURRENT_SOURCE_DIR` (this file's own
+    directory) — only ever correct because the repo-root `CMakeLists.txt`
+    happened to be every existing build's sole entry point. Android's
+    `android/app/src/main/cpp/CMakeLists.txt` is a second entry point with a
+    different outermost source dir, which broke it. Fixed to use
+    `CMAKE_CURRENT_SOURCE_DIR`, which is correct for both entry points.
+  - Same file: Argon2's `if(UNIX) target_link_libraries(argon2 PRIVATE
+    pthread)` — Android sets `UNIX=TRUE` too (it's a Unix-like target) but
+    bionic libc folds pthread symbols into libc itself, so there is no
+    separate `libpthread` to link, and the link step failed outright.
+    Guarded with `AND NOT ANDROID`.
+- `./gradlew :app:assembleDebug` succeeds; `libvaporwault_jni.so` (containing
+  `vw_core` + `vw_client_core.c` + `vw_vault.c`, unmodified from `src/`, plus
+  mbedTLS 3.6.7 + the vendored Argon2 reference, both fetched and
+  cross-compiled per-ABI exactly as the desktop build does) is produced and
+  packaged into `app-debug.apk` for all three target ABIs.
+- **Not yet verified**: actually running the app on an emulator/device and
+  exercising a real connect+login against a `vapourwaultd` instance — no AVD
+  was created and no emulator was started this session. The acceptance
+  criterion's build-toolchain half is done and gives high confidence (this
+  was the actually-uncertain part — whether the existing C sources and their
+  vendored deps cross-compile for Android at all); the runtime half is a
+  reasonable next step before or alongside TASK-226, not assumed to be
+  covered by the build succeeding.

@@ -8,7 +8,14 @@ include(FetchContent)
 
 # ── mbedTLS — TLS 1.3, crypto primitives ─────────────────────────────────────
 # Point mbedTLS at our trimmed config header before its CMake tree is loaded.
-set(MBEDTLS_CONFIG_FILE "${CMAKE_SOURCE_DIR}/third_party/mbedtls_config.h"
+# CMAKE_CURRENT_SOURCE_DIR (this file's own directory), not CMAKE_SOURCE_DIR
+# (the outermost project's source dir) — the latter only matches this
+# directory when this file is add_subdirectory()'d from the repo-root
+# CMakeLists.txt; a second CMake entry point add_subdirectory()-ing this
+# same file directly (the android/ NDK build, TASK-225) has its own,
+# different outermost source dir (`android/app/src/main/cpp/`), which broke
+# this path once such a second entry point started existing.
+set(MBEDTLS_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/mbedtls_config.h"
     CACHE STRING "Path to the project-specific mbedTLS config header" FORCE)
 set(ENABLE_TESTING        OFF CACHE BOOL "" FORCE)
 set(ENABLE_PROGRAMS       OFF CACHE BOOL "" FORCE)
@@ -74,7 +81,12 @@ add_library(argon2 STATIC
     ${argon2_fetch_SOURCE_DIR}/src/blake2/blake2b.c
 )
 target_include_directories(argon2 PUBLIC ${argon2_fetch_SOURCE_DIR}/include)
-if(UNIX)
+# Android's bionic libc folds pthread symbols into libc itself — there is no
+# separate libpthread to link, and passing -lpthread there is a hard link
+# error (unlike on desktop Linux/macOS, where UNIX is also true but a real
+# separate libpthread exists). CMake's NDK toolchain file sets ANDROID=TRUE
+# in addition to UNIX=TRUE, so exclude it explicitly (TASK-225).
+if(UNIX AND NOT ANDROID)
     target_link_libraries(argon2 PRIVATE pthread)
 endif()
 
