@@ -1,6 +1,6 @@
 <!--
   This is a template, not a task — do not edit it in place.
-  Copy this file to TODO/todo/TASK-NNN.md (new tasks always start in
+  Copy this file to TODO/todo/TASK-NNNNN.md (new tasks always start in
   TODO/todo/, since status starts at "todo") and fill it in there.
   See CLAUDE.md's "TODO-List Protocol" for the todo/ vs review/ vs done/
   folder rules — the file must move folders every time status crosses a
@@ -13,7 +13,7 @@
   entirely, so colons are fine once quoted.
 -->
 ---
-id:          TASK-NNN
+id:          TASK-NNNNN
 title:       "Short imperative description of the work"
 status:      todo
 assignee:    ARCH.00

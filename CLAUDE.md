@@ -271,8 +271,12 @@ Gradle/CMake/NDK — see `ARCHITECTURE.md`'s Approved External Dependencies tabl
 
 ## TODO-List Protocol
 
-Tasks live under the `TODO/` directory, one file per task: `TODO/<folder>/TASK-NNN.md`.
-The template is at `TODO/TEMPLATE.md`. Copy it; do not edit the template itself.
+Tasks live under the `TODO/` directory, one file per task: `TODO/<folder>/TASK-NNNNN.md`,
+where `NNNNN` is the task number zero-padded to 5 digits (e.g. `TASK-00237`) — padded to
+5 digits, not 3, since the project outgrew 3-digit numbering (originally `TASK-NNN`;
+every existing task file and cross-reference was renumbered in one pass rather than
+left inconsistent). The template is at `TODO/TEMPLATE.md`. Copy it; do not edit the
+template itself.
 
 `TODO/` has exactly three subfolders, and every task file lives in exactly one of them:
 
@@ -298,7 +302,7 @@ moving the file, don't just edit the status. New tasks are created directly in
 
 ```yaml
 ---
-id:          TASK-NNN
+id:          TASK-NNNNN
 title:       "Short imperative description"
 status:      todo          # todo | in_progress | review | done | blocked
 assignee:    SRV.01        # exactly one agent ID
@@ -317,7 +321,7 @@ and date; they never delete prior notes.
 
 **`title` must always be a double-quoted string.** A colon followed by a space inside a
 plain (unquoted) YAML scalar is ambiguous with a nested mapping — some parsers accept it,
-others don't, and at least one past task file (see `TASK-169`'s history) had its title
+others don't, and at least one past task file (see `TASK-00169`'s history) had its title
 silently rewritten because of this. Quoting the title sidesteps that entirely and is safe
 against other stray-punctuation issues too, so a colon inside the title is fine as long as
 the whole value is quoted (`title: "Server: replica hot-standby..."`).
