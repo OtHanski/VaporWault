@@ -31,7 +31,7 @@ extern "C" {
  * Returns an opaque, non-zero native session handle on success (an
  * vw_client_sess_t* cast to jlong), or 0 on failure — call
  * nativeLastError() to get the vw_err_t code. The caller (Kotlin) owns the
- * handle and must eventually pass it to nativeClose()/nativeLogout().
+ * handle and must eventually pass it to nativeLogout().
  */
 JNIEXPORT jlong JNICALL
 Java_com_vaporwault_client_VwNative_nativeConnect(

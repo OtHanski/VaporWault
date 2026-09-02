@@ -1,7 +1,7 @@
 ---
 id:          TASK-224
 title:       "Design the Android client: roster role, module map, architectural decisions"
-status:      review
+status:      done
 assignee:    ARCH.00
 created_by:  ARCH.00
 created:     2026-08-31
@@ -64,3 +64,14 @@ Work done in this task:
 - ARCH.00, 2026-08-31: Docs written; moved to `review` for CQR.08 sign-off
   before `done`. No code changes in this task — text edits to two docs plus
   new TODO task files.
+- CQR.08, 2026-09-02: Reviewed `CLAUDE.md`/`ARCHITECTURE.md` diffs (clean —
+  roster table and role section correctly describe MOB.10; module map,
+  dependency addendum, decisions table, and Phase 21 entry are consistent
+  with the rest of each document's level of detail and cross-reference task
+  IDs correctly) and every follow-on task file's `depends_on`/`review_by`
+  against the routing rules. Found one violation: `TASK-234` was tagged
+  `security-sensitive` but `review_by` only listed `CQR.08`, omitting
+  `SEC.07` — routing rule 1 requires both. Fixed directly (see `TASK-234`'s
+  own note) since it was a one-line frontmatter fix. No other
+  `depends_on`/`review_by`/`tags` inconsistencies found across
+  `TASK-225`–`237`. All acceptance criteria met — signing off.

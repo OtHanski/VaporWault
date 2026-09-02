@@ -1,6 +1,7 @@
 #include "vw_jni_bridge.h"
 
 #include "vw_client_core.h"
+#include "../core/vw_crypto.h"
 #include "../core/vw_net.h"
 
 #include <android/log.h>
@@ -52,6 +53,11 @@ Java_com_vaporwault_client_VwNative_nativeConnect(
     (*env)->ReleaseStringUTFChars(env, host, host_c);
     (*env)->ReleaseStringUTFChars(env, ca_cert_pem_path, ca_path_c);
     (*env)->ReleaseStringUTFChars(env, username, username_c);
+    /* password_bytes is our own copy of the plaintext password (STYLE.md
+     * §15: zero secrets before release, same as every comparable buffer in
+     * vw_client_core.c itself — that file only zeroes what it derives
+     * (auth_token) since the raw password buffer isn't its to zero). */
+    vw_crypto_secure_zero(password_bytes, (size_t)password_len);
     (*env)->ReleaseByteArrayElements(env, password, password_bytes, JNI_ABORT);
 
     g_last_error = rc;

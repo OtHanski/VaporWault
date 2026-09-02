@@ -1,7 +1,7 @@
 ---
 id:          TASK-225
 title:       "Android project scaffolding: Gradle/NDK build + JNI connect-login proof-of-life"
-status:      review
+status:      done
 assignee:    MOB.10
 created_by:  ARCH.00
 created:     2026-08-31
@@ -85,6 +85,61 @@ Scope:
   TLS 1.3 handshake, `HELLO`/`HELLO_OK`, and `AUTH_REQUEST`/`AUTH_OK` round
   trip through the JNI bridge into `vw_client_core.c` against a live server,
   not just a successful compile. Both acceptance criteria are now met.
+- **CQR.08 review, 2026-09-02:**
+  - **BLOCKING** (fixed in this pass, see below): `vw_jni_bridge.c`'s
+    `nativeConnect()` obtains `password_bytes` via `GetByteArrayElements()`
+    — a local, owned copy of the plaintext password — but never zeroed it
+    before `ReleaseByteArrayElements()`. This is a real, direct violation
+    of `docs/STYLE.md` §15's mandatory `secure_zero`-before-release
+    convention, and inconsistent with the very file this bridges to:
+    `vw_client_core.c` zeroes every comparable buffer it touches
+    (`auth_token`, `password_token`, wire buffers — `grep secure_zero
+    src/client/vw_client_core.c` shows a dozen call sites). `password` is
+    `const` there because `vw_client_core.c` doesn't own that buffer and
+    correctly leaves zeroing to whoever does — which, for this bridge, is
+    the bridge itself. **Fix applied**: `vw_crypto_secure_zero()` (the
+    shared primitive in `src/core/vw_crypto.h`, same one `vw_client_core.c`
+    uses under the hood) is now called on `password_bytes` before release.
+  - **Advisory**: `vw_jni_bridge.h`'s doc comment for `nativeConnect()`
+    said the caller "must eventually pass it to `nativeClose()`/
+    `nativeLogout()`" — no `nativeClose()` exists in this file. Fixed
+    (removed the dangling reference) alongside the finding above, since it
+    was a one-line change in the same file.
+  - **Advisory, not fixed** (deliberately, per rationale): `MainActivity.kt`
+    reads the password into an immutable Kotlin `String`
+    (`passField.text.toString()`) before converting to a `ByteArray` — a
+    `String` can't be reliably zeroed, which is exactly the reason TASK-230
+    already specifies `CharArray`-based handling for the *real* vault/login
+    UI. Leaving this as-is here since `MainActivity.kt` is explicitly a
+    throwaway smoke-test Activity (its own doc comment says so, superseded
+    entirely by TASK-229), and flagging it now so it isn't copy-pasted
+    forward into TASK-229's real login screen.
+  - **Advisory, not fixed**: `android/app/build.gradle`'s
+    `versionName "0.1.0"` / `versionCode 1` aren't wired to the root
+    `VERSION` file the way every other target's version string is
+    (`TASK-203`'s decision, `cmake/vw_version.h.in`). Worth revisiting when
+    BLD.05 wires Android into CI/release (`TASK-233`) rather than now.
+  - **Advisory, not fixed**: `nativeConnect()` doesn't check
+    `GetStringUTFChars`/`GetByteArrayElements` for a `NULL` return (JVM
+    OOM) before dereferencing (e.g. `ca_path_c[0]`) — a real but
+    exceedingly unlikely crash path. Worth hardening once TASK-226 turns
+    this proof-of-life bridge into the long-lived full surface.
+  - Everything else reviewed clean: JNI resource cleanup (strings/byte
+    array released on every path, including the failure path),
+    pointer<->`jlong` round-trip via `intptr_t` (correct and necessary for
+    the 32-bit `armeabi-v7a` ABI), `_Thread_local` error slot (correctly
+    scoped given `MainActivity.kt` calls `nativeConnect`+`nativeLastError`
+    from the same background thread), CMake `add_subdirectory` ordering,
+    and the `third_party/CMakeLists.txt` portability fixes (both correct
+    and minimal).
+  - Blocking finding fixed and re-verified: `./gradlew :app:assembleDebug`
+    still succeeds after the `vw_crypto_secure_zero()` fix, and
+    `libvaporwault_jni.so` was confirmed freshly rebuilt for all three ABIs
+    (not just a stale/cached artifact). Runtime smoke test above already
+    covered the behavioral path this touches (password handling in
+    `nativeConnect`); not re-run since the fix is purely "zero this buffer
+    after use," not a change to control flow. Signing off — all acceptance
+    criteria met, blocking finding resolved.
 - Out-of-domain finding while doing this (server-side, not MOB.10's or this
   task's to fix — filed as `TASK-237` for SRV.01 per the routing rules):
   the test server logged `WARN unhandled msg type 0x0107` for the

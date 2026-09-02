@@ -8,7 +8,7 @@ created:     2026-08-31
 priority:    high
 depends_on:  [TASK-227, TASK-228, TASK-230]
 blocks:      [TASK-235, TASK-236]
-review_by:   [CQR.08]
+review_by:   [SEC.07, CQR.08]
 tags:        [security-sensitive]
 ---
 
@@ -41,3 +41,10 @@ Scope:
 - Findings feed TASK-235's regression test list.
 
 ## Notes
+
+- CQR.08, 2026-09-02: `review_by` was missing `SEC.07` despite this task
+  being tagged `security-sensitive` — a direct violation of `CLAUDE.md`'s
+  routing rule 1 ("both `SEC.07` and `CQR.08`... neither can be omitted"),
+  found during TASK-224's review. Fixed. (Being the assignee doesn't
+  substitute for being listed as a required reviewer — the two are
+  separate roles in the protocol.)
