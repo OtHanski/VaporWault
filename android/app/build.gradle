@@ -6,7 +6,7 @@ plugins {
 android {
     namespace "com.vaporwault.client"
     compileSdk 34
-    ndkVersion "27.2.12479018"
+    ndkVersion "28.2.13676358"
 
     defaultConfig {
         applicationId "com.vaporwault.client"
@@ -14,6 +14,7 @@ android {
         targetSdk 34
         versionCode 1
         versionName "0.1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
             // 32-bit x86 is obsolete for new Play Store targeting; arm64-v8a is
@@ -61,4 +62,13 @@ dependencies {
     implementation "androidx.appcompat:appcompat:1.7.0"
     implementation "androidx.documentfile:documentfile:1.0.1"
     implementation "androidx.recyclerview:recyclerview:1.3.2"
+
+    // Instrumented tests only (TASK-235). uiautomator (not just Espresso)
+    // is required because several flows this app drives cross into
+    // system UI outside the app's own process — the SAF document
+    // picker/DocumentsUI in particular — which Espresso's in-app view
+    // matchers cannot reach at all.
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
 }

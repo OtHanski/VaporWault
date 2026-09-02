@@ -6,6 +6,9 @@
     <string name="hint_username">Username</string>
     <string name="hint_password">Password</string>
     <string name="hint_otp">2FA code</string>
+    <string name="action_import_ca_cert">Import server CA certificate (optional)</string>
+    <string name="status_no_ca_cert">⚠ No CA certificate imported — the server\'s TLS certificate will NOT be verified. Only use this against a server you trust on a trusted network.</string>
+    <string name="status_ca_cert_imported">CA certificate imported: %1$s</string>
     <string name="default_port">4430</string>
     <string name="action_connect">Connect</string>
     <string name="action_remove">Remove</string>
@@ -43,4 +46,33 @@
     <string name="status_creating_vault">Creating vault…</string>
     <string name="error_passphrase_mismatch">Passphrases don\'t match</string>
     <string name="error_passphrase_too_short">Passphrase must be at least 8 characters</string>
+
+    <string name="action_share">Share</string>
+    <string name="action_get_link">Get link</string>
+    <string name="action_shares">Shares</string>
+    <string name="action_revoke">Revoke</string>
+    <string name="title_shares">Shares &amp; links</string>
+    <string name="label_shares_created">Shares you\'ve granted</string>
+    <string name="label_links_created">Public links you\'ve created</string>
+    <string name="label_permission_view">View</string>
+    <string name="label_permission_edit">Edit</string>
+    <string name="hint_expiry_days">Expires in N days (blank = never)</string>
+    <string name="hint_link_password_optional">Link password (blank = none)</string>
+    <string name="empty_shares">No shares yet</string>
+    <string name="empty_links">No links yet</string>
+    <string name="status_link_created">Link created — token: %1$s</string>
+
+    <string name="action_account">Account</string>
+    <string name="title_account">Account settings</string>
+    <string name="label_email">Email address</string>
+    <string name="action_save_email">Save email</string>
+    <string name="label_2fa">Two-factor login (email OTP)</string>
+    <string name="action_2fa_on">Turn on</string>
+    <string name="action_2fa_off">Turn off</string>
+    <string name="hint_current_password">Current password (required to change 2FA)</string>
+    <string name="label_notify_prefs">Email notifications</string>
+    <string name="label_notify_share_received">Someone shared a file with me</string>
+    <string name="label_notify_quota_warning">Storage quota warning</string>
+    <string name="label_notify_new_login">New login to my account</string>
+    <string name="label_notify_account_security_change">Account security changes (email/2FA)</string>
 </resources>

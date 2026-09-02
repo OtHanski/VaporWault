@@ -1,11 +1,13 @@
 package com.vaporwault.client.ui
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -14,6 +16,8 @@ import com.vaporwault.client.VwClient
 import com.vaporwault.client.VwSession
 import com.vaporwault.client.accounts.Profile
 import com.vaporwault.client.accounts.VwAccountRegistry
+import java.io.File
+import java.util.UUID
 import kotlin.concurrent.thread
 
 /**
@@ -33,6 +37,19 @@ class LoginActivity : AppCompatActivity() {
     private lateinit var profileAdapter: ProfileAdapter
     private lateinit var statusText: TextView
     private lateinit var otpField: EditText
+    private lateinit var caCertStatusText: TextView
+
+    /** Path to the imported CA cert PEM, copied into the app's private
+     * storage — see [importCaCert]. `null` = none imported, which means
+     * the next [connect] call uses `VW_CERT_VERIFY_NONE` (TASK-234: this
+     * was previously the *only* reachable path from this UI — every real
+     * connection silently skipped TLS certificate verification, since
+     * nothing ever let the user supply a cert). */
+    private var importedCaCertPath: String? = null
+
+    private val importCaCert = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) copyCaCert(uri)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,8 +62,13 @@ class LoginActivity : AppCompatActivity() {
         val passField = findViewById<EditText>(R.id.passField)
         otpField = findViewById(R.id.otpField)
         statusText = findViewById(R.id.statusText)
+        caCertStatusText = findViewById(R.id.caCertStatusText)
         val connectButton = findViewById<Button>(R.id.connectButton)
         val profileList = findViewById<RecyclerView>(R.id.profileList)
+
+        findViewById<Button>(R.id.importCaCertButton).setOnClickListener {
+            importCaCert.launch(arrayOf("*/*"))
+        }
 
         profileAdapter = ProfileAdapter(
             profiles = registry.listProfiles(),
@@ -67,6 +89,36 @@ class LoginActivity : AppCompatActivity() {
             val otp = otpField.text.toString().trim()
             connect(host, port, user, pass, otp)
         }
+    }
+
+    /** Copies the picked cert into this app's private storage — `vw_net.c`
+     * needs a real filesystem path (`ca_cert_pem_path`), not a
+     * `content://` URI, the same reason `VaultTransferer` stages through
+     * the cache for vault transfers. A fresh file per import (not one
+     * reused path) so multiple profiles can each keep their own. */
+    private fun copyCaCert(sourceUri: Uri) {
+        val dir = File(filesDir, "ca_certs").apply { mkdirs() }
+        val dest = File(dir, "${UUID.randomUUID()}.pem")
+        val copied = contentResolver.openInputStream(sourceUri)?.use { input ->
+            dest.outputStream().use { output -> input.copyTo(output) }
+            true
+        } ?: false
+        if (!copied) {
+            statusText.text = "Could not read the selected certificate file"
+            return
+        }
+        importedCaCertPath = dest.absolutePath
+        caCertStatusText.text = getString(R.string.status_ca_cert_imported, queryDisplayName(sourceUri) ?: "cert")
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) return c.getString(idx)
+            }
+        }
+        return null
     }
 
     private fun resumeProfile(profile: Profile) {
@@ -99,7 +151,10 @@ class LoginActivity : AppCompatActivity() {
     private fun connect(host: String, port: Int, user: String, pass: ByteArray, otp: String) {
         statusText.text = "Connecting…"
         thread {
-            val result = registry.addProfile(label = user, host = host, port = port, username = user, password = pass, otp = otp)
+            val result = registry.addProfile(
+                label = user, host = host, port = port, username = user, password = pass,
+                caCertPemPath = importedCaCertPath ?: "", otp = otp,
+            )
             // Captured on this background thread — see the identical note
             // in resumeProfile() above; VwClient.lastError() is per-thread.
             val lastError = if (result == null) VwClient.lastError() else 0

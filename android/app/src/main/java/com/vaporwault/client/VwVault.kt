@@ -90,7 +90,10 @@ class VwVault private constructor(vaultHandle: Long, val vaultId: Long) : AutoCl
             return if (handle != 0L) VwVault(handle, vaultId) else null
         }
 
-        /** vw_err_t code from the most recent failed bridge call on this thread. */
+        /** vw_err_t code from the most recent failed bridge call **on this
+         * thread** — same `_Thread_local` footgun as [VwClient.lastError];
+         * see that function's doc comment. Capture it on the calling
+         * background thread, never from inside `runOnUiThread`. */
         fun lastError(): Int = VwNative.nativeLastError()
 
         /**

@@ -41,6 +41,14 @@
             android:name=".ui.VaultActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".ui.SharesActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.AccountActivity"
+            android:exported="false" />
+
         <service
             android:name=".transfer.TransferForegroundService"
             android:foregroundServiceType="dataSync"

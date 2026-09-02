@@ -8,6 +8,7 @@ import android.provider.OpenableColumns
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.RadioGroup
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -119,6 +120,14 @@ class FileBrowserActivity : AppCompatActivity() {
             }
         }
 
+        // Account-wide, not folder/vault-scoped — available in both modes.
+        findViewById<Button>(R.id.sharesButton).setOnClickListener {
+            startActivity(Intent(this, SharesActivity::class.java))
+        }
+        findViewById<Button>(R.id.accountButton).setOnClickListener {
+            startActivity(Intent(this, AccountActivity::class.java))
+        }
+
         loadCurrentFolder()
     }
 
@@ -162,6 +171,8 @@ class FileBrowserActivity : AppCompatActivity() {
     private fun handleAction(entry: FileEntry, actionId: Int) {
         when (actionId) {
             R.id.action_download -> promptDownload(entry)
+            R.id.action_share -> promptShare(entry)
+            R.id.action_get_link -> promptGetLink(entry)
             R.id.action_rename -> promptRename(entry)
             R.id.action_move -> promptMove(entry)
             R.id.action_delete -> confirmDelete(entry)
@@ -228,6 +239,77 @@ class FileBrowserActivity : AppCompatActivity() {
             }
         }
         TransferBus.register(listener)
+    }
+
+    private fun promptShare(entry: FileEntry) {
+        val view = layoutInflater.inflate(R.layout.dialog_share, null)
+        val usernameField = view.findViewById<EditText>(R.id.shareUsernameField)
+        val permGroup = view.findViewById<RadioGroup>(R.id.sharePermissionGroup)
+        val expiryField = view.findViewById<EditText>(R.id.shareExpiryField)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.action_share)
+            .setView(view)
+            .setPositiveButton(R.string.action_share) { _, _ ->
+                val username = usernameField.text.toString().trim()
+                if (username.isEmpty()) return@setPositiveButton
+                val permission = if (permGroup.checkedRadioButtonId == R.id.sharePermEdit) 2 else 1
+                val expiresAt = expiryDaysToUnix(expiryField.text.toString().trim())
+                statusText.text = getString(R.string.status_working)
+                thread {
+                    val shareId = client.shareGrant(entry.fileId, username, permission, expiresAt)
+                    val lastError = if (shareId == 0L) VwClient.lastError() else 0
+                    runOnUiThread {
+                        statusText.text = if (shareId != 0L) "Shared with $username"
+                                           else "Share failed: vw_err_t=$lastError"
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun promptGetLink(entry: FileEntry) {
+        val view = layoutInflater.inflate(R.layout.dialog_link, null)
+        val permGroup = view.findViewById<RadioGroup>(R.id.linkPermissionGroup)
+        val passwordField = view.findViewById<EditText>(R.id.linkPasswordField)
+        val expiryField = view.findViewById<EditText>(R.id.linkExpiryField)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.action_get_link)
+            .setView(view)
+            .setPositiveButton(R.string.action_get_link) { _, _ ->
+                val permission = if (permGroup.checkedRadioButtonId == R.id.linkPermEdit) 2 else 1
+                val password = passwordField.text.toString()
+                val expiresAt = expiryDaysToUnix(expiryField.text.toString().trim())
+                statusText.text = getString(R.string.status_working)
+                thread {
+                    val result = client.linkCreate(entry.fileId, permission, expiresAt, password)
+                    val lastError = if (result == null) VwClient.lastError() else 0
+                    runOnUiThread {
+                        if (result == null) {
+                            statusText.text = "Get link failed: vw_err_t=$lastError"
+                            return@runOnUiThread
+                        }
+                        statusText.text = ""
+                        val tokenHex = result.token.joinToString("") { "%02x".format(it) }
+                        AlertDialog.Builder(this)
+                            .setTitle(R.string.action_get_link)
+                            .setMessage(getString(R.string.status_link_created, tokenHex))
+                            .setPositiveButton(android.R.string.ok, null)
+                            .show()
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** Blank/zero/negative input means "never expires" (0, matching the
+     * wire's own expires_at=0 convention) — never a validation error, this
+     * is the common case for a share/link. */
+    private fun expiryDaysToUnix(daysStr: String): Long {
+        val days = daysStr.toLongOrNull() ?: return 0L
+        if (days <= 0) return 0L
+        return System.currentTimeMillis() / 1000L + days * 86400L
     }
 
     private fun promptRename(entry: FileEntry) {

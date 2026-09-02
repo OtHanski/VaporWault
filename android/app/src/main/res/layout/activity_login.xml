@@ -75,6 +75,20 @@
             android:visibility="gone" />
 
         <Button
+            android:id="@+id/importCaCertButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/action_import_ca_cert" />
+
+        <TextView
+            android:id="@+id/caCertStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/status_no_ca_cert"
+            android:textSize="12sp" />
+
+        <Button
             android:id="@+id/connectButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

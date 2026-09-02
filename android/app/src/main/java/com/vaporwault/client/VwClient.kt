@@ -147,7 +147,19 @@ class VwClient private constructor(sessionHandle: Long) : AutoCloseable {
             return if (handle != 0L) VwClient(handle) else null
         }
 
-        /** vw_err_t code from the most recent failed bridge call on this thread. */
+        /**
+         * vw_err_t code from the most recent failed bridge call **on this
+         * thread** — the native slot behind this is `_Thread_local`. Call
+         * it on the same background thread that made the failing call,
+         * *before* posting to `runOnUiThread`/the main thread — calling it
+         * from inside `runOnUiThread` silently reads the main thread's own
+         * (untouched, always-`VW_OK`) slot instead and reports `0`
+         * regardless of what actually failed. Hit repeatedly across this
+         * codebase (`LoginActivity`, `VaultActivity`, `AccountActivity`) —
+         * always capture into a `val` on the calling thread first:
+         * `val lastError = if (result == null) VwClient.lastError() else 0`
+         * then reference that `val` inside `runOnUiThread`.
+         */
         fun lastError(): Int = VwNative.nativeLastError()
 
         const val ERR_AUTH_BAD_CREDS = 300

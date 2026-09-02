@@ -33,6 +33,18 @@
             android:text="@string/action_vaults" />
 
         <Button
+            android:id="@+id/sharesButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/action_shares" />
+
+        <Button
+            android:id="@+id/accountButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/action_account" />
+
+        <Button
             android:id="@+id/transfersButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
