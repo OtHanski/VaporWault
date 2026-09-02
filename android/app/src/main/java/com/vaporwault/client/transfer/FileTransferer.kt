@@ -50,20 +50,34 @@ class FileTransferer(private val context: Context, private val client: VwClient)
 
     /** Uploads [sourceUri] to [target]. [onProgress] reports bytes read
      * from the source so far / total size (-1 total if unknown — SAF
-     * doesn't always expose a size). Returns null on any failure — call
-     * [VwClient.lastError] for the last native call's reason, though a
-     * local read/stream-open failure has no vw_err_t to report. */
-    fun uploadFile(sourceUri: Uri, target: UploadTarget, onProgress: (Long, Long) -> Unit): CommitResult? {
+     * doesn't always expose a size). [isCancelled] is polled between
+     * chunks; when it returns true the upload stops and this returns null
+     * (nothing already committed server-side — only the FILE_COMMIT at
+     * the very end makes the file visible, and that's never reached).
+     * Returns null on any failure — call [VwClient.lastError] for the
+     * last native call's reason, though a local read/stream-open failure
+     * or a cancellation has no vw_err_t to report. */
+    fun uploadFile(
+        sourceUri: Uri,
+        target: UploadTarget,
+        isCancelled: () -> Boolean = { false },
+        onProgress: (Long, Long) -> Unit,
+    ): CommitResult? {
         val totalSize = queryUriSize(sourceUri) ?: -1L
         val hashesOut = ByteArrayOutputStream()
         val digest = MessageDigest.getInstance("SHA-256")
         val readBuf = ByteArray(CHUNK_SIZE)
         val directBuf = ByteBuffer.allocateDirect(CHUNK_SIZE)
         var bytesDone = 0L
+        var cancelled = false
 
         val input = context.contentResolver.openInputStream(sourceUri) ?: return null
         input.use {
             while (true) {
+                if (isCancelled()) {
+                    cancelled = true
+                    break
+                }
                 var filled = 0
                 while (filled < readBuf.size) {
                     val n = it.read(readBuf, filled, readBuf.size - filled)
@@ -93,6 +107,7 @@ class FileTransferer(private val context: Context, private val client: VwClient)
                 if (filled < readBuf.size) break // short read == end of stream
             }
         }
+        if (cancelled) return null
 
         val chunkHashes = hashesOut.toByteArray()
         return when (target) {
@@ -103,10 +118,16 @@ class FileTransferer(private val context: Context, private val client: VwClient)
         }
     }
 
-    /** Downloads file_id's current version to [destUri]. Returns false on
-     * any failure (including an encrypted version — vault decrypt is
-     * TASK-230's job, not this one). */
-    fun downloadFile(fileId: Long, destUri: Uri, onProgress: (Long, Long) -> Unit): Boolean {
+    /** Downloads file_id's current version to [destUri]. [isCancelled] is
+     * polled between chunks, same convention as [uploadFile]. Returns
+     * false on any failure (including an encrypted version — vault
+     * decrypt is TASK-230's job, not this one — or a cancellation). */
+    fun downloadFile(
+        fileId: Long,
+        destUri: Uri,
+        isCancelled: () -> Boolean = { false },
+        onProgress: (Long, Long) -> Unit,
+    ): Boolean {
         val entry = client.statById(fileId) ?: return false
         val chunks = client.versionChunks(entry.versionId) ?: return false
         if (chunks.vaultId != 0L) return false
@@ -117,6 +138,7 @@ class FileTransferer(private val context: Context, private val client: VwClient)
 
         output.use {
             for (i in 0 until chunks.chunkCount) {
+                if (isCancelled()) return false
                 val hash = chunks.hashes.copyOfRange(i * HASH_BYTES, (i + 1) * HASH_BYTES)
                 val len = client.chunkDownload(hash, directBuf, CHUNK_SIZE)
                 if (len < 0) return false

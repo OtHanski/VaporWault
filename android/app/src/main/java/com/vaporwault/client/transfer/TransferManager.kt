@@ -9,6 +9,8 @@ import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import com.vaporwault.client.VwClient
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -21,10 +23,12 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * Each call returns a `transferId` immediately; the actual transfer runs
  * asynchronously and reports progress/completion through [TransferBus]
- * under that id.
+ * under that id. [cancel] requests cooperative cancellation — checked
+ * between chunks, not instant.
  */
 object TransferManager {
     private val nextWorkId = AtomicInteger(1)
+    private val cancelFlags = ConcurrentHashMap<String, AtomicBoolean>()
 
     fun uploadFile(
         context: Context,
@@ -35,10 +39,14 @@ object TransferManager {
         sizeBytes: Long,
     ): String {
         val transferId = "up-${System.currentTimeMillis()}"
+        val cancelled = AtomicBoolean(false)
+        cancelFlags[transferId] = cancelled
+        TransferBus.notifyStarted(transferId, label, sizeBytes)
         run(context, uploadBytes = sizeBytes, downloadBytes = 0) {
-            val result = FileTransferer(context, client).uploadFile(sourceUri, target) { done, total ->
+            val result = FileTransferer(context, client).uploadFile(sourceUri, target, isCancelled = cancelled::get) { done, total ->
                 TransferBus.notifyProgress(transferId, label, done, total)
             }
+            cancelFlags.remove(transferId)
             TransferBus.notifyComplete(transferId, result != null)
         }
         return transferId
@@ -53,13 +61,24 @@ object TransferManager {
         sizeBytes: Long,
     ): String {
         val transferId = "down-${System.currentTimeMillis()}"
+        val cancelled = AtomicBoolean(false)
+        cancelFlags[transferId] = cancelled
+        TransferBus.notifyStarted(transferId, label, sizeBytes)
         run(context, uploadBytes = 0, downloadBytes = sizeBytes) {
-            val success = FileTransferer(context, client).downloadFile(fileId, destUri) { done, total ->
+            val success = FileTransferer(context, client).downloadFile(fileId, destUri, isCancelled = cancelled::get) { done, total ->
                 TransferBus.notifyProgress(transferId, label, done, total)
             }
+            cancelFlags.remove(transferId)
             TransferBus.notifyComplete(transferId, success)
         }
         return transferId
+    }
+
+    /** Requests cancellation of an in-flight transfer — cooperative, takes
+     * effect at the next chunk boundary, not instantly. A no-op if
+     * [transferId] is already complete or unknown. */
+    fun cancel(transferId: String) {
+        cancelFlags[transferId]?.set(true)
     }
 
     private fun run(context: Context, uploadBytes: Long, downloadBytes: Long, work: () -> Unit) {
