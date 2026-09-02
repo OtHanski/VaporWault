@@ -51,6 +51,12 @@
         android:layout_height="wrap_content"
         android:text="@string/action_resume_profiles" />
 
+    <Button
+        android:id="@+id/transferTestButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/action_transfer_test" />
+
     <TextView
         android:id="@+id/resultText"
         android:layout_width="match_parent"

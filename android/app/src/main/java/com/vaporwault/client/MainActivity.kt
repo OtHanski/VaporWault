@@ -1,14 +1,22 @@
 package com.vaporwault.client
 
+import android.net.Uri
 import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.vaporwault.client.accounts.VwAccountRegistry
+import com.vaporwault.client.transfer.TransferBus
+import com.vaporwault.client.transfer.TransferListener
+import com.vaporwault.client.transfer.TransferManager
+import com.vaporwault.client.transfer.UploadTarget
 import java.io.File
 import java.nio.ByteBuffer
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -46,6 +54,7 @@ class MainActivity : AppCompatActivity() {
         val connectButton = findViewById<Button>(R.id.connectButton)
         val addProfileButton = findViewById<Button>(R.id.addProfileButton)
         val resumeProfilesButton = findViewById<Button>(R.id.resumeProfilesButton)
+        val transferTestButton = findViewById<Button>(R.id.transferTestButton)
 
         connectButton.setOnClickListener {
             val host = hostField.text.toString()
@@ -70,6 +79,16 @@ class MainActivity : AppCompatActivity() {
         resumeProfilesButton.setOnClickListener {
             resultText.text = "Resuming profiles..."
             runAsync(resultText) { runResumeAllProfiles() }
+        }
+
+        transferTestButton.setOnClickListener {
+            val host = hostField.text.toString()
+            val port = portField.text.toString().toIntOrNull() ?: 0
+            val user = userField.text.toString()
+            val pass = passField.text.toString().toByteArray(Charsets.UTF_8)
+
+            resultText.text = "Running transfer test..."
+            runAsync(resultText) { runTransferTest(host, port, user, pass) }
         }
     }
 
@@ -200,5 +219,84 @@ class MainActivity : AppCompatActivity() {
         } finally {
             client.close()
         }
+    }
+
+    /**
+     * TASK-228 round trip: exercises the real [TransferManager]/
+     * [com.vaporwault.client.transfer.FileTransferer] pipeline — chunked
+     * upload, then chunked download, then a byte-for-byte content
+     * comparison — using `file://` Uris into the app's own private cache
+     * rather than driving the actual system document picker
+     * (`ACTION_OPEN_DOCUMENT`/`ACTION_CREATE_DOCUMENT`): `ContentResolver`
+     * handles the `file` scheme the same way it handles `content`, so this
+     * exercises [FileTransferer]'s real code path faithfully — it never
+     * assumes a particular Uri scheme. What this does *not* exercise is
+     * the picker Intent flow itself, which is TASK-229's UI to build.
+     */
+    private fun runTransferTest(host: String, port: Int, user: String, pass: ByteArray): String {
+        val client = VwClient.connect(host, port, user, pass)
+            ?: return "connect failed: vw_err_t=${VwClient.lastError()}"
+        try {
+            val dirId = client.mkdir(0, "android_xfer_test_${System.currentTimeMillis()}")
+            if (dirId == 0L) return "mkdir FAILED: vw_err_t=${VwClient.lastError()}"
+
+            val srcFile = File(cacheDir, "task228_src.bin")
+            val testBytes = ByteArray(12 * 1024 * 1024)
+            SecureRandom().nextBytes(testBytes)
+            srcFile.writeBytes(testBytes)
+
+            val uploadId = TransferManager.uploadFile(
+                applicationContext, client, Uri.fromFile(srcFile),
+                UploadTarget.NewInFolder(dirId, "test228.bin"), "test228.bin", srcFile.length(),
+            )
+            val (uploadOk, uploadTimedOut) = awaitTransfer(uploadId, 30)
+            if (uploadTimedOut) return "upload TIMED OUT (id=$uploadId)"
+            if (!uploadOk) return "upload FAILED (id=$uploadId): vw_err_t=${VwClient.lastError()}"
+
+            val remoteEntry = client.listFilesById(dirId, recursive = false)?.firstOrNull { it.name == "test228.bin" }
+                ?: return "upload verify FAILED: file not found in listing after upload"
+
+            val destFile = File(cacheDir, "task228_dest.bin").apply { delete() }
+            val downloadId = TransferManager.downloadFile(
+                applicationContext, client, remoteEntry.fileId, Uri.fromFile(destFile),
+                "test228.bin", remoteEntry.sizeBytes,
+            )
+            val (downloadOk, downloadTimedOut) = awaitTransfer(downloadId, 30)
+            if (downloadTimedOut) return "download TIMED OUT (id=$downloadId)"
+            if (!downloadOk) return "download FAILED (id=$downloadId): vw_err_t=${VwClient.lastError()}"
+
+            val matches = destFile.readBytes().contentEquals(testBytes)
+            return if (matches) {
+                "TRANSFER TEST PASS (upload_id=$uploadId, download_id=$downloadId, " +
+                    "${testBytes.size} bytes, content matches)"
+            } else {
+                "TRANSFER TEST FAILED: downloaded content mismatch"
+            }
+        } finally {
+            client.close()
+        }
+    }
+
+    /** Blocks the calling (background) thread until [TransferBus] reports
+     * [transferId] complete. Returns (succeeded, timedOut). */
+    private fun awaitTransfer(transferId: String, timeoutSeconds: Long): Pair<Boolean, Boolean> {
+        val latch = CountDownLatch(1)
+        var succeeded = false
+        val listener = object : TransferListener {
+            override fun onProgress(id: String, label: String, bytesDone: Long, bytesTotal: Long) {}
+            override fun onComplete(id: String, ok: Boolean) {
+                if (id == transferId) {
+                    succeeded = ok
+                    latch.countDown()
+                }
+            }
+        }
+        TransferBus.register(listener)
+        val finished = try {
+            latch.await(timeoutSeconds, TimeUnit.SECONDS)
+        } finally {
+            TransferBus.unregister(listener)
+        }
+        return succeeded to !finished
     }
 }
