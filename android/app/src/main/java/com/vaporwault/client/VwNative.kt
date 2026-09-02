@@ -110,4 +110,20 @@ object VwNative {
     external fun nativeAccount2faSet(sessionHandle: Long, password: ByteArray, enable: Boolean): Int
     external fun nativeNotifyPrefsGet(sessionHandle: Long): Long
     external fun nativeNotifyPrefsSet(sessionHandle: Long, prefs: Long): Long
+
+    // ── Vault ─────────────────────────────────────────────────────────────
+
+    /** `passphrase` is consumed and zeroed native-side before this returns. */
+    external fun nativeVaultSetup(sessionHandle: Long, folderFileId: Long, passphrase: ByteArray): LongArray?
+    /** `passphrase` is consumed and zeroed native-side before this returns. */
+    external fun nativeVaultUnlock(sessionHandle: Long, vaultId: Long, passphrase: ByteArray): Long
+    external fun nativeVaultClose(vaultHandle: Long)
+    external fun nativeVaultFolderFileId(vaultHandle: Long): Long
+    external fun nativeVaultList(sessionHandle: Long): ByteArray?
+    external fun nativeVaultUploadFile(
+        vaultHandle: Long, sessionHandle: Long, fileId: Long, leafName: String, localPath: String,
+    ): LongArray?
+    external fun nativeVaultDownloadFile(
+        vaultHandle: Long, sessionHandle: Long, fileId: Long, localPath: String,
+    ): Int
 }

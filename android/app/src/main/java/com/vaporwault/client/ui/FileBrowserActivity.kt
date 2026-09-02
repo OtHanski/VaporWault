@@ -60,7 +60,15 @@ class FileBrowserActivity : AppCompatActivity() {
             return
         }
         setContentView(R.layout.activity_file_browser)
-        breadcrumbs.add(BreadcrumbLevel(getString(R.string.root_breadcrumb), null))
+        val vault = VwSession.vault
+        if (vault != null) {
+            // Vaults are flat (see uploadFile's note) — a single breadcrumb
+            // level at the vault's own folder, never "Home", and no way to
+            // navigate above it short of Exit Vault.
+            breadcrumbs.add(BreadcrumbLevel(getString(R.string.vault_breadcrumb), vault.folderFileId))
+        } else {
+            breadcrumbs.add(BreadcrumbLevel(getString(R.string.root_breadcrumb), null))
+        }
 
         statusText = findViewById(R.id.statusText)
         emptyText = findViewById(R.id.emptyText)
@@ -88,7 +96,28 @@ class FileBrowserActivity : AppCompatActivity() {
             finish()
         }
         findViewById<Button>(R.id.uploadButton).setOnClickListener { openDocument.launch(arrayOf("*/*")) }
-        findViewById<Button>(R.id.newFolderButton).setOnClickListener { promptNewFolder() }
+        val newFolderButton = findViewById<Button>(R.id.newFolderButton)
+        newFolderButton.setOnClickListener { promptNewFolder() }
+
+        if (vault != null) {
+            // No subfolder concept inside a vault (see uploadFile's note) —
+            // plain FILE_MKDIR would create an unencrypted folder nested
+            // inside the vault's own, which is more confusing than useful.
+            newFolderButton.visibility = View.GONE
+            findViewById<Button>(R.id.vaultsButton).visibility = View.GONE
+            findViewById<Button>(R.id.exitVaultButton).apply {
+                visibility = View.VISIBLE
+                setOnClickListener {
+                    VwSession.clearVault()
+                    startActivity(Intent(this@FileBrowserActivity, FileBrowserActivity::class.java))
+                    finish()
+                }
+            }
+        } else {
+            findViewById<Button>(R.id.vaultsButton).setOnClickListener {
+                startActivity(Intent(this, VaultActivity::class.java))
+            }
+        }
 
         loadCurrentFolder()
     }
@@ -145,21 +174,37 @@ class FileBrowserActivity : AppCompatActivity() {
     }
 
     private fun downloadFile(entry: FileEntry, destUri: Uri) {
-        val transferId = TransferManager.downloadFile(
-            applicationContext, client, entry.fileId, destUri, entry.name, entry.sizeBytes,
-        )
+        val vault = VwSession.vault
+        val transferId = if (vault != null) {
+            TransferManager.vaultDownloadFile(
+                applicationContext, client, vault, entry.fileId, destUri, entry.name, entry.sizeBytes,
+            )
+        } else {
+            TransferManager.downloadFile(
+                applicationContext, client, entry.fileId, destUri, entry.name, entry.sizeBytes,
+            )
+        }
         awaitAndRefresh(transferId, "Download")
     }
 
     private fun uploadFile(sourceUri: Uri) {
         val name = queryDisplayName(sourceUri) ?: "upload.bin"
         val size = querySize(sourceUri) ?: -1L
-        val target = if (breadcrumbs.last().dirFileId == null) {
-            UploadTarget.NewFile("/$name")
+        val vault = VwSession.vault
+        val transferId = if (vault != null) {
+            // Vaults are flat — vw_vault_upload_file's file_id==0 mode only
+            // ever creates a direct child of the vault's own folder, no
+            // nested subfolder concept, so there's no NewInFolder analogue
+            // to branch on here the way the plaintext path does.
+            TransferManager.vaultUploadFile(applicationContext, client, vault, sourceUri, 0L, name, name, size)
         } else {
-            UploadTarget.NewInFolder(currentDirId(), name)
+            val target = if (breadcrumbs.last().dirFileId == null) {
+                UploadTarget.NewFile("/$name")
+            } else {
+                UploadTarget.NewInFolder(currentDirId(), name)
+            }
+            TransferManager.uploadFile(applicationContext, client, sourceUri, target, name, size)
         }
-        val transferId = TransferManager.uploadFile(applicationContext, client, sourceUri, target, name, size)
         awaitAndRefresh(transferId, "Upload")
     }
 

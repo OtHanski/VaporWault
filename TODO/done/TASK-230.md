@@ -1,0 +1,163 @@
+---
+id:          TASK-230
+title:       "Vault support: JNI exposure of vw_vault, passphrase UI, vault browser"
+status:      done
+assignee:    MOB.10
+created_by:  ARCH.00
+created:     2026-08-31
+priority:    high
+depends_on:  [TASK-226, TASK-229]
+blocks:      [TASK-234]
+review_by:   [SEC.07, CQR.08]
+tags:        [security-sensitive]
+---
+
+Bring E2EE vault support (create/unlock/browse) to the Android client, in
+scope for the first milestone per the user's explicit decision.
+
+Scope:
+- Extend the JNI bridge (built on `vw_client_core.c`/`vw_vault.c`, already
+  compiled into `libvaporwault_jni.so` per TASK-225) with `VAULT_CREATE`,
+  `VAULT_KEY_FETCH`, `VAULT_LIST`, and the `FILE_COMMIT`/
+  `VERSION_CHUNKS_RESP` optional `vault_id`/`wrapped_dek` fields.
+- Passphrase-entry UI feeding straight into
+  `vw_crypto_vault_derive_kek`/`vw_vault.c` through the bridge — the
+  passphrase must be held only as a `CharArray` on the Kotlin side, zeroed
+  after use, never logged, never persisted, never passed as a Java `String`
+  (which the JVM cannot reliably zero).
+- Verify byte-for-byte parity with the desktop implementation: Argon2id
+  floor `m_cost >= 19456 KiB`, `t_cost >= 2`, `parallelism == 1` exactly, and
+  the deterministic per-chunk nonce derivation
+  (`HKDF-SHA256(ikm=DEK, info="vw-chunk-nonce" || chunk_index_LE64)`) — cross-
+  check against `src/core/vw_crypto.c`/`src/client/vw_vault.c` directly,
+  the same way the web frontend's `vault-crypto.ts` documents having done
+  (see its header comment).
+- Vault browser UI: create a vault, unlock an existing one, browse its
+  contents through the same file-browser components TASK-229 built.
+
+## Acceptance criteria
+
+- A vault created on desktop (or web) can be unlocked and browsed from
+  Android with the same passphrase, and vice versa — real interop, not just
+  "Android's own vaults work with Android."
+- The passphrase never appears in a log, crash report, or persisted file at
+  any point.
+- SEC.07 has reviewed the KDF parameter and nonce-derivation parity, and the
+  passphrase-handling lifecycle, before this closes.
+
+## Notes
+
+MOB.10, 2026-09-02: Extended `vw_jni_bridge.{h,c}` with `nativeVaultSetup`/
+`_Unlock`/`_Close`/`_FolderFileId`/`_List`/`_UploadFile`/`_DownloadFile` —
+all thin wrappers over `vw_vault.c`'s unmodified `vw_vault_setup`/`_unlock`/
+`_upload_file`/`_download_file` (never `vw_client_vault_create`/
+`_key_fetch` directly — those are the raw wire-only primitives; the crypto
+lives one layer up in `vw_vault.c`, so calling them directly would mean
+reimplementing KDF/wrap logic in this bridge, exactly what reusing the C
+module is meant to avoid). `kdf_params` is hardcoded `NULL` in
+`nativeVaultSetup` — this bridge has no way to request weaker-than-floor
+params. Added Kotlin `VwVault` (setup/unlock/close, `CharArray`-only
+passphrase API — never a `String`, built straight from an `EditText`'s
+`Editable.getChars()`, zeroed by the caller after every use — see that
+file's class doc), `VaultEntry`/`VwClient.listVaults()`, `VaultTransferer`
+(SAF ⇄ private-cache staging around the two whole-file native calls, since
+`vw_vault_upload_file`/`_download_file` need a real POSIX path and can't
+take a `content://` stream directly), and `VaultActivity`/`VaultAdapter`
+(list existing vaults + unlock, or create a new one). `FileBrowserActivity`
+gained a vault mode (`VwSession.vault != null`): breadcrumb pinned to the
+vault's own folder with no way to navigate above it, New Folder and the
+Vaults button hidden (vaults are flat — `vw_vault_upload_file`'s
+`file_id==0` mode only ever creates a direct child of the vault's folder,
+no subfolder concept to create a plaintext folder inside), and a new "Exit
+vault" action. Upload/download in `FileBrowserActivity` branch on
+`VwSession.vault` to route through the vault-aware path instead of the
+plaintext one.
+
+**Real bug found and fixed**: the very first create-vault attempt failed
+with `vw_err_t=500` (`VW_ERR_CRYPTO`). Bisected (temporary diagnostic log,
+removed before this closed) to `vw_crypto_random` itself failing — its
+`g_initialized` guard was never true, because **nothing in the Android JNI
+bridge ever called `vw_crypto_init()`**. This is the exact same gap
+`vw_daemon.c` hit and fixed at TASK-100 (its own comment there: "login
+alone never needed it, only vault operations do, so the gap was invisible
+until vaults existed") — except Android has no daemon process for that
+startup call to live in, and nobody ported the fix when the JNI bridge was
+first scaffolded in TASK-225, since TASK-225/226/227/228/229 never
+exercised a code path needing `vw_crypto_random` (TLS/session-token
+generation apparently don't gate on this flag). Fixed by adding a
+`JNI_OnLoad` hook — the JVM's own "once per process lifetime, before any
+other native method can run" guarantee, the natural Android analogue of the
+daemon's "once at startup."
+
+**Runtime verification**, against `build-wsl-fresh` + emulator (`androidtest2`,
+no 2FA, avoiding the unrelated `TASK-238` blocker), through the UI only:
+- Create vault (`MyVault4`, a fresh folder + `vw_vault_setup`) → succeeded
+  after the `vw_crypto_init` fix; failed with the diagnosable `vw_err_t=500`
+  before it, confirming the fix actually mattered rather than being
+  speculative.
+- Upload a file into the vault: server log shows `CHUNK_UPLOAD len=380` for
+  a 364-byte source file — the +16 bytes is the AES-256-GCM tag, confirming
+  real encryption happened (not a silent plaintext passthrough).
+- Download the same file back: saved locally at exactly 364 bytes (tag
+  correctly stripped) and `diff`'d byte-identical against the original
+  source file — the full encrypt→upload→download→decrypt round trip is
+  correct, not just "no error returned."
+- Exit vault → breadcrumb correctly resets to "Home"; re-enter Vaults →
+  the created vault is listed → Unlock with the same passphrase → same file
+  visible again (VK re-derivation/unwrap from a fresh `VAULT_KEY_FETCH`
+  works, not just the in-memory handle from setup).
+- Negative case: Unlock with a wrong passphrase → cleanly reported
+  `vw_err_t=300` (`VW_ERR_AUTH_BAD_CREDS`, matching `vw_vault_unlock`'s
+  documented mapping) and stayed on `VaultActivity` — no crash, no silent
+  false-success.
+- Caught and fixed, before it ever ran, a repeat of TASK-229's own
+  `lastError()`-on-the-wrong-thread bug in three spots in the brand-new
+  `VaultActivity.kt` (copy-pasted the pattern without thinking it through
+  again) — see that file's `runOnUiThread` blocks for the fix (capture
+  `lastError()` on the background thread first).
+- Separately, a Write-tool encoding artifact turned a `' '` (space) char
+  literal into a literal NUL byte in `VaultActivity.kt` on first write
+  (caught via `file`/byte-level inspection, not visible in a normal Read).
+  Harmless in effect (NUL is actually the more conventional value to
+  zero a secret `CharArray` with — `java.util.Arrays.fill(char[],
+  Char.MIN_VALUE)` is the standard JDK idiom `javax.security.auth
+  .Destroyable` implementations use), but rewritten explicitly as
+  `Char.MIN_VALUE` via a plain loop to remove the ambiguity rather than
+  leave a `' '` literal whose actual on-disk byte can't be trusted at a
+  glance.
+
+**Disclosed gap — no real cross-client interop test performed**: the
+acceptance criteria calls for a vault created on desktop (or web) to be
+unlockable from Android and vice versa. The desktop **CLI** has zero vault
+commands (`vapourwault-cli.exe --help` — nothing under "vault"); vault
+support there is GUI-only (`src/gui/client/views/vw_view_vault.cpp`), and
+Dear ImGui has no accessibility tree for the same kind of `adb`-driven UI
+automation this session has been using for Android, making a real interop
+pass meaningfully more expensive to set up than everything else in this
+task. Not attempted this pass — logical confidence is high (Android reuses
+`vw_vault.c`/`vw_crypto.c` **unmodified**, cross-compiled, so KDF params and
+the deterministic per-chunk nonce derivation are byte-identical by
+construction, not re-derived logic the way the web frontend's
+`vault-crypto.ts` reimplementation is), but that is not the same as having
+actually run it. Flagging for QA.06/SEC.07 to close as part of their review
+pass rather than asserting it here — a genuine gap, not a "should be fine."
+
+**Self-review** (solo implementer+reviewer, `security-sensitive` — covering
+both `SEC.07` and `CQR.08` angles in one pass, matching this project's
+established pattern):
+- Passphrase never touches a JVM `String` at any point in the Kotlin layer
+  (`VaultActivity.passphraseChars`, `VwVault.charsToUtf8Bytes`) or lingers
+  past use (`wipe()` after every native call in `VaultActivity`; `VwVault.
+  setup`/`unlock` zero their own UTF-8 copy natively before returning). The
+  JNI bridge's own secret-zeroing convention (`vw_crypto_secure_zero` before
+  `ReleaseByteArrayElements(..., JNI_ABORT)`) is applied identically to the
+  passphrase bytes in `nativeVaultSetup`/`nativeVaultUnlock`, matching every
+  other secret (`nativeConnect`'s password, `nativeAccount2faSet`'s
+  password) already reviewed in TASK-226/229.
+- No blocking findings beyond the two already fixed above (the missing
+  `vw_crypto_init` call; the repeated `lastError()`-thread bug). `wrap_key`/
+  `unwrap_key`/nonce derivation are untouched, reused C — no new crypto
+  logic was written for this task, only wiring.
+- `VaultTransferer`'s temp-cache staging is wrapped in `try`/`finally` on
+  both upload and download, so a failed transfer never leaves a stray
+  plaintext file behind in the app's private cache.

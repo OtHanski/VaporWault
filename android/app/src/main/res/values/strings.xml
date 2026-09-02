@@ -24,6 +24,23 @@
     <string name="empty_folder">This folder is empty</string>
     <string name="empty_transfers">No transfers yet</string>
     <string name="root_breadcrumb">Home</string>
+    <string name="vault_breadcrumb">🔒 Vault</string>
     <string name="status_loading">Loading…</string>
     <string name="status_working">Working…</string>
+
+    <string name="action_vaults">Vaults</string>
+    <string name="action_exit_vault">Exit vault</string>
+    <string name="action_unlock">Unlock</string>
+    <string name="action_create_vault">Create vault</string>
+    <string name="title_vaults">Vaults</string>
+    <string name="label_existing_vaults">Existing vaults</string>
+    <string name="label_create_vault">Create a new vault</string>
+    <string name="hint_new_vault_folder_name">New folder name</string>
+    <string name="hint_passphrase">Encryption passphrase</string>
+    <string name="hint_passphrase_confirm">Confirm passphrase</string>
+    <string name="empty_vaults">No vaults yet</string>
+    <string name="status_unlocking">Unlocking…</string>
+    <string name="status_creating_vault">Creating vault…</string>
+    <string name="error_passphrase_mismatch">Passphrases don\'t match</string>
+    <string name="error_passphrase_too_short">Passphrase must be at least 8 characters</string>
 </resources>

@@ -9,6 +9,7 @@ import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import com.vaporwault.client.VwClient
+import com.vaporwault.client.VwVault
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -69,6 +70,48 @@ object TransferManager {
                 TransferBus.notifyProgress(transferId, label, done, total)
             }
             cancelFlags.remove(transferId)
+            TransferBus.notifyComplete(transferId, success)
+        }
+        return transferId
+    }
+
+    /** Vault-aware counterpart to [uploadFile] (TASK-230) — see
+     * [VaultTransferer]'s doc for why this can't report incremental
+     * progress or be cancelled mid-transfer the way the plaintext path
+     * can; [cancel] is a no-op for a vault transferId. */
+    fun vaultUploadFile(
+        context: Context,
+        client: VwClient,
+        vault: VwVault,
+        sourceUri: Uri,
+        fileId: Long,
+        leafName: String,
+        label: String,
+        sizeBytes: Long,
+    ): String {
+        val transferId = "vup-${System.currentTimeMillis()}"
+        TransferBus.notifyStarted(transferId, label, sizeBytes)
+        run(context, uploadBytes = sizeBytes, downloadBytes = 0) {
+            val result = VaultTransferer(context, client, vault).uploadFile(sourceUri, fileId, leafName)
+            TransferBus.notifyComplete(transferId, result != null)
+        }
+        return transferId
+    }
+
+    /** Vault-aware counterpart to [downloadFile] — see [vaultUploadFile]'s doc. */
+    fun vaultDownloadFile(
+        context: Context,
+        client: VwClient,
+        vault: VwVault,
+        fileId: Long,
+        destUri: Uri,
+        label: String,
+        sizeBytes: Long,
+    ): String {
+        val transferId = "vdown-${System.currentTimeMillis()}"
+        TransferBus.notifyStarted(transferId, label, sizeBytes)
+        run(context, uploadBytes = 0, downloadBytes = sizeBytes) {
+            val success = VaultTransferer(context, client, vault).downloadFile(fileId, destUri)
             TransferBus.notifyComplete(transferId, success)
         }
         return transferId

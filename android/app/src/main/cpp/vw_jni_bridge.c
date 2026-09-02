@@ -1,6 +1,7 @@
 #include "vw_jni_bridge.h"
 
 #include "vw_client_core.h"
+#include "vw_vault.h"
 #include "../core/vw_crypto.h"
 #include "../core/vw_net.h"
 #include "../core/vw_proto.h"
@@ -18,6 +19,31 @@
  * failure-sentinel convention every function below follows).
  */
 static _Thread_local vw_err_t g_last_error = VW_OK;
+
+/*
+ * vw_crypto_init() (PSA Crypto + the process-wide CTR-DRBG behind
+ * vw_crypto_random) is required before anything in this bridge calls
+ * vw_crypto_random — directly, or transitively via vw_vault_setup/_unlock
+ * (fresh VK/salt generation, AES-GCM nonces) or vw_crypto_vault_derive_kek's
+ * Argon2id path. Desktop's daemon calls this once at process startup
+ * (vw_daemon.c, TASK-100's finding: login alone never needed it, only
+ * vault operations do, so the gap was invisible until vaults existed).
+ * Android has no daemon process for that call to live in — JNI_OnLoad is
+ * the equivalent "once per process lifetime, before any other native
+ * method can run" hook the JVM guarantees, so it belongs here instead.
+ * Without it, every vault operation fails fast with VW_ERR_CRYPTO
+ * (vw_crypto.c's g_initialized guard) while plaintext operations keep
+ * working fine (TLS/session token generation don't go through this gate) —
+ * exactly the confusing, vault-only failure mode this was found by.
+ */
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    (void)vm; (void)reserved;
+    if (vw_crypto_init() != VW_OK) {
+        LOGE("vw_crypto_init failed at library load");
+        return -1;
+    }
+    return JNI_VERSION_1_6;
+}
 
 /* ── JNI string helpers ───────────────────────────────────────────────────
  * Returns NULL if `s` is a Java null OR GetStringUTFChars failed (OOM) —
@@ -148,6 +174,25 @@ static jbyteArray encode_version_entries(JNIEnv *env, const vw_version_entry_t *
     uint8_t *p = buf;
     vw_write_u32le(p, count); p += 4;
     for (uint32_t i = 0; i < count; i++) p = write_version_entry(p, &entries[i]);
+    jbyteArray arr = make_byte_array(env, buf, total);
+    free(buf);
+    return arr;
+}
+
+#define VAULT_ENTRY_SIZE 24u /* u64 vault_id + u64 folder_file_id + i64 created_at; no strings */
+static uint8_t *write_vault_entry(uint8_t *p, const vw_vault_entry_t *e) {
+    vw_write_u64le(p, e->vault_id);              p += 8;
+    vw_write_u64le(p, e->folder_file_id);        p += 8;
+    vw_write_u64le(p, (uint64_t)e->created_at);  p += 8;
+    return p;
+}
+static jbyteArray encode_vault_entries(JNIEnv *env, const vw_vault_entry_t *entries, uint32_t count) {
+    uint32_t total = 4 + count * VAULT_ENTRY_SIZE;
+    uint8_t *buf = malloc(total);
+    if (!buf) return NULL;
+    uint8_t *p = buf;
+    vw_write_u32le(p, count); p += 4;
+    for (uint32_t i = 0; i < count; i++) p = write_vault_entry(p, &entries[i]);
     jbyteArray arr = make_byte_array(env, buf, total);
     free(buf);
     return arr;
@@ -992,4 +1037,171 @@ Java_com_vaporwault_client_VwNative_nativeNotifyPrefsSet(JNIEnv *env, jobject th
     g_last_error = rc;
     if (rc != VW_OK) return -1;
     return (jlong)out_prefs;
+}
+
+/* ── Vault (TASK-230) ─────────────────────────────────────────────────────
+ * All key-derivation/wrapping/unwrapping crypto lives in vw_vault.c
+ * (unmodified, cross-compiled from src/client/ same as vw_client_core.c) —
+ * this bridge only moves the passphrase in as raw bytes and the resulting
+ * opaque vault handle out; see vw_vault.h's own header comment for the
+ * envelope design. A "vault handle" is a vw_vault_t* cast to jlong, same
+ * intptr_t round trip as a session handle. kdf_params is always NULL here
+ * (the SEC.07-pinned floor) — this bridge does not expose a way to pick
+ * weaker-than-floor params, matching vw_vault_setup's own doc comment on
+ * what a NULL kdf_params means. */
+
+JNIEXPORT jlongArray JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultSetup(
+    JNIEnv *env, jobject thiz,
+    jlong session_handle, jlong folder_file_id, jbyteArray passphrase)
+{
+    (void)thiz;
+    vw_client_sess_t *sess = (vw_client_sess_t *)(intptr_t)session_handle;
+    if (!passphrase) { g_last_error = VW_ERR_INVALID_ARG; return NULL; }
+
+    jbyte *pass_bytes = (*env)->GetByteArrayElements(env, passphrase, NULL);
+    jsize pass_len = (*env)->GetArrayLength(env, passphrase);
+    if (!pass_bytes) { g_last_error = VW_ERR_OOM; return NULL; }
+
+    vw_vault_t *vault = NULL;
+    uint64_t vault_id = 0;
+    vw_err_t rc = vw_vault_setup(sess, (uint64_t)folder_file_id,
+                                  pass_bytes, (size_t)pass_len,
+                                  NULL, &vault, &vault_id);
+
+    vw_crypto_secure_zero(pass_bytes, (size_t)pass_len);
+    (*env)->ReleaseByteArrayElements(env, passphrase, pass_bytes, JNI_ABORT);
+
+    g_last_error = rc;
+    if (rc != VW_OK) return NULL;
+
+    jlong result[2] = { (jlong)(intptr_t)vault, (jlong)vault_id };
+    jlongArray arr = (*env)->NewLongArray(env, 2);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 2, result);
+    return arr;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultUnlock(
+    JNIEnv *env, jobject thiz,
+    jlong session_handle, jlong vault_id, jbyteArray passphrase)
+{
+    (void)thiz;
+    vw_client_sess_t *sess = (vw_client_sess_t *)(intptr_t)session_handle;
+    if (!passphrase) { g_last_error = VW_ERR_INVALID_ARG; return 0; }
+
+    jbyte *pass_bytes = (*env)->GetByteArrayElements(env, passphrase, NULL);
+    jsize pass_len = (*env)->GetArrayLength(env, passphrase);
+    if (!pass_bytes) { g_last_error = VW_ERR_OOM; return 0; }
+
+    vw_vault_t *vault = NULL;
+    vw_err_t rc = vw_vault_unlock(sess, (uint64_t)vault_id,
+                                   pass_bytes, (size_t)pass_len, &vault);
+
+    vw_crypto_secure_zero(pass_bytes, (size_t)pass_len);
+    (*env)->ReleaseByteArrayElements(env, passphrase, pass_bytes, JNI_ABORT);
+
+    g_last_error = rc;
+    if (rc != VW_OK) return 0;
+    return (jlong)(intptr_t)vault;
+}
+
+JNIEXPORT void JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultClose(JNIEnv *env, jobject thiz, jlong vault_handle)
+{
+    (void)env; (void)thiz;
+    vw_vault_close((vw_vault_t *)(intptr_t)vault_handle);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultFolderFileId(JNIEnv *env, jobject thiz, jlong vault_handle)
+{
+    (void)env; (void)thiz;
+    return (jlong)vw_vault_folder_file_id_of((const vw_vault_t *)(intptr_t)vault_handle);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultList(JNIEnv *env, jobject thiz, jlong session_handle)
+{
+    (void)thiz;
+    vw_client_sess_t *sess = (vw_client_sess_t *)(intptr_t)session_handle;
+    vw_vault_entry_t *entries = NULL;
+    uint32_t count = 0;
+    vw_err_t rc = vw_client_vault_list(sess, &entries, &count);
+    g_last_error = rc;
+    if (rc != VW_OK) return NULL;
+    jbyteArray result = encode_vault_entries(env, entries, count);
+    free(entries);
+    if (!result) g_last_error = VW_ERR_OOM;
+    return result;
+}
+
+/* file_id == 0 creates a new file named leaf_name inside the vault's
+ * folder; file_id != 0 uploads a new version of that existing file (see
+ * vw_vault_upload_file's own doc comment — leaf_name is ignored in that
+ * case). local_path is a real POSIX path in the app's private cache
+ * (android/app's SAF content:// URIs cannot be handed to vw_vault.c's
+ * whole-file upload directly — see VaultTransferer.kt). No live progress
+ * callback in this first cut (progress_cb=NULL): a real native-to-Java
+ * callback is a nontrivial new pattern for this bridge and TASK-230's
+ * acceptance criteria don't require it — the UI shows an indeterminate
+ * "Encrypting…" status for the duration of this one blocking call instead,
+ * disclosed as a scope simplification in the task's Notes. */
+JNIEXPORT jlongArray JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultUploadFile(
+    JNIEnv *env, jobject thiz,
+    jlong vault_handle, jlong session_handle, jlong file_id,
+    jstring leaf_name, jstring local_path)
+{
+    (void)thiz;
+    vw_vault_t *vault = (vw_vault_t *)(intptr_t)vault_handle;
+    vw_client_sess_t *sess = (vw_client_sess_t *)(intptr_t)session_handle;
+
+    const char *leaf_c = borrow_str(env, leaf_name);
+    const char *path_c = borrow_str(env, local_path);
+    if (!path_c) {
+        release_str(env, leaf_name, leaf_c);
+        release_str(env, local_path, path_c);
+        g_last_error = VW_ERR_INVALID_ARG;
+        return NULL;
+    }
+
+    uint64_t out_file_id = 0, out_version_id = 0;
+    vw_err_t rc = vw_vault_upload_file(vault, sess, (uint64_t)file_id,
+                                        leaf_c ? leaf_c : "", path_c,
+                                        NULL, NULL,
+                                        &out_file_id, &out_version_id);
+
+    release_str(env, leaf_name, leaf_c);
+    release_str(env, local_path, path_c);
+
+    g_last_error = rc;
+    if (rc != VW_OK) return NULL;
+
+    jlong result[2] = { (jlong)out_file_id, (jlong)out_version_id };
+    jlongArray arr = (*env)->NewLongArray(env, 2);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 2, result);
+    return arr;
+}
+
+/* local_path is where the decrypted plaintext is written (a real POSIX
+ * path in the app's private cache — see VaultTransferer.kt for the copy
+ * to/from the user's chosen SAF destination). */
+JNIEXPORT jint JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultDownloadFile(
+    JNIEnv *env, jobject thiz,
+    jlong vault_handle, jlong session_handle, jlong file_id, jstring local_path)
+{
+    (void)thiz;
+    vw_vault_t *vault = (vw_vault_t *)(intptr_t)vault_handle;
+    vw_client_sess_t *sess = (vw_client_sess_t *)(intptr_t)session_handle;
+
+    const char *path_c = borrow_str(env, local_path);
+    if (!path_c) { g_last_error = VW_ERR_INVALID_ARG; return (jint)VW_ERR_INVALID_ARG; }
+
+    vw_err_t rc = vw_vault_download_file(vault, sess, (uint64_t)file_id, path_c, NULL, NULL);
+    release_str(env, local_path, path_c);
+
+    g_last_error = rc;
+    return (jint)rc;
 }

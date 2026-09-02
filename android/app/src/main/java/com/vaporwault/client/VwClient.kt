@@ -68,6 +68,10 @@ data class VersionChunks(
  * (see vw_client_core.h's vw_client_link_create doc). */
 data class LinkCreateResult(val shareId: Long, val token: ByteArray)
 
+/** One VAULT_LIST entry (vw_vault_entry_t). Never includes wrapped-key
+ * material — [VwVault.unlock] is the only way to actually open one. */
+data class VaultEntry(val vaultId: Long, val folderFileId: Long, val createdAt: Long)
+
 /**
  * Ergonomic wrapper over [VwNative]'s raw JNI bridge — the mobile analogue
  * of desktop's `VwGuiIpc` (src/gui/client/vw_gui_ipc.h) relative to
@@ -146,6 +150,7 @@ class VwClient private constructor(sessionHandle: Long) : AutoCloseable {
         /** vw_err_t code from the most recent failed bridge call on this thread. */
         fun lastError(): Int = VwNative.nativeLastError()
 
+        const val ERR_AUTH_BAD_CREDS = 300
         const val ERR_AUTH_2FA_REQUIRED = 301
     }
 
@@ -312,6 +317,19 @@ class VwClient private constructor(sessionHandle: Long) : AutoCloseable {
      * [getNotifyPrefs] first, flip the bit locally, then pass the full
      * result here. Returns the stored value on success, or -1 on failure. */
     fun setNotifyPrefs(prefs: Long): Long = VwNative.nativeNotifyPrefsSet(handle, prefs)
+
+    // ── Vault ────────────────────────────────────────────────────────────
+
+    /** Vaults owned by the caller — never includes wrapped-key material;
+     * use [VwVault.unlock] to actually open one. */
+    fun listVaults(): List<VaultEntry>? =
+        VwNative.nativeVaultList(handle)?.let(::decodeVaultEntries)
+
+    /** This session's raw handle, needed by [VwVault]'s static factory
+     * methods (which — like [VwClient]'s own — take a session handle
+     * directly rather than a [VwClient] instance, matching [VwNative]'s
+     * shape one level up). */
+    internal fun rawHandle(): Long = handle
 }
 
 // ── Record decoding ──────────────────────────────────────────────────────
@@ -368,6 +386,9 @@ private fun ByteBuffer.readLinkEntry(): LinkEntry {
 private fun ByteBuffer.readVersionEntry(): VersionEntry =
     VersionEntry(versionId = long, createdAt = long, sizeBytes = long)
 
+private fun ByteBuffer.readVaultEntry(): VaultEntry =
+    VaultEntry(vaultId = long, folderFileId = long, createdAt = long)
+
 private fun decodeFileEntries(bytes: ByteArray): List<FileEntry> {
     val buf = leBuffer(bytes)
     val count = buf.int
@@ -390,6 +411,12 @@ private fun decodeVersionEntries(bytes: ByteArray): List<VersionEntry> {
     val buf = leBuffer(bytes)
     val count = buf.int
     return List(count) { buf.readVersionEntry() }
+}
+
+private fun decodeVaultEntries(bytes: ByteArray): List<VaultEntry> {
+    val buf = leBuffer(bytes)
+    val count = buf.int
+    return List(count) { buf.readVaultEntry() }
 }
 
 private fun decodeVersionChunks(bytes: ByteArray): VersionChunks {

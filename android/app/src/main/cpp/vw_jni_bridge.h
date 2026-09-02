@@ -2,8 +2,8 @@
 #define VW_JNI_BRIDGE_H
 
 /*
- * vw_jni_bridge — JNI shim over vw_client_core (TASK-225/226). Vault RPCs
- * (vw_vault.c) are TASK-230's job, not this file's.
+ * vw_jni_bridge — JNI shim over vw_client_core (TASK-225/226) and vw_vault
+ * (TASK-230).
  *
  * Every exported function follows the standard JNI naming convention
  * (Java_<package>_<Class>_<method>) for the Kotlin object
@@ -378,6 +378,69 @@ JNIEXPORT jlong JNICALL
 Java_com_vaporwault_client_VwNative_nativeNotifyPrefsSet(JNIEnv *env, jobject thiz,
                                                           jlong session_handle,
                                                           jlong prefs);
+
+/* ── Vault (TASK-230) ──────────────────────────────────────────────────── */
+
+/*
+ * VAULT_CREATE + KEK derivation + VK wrap (vw_vault_setup). passphrase is
+ * consumed and zeroed before this returns, regardless of outcome — the
+ * Kotlin side must never retain a copy past this call (see VwVault.kt).
+ * Returns [vaultHandle, vaultId] on success, or null on failure — a
+ * fresh-random VK, wrapped under a KEK derived at the SEC.07-pinned
+ * Argon2id floor (this bridge does not expose weaker params).
+ */
+JNIEXPORT jlongArray JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultSetup(
+    JNIEnv *env, jobject thiz,
+    jlong session_handle, jlong folder_file_id, jbyteArray passphrase);
+
+/*
+ * VAULT_KEY_FETCH + KEK re-derivation + VK unwrap (vw_vault_unlock).
+ * passphrase is consumed and zeroed before this returns. Returns 0 (an
+ * invalid handle) on failure, including a wrong passphrase
+ * (nativeLastError() == VW_ERR_AUTH_BAD_CREDS in that case specifically).
+ */
+JNIEXPORT jlong JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultUnlock(
+    JNIEnv *env, jobject thiz,
+    jlong session_handle, jlong vault_id, jbyteArray passphrase);
+
+/* Zeroes the in-memory VK and frees the handle. Safe with 0. */
+JNIEXPORT void JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultClose(JNIEnv *env, jobject thiz, jlong vault_handle);
+
+/* The folder_file_id this (already unlocked/created) vault covers. */
+JNIEXPORT jlong JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultFolderFileId(JNIEnv *env, jobject thiz, jlong vault_handle);
+
+/* VAULT_LIST — vaults owned by the caller, never including wrapped-key
+ * material (that's nativeVaultUnlock's job). Record shape: u64 vault_id +
+ * u64 folder_file_id + i64 created_at, fixed 24 bytes, no strings. */
+JNIEXPORT jbyteArray JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultList(JNIEnv *env, jobject thiz, jlong session_handle);
+
+/*
+ * Encrypt local_path (a real POSIX path — see VaultTransferer.kt for why
+ * this can't be a content:// URI directly) and upload it into vault's
+ * folder. file_id == 0 creates a new file named leaf_name; file_id != 0
+ * uploads a new version of that existing (vault-owned) file. Returns
+ * [fileId, versionId] on success, null on failure. No live progress
+ * reporting in this first cut — see the .c file's doc comment on this
+ * function for why.
+ */
+JNIEXPORT jlongArray JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultUploadFile(
+    JNIEnv *env, jobject thiz,
+    jlong vault_handle, jlong session_handle, jlong file_id,
+    jstring leaf_name, jstring local_path);
+
+/* Download and decrypt file_id's current version, writing plaintext to
+ * local_path (a real POSIX path — caller copies to/from the user's SAF
+ * destination). Returns the vw_err_t code directly (VW_OK == 0). */
+JNIEXPORT jint JNICALL
+Java_com_vaporwault_client_VwNative_nativeVaultDownloadFile(
+    JNIEnv *env, jobject thiz,
+    jlong vault_handle, jlong session_handle, jlong file_id, jstring local_path);
 
 #ifdef __cplusplus
 }
