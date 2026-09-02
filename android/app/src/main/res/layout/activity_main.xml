@@ -39,6 +39,18 @@
         android:layout_height="wrap_content"
         android:text="@string/action_connect" />
 
+    <Button
+        android:id="@+id/addProfileButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/action_add_profile" />
+
+    <Button
+        android:id="@+id/resumeProfilesButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/action_resume_profiles" />
+
     <TextView
         android:id="@+id/resultText"
         android:layout_width="match_parent"

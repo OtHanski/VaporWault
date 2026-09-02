@@ -5,20 +5,30 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.vaporwault.client.accounts.VwAccountRegistry
+import java.io.File
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import kotlin.concurrent.thread
 
 /**
- * TASK-225/226 toolchain + bridge-surface smoke test — not real UI (that's
- * TASK-229's job). Connects, then exercises the round trip TASK-226's
- * acceptance criteria calls for (list a directory, upload+commit a file,
- * download it back, share it, revoke it) against a real vapourwaultd,
- * reporting a step-by-step pass/fail summary.
+ * TASK-225/226/227 toolchain + bridge-surface + account-registry smoke
+ * test — not real UI (that's TASK-229's job).
  *
- * Sharing needs a second, already-existing account on the test server to
- * grant to — hardcoded below as "androidtest2"; the connecting account
- * (whatever is typed into the form) is the grantor.
+ * - CONNECT: the round trip TASK-226's acceptance criteria calls for (list
+ *   a directory, upload+commit a file, download it back, share it, revoke
+ *   it) against a real vapourwaultd, reporting a step-by-step pass/fail
+ *   summary. Sharing needs a second, already-existing account on the test
+ *   server to grant to — hardcoded below as "androidtest2"; the connecting
+ *   account (whatever is typed into the form) is the grantor.
+ * - ADD PROFILE: exercises TASK-227's [VwAccountRegistry.addProfile] with
+ *   the typed-in fields, then reads the resulting `.cred` file's raw bytes
+ *   directly to confirm the session token is nowhere in it in the clear.
+ * - RESUME PROFILES: exercises [VwAccountRegistry.resume] for every saved
+ *   profile without touching the password fields at all — this is the
+ *   "restart the app" scenario; run it after a real `adb shell am
+ *   force-stop` + relaunch, not just within the same process, to actually
+ *   prove the AndroidKeyStore-wrapped credentials survive a real restart.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -34,6 +44,8 @@ class MainActivity : AppCompatActivity() {
         val passField = findViewById<EditText>(R.id.passField)
         val resultText = findViewById<TextView>(R.id.resultText)
         val connectButton = findViewById<Button>(R.id.connectButton)
+        val addProfileButton = findViewById<Button>(R.id.addProfileButton)
+        val resumeProfilesButton = findViewById<Button>(R.id.resumeProfilesButton)
 
         connectButton.setOnClickListener {
             val host = hostField.text.toString()
@@ -42,19 +54,90 @@ class MainActivity : AppCompatActivity() {
             val pass = passField.text.toString().toByteArray(Charsets.UTF_8)
 
             resultText.text = "Connecting..."
-            thread {
-                // Test-only: empty CA path disables cert verification
-                // (VW_CERT_VERIFY_NONE). Never do this outside a local
-                // smoke test against tests/integration/gen_test_cert.sh.
-                val message = try {
-                    runRoundTrip(host, port, user, pass)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    "Exception: ${e.message}"
-                }
-                runOnUiThread { resultText.text = message }
+            runAsync(resultText) { runRoundTrip(host, port, user, pass) }
+        }
+
+        addProfileButton.setOnClickListener {
+            val host = hostField.text.toString()
+            val port = portField.text.toString().toIntOrNull() ?: 0
+            val user = userField.text.toString()
+            val pass = passField.text.toString().toByteArray(Charsets.UTF_8)
+
+            resultText.text = "Adding profile..."
+            runAsync(resultText) { runAddProfile(host, port, user, pass) }
+        }
+
+        resumeProfilesButton.setOnClickListener {
+            resultText.text = "Resuming profiles..."
+            runAsync(resultText) { runResumeAllProfiles() }
+        }
+    }
+
+    private fun runAsync(resultText: TextView, block: () -> String) {
+        thread {
+            val message = try {
+                block()
+            } catch (e: Exception) {
+                e.printStackTrace()
+                "Exception: ${e.message}"
+            }
+            runOnUiThread { resultText.text = message }
+        }
+    }
+
+    private fun runAddProfile(host: String, port: Int, user: String, pass: ByteArray): String {
+        val registry = VwAccountRegistry(applicationContext)
+        val (profile, client) = registry.addProfile(label = user, host, port, user, pass)
+            ?: return "addProfile FAILED: vw_err_t=${VwClient.lastError()}"
+
+        val sessionToken = client.token()
+        client.close()
+
+        // TASK-227 acceptance criterion: credentials are never stored in
+        // plaintext anywhere on disk. Read the raw .cred file bytes
+        // directly and confirm the session token isn't in there verbatim.
+        val credFile = File(File(applicationContext.filesDir, "profiles"), "${profile.id}.cred")
+        val rawBytes = credFile.readBytes()
+        val containsPlaintextToken = rawBytes.indexOfSubarray(sessionToken) >= 0
+
+        return if (containsPlaintextToken) {
+            "addProfile FAILED: session token found in cleartext in ${credFile.name}!"
+        } else {
+            "addProfile ok (profile_id=${profile.id}, user=$user)\n" +
+                "cred file is ${rawBytes.size} bytes, session token not found in cleartext\n" +
+                "stored profiles: ${registry.listProfiles().size}"
+        }
+    }
+
+    private fun runResumeAllProfiles(): String {
+        val registry = VwAccountRegistry(applicationContext)
+        val profiles = registry.listProfiles()
+        if (profiles.isEmpty()) return "no stored profiles — tap ADD PROFILE first"
+
+        val results = profiles.joinToString("\n") { profile ->
+            val client = registry.resume(profile.id)
+            if (client == null) {
+                "${profile.username}: FAILED vw_err_t=${VwClient.lastError()}"
+            } else {
+                val userId = client.userId()
+                client.close()
+                "${profile.username}: resumed ok (user_id=$userId), no password used"
             }
         }
+        return "RESUME RESULTS (${profiles.size} profile(s)):\n$results"
+    }
+
+    /** Naive subarray search — these blobs are a few dozen bytes, no need
+     * for anything fancier. */
+    private fun ByteArray.indexOfSubarray(needle: ByteArray): Int {
+        if (needle.isEmpty() || needle.size > size) return -1
+        outer@ for (start in 0..(size - needle.size)) {
+            for (i in needle.indices) {
+                if (this[start + i] != needle[i]) continue@outer
+            }
+            return start
+        }
+        return -1
     }
 
     private fun runRoundTrip(host: String, port: Int, user: String, pass: ByteArray): String {

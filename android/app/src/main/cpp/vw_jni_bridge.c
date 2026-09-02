@@ -240,6 +240,70 @@ Java_com_vaporwault_client_VwNative_nativeConnect(
 }
 
 JNIEXPORT jlong JNICALL
+Java_com_vaporwault_client_VwNative_nativeConnectWithHash(
+    JNIEnv *env, jobject thiz,
+    jstring host, jint port, jstring ca_cert_pem_path,
+    jstring username, jbyteArray auth_token, jstring otp)
+{
+    (void)thiz;
+
+    const char *host_c = borrow_str(env, host);
+    const char *ca_path_c = borrow_str(env, ca_cert_pem_path);
+    const char *username_c = borrow_str(env, username);
+    const char *otp_c = borrow_str(env, otp);
+    if (!host_c || !ca_path_c || !username_c || !otp_c || !auth_token ||
+        (*env)->GetArrayLength(env, auth_token) != VW_TOKEN_BYTES) {
+        release_str(env, host, host_c);
+        release_str(env, ca_cert_pem_path, ca_path_c);
+        release_str(env, username, username_c);
+        release_str(env, otp, otp_c);
+        g_last_error = VW_ERR_INVALID_ARG;
+        return 0;
+    }
+
+    jbyte *token_bytes = (*env)->GetByteArrayElements(env, auth_token, NULL);
+    if (!token_bytes) {
+        release_str(env, host, host_c);
+        release_str(env, ca_cert_pem_path, ca_path_c);
+        release_str(env, username, username_c);
+        release_str(env, otp, otp_c);
+        g_last_error = VW_ERR_OOM;
+        return 0;
+    }
+
+    vw_client_cfg_t cfg = {
+        .host = host_c,
+        .port = (uint16_t)port,
+        .cert_verify = (ca_path_c[0] == '\0') ? VW_CERT_VERIFY_NONE
+                                               : VW_CERT_VERIFY_REQUIRED,
+        .ca_cert_pem_path = (ca_path_c[0] == '\0') ? NULL : ca_path_c,
+        .conn_opts = NULL,
+    };
+
+    otp_ctx_t otp_ctx = { .otp = otp_c };
+    vw_otp_callback_t otp_cb = (otp_c[0] != '\0') ? otp_callback : NULL;
+    void *otp_userdata = (otp_c[0] != '\0') ? (void *)&otp_ctx : NULL;
+
+    vw_client_sess_t *sess = NULL;
+    vw_err_t rc = vw_client_connect_with_hash(&cfg,
+                                               username_c, (uint16_t)strlen(username_c),
+                                               (const uint8_t *)token_bytes,
+                                               otp_cb, otp_userdata,
+                                               &sess);
+
+    release_str(env, host, host_c);
+    release_str(env, ca_cert_pem_path, ca_path_c);
+    release_str(env, username, username_c);
+    release_str(env, otp, otp_c);
+    vw_crypto_secure_zero(token_bytes, VW_TOKEN_BYTES);
+    (*env)->ReleaseByteArrayElements(env, auth_token, token_bytes, JNI_ABORT);
+
+    g_last_error = rc;
+    if (rc != VW_OK) return 0;
+    return (jlong)(intptr_t)sess;
+}
+
+JNIEXPORT jlong JNICALL
 Java_com_vaporwault_client_VwNative_nativeSessionResume(
     JNIEnv *env, jobject thiz,
     jstring host, jint port, jstring ca_cert_pem_path,

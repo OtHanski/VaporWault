@@ -27,6 +27,15 @@ object VwNative {
         otp: String,
     ): Long
 
+    external fun nativeConnectWithHash(
+        host: String,
+        port: Int,
+        caCertPemPath: String,
+        username: String,
+        authToken: ByteArray,
+        otp: String,
+    ): Long
+
     external fun nativeSessionResume(
         host: String,
         port: Int,

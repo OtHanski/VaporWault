@@ -72,6 +72,23 @@ Java_com_vaporwault_client_VwNative_nativeConnect(
     jstring username, jbyteArray password, jstring otp);
 
 /*
+ * Connect and authenticate using an already-derived auth_token
+ * (SHA-256(password) — the exact 32 bytes AUTH_REQUEST sends, see
+ * vw_client_core.h's header comment) instead of a raw password.
+ * TASK-227: lets a saved "login token" reconnect a profile without ever
+ * re-prompting for a password when nativeSessionResume fails (typically
+ * the session token's natural expiry) — the same two-tier fallback the
+ * desktop daemon's own read-only-fallback connect already relies on
+ * (vw_client_connect_with_hash's doc, TASK-173). otp semantics identical
+ * to nativeConnect. Returns a non-zero handle on success, 0 on failure.
+ */
+JNIEXPORT jlong JNICALL
+Java_com_vaporwault_client_VwNative_nativeConnectWithHash(
+    JNIEnv *env, jobject thiz,
+    jstring host, jint port, jstring ca_cert_pem_path,
+    jstring username, jbyteArray auth_token, jstring otp);
+
+/*
  * Resume a saved session using a previously-stored token (PROTOCOL.md §7.1:
  * single-use — the server issues a fresh replacement token on success; the
  * caller must re-fetch and re-persist it via nativeGetToken() immediately

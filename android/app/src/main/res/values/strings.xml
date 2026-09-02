@@ -6,4 +6,6 @@
     <string name="hint_username">Username</string>
     <string name="hint_password">Password</string>
     <string name="action_connect">Connect</string>
+    <string name="action_add_profile">Add Profile</string>
+    <string name="action_resume_profiles">Resume Profiles</string>
 </resources>

@@ -115,6 +115,27 @@ class VwClient private constructor(sessionHandle: Long) : AutoCloseable {
             return if (handle != 0L) VwClient(handle) else null
         }
 
+        /**
+         * Reconnect using an already-derived auth_token (SHA-256(password))
+         * instead of a raw password — never re-prompts the user. This is
+         * how a saved "login token" (see the `accounts` package, TASK-227)
+         * resumes a profile when [resume] fails, typically because the
+         * session token naturally expired — the same two-tier fallback the
+         * desktop daemon's own read-only-fallback connect already relies
+         * on. [authToken] must be exactly 32 bytes.
+         */
+        fun connectWithHash(
+            host: String,
+            port: Int,
+            username: String,
+            authToken: ByteArray,
+            caCertPemPath: String = "",
+            otp: String = "",
+        ): VwClient? {
+            val handle = VwNative.nativeConnectWithHash(host, port, caCertPemPath, username, authToken, otp)
+            return if (handle != 0L) VwClient(handle) else null
+        }
+
         /** Resume a previously-saved session token (single-use — see
          * [VwClient.token]'s doc for what to do with the result). */
         fun resume(host: String, port: Int, caCertPemPath: String, savedToken: ByteArray): VwClient? {
