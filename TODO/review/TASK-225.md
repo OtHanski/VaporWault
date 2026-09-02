@@ -71,11 +71,29 @@ Scope:
   mbedTLS 3.6.7 + the vendored Argon2 reference, both fetched and
   cross-compiled per-ABI exactly as the desktop build does) is produced and
   packaged into `app-debug.apk` for all three target ABIs.
-- **Not yet verified**: actually running the app on an emulator/device and
-  exercising a real connect+login against a `vapourwaultd` instance — no AVD
-  was created and no emulator was started this session. The acceptance
-  criterion's build-toolchain half is done and gives high confidence (this
-  was the actually-uncertain part — whether the existing C sources and their
-  vendored deps cross-compile for Android at all); the runtime half is a
-  reasonable next step before or alongside TASK-226, not assumed to be
-  covered by the build succeeding.
+- **Runtime verified, 2026-09-02**: created an x86_64 Android 14 AVD
+  (`system-images;android-34;default;x86_64`), booted it headless
+  (`-no-window -gpu swiftshader_indirect`), and ran a real `vapourwaultd`
+  test instance (test TLS cert via `tests/integration/gen_test_cert.sh`, one
+  user created via `vapourwault-server-cli user-create`) reachable from the
+  emulator via `adb reverse tcp:4430 tcp:4430`. Installed `app-debug.apk`,
+  launched `MainActivity`, and drove the UI via `adb shell input
+  tap`/`text` (host=127.0.0.1, port=4430, user/pass for the created
+  account) followed by an `adb shell uiautomator dump` read of
+  `resultText`'s actual value — confirmed
+  `"Connected and logged in successfully (session closed)."`, i.e. a real
+  TLS 1.3 handshake, `HELLO`/`HELLO_OK`, and `AUTH_REQUEST`/`AUTH_OK` round
+  trip through the JNI bridge into `vw_client_core.c` against a live server,
+  not just a successful compile. Both acceptance criteria are now met.
+- Out-of-domain finding while doing this (server-side, not MOB.10's or this
+  task's to fix — filed as `TASK-237` for SRV.01 per the routing rules):
+  the test server logged `WARN unhandled msg type 0x0107` for the
+  `AUTH_LOGOUT` the smoke-test app sends on its way out. Checked the
+  *current* source, not just the prebuilt test binary — `src/server/`
+  genuinely has no dispatch case for `VW_MSG_AUTH_LOGOUT` anywhere
+  (`vw_server_core.c`'s dispatch only handles `AUTH_REQUEST`/
+  `SESSION_RESUME`), even though `vw_client_logout()` has always sent it
+  (`vw_client_core.c:297`). Harmless to *this* task (the connect+login this
+  task verifies fully succeeded before logout was ever sent), but a real,
+  pre-existing gap: a session token is not invalidated server-side on
+  logout, only at natural expiry.
