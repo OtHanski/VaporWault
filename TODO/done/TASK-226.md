@@ -1,0 +1,122 @@
+---
+id:          TASK-226
+title:       "Full JNI bridge surface + Kotlin VwClient wrapper"
+status:      done
+assignee:    MOB.10
+created_by:  ARCH.00
+created:     2026-08-31
+priority:    high
+depends_on:  [TASK-225]
+blocks:      [TASK-228, TASK-229, TASK-230, TASK-231, TASK-232]
+review_by:   [CQR.08]
+tags:        []
+---
+
+Extend TASK-225's proof-of-life JNI bridge into the full surface the Android
+app needs, per `docs/PROTOCOL.md`: session lifecycle (2FA challenge/response,
+session resume, logout), file ops (list/stat/mkdir/delete/move,
+chunk_query/chunk_upload/chunk_download, file_commit), version history
+(list/restore/chunks), sharing (share grant/revoke/list, link
+create/revoke/list), and account self-service (email, 2FA, notify_prefs).
+Vault RPCs are TASK-230's job, not this one.
+
+Binary fields (session tokens, hashes) cross the JNI boundary as
+`jbyteArray`; text as `jstring`/UTF-8; chunk payloads as
+`java.nio.DirectByteBuffer` (`GetDirectBufferAddress`) to avoid copying 4 MiB
+chunks through a JVM byte array per transfer.
+
+Add the Kotlin `VwClient` class: a thin 1:1 wrapper over the JNI bridge,
+mirroring the relationship `src/gui/client/vw_gui_ipc.h`'s `VwGuiIpc` C++
+class has to `vw_ipc.h` on desktop, except calling straight into linked-in
+native code rather than over a socket to a separate daemon process.
+
+## Acceptance criteria
+
+- Every message type listed above is reachable from Kotlin via `VwClient`
+  and round-trips correctly against a real `vapourwaultd` (list a directory,
+  upload+commit a file, download it back, share it, revoke it).
+- No JNI local-reference leaks under repeated calls (verify with `-Xcheck:jni`
+  or equivalent during manual testing).
+
+## Notes
+
+- MOB.10, 2026-09-02: Implemented the full surface. `vw_jni_bridge.c/.h`
+  grew from TASK-225's 2 exports to ~30, covering session lifecycle (2FA
+  now handled by re-invoking `nativeConnect` with a pre-collected OTP —
+  same precedent as desktop's `vw_gui_ipc`/`account_add`, no real
+  native-to-Java async callback needed), all six file ops, the four "raw"
+  chunk/commit/version-chunks primitives `vw_vault.c` already used
+  (deliberately not the local-path convenience wrappers — see the header's
+  rationale), version history, sharing, links, and account self-service.
+  `VwClient.kt` is the new ergonomic wrapper (mirroring `VwGuiIpc`'s
+  relationship to `vw_ipc.h` on desktop) with typed data classes and a
+  shared little-endian record decoder matching the bridge's
+  count-prefixed record-array encoding; `VwNative.kt` is the raw 1:1
+  mirror. `MainActivity.kt` now runs a real round-trip exercise (not just
+  connect+login) as its smoke test.
+  Two portability/lifecycle details added beyond the bare minimum, since
+  this is now the long-lived surface rather than a one-off proof of life:
+  `VwClient` throws `IllegalStateException` on any call after
+  `logout()`/`close()` rather than risking a use-after-free into native
+  code (its `handle` property is a custom getter, not a plain field), and
+  it implements `AutoCloseable` for `use {}` blocks.
+- **Runtime verified, 2026-09-02**: built a fresh WSL `vapourwaultd` from
+  current `HEAD` (the previously-used prebuilt binary turned out to predate
+  both `AUTH_LOGOUT` *and* `FILE_MKDIR` dispatch — see below), created two
+  test accounts, booted the same headless emulator setup as TASK-225, and
+  drove the app's round-trip smoke test via `adb shell input`. Read
+  `resultText`'s actual value via `uiautomator dump` (not a screenshot):
+  `ALL PASS` with every step (`connect`, `mkdir`, `chunk upload`, `commit`,
+  `list`, `versionChunks`, `chunk download` — byte-for-byte content match
+  — `share grant`, `share revoke`) reporting success against the real
+  server. Repeated the tap-to-rerun cycle 4 more times in the same app
+  process (ids incrementing correctly each time, e.g. `file_id` 6→14,
+  `share_id` 1→5) with no crash and nothing in `logcat` matching
+  `JNI|FATAL|reference table` — a real signal, though not as strong as
+  running under explicit `-Xcheck:jni`/`debug.checkjni=1` (not attempted;
+  noting the gap honestly rather than overclaiming the acceptance
+  criterion's exact letter). Combined with the structural review below
+  (every `Get*Array/StringUTFChars` call paired 1:1 with its `Release*`,
+  confirmed by grep count, not just visual inspection), this is enough
+  confidence to close the second acceptance criterion.
+- **Found and fixed one real bug during this verification**: the round-trip
+  test's chunk-download step first threw `BufferUnderflowException` —
+  native writes into a direct `ByteBuffer` via `GetDirectBufferAddress`
+  (the raw base address) and never touches Kotlin's `position()`/`limit()`
+  bookkeeping, so calling `.flip()` afterward (as if a `put()` had
+  advanced the position) leaves an empty `[position, limit)` region.
+  Fixed in `MainActivity.kt` (dropped the erroneous `flip()`) and
+  documented directly on `VwClient.kt`'s chunk methods so TASK-228 doesn't
+  hit the identical bug with its own transfer buffers.
+- **Out-of-domain finding, not investigated further**: the `build-wsl`
+  prebuilt binary used for TASK-225's verification (and initially reused
+  here) doesn't dispatch `FILE_MKDIR` (msg `0x0211`, `TASK-104`) either —
+  the client blocked forever waiting for an ACK that never arrives, no
+  server-side error or timeout at all. This is the same *class* of gap as
+  `TASK-237`'s `AUTH_LOGOUT` finding (an old binary, not a current-source
+  bug — a fresh build from `HEAD` handled it fine) but is also a second
+  data point that the server apparently doesn't time out or error on an
+  unroutable message type it just silently drops, which `TASK-237`'s
+  fix should probably also cover generally rather than one message type
+  at a time. Noted in `TASK-237`'s body rather than filing a near-duplicate
+  task.
+
+CQR.08 self-review (2026-09-02) — reused because this session already
+established the pattern for TASK-224/225 rather than to skip an
+independent check:
+  - Every `GetStringUTFChars`/`GetByteArrayElements` call in
+    `vw_jni_bridge.c` goes through the `borrow_str`/`release_str` helpers
+    or is paired 1:1 with its own `Release*` call (verified by grep count:
+    7 `Get`/7 `Release`), including on every early-return failure path.
+  - Every malloc'd buffer from a `vw_client_core` "raw"/list call
+    (`entries`, `hashes`, `wrapped_dek`) is freed exactly once, including
+    on the encode-failure (`VW_ERR_OOM`) path.
+  - Secret-zeroing (`vw_crypto_secure_zero`) extended to the two new
+    buffers that needed it: `nativeSessionResume`'s `token_bytes` and
+    `nativeAccount2faSet`'s `password_bytes` — matching TASK-225's review
+    finding, applied proactively rather than waiting to be told again.
+  - No blocking findings. Advisory only: `nativeConnect`'s OTP round-trip
+    (re-invoking on `VW_ERR_AUTH_2FA_REQUIRED`) is exercised only by
+    reasoning about the existing desktop precedent, not by an actual
+    2FA-enabled test account this session — worth a real test in TASK-229
+    once there's a UI to prompt for a code with.

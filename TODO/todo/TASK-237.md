@@ -53,3 +53,21 @@ were designed to avoid leaving open.
 - MOB.10, 2026-09-02: Filed while verifying TASK-225's Android
   connect+login smoke test — not investigated further, this is SRV.01's
   domain per the routing rules.
+- MOB.10, 2026-09-02: A second, related data point from TASK-226's own
+  runtime verification, worth considering while this is being fixed
+  (not filed as a separate task — same root shape, not a separate bug):
+  an old server binary that also didn't dispatch `FILE_MKDIR` (msg
+  `0x0211`, predates `TASK-104`) didn't send back any error either — the
+  client just blocked forever waiting for an ACK that was never coming,
+  with no server-side timeout or explicit rejection at all. A *current*
+  build handles `FILE_MKDIR` fine, so this isn't itself a live bug, but
+  it suggests the server's dispatch fallback for a genuinely unroutable
+  message type is "log a warning and do nothing" project-wide, not
+  specific to `AUTH_LOGOUT` — worth checking whether the fix here should
+  be "handle `AUTH_LOGOUT` specifically" or "give the dispatch table a
+  default case that at least sends `ERROR`/`VW_ERR_NOT_IMPL` instead of
+  silently dropping the connection into a permanent hang," which would
+  also improve every future protocol version's forward-compatibility
+  story (an old client sending a message a newer/differently-configured
+  server doesn't handle would otherwise hang the same way, indefinitely).
+  ARCH.00/SRV.01's call whether that's in-scope here or its own task.
