@@ -7,7 +7,7 @@ created_by:  ARCH.00
 created:     2026-08-31
 priority:    normal
 depends_on:  [TASK-225]
-blocks:      [TASK-235]
+blocks:      [TASK-235, TASK-239]
 review_by:   [CQR.08]
 tags:        []
 ---

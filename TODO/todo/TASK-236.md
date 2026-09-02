@@ -6,7 +6,7 @@ assignee:    ARCH.00
 created_by:  ARCH.00
 created:     2026-08-31
 priority:    normal
-depends_on:  [TASK-235]
+depends_on:  [TASK-235, TASK-239]
 blocks:      []
 review_by:   [CQR.08]
 tags:        []
@@ -27,3 +27,8 @@ way every prior phase's closure has done.
   Decisions table, not left undocumented.
 
 ## Notes
+
+ARCH.00, 2026-09-02: Added `TASK-239` (Android build in the release cycle,
+`release.yml`) as a dependency — the user asked whether the Android app was
+already part of the release cycle, it wasn't, and this milestone should not
+be closeable while that gap exists.
