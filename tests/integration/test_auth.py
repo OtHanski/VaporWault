@@ -149,6 +149,62 @@ def test_brute_force_lockout(server, admin_client, unique_username):
     )
 
 
+def test_logout_invalidates_session(server, admin_client, unique_username):
+    """
+    TASK-237 regression: AUTH_LOGOUT must actually invalidate the session
+    token server-side. Before the fix, the server's post-auth dispatch had
+    no case for AUTH_LOGOUT at all (logged "unhandled msg type 0x0107" and
+    silently did nothing) — the token stayed valid until its natural
+    expires_at, so a captured pre-logout token could keep being used for
+    the rest of its lifetime regardless of the user's own "log out" action.
+
+    Log out on the original connection, then attempt SESSION_RESUME with
+    the same token on a fresh connection (matching how a real client would
+    reuse a stored token) — this must now fail, not succeed. Expects
+    VW_ERR_AUTH_BAD_CREDS, matching every other SESSION_RESUME failure
+    (docs/PROTOCOL.md §7.1's anti-oracle invariant: the wire code never
+    reveals *why* a token was rejected — expired, revoked, or never valid
+    all look identical to the caller).
+    """
+    make_user(admin_client, server, unique_username)
+
+    with new_client(server) as c:
+        info = c.login(unique_username, PASSWORD)
+        token = info["session_token"]
+        c.logout()
+
+    with new_client(server) as c:
+        with pytest.raises(VwAuthError) as exc_info:
+            c.session_resume(token)
+
+    assert exc_info.value.code == VW_ERR_AUTH_BAD_CREDS, (
+        f"expected VW_ERR_AUTH_BAD_CREDS ({VW_ERR_AUTH_BAD_CREDS}) after logout, "
+        f"got {exc_info.value.code}"
+    )
+
+
+def test_logout_does_not_affect_other_sessions(server, admin_client, unique_username):
+    """
+    Logging out one session must not invalidate a different, still-active
+    session for the same user (e.g. the same account logged in on two
+    devices) — AUTH_LOGOUT must revoke exactly the token this connection
+    authenticated with, not every session belonging to that user_id.
+    """
+    make_user(admin_client, server, unique_username)
+
+    with new_client(server) as c:
+        info_a = c.login(unique_username, PASSWORD)
+    token_a = info_a["session_token"]
+
+    with new_client(server) as c:
+        c.login(unique_username, PASSWORD)
+        c.logout()
+
+    # token_a (a separate, still-active session) must remain valid.
+    with new_client(server) as c:
+        c.session_resume(token_a)
+
+
 def test_unrecognized_message_after_auth_gets_error_not_hang(server, admin_client, unique_username):
     """
     TASK-105 regression: re-sending a pre-auth-phase message type (here,

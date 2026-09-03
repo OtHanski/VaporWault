@@ -83,6 +83,12 @@ MSG_VAULT_KEY_FETCH_RESP  = 0x0804
 MSG_VAULT_LIST            = 0x0805
 MSG_VAULT_LIST_RESP       = 0x0806
 
+# Account self-service (TASK-219/222)
+MSG_ACCOUNT_EMAIL_SET     = 0x0B03
+MSG_ACCOUNT_EMAIL_SET_ACK = 0x0B04
+MSG_ACCOUNT_2FA_SET       = 0x0B05
+MSG_ACCOUNT_2FA_SET_ACK   = 0x0B06
+
 VW_PERM_NONE  = 0
 VW_PERM_VIEW  = 1
 VW_PERM_EDIT  = 2
@@ -107,6 +113,7 @@ VW_ERR_INVALID_ARG     = 3
 VW_ERR_NOT_FOUND       = 5
 VW_ERR_PERMISSION      = 7
 VW_ERR_AUTH_BAD_CREDS  = 300
+VW_ERR_AUTH_SESSION_EXPIRED = 303
 VW_ERR_AUTH_LOCKED     = 304
 VW_ERR_RATE_LIMITED    = 605
 VW_ERR_LINK_PASSWORD_REQUIRED = 607  # TASK-186
@@ -126,6 +133,19 @@ class VwAuthError(RuntimeError):
         super().__init__(f"AUTH_FAIL code={code} lockout_secs={lockout_secs}")
         self.code = code
         self.lockout_secs = lockout_secs
+
+
+class VwTwoFaRequired(RuntimeError):
+    """
+    AUTH_CHALLENGE received and no otp_code was supplied to login() — mirrors
+    do_auth_with_token's own otp_cb==NULL path (src/client/vw_client_core.c):
+    the connection is not carried forward, matching every real 2FA-capable
+    client's "probe" pattern (empty-OTP attempt just to trigger the email,
+    then a separate connection once the user has the code — TASK-238).
+    """
+    def __init__(self, hint=""):
+        super().__init__(f"2FA required: {hint}")
+        self.hint = hint
 
 
 # ── Low-level framing helpers ──────────────────────────────────────────────────
@@ -217,14 +237,28 @@ class VwClient:
 
     # ── Auth ────────────────────────────────────────────────────────────────
 
-    def login(self, username, password):
+    def login(self, username, password, otp_code=None):
         """
-        Authenticate with username + password.
+        Authenticate with username + password, on this one connection —
+        mirrors do_auth_with_token (src/client/vw_client_core.c): AUTH_REQUEST,
+        then either AUTH_OK/AUTH_FAIL directly, or, for a 2FA account,
+        AUTH_CHALLENGE.
+
+        otp_code=None (default) mirrors otp_cb==NULL: on AUTH_CHALLENGE this
+        raises VwTwoFaRequired instead of submitting anything — the "probe"
+        pattern real 2FA clients use to trigger the OTP email, matching
+        TASK-238's regression coverage (a *separate*, later login() call with
+        the code the user read from that email is expected to reuse the same
+        pending challenge, not silently mint and email a second, different
+        one).
+        otp_code=<code> mirrors an otp_cb that returns an already-known code:
+        AUTH_OTP is sent immediately on this same connection.
 
         Returns dict: session_token (bytes[32]), expires_at (int), is_admin (bool),
         quota_bytes (int), used_bytes (int), user_id (int).
 
-        Raises VwAuthError on AUTH_FAIL.
+        Raises VwAuthError on AUTH_FAIL (whether from AUTH_REQUEST or, when
+        otp_code is given, from AUTH_OTP), VwTwoFaRequired as described above.
         """
         auth_token = hashlib.sha256(password.encode("utf-8")).digest()
         payload = _encode_str(username) + auth_token
@@ -234,6 +268,17 @@ class VwClient:
             code = struct.unpack_from("<I", resp, 0)[0] if len(resp) >= 4 else 0
             lockout = struct.unpack_from("<H", resp, 4)[0] if len(resp) >= 6 else 0
             raise VwAuthError(code, lockout)
+        if mt == MSG_AUTH_CHALLENGE:
+            if otp_code is None:
+                hint_len = struct.unpack_from("<H", resp, 1)[0] if len(resp) >= 3 else 0
+                hint = resp[3:3 + hint_len].decode("utf-8", errors="replace")
+                raise VwTwoFaRequired(hint)
+            self._send(MSG_AUTH_OTP, _encode_str(otp_code))
+            mt, resp = self._recv()
+            if mt == MSG_AUTH_FAIL:
+                code = struct.unpack_from("<I", resp, 0)[0] if len(resp) >= 4 else 0
+                lockout = struct.unpack_from("<H", resp, 4)[0] if len(resp) >= 6 else 0
+                raise VwAuthError(code, lockout)
         self._expect(MSG_AUTH_OK, mt, resp)
         return self._parse_auth_ok(resp)
 
@@ -252,6 +297,43 @@ class VwClient:
             raise VwAuthError(code, lockout)
         self._expect(MSG_AUTH_OK, mt, resp)
         return self._parse_auth_ok(resp)
+
+    def logout(self):
+        """
+        Send AUTH_LOGOUT (TASK-237), invalidating the session token this
+        connection authenticated with. Fire-and-forget: no response is
+        expected or waited for, matching the real client contract
+        (vw_client_logout does not wait for a reply before closing).
+        """
+        self._send(MSG_AUTH_LOGOUT, b"")
+
+    # ── Account self-service (TASK-219/222) ──────────────────────────────────
+
+    def account_email_set(self, session_token, email):
+        """Set (or, with an empty string, clear) the account's email address."""
+        payload = bytes(session_token) + _encode_str(email)
+        self._send(MSG_ACCOUNT_EMAIL_SET, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_ACCOUNT_EMAIL_SET_ACK, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "account email set failed")
+
+    def account_2fa_set(self, session_token, password, enable):
+        """
+        Enable/disable email-OTP 2FA on the account. Requires re-proving the
+        current password (password_token = SHA-256(password), same
+        derivation as AUTH_REQUEST's auth_token) and, when enabling, an
+        email address already set via account_email_set.
+        """
+        password_token = hashlib.sha256(password.encode("utf-8")).digest()
+        payload = bytes(session_token) + password_token + bytes([1 if enable else 0])
+        self._send(MSG_ACCOUNT_2FA_SET, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_ACCOUNT_2FA_SET_ACK, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "account 2fa set failed")
 
     def _parse_auth_ok(self, resp):
         token      = resp[0:32]

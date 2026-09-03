@@ -653,6 +653,18 @@ static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn) {
             if (err == VW_ERR_NET_CLOSED) break;
             if (err != VW_OK) { vw_log(LOG_DEBUG, "recv error %d", (int)err); break; }
 
+            /* TASK-237: AUTH_LOGOUT carries no payload (fire-and-forget —
+             * vw_client_logout does not wait for a response), so it can't
+             * flow through vw_server_dispatch_file_op's per-message,
+             * token-in-payload validation like every other Phase 2 op.
+             * Revoke the token this connection authenticated with
+             * (captured in `info` above) and stop serving it — the client
+             * is closing its end regardless. */
+            if (type == VW_MSG_AUTH_LOGOUT) {
+                (void)vw_server_handle_auth_logout(sctx, info.session_token);
+                break;
+            }
+
             err = vw_server_dispatch_file_op(sctx, conn, type, buf, plen);
             if (err == VW_ERR_AUTH_REQUIRED || err == VW_ERR_PROTO_INVALID) break;
             if (err == VW_ERR_NOT_IMPL)

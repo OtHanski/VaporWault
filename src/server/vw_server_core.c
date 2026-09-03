@@ -989,3 +989,13 @@ vw_err_t vw_server_conn_handle(vw_server_ctx_t *ctx,
     }
     return VW_ERR_PROTO_INVALID;
 }
+
+vw_err_t vw_server_handle_auth_logout(vw_server_ctx_t *ctx,
+                                        const uint8_t session_token[VW_TOKEN_BYTES])
+{
+    if (!ctx || !session_token) return VW_ERR_INVALID_ARG;
+
+    vw_err_t err = vw_auth_revoke_session(ctx->auth, session_token);
+    if (err == VW_ERR_NOT_FOUND) return VW_OK;
+    return err;
+}

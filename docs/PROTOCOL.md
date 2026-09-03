@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 28 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 29 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -240,6 +240,24 @@ is sent. On failure: `AUTH_RECOVER_FAIL` is sent with a generic reason.
 | Field         | Type      |
 |---------------|-----------|
 | session_token | bytes[32] |
+
+**AUTH_LOGOUT payload (documented `TASK-237` — behavior was implicit/unimplemented
+before):** No payload (empty). Fire-and-forget: the client sends it and closes the
+connection without waiting for a response; the server sends none.
+
+The server revokes the session token this connection authenticated with (from the
+AUTH_OK/SESSION_RESUME that started this connection, not a token in the message
+itself — there is none) via the same revocation path AUTH_RECOVER_CONFIRM and
+SESSION_RESUME's own token-rotation already use. Once revoked, that token is
+rejected by any subsequent request on *any* connection, not just this one — a
+stolen token cannot outlive an explicit logout the way it previously could when
+this message went unhandled. As with every other rejection of a bad/expired/
+revoked token, the wire-visible code does not distinguish *why* the token was
+rejected (matching the anti-oracle invariant above): a further SESSION_RESUME
+attempt with the revoked token gets `AUTH_FAIL`/`VW_ERR_AUTH_BAD_CREDS` like any
+other resume failure, and a revoked token used mid-session on a still-open
+connection gets `ERROR`/`VW_ERR_AUTH_REQUIRED` like any other rejected token —
+neither ever surfaces a distinct "this token was explicitly revoked" code.
 
 ### 7.2 File operations
 
@@ -2084,6 +2102,7 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 29      | 2026-09-03 | SRV.01  | Documented `AUTH_LOGOUT` (§7.1) for the first time, resolving `TASK-237`: the message existed on the wire since Phase 1 but the server never handled it (a client-initiated logout never actually invalidated the session token — it just sat valid until natural expiry), so there was nothing correct to document until now. No payload; revokes the session token the connection authenticated with; wire-visible rejection codes for that revoked token match every other bad-token case (`AUTH_FAIL`/`VW_ERR_AUTH_BAD_CREDS` on `SESSION_RESUME`, `ERROR`/`VW_ERR_AUTH_REQUIRED` mid-session), per the existing anti-oracle invariant — verified empirically rather than assumed. Purely a behavior fix + doc addition, no existing byte layout changed; no protocol version bump required. |
 | 28      | 2026-08-27 | PRT.04  | Account self-service two-factor enrollment (§7.15), resolving `TASK-219`: new `ACCOUNT_2FA_SET`/`_SET_ACK` (0x0B05–0x0B06). Before this, there was no self-service or admin-driven way to change a user's 2FA enrollment after creation at all, so `TASK-207`'s `account_security_change` alert had no real trigger for its "2FA enabled/disabled" half. Requires re-proving the current password (same shape as `AUTH_REQUEST`'s `auth_token`) before touching the flag — a security-sensitive toggle, not a preference. Enabling with no email on file is rejected (`VW_ERR_INVALID_ARG`): 2FA codes are emailed, so enabling without one would lock the account out of every future login. Chose one parameterized `SET` over this task's own alternative of two separate `2FA_ENABLE`/`2FA_DISABLE` opcodes (identical re-auth handling and shape on both directions, differing only in one stored bit) while still avoiding its rejected alternative (reviving `USER_MODIFY` as a generic field-patch message) for the reason that task itself gave. Storage reuses the existing `otp_enabled` field via `vw_store_user_update_field` — already an explicitly-supported use per that function's own doc comment — no new store-layer setter needed. Entirely new message pair, no existing byte layout changed; no protocol version bump required. |
 | 27      | 2026-08-27 | PRT.04  | Hot-standby replication of `notify_prefs.db` (§7.7), resolving `TASK-220`: new file tag 9 (`store/notify_prefs.db`) added to the fixed `CLUSTER_FILE_SYNC_LIST`/`_FETCH` file-tag table (`vw_cluster_file_tag_t`), `VW_CLUSTER_FILE_TAG_COUNT` 8→9. Before this, a replica's own `notify_prefs.db` was always a fresh, all-defaults-off copy, never synced from the primary — a `NOTIFY_PREFS_GET` served from a fallback-connected replica (TASK-173) always read back 0 regardless of the real preference on file at the primary (stale-but-safe: under-reports opt-in, never over-reports, so no security issue, but a real correctness gap). Also fixed in the same pass, found while implementing rather than deferred: `vw_store_reload_users_and_quotas` (the function the replica's sync pass calls to refresh in-memory state after fetching new files) didn't reload `notify_prefs`/`notify_free` at all — so even with the file tag fixed, a long-running replica process's in-memory preference table would still have gone stale until its next restart. `notify_prefs` reload folded into that existing function rather than a new one, same reasoning already used for quotas sharing it with users. `CLUSTER_FILE_SYNC_LIST_RESP`'s entry count is purely additive (driven entirely by the `VW_CLUSTER_FILE_TAG_COUNT` constant in both the primary and replica implementations); no protocol version bump required. |
 | 26      | 2026-08-27 | PRT.04  | Account self-service email address (§7.14), resolving `TASK-222`: new `ACCOUNT_EMAIL_GET`/`_GET_RESP`/`SET`/`_SET_ACK` (0x0B01–0x0B04). The first real wire path that can ever put a non-empty email on a user record — neither `USER_CREATE_REQ` nor `INVITE_REDEEM` carry one, which silently made the already-shipped `TASK-046` password recovery and `TASK-207`'s notify-preferences system unreachable for every real account. Server-side format validation (`vw_email_validate`) is a hard security requirement, not cosmetic: `vw_smtp.c`'s `MAIL FROM`/`RCPT TO` lines do no escaping of their own, so this is the sole gate against SMTP command injection into the outbound relay. Also fixed in the same pass: `email_ht_insert`'s pre-existing bug where every empty-email account (i.e. every account, until this task) still counted against the index's growth threshold. Entirely new message pair-of-pairs, no existing byte layout changed; no protocol version bump required. |
