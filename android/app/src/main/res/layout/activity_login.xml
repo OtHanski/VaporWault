@@ -17,24 +17,24 @@
             android:textStyle="bold"
             android:layout_marginBottom="8dp" />
 
-        <!-- TASK-00241/TASK-00245: wrap_content, NOT a fixed height. A
-             fixed height (240dp) turned out to still leave connectButton
-             unreachable with 10 saved profiles in CI (LoginProfileScaleTest
-             failing on PR #1) — RecyclerView's *default* nested-scrolling
-             behavior competing with the outer ScrollView for the same
-             gesture stream, not the MeasureSpec type itself, is the
-             documented cause of "wrap_content inside ScrollView measures/
-             renders wrong" for RecyclerView. The correct fix (see
-             LoginActivity.kt's onCreate) is disabling the RecyclerView's
-             own nested scrolling, which lets modern RecyclerView's
-             auto-measure correctly size itself to its full content and
-             hand all scrolling to the single outer ScrollView — no fixed
-             height needed, and every view below it stays reachable
-             regardless of profile count. -->
-        <androidx.recyclerview.widget.RecyclerView
+        <!-- TASK-00241/TASK-00245/TASK-00246: `adb shell dumpsys activity`
+             (the real view tree, not the accessibility one UiAutomator
+             queries) shows this content was always laid out correctly —
+             TASK-00241/245's "RecyclerView-in-ScrollView measures wrong"
+             diagnosis was chasing UiAutomator's inability to see content
+             scrolled out of the viewport (see LoginProfileScaleTest's doc
+             comment and UiTestHelpers.swipeToBottom, the actual fix), not
+             a real layout defect. Switched away from RecyclerView anyway:
+             the saved-profile list is always small (a handful of
+             accounts, never a paginated/virtualized dataset), so there
+             was never a reason to pay for RecyclerView's recycling
+             machinery here, and a plain LinearLayout removes an entire
+             class of ScrollView-nesting footguns for no cost. -->
+        <LinearLayout
             android:id="@+id/profileList"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content" />
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
 
         <View
             android:layout_width="match_parent"

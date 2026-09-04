@@ -6,11 +6,10 @@ import android.os.Bundle
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
 import com.vaporwault.client.R
 import com.vaporwault.client.VwClient
 import com.vaporwault.client.VwSession
@@ -34,7 +33,7 @@ import kotlin.concurrent.thread
 class LoginActivity : AppCompatActivity() {
 
     private lateinit var registry: VwAccountRegistry
-    private lateinit var profileAdapter: ProfileAdapter
+    private lateinit var profileList: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var otpField: EditText
     private lateinit var caCertStatusText: TextView
@@ -64,16 +63,25 @@ class LoginActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         caCertStatusText = findViewById(R.id.caCertStatusText)
         val connectButton = findViewById<Button>(R.id.connectButton)
-        val profileList = findViewById<RecyclerView>(R.id.profileList)
+        profileList = findViewById(R.id.profileList)
         val savedProfilesLabel = findViewById<TextView>(R.id.savedProfilesLabel)
 
-        // TASK-241's fix gave profileList a fixed height (so it scrolls
-        // internally instead of breaking the rest of the form once enough
-        // profiles accumulate) — but a fixed height means an empty list
-        // would otherwise always reserve that space even with zero saved
-        // profiles, the common case for a fresh install. Collapse both it
-        // and its label together when there's nothing to show.
-        fun updateProfileListVisibility(profiles: List<Profile>) {
+        // Collapse both the list and its label together when there's
+        // nothing to show — the common case for a fresh install.
+        fun renderProfiles(profiles: List<Profile>) {
+            profileList.removeAllViews()
+            for (profile in profiles) {
+                val row = layoutInflater.inflate(R.layout.item_profile, profileList, false)
+                row.findViewById<TextView>(R.id.profileLabel).apply {
+                    text = "${profile.label} — ${profile.username}@${profile.host}:${profile.port}"
+                    setOnClickListener { resumeProfile(profile) }
+                }
+                row.findViewById<Button>(R.id.profileRemoveButton).setOnClickListener {
+                    registry.removeProfile(profile.id)
+                    renderProfiles(registry.listProfiles())
+                }
+                profileList.addView(row)
+            }
             val visibility = if (profiles.isEmpty()) View.GONE else View.VISIBLE
             profileList.visibility = visibility
             savedProfilesLabel.visibility = visibility
@@ -83,29 +91,7 @@ class LoginActivity : AppCompatActivity() {
             importCaCert.launch(arrayOf("*/*"))
         }
 
-        val initialProfiles = registry.listProfiles()
-        profileAdapter = ProfileAdapter(
-            profiles = initialProfiles,
-            onTap = { profile -> resumeProfile(profile) },
-            onRemove = { profile ->
-                registry.removeProfile(profile.id)
-                val remaining = registry.listProfiles()
-                profileAdapter.update(remaining)
-                updateProfileListVisibility(remaining)
-            },
-        )
-        profileList.layoutManager = LinearLayoutManager(this)
-        profileList.adapter = profileAdapter
-        // TASK-00245: required for wrap_content to actually measure to the
-        // list's full content height inside the outer ScrollView — with
-        // nested scrolling left enabled (the default), profileList's own
-        // scroll handling competes with the outer ScrollView and the
-        // measured height ends up wrong once there's enough content to
-        // matter, which is what silently made connectButton (and
-        // everything else below profileList) unreachable with 10 saved
-        // profiles. See activity_login.xml's comment on profileList.
-        profileList.isNestedScrollingEnabled = false
-        updateProfileListVisibility(initialProfiles)
+        renderProfiles(registry.listProfiles())
 
         connectButton.setOnClickListener {
             val host = hostField.text.toString().trim()

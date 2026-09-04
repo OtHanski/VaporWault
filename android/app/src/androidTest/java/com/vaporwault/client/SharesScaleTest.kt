@@ -30,6 +30,7 @@ class SharesScaleTest {
 
     private val folderPrefix = "vw-sharesscale-test-"
     private val createdFileIds = mutableListOf<Long>()
+    private val createdShareIds = mutableListOf<Long>()
 
     private fun login(): VwClient {
         repeat(3) { device().pressBack() }
@@ -49,6 +50,17 @@ class SharesScaleTest {
     @After
     fun cleanup() {
         val client = VwSession.client
+        // TASK-00246: shares are never hard-deleted server-side (see
+        // vw_share.h's vw_share_record_t doc comment) and deleting the
+        // shared *file* does not revoke the share record pointing at it —
+        // this class used to only delete the folders, leaving 10 ghost
+        // share entries (target-resolvable, but with an unresolvable —
+        // and therefore blank — file name once the file is gone) in every
+        // later test's SharesActivity listing. A real, observed cause of
+        // SharingFlowTest.grantListAndRevokeShare failing to find its own
+        // share's row: those 10 leaked entries pushed it out of shareList's
+        // fixed-height visible window. Revoke before deleting.
+        createdShareIds.forEach { client?.shareRevoke(it) }
         createdFileIds.forEach { client?.deleteFileById(it) }
         // TASK-245: login() creates a brand-new saved profile every call
         // (VwAccountRegistry.addProfile never de-dupes by username/host) —
@@ -73,6 +85,7 @@ class SharesScaleTest {
             createdFileIds.add(fileId)
             val shareId = client.shareGrant(fileId, TestServerConfig.shareTargetUsername, 1)
             check(shareId != 0L) { "shareGrant failed for $folderPrefix$i: vw_err_t=${VwClient.lastError()}" }
+            createdShareIds.add(shareId)
         }
 
         click("sharesButton")

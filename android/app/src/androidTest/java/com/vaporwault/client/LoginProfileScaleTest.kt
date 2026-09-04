@@ -5,6 +5,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.vaporwault.client.UiTestHelpers.device
 import com.vaporwault.client.UiTestHelpers.exists
+import com.vaporwault.client.UiTestHelpers.swipeToBottom
 import com.vaporwault.client.UiTestHelpers.waitFor
 import com.vaporwault.client.accounts.ProfileStore
 import com.vaporwault.client.ui.LoginActivity
@@ -14,11 +15,21 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Regression test for TASK-00241: with enough saved profiles,
- * `LoginActivity`'s `connectButton` (and the rest of the add-profile form
- * below it) stopped appearing in the view hierarchy at all. Seeds profile
- * metadata directly via [ProfileStore] (no live server needed — these
- * profiles are never resumed, only listed) rather than a real
+ * Regression test for TASK-00241/TASK-00246: with enough saved profiles,
+ * `LoginActivity`'s `connectButton` sits below the fold in the outer
+ * `ScrollView`. `adb shell dumpsys activity` (the real view tree) confirms
+ * it's always been correctly laid out there — the actual bug across
+ * TASK-00241 and TASK-00245's attempts was a `profileList` RecyclerView
+ * whose wrap_content auto-measure inside a ScrollView genuinely came out
+ * wrong (confirmed by comparing `dumpsys`'s real bounds against the
+ * on-screen result), now avoided entirely by inflating profile rows into a
+ * plain `LinearLayout` instead — RecyclerView's virtualization was never
+ * needed for a list this small. Separately, this test itself has to
+ * [UiTestHelpers.swipeToBottom] before searching: UiAutomator's
+ * accessibility-node queries never report content currently scrolled out
+ * of the viewport, regardless of how it's laid out. Seeds profile metadata
+ * directly via [ProfileStore] (no live server needed — these profiles are
+ * never resumed, only listed) rather than a real
  * [com.vaporwault.client.accounts.VwAccountRegistry.addProfile] round trip.
  */
 @RunWith(AndroidJUnit4::class)
@@ -70,6 +81,7 @@ class LoginProfileScaleTest {
     fun connectButtonReachableWithTenSavedProfiles() {
         seedProfiles(10)
         launchLoginActivity()
+        swipeToBottom()
         try {
             waitFor("connectButton")
         } catch (e: IllegalStateException) {

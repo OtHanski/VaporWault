@@ -166,13 +166,40 @@ object UiTestHelpers {
             .use { it.readBytes().toString(Charsets.UTF_8) }
 
     /** For diagnosing a `wait*` timeout: the live accessibility-tree XML at
-     * the moment of failure. Two separate [shell] calls, not one command
-     * joined with `&&` — [UiAutomation.executeShellCommand] does not run
-     * through a shell interpreter, so `&&`/pipes are not guaranteed to work
-     * (confirmed empirically: a joined `dump && cat` call returned empty
-     * output in CI, TASK-00245). */
-    fun dumpWindowHierarchy(): String {
-        shell("uiautomator dump /sdcard/vw_dump.xml")
-        return shell("cat /sdcard/vw_dump.xml")
+     * the moment of failure. TASK-00245's first attempt shelled out to a
+     * standalone `uiautomator dump` process, which needs to register its
+     * *own* `UiAutomation` connection — but the instrumentation running
+     * this very test already holds the one connection Android allows
+     * system-wide, so that process always crashed
+     * (`IllegalStateException: UiAutomationService ... already
+     * registered!`, visible in logcat, never in the test's own output
+     * since it's a separate process) and `cat` on the never-written file
+     * silently returned empty. `UiDevice.dumpWindowHierarchy` uses the
+     * instrumentation's *existing* connection instead of opening a new
+     * one, so it works from inside a running test. */
+    fun dumpWindowHierarchy(): String =
+        java.io.ByteArrayOutputStream().use { out ->
+            device().dumpWindowHierarchy(out)
+            out.toString("UTF-8")
+        }
+
+    /** Swipes the whole screen upward repeatedly to reach the bottom of a
+     * tall, single-ScrollView form (TASK-00246). UiAutomator's own
+     * accessibility-node search (`Until.hasObject`/`By`, everything else
+     * in this file) never reports content currently scrolled out of the
+     * viewport — confirmed via `adb shell dumpsys activity`, which showed
+     * the *real* view tree laying out such content correctly — so a form
+     * long enough to need scrolling has to actually be scrolled first,
+     * same as a real user would. `UiObject2.scroll()` was tried first and
+     * silently no-opped for reasons not pinned down (same `dumpsys`
+     * comparison showed identical bounds before/after); repeated
+     * fixed-distance swipes on the raw `UiDevice` reliably work. */
+    fun swipeToBottom(times: Int = 6) {
+        val dev = device()
+        val x = dev.displayWidth / 2
+        repeat(times) {
+            dev.swipe(x, (dev.displayHeight * 0.8).toInt(), x, (dev.displayHeight * 0.15).toInt(), 20)
+            Thread.sleep(200)
+        }
     }
 }
