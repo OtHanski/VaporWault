@@ -14,6 +14,7 @@ import com.vaporwault.client.UiTestHelpers.waitFor
 import com.vaporwault.client.UiTestHelpers.waitForAll
 import com.vaporwault.client.UiTestHelpers.waitUntilTextAppears
 import com.vaporwault.client.ui.LoginActivity
+import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -55,6 +56,21 @@ class SharingFlowTest {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         InstrumentationRegistry.getInstrumentation().targetContext.startActivity(intent)
         waitFor("connectButton")
+    }
+
+    @After
+    fun cleanup() {
+        // TASK-245: setUp() runs once per @Test method (3 times in this
+        // class), and login() creates a brand-new saved profile every call
+        // (VwAccountRegistry.addProfile never de-dupes by username/host) —
+        // this class had no @After at all, so all 3 leaked. Same reasoning
+        // as CoreFlowTest/VaultFlowTest's identical cleanup.
+        val registry = com.vaporwault.client.accounts.VwAccountRegistry(
+            InstrumentationRegistry.getInstrumentation().targetContext,
+        )
+        registry.listProfiles()
+            .filter { it.username == TestServerConfig.username && it.host == TestServerConfig.host }
+            .forEach { registry.removeProfile(it.id) }
     }
 
     private fun login() {

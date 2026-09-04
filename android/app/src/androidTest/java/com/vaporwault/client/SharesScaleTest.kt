@@ -50,6 +50,17 @@ class SharesScaleTest {
     fun cleanup() {
         val client = VwSession.client
         createdFileIds.forEach { client?.deleteFileById(it) }
+        // TASK-245: login() creates a brand-new saved profile every call
+        // (VwAccountRegistry.addProfile never de-dupes by username/host) —
+        // left uncleaned, it's a leaked stray profile the next test class's
+        // own LoginActivity launch inherits. Same reasoning as CoreFlowTest/
+        // VaultFlowTest's identical cleanup.
+        val registry = com.vaporwault.client.accounts.VwAccountRegistry(
+            InstrumentationRegistry.getInstrumentation().targetContext,
+        )
+        registry.listProfiles()
+            .filter { it.username == TestServerConfig.username && it.host == TestServerConfig.host }
+            .forEach { registry.removeProfile(it.id) }
     }
 
     @Test

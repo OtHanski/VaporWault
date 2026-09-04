@@ -49,6 +49,14 @@ class VaultsScaleTest {
     fun cleanup() {
         val client = VwSession.client
         createdFileIds.forEach { client?.deleteFileById(it) }
+        // TASK-245: see SharesScaleTest's identical cleanup for why —
+        // login() leaks a brand-new saved profile every call.
+        val registry = com.vaporwault.client.accounts.VwAccountRegistry(
+            InstrumentationRegistry.getInstrumentation().targetContext,
+        )
+        registry.listProfiles()
+            .filter { it.username == TestServerConfig.username && it.host == TestServerConfig.host }
+            .forEach { registry.removeProfile(it.id) }
     }
 
     @Test
