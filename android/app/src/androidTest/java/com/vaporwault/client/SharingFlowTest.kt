@@ -164,7 +164,17 @@ class SharingFlowTest {
         // actually in place, a real observed CI flake. Poll for the fully
         // formatted text directly instead, scoped to this test's own row
         // like the link tests' password-suffix checks below.
-        waitUntilTextAppears("$testFolderName → ${TestServerConfig.shareTargetUsername}", timeoutMs = 20_000)
+        //
+        // Still timed out even against the full formatted text in CI after
+        // that fix — dump the live hierarchy into the failure message
+        // (no logcat capture step in ci.yml) so a repeat failure carries
+        // real evidence of what SharesActivity actually rendered instead
+        // of another guess.
+        try {
+            waitUntilTextAppears("$testFolderName → ${TestServerConfig.shareTargetUsername}", timeoutMs = 20_000)
+        } catch (e: IllegalStateException) {
+            throw IllegalStateException("${e.message}\n--- window dump ---\n${UiTestHelpers.dumpWindowHierarchy()}", e)
+        }
 
         revokeLastAndConfirmGone(testFolderName)
     }

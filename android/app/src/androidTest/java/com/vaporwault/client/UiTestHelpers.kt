@@ -164,4 +164,15 @@ object UiTestHelpers {
             .executeShellCommand(cmd)
             .let { pfd -> android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd) }
             .use { it.readBytes().toString(Charsets.UTF_8) }
+
+    /** For diagnosing a `wait*` timeout: the live accessibility-tree XML at
+     * the moment of failure. Two separate [shell] calls, not one command
+     * joined with `&&` — [UiAutomation.executeShellCommand] does not run
+     * through a shell interpreter, so `&&`/pipes are not guaranteed to work
+     * (confirmed empirically: a joined `dump && cat` call returned empty
+     * output in CI, TASK-00245). */
+    fun dumpWindowHierarchy(): String {
+        shell("uiautomator dump /sdcard/vw_dump.xml")
+        return shell("cat /sdcard/vw_dump.xml")
+    }
 }

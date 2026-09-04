@@ -79,8 +79,7 @@ class LoginProfileScaleTest {
             // (there's no logcat capture step in ci.yml) so a repeat
             // failure carries real evidence instead of requiring another
             // guess-and-push round trip.
-            val dump = UiTestHelpers.shell("uiautomator dump /sdcard/vw_dump.xml && cat /sdcard/vw_dump.xml")
-            throw IllegalStateException("${e.message}\n--- window dump ---\n$dump", e)
+            throw IllegalStateException("${e.message}\n--- window dump ---\n${UiTestHelpers.dumpWindowHierarchy()}", e)
         }
         check(exists("connectButton")) {
             "connectButton not found in the view hierarchy with 10 saved profiles"
