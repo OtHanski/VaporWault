@@ -1,8 +1,11 @@
 package com.vaporwault.client.ui
 
+import android.Manifest
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.View
@@ -12,6 +15,7 @@ import android.widget.RadioGroup
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.vaporwault.client.FileEntry
@@ -22,6 +26,7 @@ import com.vaporwault.client.transfer.TransferBus
 import com.vaporwault.client.transfer.TransferListener
 import com.vaporwault.client.transfer.TransferManager
 import com.vaporwault.client.transfer.UploadTarget
+import java.io.File
 import kotlin.concurrent.thread
 
 /**
@@ -43,6 +48,24 @@ class FileBrowserActivity : AppCompatActivity() {
 
     private val client: VwClient get() = VwSession.client ?: error("no active session")
 
+    // TASK-246: every upload actually runs on a background thread inside a
+    // JobScheduler-dispatched TransferJobService (API 34+) or foreground
+    // service (pre-34), not synchronously on this Activity's own thread.
+    // The picker only grants this Activity a read grant on the returned
+    // Uri that's guaranteed valid for as long as this callback runs — not
+    // guaranteed to survive to whenever that background job actually
+    // executes. TASK-243 tried extending that grant's lifetime instead
+    // (takePersistableUriPermission) and confirmed, via a diagnostic log,
+    // that the grant was genuinely still present at crash time and the
+    // read still failed for some document-provider resolutions
+    // (MediaDocumentsProvider specifically) — so a longer-lived grant
+    // doesn't fully close this. Instead: read the picked Uri's bytes into
+    // this app's own private storage synchronously, right here, while the
+    // grant is at its freshest — the background job then only ever touches
+    // a plain `file://` Uri over that local copy, which needs no SAF grant
+    // at all (ContentResolver.openInputStream special-cases the file
+    // scheme as a direct filesystem open). [uploadFile] deletes the staged
+    // copy once the transfer completes.
     private val openDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) uploadFile(uri)
     }
@@ -50,8 +73,30 @@ class FileBrowserActivity : AppCompatActivity() {
     private val createDocument = registerForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
         val entry = pendingDownload
         pendingDownload = null
-        if (uri != null && entry != null) downloadFile(entry, uri)
+        if (uri != null && entry != null) {
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            } catch (_: SecurityException) {
+                // Provider doesn't support persistable grants — proceed anyway.
+            }
+            downloadFile(entry, uri)
+        }
     }
+
+    // TASK-243: found while writing VaultFlowTest — every upload/download
+    // here runs through TransferManager, which on API 34+ schedules a
+    // User-Initiated Data Transfer job (TransferJobService). A UIDT job
+    // must promote itself to a visible notification (its
+    // setNotification() call); without POST_NOTIFICATIONS granted, that
+    // silently degrades the job badly enough that the picked SAF Uri's
+    // read grant is gone by the time the transfer actually runs a
+    // SecurityException ("... requires ACTION_OPEN_DOCUMENT or related
+    // APIs"), reproduced consistently for vault uploads specifically.
+    // Requested here (best-effort, no blocking on the result — a denial
+    // still leaves every pre-34 and non-UIDT path unaffected) since this
+    // screen is where every transfer actually originates.
+    private val requestNotificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* best-effort */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,6 +104,12 @@ class FileBrowserActivity : AppCompatActivity() {
             startActivity(Intent(this, LoginActivity::class.java))
             finish()
             return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         setContentView(R.layout.activity_file_browser)
         val vault = VwSession.vault
@@ -195,34 +246,89 @@ class FileBrowserActivity : AppCompatActivity() {
                 applicationContext, client, entry.fileId, destUri, entry.name, entry.sizeBytes,
             )
         }
-        awaitAndRefresh(transferId, "Download")
+        awaitAndRefresh(transferId, "Download", releaseUri = destUri, releaseFlags = Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
     }
 
     private fun uploadFile(sourceUri: Uri) {
         val name = queryDisplayName(sourceUri) ?: "upload.bin"
         val size = querySize(sourceUri) ?: -1L
+
+        // vault/target snapshot the background staging thread below needs
+        // — read here, on the main thread, since breadcrumbs is only ever
+        // otherwise touched from it (openFolder/navigateToBreadcrumb).
         val vault = VwSession.vault
-        val transferId = if (vault != null) {
-            // Vaults are flat — vw_vault_upload_file's file_id==0 mode only
-            // ever creates a direct child of the vault's own folder, no
-            // nested subfolder concept, so there's no NewInFolder analogue
-            // to branch on here the way the plaintext path does.
-            TransferManager.vaultUploadFile(applicationContext, client, vault, sourceUri, 0L, name, name, size)
-        } else {
-            val target = if (breadcrumbs.last().dirFileId == null) {
+        val target = if (vault == null) {
+            if (breadcrumbs.last().dirFileId == null) {
                 UploadTarget.NewFile("/$name")
             } else {
                 UploadTarget.NewInFolder(currentDirId(), name)
             }
-            TransferManager.uploadFile(applicationContext, client, sourceUri, target, name, size)
+        } else {
+            null
         }
-        awaitAndRefresh(transferId, "Upload")
+
+        // TASK-246: stage into cacheDir before the picked Uri's grant has
+        // any chance to become stale by the time a background transfer
+        // job actually runs — but the copy itself is real, possibly slow
+        // blocking I/O (a large file), so it must not run on this (the
+        // main) thread the way every other network/IO call in this class
+        // already avoids doing. Staging is initiated here (from the picker
+        // callback, while the grant is freshest) but the actual bytes move
+        // on a background thread, same as everything else that touches
+        // the network or disk in this Activity.
+        statusText.text = "Preparing upload…"
+        thread {
+            val staged = File.createTempFile("vw_upload_", ".tmp", cacheDir)
+            val copied = try {
+                contentResolver.openInputStream(sourceUri)?.use { input ->
+                    staged.outputStream().use { output -> input.copyTo(output) }
+                    true
+                } ?: false
+            } catch (e: Exception) {
+                false
+            }
+            if (!copied) {
+                staged.delete()
+                runOnUiThread { statusText.text = "Could not read the selected file" }
+                return@thread
+            }
+            val stagedUri = Uri.fromFile(staged)
+
+            val transferId = if (vault != null) {
+                // Vaults are flat — vw_vault_upload_file's file_id==0 mode
+                // only ever creates a direct child of the vault's own
+                // folder, no nested subfolder concept, so there's no
+                // NewInFolder analogue to branch on here the way the
+                // plaintext path does.
+                TransferManager.vaultUploadFile(applicationContext, client, vault, stagedUri, 0L, name, name, size)
+            } else {
+                TransferManager.uploadFile(applicationContext, client, stagedUri, target!!, name, size)
+            }
+            runOnUiThread { awaitAndRefresh(transferId, "Upload", stagedFile = staged) }
+        }
     }
 
     /** Registers a one-shot [TransferListener] that updates [statusText]
      * as the transfer progresses and refreshes the current folder listing
-     * once it completes successfully. */
-    private fun awaitAndRefresh(transferId: String, label: String) {
+     * once it completes successfully.
+     *
+     * [releaseUri] (paired with [releaseFlags], matching whichever grant
+     * [createDocument] took for a download destination) is released once
+     * the transfer finishes, succeeded or not — a persisted grant is only
+     * needed long enough to survive to the background transfer job
+     * actually running, not forever; Android caps an app at 128 persisted
+     * grants total, and every picked document accumulates one otherwise.
+     *
+     * [stagedFile] (an [uploadFile] source staged into [cacheDir] —
+     * TASK-246) is deleted once the transfer finishes, succeeded or not —
+     * it was only ever needed for the duration of this one transfer. */
+    private fun awaitAndRefresh(
+        transferId: String,
+        label: String,
+        releaseUri: Uri? = null,
+        releaseFlags: Int = 0,
+        stagedFile: File? = null,
+    ) {
         lateinit var listener: TransferListener
         listener = object : TransferListener {
             override fun onProgress(id: String, itemLabel: String, bytesDone: Long, bytesTotal: Long) {
@@ -232,6 +338,15 @@ class FileBrowserActivity : AppCompatActivity() {
             override fun onComplete(id: String, succeeded: Boolean) {
                 if (id != transferId) return
                 TransferBus.unregister(listener)
+                if (releaseUri != null) {
+                    try {
+                        contentResolver.releasePersistableUriPermission(releaseUri, releaseFlags)
+                    } catch (_: SecurityException) {
+                        // Nothing to release (e.g. the provider never
+                        // actually persisted the grant) — harmless.
+                    }
+                }
+                stagedFile?.delete()
                 runOnUiThread {
                     statusText.text = if (succeeded) "$label complete" else "$label failed"
                     if (succeeded) loadCurrentFolder()

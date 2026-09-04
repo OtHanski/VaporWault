@@ -72,6 +72,12 @@ class CoreFlowTest {
         // real `MediaStore` insert through `ContentResolver`, which is what
         // the SAF Downloads picker itself is backed by anyway.
         seedTestFileInDownloads()
+        // TASK-243: FileBrowserActivity now requests POST_NOTIFICATIONS on
+        // first launch (needed for the User-Initiated Data Transfer job's
+        // required setNotification() call — see that request's own doc
+        // comment) — grant it up front so that system dialog never blocks
+        // this test on a fresh install.
+        UiTestHelpers.grantNotificationPermission()
 
         // Defensive: a previous run that failed mid-flow (e.g. while the
         // SAF picker was open) can leave system UI on top with no app

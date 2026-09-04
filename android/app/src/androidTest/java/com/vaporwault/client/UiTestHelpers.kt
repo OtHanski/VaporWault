@@ -1,5 +1,6 @@
 package com.vaporwault.client
 
+import android.os.Build
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
@@ -22,6 +23,22 @@ object UiTestHelpers {
     fun device(): UiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
 
     fun byId(resId: String) = By.res(PKG, resId)
+
+    /** Grants `POST_NOTIFICATIONS` up front, the same way a real user
+     * tapping "Allow" on `FileBrowserActivity`'s first-launch runtime
+     * permission request would (TASK-243, added alongside that request) —
+     * without this, that system dialog blocks the very first
+     * `FileBrowserActivity` a fresh test run reaches, since nothing here
+     * taps it. Every test that navigates into `FileBrowserActivity` needs
+     * this in its own setup; a no-op if already granted. Guarded the same
+     * way the production request in `FileBrowserActivity` is — the
+     * permission itself doesn't exist before API 33, and granting an
+     * unknown permission name there throws rather than no-oping. */
+    fun grantNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        InstrumentationRegistry.getInstrumentation().uiAutomation
+            .grantRuntimePermission(PKG, "android.permission.POST_NOTIFICATIONS")
+    }
 
     fun waitFor(resId: String, timeoutMs: Long = DEFAULT_TIMEOUT_MS): UiObject2 {
         val dev = device()

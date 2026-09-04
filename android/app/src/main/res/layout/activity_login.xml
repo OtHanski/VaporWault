@@ -17,11 +17,24 @@
             android:textStyle="bold"
             android:layout_marginBottom="8dp" />
 
+        <!-- TASK-00241: NOT wrap_content. A RecyclerView's wrap_content
+             auto-measure inside a ScrollView only reliably works up to
+             roughly one screenful of content — past that, the ScrollView's
+             total scrollable height gets capped at approximately the
+             RecyclerView's own height, and every sibling declared after it
+             (the whole add-profile form, including connectButton) is
+             dropped from layout entirely, not merely scrolled off-screen
+             (confirmed via UiAutomator being unable to find connectButton
+             at all, even off-screen, with 10 saved profiles present).
+             A fixed height makes profileList's own MeasureSpec EXACT
+             instead of UNSPECIFIED, so it scrolls its own content
+             internally (nested scrolling, enabled by default) regardless
+             of profile count, while every view below it stays reachable
+             in the outer ScrollView no matter how many profiles exist. -->
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/profileList"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:minHeight="0dp" />
+            android:layout_height="240dp" />
 
         <View
             android:layout_width="match_parent"

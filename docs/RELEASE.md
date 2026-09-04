@@ -12,12 +12,13 @@ built server/client, see `docs/DEPLOYMENT.md`.
 
 ## 1. What the workflow does
 
-On every push of a tag matching `v*`, three jobs run:
+On every push of a tag matching `v*`, four jobs run:
 
 | Job             | Runner           | Produces |
 |-----------------|------------------|----------|
 | `build-linux`   | `ubuntu-latest`  | `vaporwault-<tag>-linux-x86_64.tar.gz` (+ `.sha256`), plus `vapourwault-server`/`vapourwault-client` `.deb` and `.rpm` packages |
 | `build-windows` | `windows-latest` | `vaporwault-<tag>-windows-x86_64.zip` (+ `.sha256`), plus `vapourwault-server`/`vapourwault-client` `.msi` installers |
+| `build-android` | `ubuntu-latest`  | `vaporwault-<tag>-android.apk` (+ `.sha256`) — **sideload-only, see below** |
 | `publish`       | `ubuntu-latest`  | A GitHub Release named `<tag>` with all of the above attached |
 
 Both platform builds compile with `CMAKE_BUILD_TYPE=Release`, `VW_WERROR=ON`
@@ -128,6 +129,36 @@ SmartScreen/unknown-publisher prompt for the `.msi`. This is an accepted
 gap, not an oversight — revisit if/when this project sets up
 code-signing infrastructure.
 
+### Android APK (`vaporwault-<tag>-android.apk`)
+
+Since `TASK-239`, `build-android` cross-compiles the client core via the NDK
+(same toolchain `ci.yml`'s `build-android` job — `TASK-233` — validates on
+every push) and runs `./gradlew assembleRelease` from `android/`.
+
+**This APK is debug-signed, not production-signed.** The project has no
+release signing keystore and no Play Store presence today, so
+`android/app/build.gradle`'s `release` build type is deliberately wired to
+`signingConfigs.debug` (the standard Gradle-generated debug key) rather than
+left unsigned — an unsigned release APK can't be installed at all, and a
+silently-shipped "release" build that looks production-signed would be
+worse than one that's clearly labeled. Concretely, this means:
+
+- The APK installs fine via `adb install` or direct sideload (with the
+  device's "install unknown apps" setting enabled) — it is **not** listed
+  on any app store and has no auto-update mechanism.
+- It is signed with the same debug key every contributor's local Android
+  Studio/Gradle install already generates, **not** a secret unique to this
+  project — anyone can locally rebuild and produce a byte-for-byte
+  equivalent signature. Do not treat this artifact's signature as an
+  authenticity guarantee the way the `.sha256` checksum is.
+- If this project ever gets a Play Store presence (or otherwise needs a
+  real release identity), generate a dedicated release keystore, wire it
+  into this job via GitHub Actions secrets (matching how `SDL2_ZIP_SHA256`/
+  `WIX_ZIP_SHA256`-style supply-chain-sensitive material is already
+  handled), and update `android/app/build.gradle`'s `release` build type to
+  use it instead of `signingConfigs.debug`. Track that as a follow-up task
+  against BLD.05 when it becomes relevant — not attempted here.
+
 ## 2. Cutting a release
 
 ```sh
@@ -178,10 +209,11 @@ detects whether a release for the tag already exists and uploads/overwrites asse
 
 The workflow also accepts manual triggers via **Actions → Release → Run workflow**
 (`workflow_dispatch`), with a `version` input used only to name the build
-artifacts. Manual runs execute `build-linux` and `build-windows` exactly as a real
-tag push would, but **never run the `publish` job** — no GitHub Release is created
-or modified. Use this to validate the build/packaging steps (e.g. after touching
-the SDL2 vendoring step or the CMake configure flags) without cutting a real tag.
+artifacts. Manual runs execute `build-linux`, `build-windows`, and `build-android`
+exactly as a real tag push would, but **never run the `publish` job** — no GitHub
+Release is created or modified. Use this to validate the build/packaging steps
+(e.g. after touching the SDL2 vendoring step or the CMake configure flags) without
+cutting a real tag.
 
 ## 4. Verifying a downloaded release archive
 

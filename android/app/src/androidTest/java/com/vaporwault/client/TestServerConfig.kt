@@ -22,4 +22,15 @@ object TestServerConfig {
     val port: Int get() = arg("vw_test_port", "4430").toInt()
     val username: String get() = arg("vw_test_user", "androidtest2")
     val password: String get() = arg("vw_test_pass", "TestPass456!")
+
+    /**
+     * A second account, distinct from [username], that must also already
+     * exist server-side (TASK-243) — [com.vaporwault.client.SharingFlowTest]
+     * grants a share to it. Only the username needs to be reachable from
+     * this suite; nothing here ever logs into it, since `SharesActivity`
+     * only lists shares/links *created by* the current account, never the
+     * "shared with me" side (out of scope, matching `SharesActivity`'s own
+     * doc comment).
+     */
+    val shareTargetUsername: String get() = arg("vw_share_target_user", "androidtest3")
 }

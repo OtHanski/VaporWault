@@ -65,21 +65,38 @@ class LoginActivity : AppCompatActivity() {
         caCertStatusText = findViewById(R.id.caCertStatusText)
         val connectButton = findViewById<Button>(R.id.connectButton)
         val profileList = findViewById<RecyclerView>(R.id.profileList)
+        val savedProfilesLabel = findViewById<TextView>(R.id.savedProfilesLabel)
+
+        // TASK-241's fix gave profileList a fixed height (so it scrolls
+        // internally instead of breaking the rest of the form once enough
+        // profiles accumulate) — but a fixed height means an empty list
+        // would otherwise always reserve that space even with zero saved
+        // profiles, the common case for a fresh install. Collapse both it
+        // and its label together when there's nothing to show.
+        fun updateProfileListVisibility(profiles: List<Profile>) {
+            val visibility = if (profiles.isEmpty()) View.GONE else View.VISIBLE
+            profileList.visibility = visibility
+            savedProfilesLabel.visibility = visibility
+        }
 
         findViewById<Button>(R.id.importCaCertButton).setOnClickListener {
             importCaCert.launch(arrayOf("*/*"))
         }
 
+        val initialProfiles = registry.listProfiles()
         profileAdapter = ProfileAdapter(
-            profiles = registry.listProfiles(),
+            profiles = initialProfiles,
             onTap = { profile -> resumeProfile(profile) },
             onRemove = { profile ->
                 registry.removeProfile(profile.id)
-                profileAdapter.update(registry.listProfiles())
+                val remaining = registry.listProfiles()
+                profileAdapter.update(remaining)
+                updateProfileListVisibility(remaining)
             },
         )
         profileList.layoutManager = LinearLayoutManager(this)
         profileList.adapter = profileAdapter
+        updateProfileListVisibility(initialProfiles)
 
         connectButton.setOnClickListener {
             val host = hostField.text.toString().trim()

@@ -39,6 +39,13 @@ android {
 
     buildTypes {
         release {
+            // TASK-239: signed with the standard Gradle debug key, not a real
+            // release keystore -- this project has neither a signing keystore
+            // nor a Play Store presence yet (see docs/RELEASE.md). Without an
+            // explicit signingConfig here, AGP produces an unsigned release
+            // APK that can't be installed at all. Revisit once real signing
+            // infrastructure exists; do not mistake this for production signing.
+            signingConfig signingConfigs.debug
             minifyEnabled false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }

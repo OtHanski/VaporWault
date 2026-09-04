@@ -1988,12 +1988,27 @@ required a bespoke setter for its uniqueness-index side effects —
 
 The client does **not** send the raw password. Before sending AUTH_REQUEST, the client:
 
-1. Derives a 32-byte value using Argon2id locally (or, in simple implementations, sends `SHA-256(password)` as the token — see Security Note below).
+1. Computes `auth_token[32] = SHA-256(password)`. This is the sole scheme —
+   every client (desktop, web, Android) does exactly this; there is no
+   client-side-Argon2id alternative, live or planned (see note below on why
+   not).
 2. Sends `auth_token[32]` in AUTH_REQUEST.
 
-The server then verifies against its stored Argon2id hash of the password.
+The server verifies `auth_token` via Argon2id against its own stored
+`(argon2id_hash, salt)` for the account — i.e. the server's Argon2id input is
+`SHA-256(password)`, not the raw password.
 
-> **Security Note (Phase 1 issue TASK-009):** For Phase 0 the wire token is `SHA-256(password)` sent from client. Phase 1 will define a proper SRP or client-side Argon2id derivation so the raw hash is never transmitted.
+> **Note on client-side Argon2id (not planned):** `AUTH_REQUEST` is a single
+> round trip, so the client has no way to learn the server's per-account
+> Argon2id salt before computing `auth_token` — there is no salt-exchange
+> message in the handshake. Client-side Argon2id derivation was never
+> implementable under this shape, not merely unimplemented so far; achieving
+> it would require a real protocol change (e.g. SRP, or an explicit
+> salt-exchange round trip added to the handshake). No such change is
+> currently planned — this is a known, accepted limitation of the Phase 0
+> handshake shape, not a near-term TODO. (Previously tracked as a "Phase 1"
+> upgrade under `TASK-009`; that framing was stale by Phase 21 and has been
+> corrected here per `TASK-240`.)
 
 ### 8.2 Session tokens
 
@@ -2102,6 +2117,7 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 30      | 2026-09-03 | PRT.04  | §8.1 (password transport) reworded, resolving `TASK-240` (a SEC.07 advisory filed during `TASK-234`'s Android review): the prior text presented "Argon2id locally" as a live client-side alternative to `SHA-256(password)`, which is structurally impossible under `AUTH_REQUEST`'s single-round-trip shape (no salt-exchange message exists for the client to learn the server's per-account salt before computing the token) — never actually implementable, not merely not-yet-implemented. Also replaced the stale "Phase 1 will define a proper SRP or client-side Argon2id derivation" note (open since `TASK-009`, Phase 0) — 20+ phases shipped since with no such change — with an explicit "not planned" framing. Verified against `src/server/vw_auth.c`'s actual verification call and `src/client/vw_client_core.c`'s implementation: every client (desktop, web, Android) sends `SHA-256(password)`; the server verifies it via Argon2id against its own stored hash+salt. Documentation-only; no wire format, message, or byte layout changed; no protocol version bump required (this table tracks spec-revision count, not wire version, per revision 16's own clarifying note). |
 | 29      | 2026-09-03 | SRV.01  | Documented `AUTH_LOGOUT` (§7.1) for the first time, resolving `TASK-237`: the message existed on the wire since Phase 1 but the server never handled it (a client-initiated logout never actually invalidated the session token — it just sat valid until natural expiry), so there was nothing correct to document until now. No payload; revokes the session token the connection authenticated with; wire-visible rejection codes for that revoked token match every other bad-token case (`AUTH_FAIL`/`VW_ERR_AUTH_BAD_CREDS` on `SESSION_RESUME`, `ERROR`/`VW_ERR_AUTH_REQUIRED` mid-session), per the existing anti-oracle invariant — verified empirically rather than assumed. Purely a behavior fix + doc addition, no existing byte layout changed; no protocol version bump required. |
 | 28      | 2026-08-27 | PRT.04  | Account self-service two-factor enrollment (§7.15), resolving `TASK-219`: new `ACCOUNT_2FA_SET`/`_SET_ACK` (0x0B05–0x0B06). Before this, there was no self-service or admin-driven way to change a user's 2FA enrollment after creation at all, so `TASK-207`'s `account_security_change` alert had no real trigger for its "2FA enabled/disabled" half. Requires re-proving the current password (same shape as `AUTH_REQUEST`'s `auth_token`) before touching the flag — a security-sensitive toggle, not a preference. Enabling with no email on file is rejected (`VW_ERR_INVALID_ARG`): 2FA codes are emailed, so enabling without one would lock the account out of every future login. Chose one parameterized `SET` over this task's own alternative of two separate `2FA_ENABLE`/`2FA_DISABLE` opcodes (identical re-auth handling and shape on both directions, differing only in one stored bit) while still avoiding its rejected alternative (reviving `USER_MODIFY` as a generic field-patch message) for the reason that task itself gave. Storage reuses the existing `otp_enabled` field via `vw_store_user_update_field` — already an explicitly-supported use per that function's own doc comment — no new store-layer setter needed. Entirely new message pair, no existing byte layout changed; no protocol version bump required. |
 | 27      | 2026-08-27 | PRT.04  | Hot-standby replication of `notify_prefs.db` (§7.7), resolving `TASK-220`: new file tag 9 (`store/notify_prefs.db`) added to the fixed `CLUSTER_FILE_SYNC_LIST`/`_FETCH` file-tag table (`vw_cluster_file_tag_t`), `VW_CLUSTER_FILE_TAG_COUNT` 8→9. Before this, a replica's own `notify_prefs.db` was always a fresh, all-defaults-off copy, never synced from the primary — a `NOTIFY_PREFS_GET` served from a fallback-connected replica (TASK-173) always read back 0 regardless of the real preference on file at the primary (stale-but-safe: under-reports opt-in, never over-reports, so no security issue, but a real correctness gap). Also fixed in the same pass, found while implementing rather than deferred: `vw_store_reload_users_and_quotas` (the function the replica's sync pass calls to refresh in-memory state after fetching new files) didn't reload `notify_prefs`/`notify_free` at all — so even with the file tag fixed, a long-running replica process's in-memory preference table would still have gone stale until its next restart. `notify_prefs` reload folded into that existing function rather than a new one, same reasoning already used for quotas sharing it with users. `CLUSTER_FILE_SYNC_LIST_RESP`'s entry count is purely additive (driven entirely by the `VW_CLUSTER_FILE_TAG_COUNT` constant in both the primary and replica implementations); no protocol version bump required. |
