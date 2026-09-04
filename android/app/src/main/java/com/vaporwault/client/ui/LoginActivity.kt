@@ -96,6 +96,15 @@ class LoginActivity : AppCompatActivity() {
         )
         profileList.layoutManager = LinearLayoutManager(this)
         profileList.adapter = profileAdapter
+        // TASK-00245: required for wrap_content to actually measure to the
+        // list's full content height inside the outer ScrollView — with
+        // nested scrolling left enabled (the default), profileList's own
+        // scroll handling competes with the outer ScrollView and the
+        // measured height ends up wrong once there's enough content to
+        // matter, which is what silently made connectButton (and
+        // everything else below profileList) unreachable with 10 saved
+        // profiles. See activity_login.xml's comment on profileList.
+        profileList.isNestedScrollingEnabled = false
         updateProfileListVisibility(initialProfiles)
 
         connectButton.setOnClickListener {

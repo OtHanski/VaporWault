@@ -17,24 +17,24 @@
             android:textStyle="bold"
             android:layout_marginBottom="8dp" />
 
-        <!-- TASK-00241: NOT wrap_content. A RecyclerView's wrap_content
-             auto-measure inside a ScrollView only reliably works up to
-             roughly one screenful of content — past that, the ScrollView's
-             total scrollable height gets capped at approximately the
-             RecyclerView's own height, and every sibling declared after it
-             (the whole add-profile form, including connectButton) is
-             dropped from layout entirely, not merely scrolled off-screen
-             (confirmed via UiAutomator being unable to find connectButton
-             at all, even off-screen, with 10 saved profiles present).
-             A fixed height makes profileList's own MeasureSpec EXACT
-             instead of UNSPECIFIED, so it scrolls its own content
-             internally (nested scrolling, enabled by default) regardless
-             of profile count, while every view below it stays reachable
-             in the outer ScrollView no matter how many profiles exist. -->
+        <!-- TASK-00241/TASK-00245: wrap_content, NOT a fixed height. A
+             fixed height (240dp) turned out to still leave connectButton
+             unreachable with 10 saved profiles in CI (LoginProfileScaleTest
+             failing on PR #1) — RecyclerView's *default* nested-scrolling
+             behavior competing with the outer ScrollView for the same
+             gesture stream, not the MeasureSpec type itself, is the
+             documented cause of "wrap_content inside ScrollView measures/
+             renders wrong" for RecyclerView. The correct fix (see
+             LoginActivity.kt's onCreate) is disabling the RecyclerView's
+             own nested scrolling, which lets modern RecyclerView's
+             auto-measure correctly size itself to its full content and
+             hand all scrolling to the single outer ScrollView — no fixed
+             height needed, and every view below it stays reachable
+             regardless of profile count. -->
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/profileList"
             android:layout_width="match_parent"
-            android:layout_height="240dp" />
+            android:layout_height="wrap_content" />
 
         <View
             android:layout_width="match_parent"

@@ -157,12 +157,14 @@ class SharingFlowTest {
         waitUntilTextAppears("Shared with ${TestServerConfig.shareTargetUsername}", timeoutMs = 20_000)
 
         click("sharesButton")
-        waitUntilTextAppears(testFolderName, timeoutMs = 20_000)
-        // Scoped to this test's own row, same reasoning as the link
-        // tests' password-suffix checks below.
-        check(textExists("$testFolderName → ${TestServerConfig.shareTargetUsername}")) {
-            "Share row for ${TestServerConfig.shareTargetUsername} not found in SharesActivity"
-        }
+        // TASK-245: was waitUntilTextAppears(testFolderName) (a bare
+        // substring match) followed by a one-shot check() for the fully
+        // formatted row — that let the bare match win the moment the row
+        // started rendering, before the async "→ username" suffix was
+        // actually in place, a real observed CI flake. Poll for the fully
+        // formatted text directly instead, scoped to this test's own row
+        // like the link tests' password-suffix checks below.
+        waitUntilTextAppears("$testFolderName → ${TestServerConfig.shareTargetUsername}", timeoutMs = 20_000)
 
         revokeLastAndConfirmGone(testFolderName)
     }

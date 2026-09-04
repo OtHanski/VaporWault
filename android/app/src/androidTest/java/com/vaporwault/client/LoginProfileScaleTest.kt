@@ -70,7 +70,18 @@ class LoginProfileScaleTest {
     fun connectButtonReachableWithTenSavedProfiles() {
         seedProfiles(10)
         launchLoginActivity()
-        waitFor("connectButton")
+        try {
+            waitFor("connectButton")
+        } catch (e: IllegalStateException) {
+            // TASK-00245: this exact assertion has failed once already in
+            // CI (PR #1) despite a fix that looked correct by inspection —
+            // dump the live hierarchy into the failure message itself
+            // (there's no logcat capture step in ci.yml) so a repeat
+            // failure carries real evidence instead of requiring another
+            // guess-and-push round trip.
+            val dump = UiTestHelpers.shell("uiautomator dump /sdcard/vw_dump.xml && cat /sdcard/vw_dump.xml")
+            throw IllegalStateException("${e.message}\n--- window dump ---\n$dump", e)
+        }
         check(exists("connectButton")) {
             "connectButton not found in the view hierarchy with 10 saved profiles"
         }
