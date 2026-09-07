@@ -4,6 +4,11 @@ Most third-party code lives under `third_party/` as git submodules, but not
 all of it — see each entry below for which mechanism applies.
 Run the commands below from the repository root **before** your first CMake configure.
 
+This covers the CMake-based desktop build (server, client daemon/CLI,
+Dear ImGui GUIs). The Android app (`android/`) is a separate Gradle/NDK
+project with its own, unrelated toolchain (JDK, Android SDK/NDK, Gradle) —
+see [`docs/ANDROID_BUILD.md`](docs/ANDROID_BUILD.md) instead.
+
 ---
 
 ## Required third-party libraries

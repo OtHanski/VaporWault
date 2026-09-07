@@ -7,11 +7,16 @@
 same idea as Dropbox or Google Drive, but you (or someone you trust) runs
 the server. A pure-C backend stores and serves files; a pure-C client
 daemon keeps local folders in sync with it; thin CLI and Dear ImGui GUI
-front ends sit on top of both. Minimal external dependencies — no
-database engine, no cloud SDKs, just mbedTLS for TLS and a handful of
-small vendored libraries.
+front ends sit on top of both. An Android app (Kotlin + the same C core
+via a JNI bridge) gives on-demand mobile browse/upload/download. Minimal
+external dependencies — no database engine, no cloud SDKs, just mbedTLS
+for TLS and a handful of small vendored libraries.
 
-**Status: pre-1.0, actively developed** ([`v0.1.0`](https://github.com/OtHanski/VaporWault/releases/latest) is the latest tagged release). Expect rough edges outside the paths described below.
+**Status: pre-1.0, actively developed.** Expect rough edges.
+
+For the time being this is completely machine-written code, a sandbox for
+testing and improving my AI programming workflow with an actually complex
+real-world setting without screwing with actual production code at work.
 
 ---
 
@@ -39,6 +44,7 @@ small vendored libraries.
 | Linux | ✅ | ✅ |
 | Windows | ⚠️ runs, but no admin CLI¹ | ✅ |
 | macOS | ❌ deferred | ❌ deferred |
+| Android | n/a | ✅ on-demand app² |
 
 The client (background sync daemon, CLI, and GUI) runs on Linux and
 Windows. macOS is not supported yet — a deliberate scoping decision, not
@@ -49,6 +55,14 @@ fine, but `vapourwault-server-cli` — how you create users, set quotas, or
 pair a cluster replica — has no working transport there yet (its admin
 socket is POSIX-only). See the platform note in
 [`docs/TUTORIAL.md`](docs/TUTORIAL.md).
+
+² The Android app is a separate client, not a port of the desktop one —
+on-demand browse/upload/download (Drive-app style), not continuous
+background folder sync, since Android has no equivalent of a persistent
+POSIX daemon. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and
+[`docs/ANDROID_BUILD.md`](docs/ANDROID_BUILD.md) to build it. Debug-signed
+APKs (no Play Store yet) are attached to
+[releases](https://github.com/OtHanski/VaporWault/releases/latest).
 
 ---
 
@@ -91,6 +105,7 @@ For the GUI, cluster setup, packaging, and Windows instructions, see
 | Client daemon (`vapourwault-daemon`) | C | Sync engine, local metadata cache, conflict handling, background service |
 | CLIs (`vapourwault-cli`, `vapourwault-server-cli`) | C | Thin front ends over the daemon/server admin channel |
 | GUIs (`vapourwault-gui`, `vapourwault-server-gui`) | C++ (Dear ImGui) | Desktop file browser, transfer queue, admin dashboard |
+| Android app (`android/`) | Kotlin + C (JNI bridge) | On-demand mobile file browser, upload/download, E2EE vault support |
 
 ## Documentation map
 
@@ -99,7 +114,7 @@ For the GUI, cluster setup, packaging, and Windows instructions, see
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | System design, module map, on-disk formats, design decisions |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | The client↔server and cluster wire protocol specification |
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | Standing up a server, TLS, users, cluster pairing |
-| [`docs/CLIENT_GETTING_STARTED.md`](docs/CLIENT_GETTING_STARTED.md) | Using the client GUI as a non-technical end user |
+| [`docs/CLIENT_GETTING_STARTED.md`](docs/CLIENT_GETTING_STARTED.md) | Using the desktop client or Android app as a non-technical end user |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Reference config, backup/restore, upgrades, hardening checklist |
 | [`docs/RELEASE.md`](docs/RELEASE.md) | How tagged releases are built and published |
 | [`docs/STYLE.md`](docs/STYLE.md) | C/C++ code style conventions |

@@ -354,3 +354,7 @@ for a first setup, sharing one pair is the least fiddly option.
   `add-folder`/`ls`/etc. become useful. **Do not run the client daemon on a
   shared multi-user host** — its IPC port has no per-user authentication;
   see `docs/DEPLOYMENT.md` §10 for the full caveat.
+- **Mobile access**: point your users at the Android app instead
+  (`docs/CLIENT_GETTING_STARTED.md`'s Android section) for on-demand
+  browse/upload/download from a phone — no daemon, no per-host caveat
+  above, since it isn't a shared background service.

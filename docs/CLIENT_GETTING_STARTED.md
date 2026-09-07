@@ -11,10 +11,12 @@ runs your VaporWault server — has already set one up and given you:
   below)
 
 You don't need to know anything about servers, command lines, or how any of
-this works under the hood. This guide only covers the app you'll actually
+this works under the hood. This guide mostly covers the desktop app you'll
 use day to day: the **VaporWault client** — a small program that keeps a
 folder on your computer in sync with your VaporWault account, the same idea
-as Dropbox or Google Drive.
+as Dropbox or Google Drive. **On Android?** Skip straight to
+[Using VaporWault on Android](#using-vaporwault-on-android) — it's a
+different app with a different way of working (no background sync folder).
 
 If you're the person setting up the *server* instead, this isn't the guide
 you want — see `docs/TUTORIAL.md`.
@@ -265,6 +267,60 @@ Turning it off works the same way — your current password, then off.
 Either direction also sends you a "your account security changed" email
 if you've turned that notification on (above), as a heads-up in case it
 wasn't actually you.
+
+---
+
+## Using VaporWault on Android
+
+The Android app is a separate, purpose-built mobile client — not the
+desktop app squeezed onto a phone. The biggest difference: **there's no
+background daemon and no "sync folder."** Everything is on-demand, the
+same way Google Drive or Dropbox's own Android apps work — you open the
+app, browse your files, and upload or download the ones you actually want.
+Nothing syncs automatically in the background while the app is closed.
+
+### Getting the app
+
+There's no Play Store listing yet. Get the APK from the project's
+[GitHub Releases page](https://github.com/OtHanski/VaporWault/releases/latest)
+(`vaporwault-<version>-android.apk`) and sideload it:
+
+1. Download the `.apk` on your phone (or copy it over from a computer).
+2. Tap it to install. Android will warn you it's from an unknown source —
+   that's expected for a sideloaded app; you'll need to allow "install
+   unknown apps" for whatever app you downloaded it with (your browser,
+   Files app, etc.).
+3. This build is signed with a shared debug key, not a unique release
+   signature — normal for a project without a Play Store presence, but
+   worth knowing if you were expecting the same kind of signature
+   guarantee an app-store install gives you.
+
+### Everyday use
+
+- **First launch**: enter your server address, username, and password —
+  same credentials as the desktop client. If your account has 2FA turned
+  on, you'll be asked for the emailed code too, same as on desktop.
+- **Multiple accounts**: the app supports adding more than one VaporWault
+  account/profile and switching between them.
+- **Browsing and transfers**: tap into folders to browse; downloads and
+  uploads happen when you actually ask for them (there's no continuous
+  background sync to wait on or worry about).
+- **Sharing**: create or manage public links and per-user share grants
+  from the app, the same features the desktop client has.
+- **Vaults**: if your account uses an end-to-end-encrypted vault, you can
+  create, unlock, and browse it from the app the same way as on desktop —
+  your passphrase never leaves the device unencrypted.
+
+### If something's not working
+
+The Android app talks to the same server the desktop client and admin
+tools do, so most of this guide's [Troubleshooting](#troubleshooting)
+section below applies just as well — a login failure, a locked account,
+or a server being unreachable look and mean the same thing on Android as
+on desktop. If you want the technical detail on how the app is built
+(there's no separate background service to blame, unlike the desktop
+daemon), see [`ARCHITECTURE.md`](../ARCHITECTURE.md)'s Android client
+section.
 
 ---
 

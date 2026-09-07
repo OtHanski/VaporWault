@@ -30,7 +30,7 @@ re-audit, 2026-08-05 `TASK-00118`) superseded here rather than kept verbatim, si
 
 VaporWault is a self-hosted cloud file hosting system. It consists of:
 
-- **Server** (Linux only): stores and serves files, manages users, replicates across cluster nodes
+- **Server** (Linux + Windows, since `TASK-00145`–`00154`'s installer packaging work): stores and serves files, manages users, replicates across cluster nodes. The Windows build has one known gap: `vapourwault-server-cli` has no working transport there yet (its admin socket is POSIX-only) — see `README.md`'s platform table
 - **Client daemon** (Linux + Windows): background process that syncs local folders to the server
 - **GUIs** (C++ / Dear ImGui): thin clients that connect to the server GUI process or local client daemon via IPC
 - **CLIs** (pure C): also thin clients connecting to the server process or local client daemon via IPC
