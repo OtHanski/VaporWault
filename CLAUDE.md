@@ -30,6 +30,7 @@ architecture notes to make authorship and routing unambiguous.
 | SEC.07  | Security Reviewer           | Security audit                    |
 | CQR.08  | Code Quality Reviewer       | Code quality, consistency         |
 | WEB.09  | Web Gateway / Frontend Dev  | Browser client, HTTP/JSON gateway |
+| MOB.10  | Mobile Developer            | Android client (native core + UI) |
 
 ---
 
@@ -224,10 +225,58 @@ see `ARCHITECTURE.md`'s Approved External Dependencies table
 
 ---
 
+### MOB.10 — Mobile Developer
+
+**Responsibilities**
+- Owns the Android client under `android/`: a Gradle/NDK project that speaks the
+  wire protocol (`vw/1`) directly to the VaporWault server as its own authenticated
+  client — a sibling of the client daemon, gateway, and CLI, same as they are to
+  each other — by cross-compiling `src/client/vw_client_core.c` and
+  `src/client/vw_vault.c` (unmodified, plus the existing `vw_core` library) for
+  Android via the NDK and driving them from Kotlin through a thin JNI bridge
+- Owns both the native JNI layer and the Kotlin/Views UI as a single role: file
+  browser, upload/download with progress, login/2FA, sharing/public-link
+  management, vault create/unlock/browse, and multi-profile account management —
+  unlike the desktop split between CLI.02 and GUI.03, there is one Gradle project
+  here and no separate GUI process to draw a "no protocol code in the GUI"
+  boundary around
+- Android-specific platform integration that has no native-client precedent to
+  port: Storage Access Framework for on-demand file/folder transfers (this app
+  does on-demand browse/upload/download, not the desktop client's continuous
+  background folder-mirroring — `vw_sync.c`, `vw_daemon.c`, `vw_ipc.c`, and the
+  `vw_watch_*` backends are therefore out of scope here), Android Keystore-backed
+  credential/session storage, and a User-Initiated Data Transfer job (with a
+  foreground-service fallback) for in-progress transfers
+- Vault/E2EE crypto on-device via the JNI bridge into `vw_vault.c`/`vw_crypto.c`
+  (Argon2id KEK derivation, AES-256-GCM) — the passphrase and any key material it
+  derives must never leave the device unwrapped, matching the same invariant
+  WEB.09's in-browser vault crypto upholds
+
+**Constraint**: Consumes `docs/PROTOCOL.md` as-is, like WEB.09 — never modifies
+the wire protocol. Reuses `vw_core` and the two client-core source files listed
+above directly (matching the project's existing "compile the source file into
+each consumer, no intermediate library" convention); does not fork or
+reimplement `vw_client_core.c`'s protocol logic in Kotlin.
+
+**TODO interactions**
+Reads: ARCH.00-assigned tasks, SEC.07 findings on the Android client, PRT.04's
+`docs/PROTOCOL.md`
+Writes: completed Android tasks, protocol questions for PRT.04 (never
+unilaterally reinterpreted), out-of-domain issues discovered
+
+**Tech**: C (JNI bridge, reused client-core), Kotlin (UI, platform integration),
+Gradle/CMake/NDK — see `ARCHITECTURE.md`'s Approved External Dependencies table
+
+---
+
 ## TODO-List Protocol
 
-Tasks live under the `TODO/` directory, one file per task: `TODO/<folder>/TASK-NNN.md`.
-The template is at `TODO/TEMPLATE.md`. Copy it; do not edit the template itself.
+Tasks live under the `TODO/` directory, one file per task: `TODO/<folder>/TASK-NNNNN.md`,
+where `NNNNN` is the task number zero-padded to 5 digits (e.g. `TASK-00237`) — padded to
+5 digits, not 3, since the project outgrew 3-digit numbering (originally `TASK-NNN`;
+every existing task file and cross-reference was renumbered in one pass rather than
+left inconsistent). The template is at `TODO/TEMPLATE.md`. Copy it; do not edit the
+template itself.
 
 `TODO/` has exactly three subfolders, and every task file lives in exactly one of them:
 
@@ -253,7 +302,7 @@ moving the file, don't just edit the status. New tasks are created directly in
 
 ```yaml
 ---
-id:          TASK-NNN
+id:          TASK-NNNNN
 title:       "Short imperative description"
 status:      todo          # todo | in_progress | review | done | blocked
 assignee:    SRV.01        # exactly one agent ID
@@ -272,7 +321,7 @@ and date; they never delete prior notes.
 
 **`title` must always be a double-quoted string.** A colon followed by a space inside a
 plain (unquoted) YAML scalar is ambiguous with a nested mapping — some parsers accept it,
-others don't, and at least one past task file (see `TASK-169`'s history) had its title
+others don't, and at least one past task file (see `TASK-00169`'s history) had its title
 silently rewritten because of this. Quoting the title sidesteps that entirely and is safe
 against other stray-punctuation issues too, so a colon inside the title is fine as long as
 the whole value is quoted (`title: "Server: replica hot-standby..."`).

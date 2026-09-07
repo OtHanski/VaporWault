@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/title_shares"
+            android:textStyle="bold"
+            android:textSize="18sp"
+            android:paddingBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/label_shares_created" />
+
+        <!-- TASK-244: fixed height, not wrap_content — same
+             RecyclerView-in-ScrollView overflow hazard TASK-241 found and
+             fixed in LoginActivity's profileList (confirmed here too via
+             SharesScaleTest: past ~one screenful, everything declared
+             after this RecyclerView in the LinearLayout — linkList's own
+             section, statusText — is dropped from layout entirely, not
+             merely scrolled off-screen). A fixed height makes this
+             RecyclerView's own MeasureSpec EXACT instead of UNSPECIFIED,
+             so it scrolls its own content internally regardless of how
+             many shares exist. -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/shareList"
+            android:layout_width="match_parent"
+            android:layout_height="240dp" />
+
+        <TextView
+            android:id="@+id/emptySharesText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/empty_shares"
+            android:padding="16dp"
+            android:visibility="gone" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#33000000"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/label_links_created" />
+
+        <!-- TASK-244: see shareList's identical comment above. -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/linkList"
+            android:layout_width="match_parent"
+            android:layout_height="240dp" />
+
+        <TextView
+            android:id="@+id/emptyLinksText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/empty_links"
+            android:padding="16dp"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="8dp" />
+
+    </LinearLayout>
+
+</ScrollView>

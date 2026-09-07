@@ -1,0 +1,81 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace "com.vaporwault.client"
+    compileSdk 34
+    ndkVersion "28.2.13676358"
+
+    defaultConfig {
+        applicationId "com.vaporwault.client"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            // 32-bit x86 is obsolete for new Play Store targeting; arm64-v8a is
+            // mandatory, armeabi-v7a covers older real devices, x86_64 covers
+            // emulators (TASK-224/225).
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    buildTypes {
+        release {
+            // TASK-239: signed with the standard Gradle debug key, not a real
+            // release keystore -- this project has neither a signing keystore
+            // nor a Play Store presence yet (see docs/RELEASE.md). Without an
+            // explicit signingConfig here, AGP produces an unsigned release
+            // APK that can't be installed at all. Revisit once real signing
+            // infrastructure exists; do not mistake this for production signing.
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    // Minimum viable AndroidX set for a Views-based app on current API
+    // levels (ARCHITECTURE.md's Approved External Dependencies addendum,
+    // TASK-224) — no Compose, no androidx.security-crypto, no WorkManager/Room.
+    implementation "androidx.core:core-ktx:1.13.1"
+    implementation "androidx.appcompat:appcompat:1.7.0"
+    implementation "androidx.documentfile:documentfile:1.0.1"
+    implementation "androidx.recyclerview:recyclerview:1.3.2"
+
+    // Instrumented tests only (TASK-235). uiautomator (not just Espresso)
+    // is required because several flows this app drives cross into
+    // system UI outside the app's own process — the SAF document
+    // picker/DocumentsUI in particular — which Espresso's in-app view
+    // matchers cannot reach at all.
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
+}

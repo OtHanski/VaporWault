@@ -2622,7 +2622,15 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
         vw_account_ctx_t *a = &accounts.accounts[i];
         vault_registry_close_all(&a->vaults);
         vw_sync_close(a->sync_ctx);
-        if (a->sess) vw_client_logout(a->sess);
+        /* vw_client_close(), not vw_client_logout(): this is the daemon
+         * process exiting (SIGTERM/service stop), not a user-initiated
+         * logout — the persisted session.tok is meant to let the next
+         * daemon start resume this exact session (vw_client_resume's own
+         * doc pairs it with vw_client_close for this reason). Since
+         * TASK-237 made AUTH_LOGOUT actually revoke the session
+         * server-side, calling vw_client_logout() here was silently
+         * invalidating the very token a restart is supposed to resume. */
+        if (a->sess) vw_client_close(a->sess);
         vw_cache_close(a->cache);
         account_cfg_free_excludes(&a->cfg);
     }

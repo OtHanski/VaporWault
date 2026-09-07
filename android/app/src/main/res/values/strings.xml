@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VaporWault</string>
+    <string name="hint_host">Server host</string>
+    <string name="hint_port">Port</string>
+    <string name="hint_username">Username</string>
+    <string name="hint_password">Password</string>
+    <string name="hint_otp">2FA code</string>
+    <string name="action_import_ca_cert">Import server CA certificate (optional)</string>
+    <string name="status_no_ca_cert">⚠ No CA certificate imported — the server\'s TLS certificate will NOT be verified. Only use this against a server you trust on a trusted network.</string>
+    <string name="status_ca_cert_imported">CA certificate imported: %1$s</string>
+    <string name="default_port">4430</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_remove">Remove</string>
+    <string name="action_download">Download</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_move">Move</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_new_folder">New folder</string>
+    <string name="action_upload">Upload</string>
+    <string name="action_transfers">Transfers</string>
+    <string name="action_logout">Log out</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="label_saved_profiles">Saved profiles</string>
+    <string name="label_add_profile">Add a profile</string>
+    <string name="title_transfer_queue">Transfers</string>
+    <string name="empty_folder">This folder is empty</string>
+    <string name="empty_transfers">No transfers yet</string>
+    <string name="root_breadcrumb">Home</string>
+    <string name="vault_breadcrumb">🔒 Vault</string>
+    <string name="status_loading">Loading…</string>
+    <string name="status_working">Working…</string>
+
+    <string name="action_vaults">Vaults</string>
+    <string name="action_exit_vault">Exit vault</string>
+    <string name="action_unlock">Unlock</string>
+    <string name="action_create_vault">Create vault</string>
+    <string name="title_vaults">Vaults</string>
+    <string name="label_existing_vaults">Existing vaults</string>
+    <string name="label_create_vault">Create a new vault</string>
+    <string name="hint_new_vault_folder_name">New folder name</string>
+    <string name="hint_passphrase">Encryption passphrase</string>
+    <string name="hint_passphrase_confirm">Confirm passphrase</string>
+    <string name="empty_vaults">No vaults yet</string>
+    <string name="status_unlocking">Unlocking…</string>
+    <string name="status_creating_vault">Creating vault…</string>
+    <string name="error_passphrase_mismatch">Passphrases don\'t match</string>
+    <string name="error_passphrase_too_short">Passphrase must be at least 8 characters</string>
+
+    <string name="action_share">Share</string>
+    <string name="action_get_link">Get link</string>
+    <string name="action_shares">Shares</string>
+    <string name="action_revoke">Revoke</string>
+    <string name="title_shares">Shares &amp; links</string>
+    <string name="label_shares_created">Shares you\'ve granted</string>
+    <string name="label_links_created">Public links you\'ve created</string>
+    <string name="label_permission_view">View</string>
+    <string name="label_permission_edit">Edit</string>
+    <string name="hint_expiry_days">Expires in N days (blank = never)</string>
+    <string name="hint_link_password_optional">Link password (blank = none)</string>
+    <string name="empty_shares">No shares yet</string>
+    <string name="empty_links">No links yet</string>
+    <string name="status_link_created">Link created — token: %1$s</string>
+
+    <string name="action_account">Account</string>
+    <string name="title_account">Account settings</string>
+    <string name="label_email">Email address</string>
+    <string name="action_save_email">Save email</string>
+    <string name="label_2fa">Two-factor login (email OTP)</string>
+    <string name="action_2fa_on">Turn on</string>
+    <string name="action_2fa_off">Turn off</string>
+    <string name="hint_current_password">Current password (required to change 2FA)</string>
+    <string name="label_notify_prefs">Email notifications</string>
+    <string name="label_notify_share_received">Someone shared a file with me</string>
+    <string name="label_notify_quota_warning">Storage quota warning</string>
+    <string name="label_notify_new_login">New login to my account</string>
+    <string name="label_notify_account_security_change">Account security changes (email/2FA)</string>
+</resources>

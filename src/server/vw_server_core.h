@@ -185,6 +185,20 @@ vw_err_t vw_server_conn_handle(vw_server_ctx_t *ctx,
                                  vw_conn_t *conn,
                                  vw_session_info_t *out_info);
 
+/*
+ * TASK-237: handle AUTH_LOGOUT on an already-authenticated connection.
+ * Revokes session_token (the token this connection authenticated with —
+ * AUTH_LOGOUT itself carries no payload, so the caller must supply the
+ * token from the vw_session_info_t populated by vw_server_conn_handle)
+ * so it is rejected by any subsequent request, on this connection or any
+ * other. Best-effort by design, matching the fire-and-forget client
+ * contract (vw_client_logout does not wait for a response): VW_ERR_NOT_FOUND
+ * (token already revoked/expired) is not an error worth surfacing to a
+ * client that is already on its way out.
+ */
+vw_err_t vw_server_handle_auth_logout(vw_server_ctx_t *ctx,
+                                        const uint8_t session_token[VW_TOKEN_BYTES]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <RadioGroup
+        android:id="@+id/linkPermissionGroup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/linkPermView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/label_permission_view"
+            android:checked="true" />
+
+        <RadioButton
+            android:id="@+id/linkPermEdit"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/label_permission_edit"
+            android:layout_marginStart="16dp" />
+
+    </RadioGroup>
+
+    <EditText
+        android:id="@+id/linkPasswordField"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:inputType="textPassword"
+        android:hint="@string/hint_link_password_optional"
+        android:layout_marginTop="8dp" />
+
+    <EditText
+        android:id="@+id/linkExpiryField"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:inputType="number"
+        android:hint="@string/hint_expiry_days"
+        android:layout_marginTop="8dp" />
+
+</LinearLayout>

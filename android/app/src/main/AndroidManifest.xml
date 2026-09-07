@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- TASK-228: on-demand transfer notification (API 33+ requires this
+         even for a foreground service's own notification) and the two
+         execution paths' own permissions. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RUN_USER_INITIATED_JOBS" />
+    <!-- Required by JobInfo.Builder.setRequiredNetwork() (a connectivity
+         constraint) — found the hard way, not called out in the UIDT docs
+         alongside setEstimatedNetworkBytes()'s own requirement of it. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.VaporWault">
+
+        <activity
+            android:name=".ui.LoginActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.FileBrowserActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.TransferQueueActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.VaultActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.SharesActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.AccountActivity"
+            android:exported="false" />
+
+        <service
+            android:name=".transfer.TransferForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <service
+            android:name=".transfer.TransferJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
+
+    </application>
+
+</manifest>

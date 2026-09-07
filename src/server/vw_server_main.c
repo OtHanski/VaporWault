@@ -653,6 +653,18 @@ static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn) {
             if (err == VW_ERR_NET_CLOSED) break;
             if (err != VW_OK) { vw_log(LOG_DEBUG, "recv error %d", (int)err); break; }
 
+            /* TASK-237: AUTH_LOGOUT carries no payload (fire-and-forget —
+             * vw_client_logout does not wait for a response), so it can't
+             * flow through vw_server_dispatch_file_op's per-message,
+             * token-in-payload validation like every other Phase 2 op.
+             * Revoke the token this connection authenticated with
+             * (captured in `info` above) and stop serving it — the client
+             * is closing its end regardless. */
+            if (type == VW_MSG_AUTH_LOGOUT) {
+                (void)vw_server_handle_auth_logout(sctx, info.session_token);
+                break;
+            }
+
             err = vw_server_dispatch_file_op(sctx, conn, type, buf, plen);
             if (err == VW_ERR_AUTH_REQUIRED || err == VW_ERR_PROTO_INVALID) break;
             if (err == VW_ERR_NOT_IMPL)
@@ -663,6 +675,17 @@ static void handle_connection(vw_server_ctx_t *sctx, vw_conn_t *conn) {
 
 done:
     if (reg && conn_id) vw_conn_registry_remove(reg, conn_id);
+}
+
+/* TASK-245: a short, fixed backoff for the accept loop's VW_ERR_OOM case —
+ * see that call site's own comment for why this exists at all. */
+static void vw_accept_oom_backoff(void) {
+#ifdef _WIN32
+    Sleep(10);
+#else
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000L /* 10ms */ };
+    nanosleep(&ts, NULL);
+#endif
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
@@ -977,7 +1000,23 @@ int vw_server_main_run(int argc, char *argv[]) {
                 vw_log(LOG_WARN, "cert reload failed");
         }
         vw_conn_t *conn = NULL;
-        if (vw_net_accept(net_ctx, &conn) != VW_OK) break;
+        vw_err_t accept_err = vw_net_accept(net_ctx, &conn);
+        if (accept_err == VW_ERR_NET_CONNECT) break; /* listening socket itself is broken — fatal */
+        if (accept_err != VW_OK) {
+            /* Per-connection failure (e.g. a client's TLS handshake never
+             * completed — EOF, malformed ClientHello, cipher mismatch).
+             * vw_net_accept already logged the specific reason; this is
+             * routine and expected on a public listener (health checks,
+             * scanners, misconfigured clients), never a reason to take the
+             * whole server down (TASK-245). VW_ERR_OOM is different: the
+             * calloc() inside vw_net_accept fails before any blocking
+             * syscall runs, so under sustained memory pressure this branch
+             * would otherwise busy-spin retrying it with zero delay,
+             * pinning a CPU core exactly when the system is already
+             * resource-constrained — back off briefly first. */
+            if (accept_err == VW_ERR_OOM) vw_accept_oom_backoff();
+            continue;
+        }
         char peer[64] = "";
         vw_net_peer_addr(conn, peer, sizeof(peer));
         vw_log(LOG_DEBUG, "accepted connection from %s", peer);

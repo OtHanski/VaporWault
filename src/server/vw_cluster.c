@@ -802,13 +802,32 @@ static void *per_replica_thread(void *arg)
 
 /* ── Accept thread ─────────────────────────────────────────────────────────── */
 
+/* TASK-245: a short, fixed backoff for the accept loops' VW_ERR_OOM case —
+ * that calloc() inside vw_net_accept fails before any blocking syscall
+ * runs, so without this, sustained memory pressure would busy-spin the
+ * loop retrying it with zero delay, pinning a CPU core exactly when the
+ * system is already resource-constrained. */
+static void vw_accept_oom_backoff(void) {
+#ifdef _WIN32
+    Sleep(10);
+#else
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000L /* 10ms */ };
+    nanosleep(&ts, NULL);
+#endif
+}
+
 #ifdef _WIN32
 static DWORD WINAPI cluster_accept_thread(LPVOID arg)
 {
     vw_cluster_t *ctx = (vw_cluster_t *)arg;
     while (!atomic_load_acq(&ctx->shutdown)) {
         vw_conn_t *conn = NULL;
-        if (vw_net_accept(ctx->net_ctx, &conn) != VW_OK) break;
+        vw_err_t accept_err = vw_net_accept(ctx->net_ctx, &conn);
+        if (accept_err == VW_ERR_NET_CONNECT) break; /* listening socket itself is broken — fatal */
+        if (accept_err != VW_OK) {
+            if (accept_err == VW_ERR_OOM) vw_accept_oom_backoff();
+            continue; /* per-connection failure (e.g. bad TLS handshake) — TASK-245 */
+        }
         per_replica_arg_t *a = (per_replica_arg_t *)malloc(sizeof(*a));
         if (!a) { vw_net_close(conn); continue; }
         a->ctx  = ctx;
@@ -825,7 +844,12 @@ static void *cluster_accept_thread(void *arg)
     vw_cluster_t *ctx = (vw_cluster_t *)arg;
     while (!atomic_load_acq(&ctx->shutdown)) {
         vw_conn_t *conn = NULL;
-        if (vw_net_accept(ctx->net_ctx, &conn) != VW_OK) break;
+        vw_err_t accept_err = vw_net_accept(ctx->net_ctx, &conn);
+        if (accept_err == VW_ERR_NET_CONNECT) break; /* listening socket itself is broken — fatal */
+        if (accept_err != VW_OK) {
+            if (accept_err == VW_ERR_OOM) vw_accept_oom_backoff();
+            continue; /* per-connection failure (e.g. bad TLS handshake) — TASK-245 */
+        }
         per_replica_arg_t *a = (per_replica_arg_t *)malloc(sizeof(*a));
         if (!a) { vw_net_close(conn); continue; }
         a->ctx  = ctx;

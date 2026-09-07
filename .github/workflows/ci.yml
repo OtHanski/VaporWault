@@ -310,3 +310,218 @@ jobs:
         working-directory: build
         run: |
           ctest --output-on-failure --no-tests=error -L integration --timeout 180
+
+  # ── Android: Gradle + NDK build validation (TASK-233) ───────────────────
+  # Build-only, matching every other job in this file — VW_BUILD_TESTS=OFF
+  # is the desktop convention for CI build validation, and there are no
+  # Android unit tests yet to run. Toolchain versions pinned here must stay
+  # in sync with android/app/build.gradle's own ndkVersion/compileSdk and
+  # docs/ANDROID_BUILD.md's documented requirements — a mismatch would mean
+  # this job silently validates a different toolchain than what a
+  # contributor's local build actually uses.
+  build-android:
+    name: Android / Debug
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # GitHub-hosted ubuntu-latest runners ship a preinstalled Android SDK
+      # (cmdline-tools included) under $ANDROID_HOME — no third-party
+      # marketplace action needed to bootstrap it, matching this project's
+      # minimal-external-dependency stance. This only installs the specific
+      # platform/build-tools/NDK/CMake side-by-side versions the Gradle
+      # project actually needs, which the base image doesn't necessarily
+      # have pre-fetched.
+      - name: Install required Android SDK/NDK/CMake components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" \
+            "platforms;android-34" "build-tools;34.0.0" \
+            "cmake;3.22.1" "ndk;28.2.13676358"
+
+      - name: Build (assembleDebug)
+        working-directory: android
+        run: ./gradlew assembleDebug --console=plain
+
+  # ── Android: instrumented test suite on a real emulator (TASK-242) ──────
+  # `build-android` above only validates that the app compiles
+  # (assembleDebug) — nothing before this job ever booted an emulator or
+  # ran anything under androidTest. TASK-235's CoreFlowTest (and TASK-241's
+  # LoginProfileScaleTest) have only ever been run manually against a
+  # locally-hosted vapourwaultd until now.
+  #
+  # KVM verified available on stock GitHub-hosted ubuntu-latest runners
+  # (not just paid "larger" runners) as of the Feb 2023 "Hardware
+  # accelerated Android virtualization on Actions" rollout — confirmed
+  # against reactivecircus/android-emulator-runner's own README, the same
+  # action used below, rather than assumed (the runner-images repo's own
+  # Ubuntu image docs don't mention KVM by name at all, so that source
+  # alone would have been inconclusive).
+  test-android-instrumented:
+    name: Android / Instrumented tests
+    runs-on: ubuntu-latest
+    needs: build-android   # no point booting an emulator if it doesn't even compile
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Same rationale as build-android above — only the specific
+      # platform/build-tools/NDK/CMake versions the Gradle project needs.
+      # The system image + emulator packages themselves are left to
+      # reactivecircus/android-emulator-runner's own api-level/target/arch
+      # inputs below rather than a second manual sdkmanager call here.
+      - name: Install required Android SDK/NDK/CMake components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" \
+            "platforms;android-34" "build-tools;34.0.0" \
+            "cmake;3.22.1" "ndk;28.2.13676358"
+
+      # A minimal server build — just vapourwaultd + vapourwault-server-cli
+      # (always built together when VW_BUILD_SERVER=ON, CMakeLists.txt),
+      # no client/GUI/tools/tests needed for this job.
+      - name: Install server build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build openssl
+
+      - name: Configure server
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVW_BUILD_SERVER=ON  \
+            -DVW_BUILD_CLIENT=OFF \
+            -DVW_BUILD_GUI=OFF    \
+            -DVW_BUILD_TOOLS=OFF  \
+            -DVW_BUILD_TESTS=OFF  \
+            -DVW_WERROR=ON
+
+      - name: Build server
+        run: cmake --build build --parallel --target vapourwaultd vapourwault-server-cli
+
+      # Matches tests/integration/gen_test_cert.sh's own approach (a fresh
+      # self-signed cert here rather than relying on the committed
+      # tests/integration/test.crt, same as the `integration` job above) —
+      # the Android client under test connects with an empty
+      # caCertPemPath (VW_CERT_VERIFY_NONE, test-only — see Profile.kt),
+      # so it never actually validates this cert; it only needs the server
+      # to have *some* valid cert/key pair to start listening with.
+      - name: Generate test TLS certificate
+        run: |
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout /tmp/vw_test.key \
+            -out    /tmp/vw_test.crt \
+            -days 1 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+
+      # Started in the background here (not inside the emulator-runner's
+      # own script step below) so it's already listening before the
+      # emulator finishes booting. Host/port/username/password match
+      # TestServerConfig's defaults exactly (android/app/src/androidTest/
+      # .../TestServerConfig.kt) so neither CoreFlowTest nor
+      # LoginProfileScaleTest need any `-e vw_test_*` instrumentation
+      # argument override.
+      - name: Start vapourwaultd
+        run: |
+          mkdir -p /tmp/vw_test_server/data
+          cat > /tmp/vw_test_server/server.conf <<EOF
+          listen_host      = 127.0.0.1
+          listen_port      = 4430
+          data_dir         = /tmp/vw_test_server/data
+          cert_pem_path    = /tmp/vw_test.crt
+          key_pem_path     = /tmp/vw_test.key
+          log_level        = INFO
+          max_connections  = 32
+          max_workers      = 4
+          admin_socket     = /tmp/vw_test_server/admin.sock
+          gc_interval_secs = 60
+          smtp_host        =
+          EOF
+          build/bin/vapourwaultd --config /tmp/vw_test_server/server.conf \
+            > /tmp/vw_test_server/server.log 2>&1 &
+          echo $! > /tmp/vw_test_server/server.pid
+
+          for i in $(seq 1 50); do
+            [ -S /tmp/vw_test_server/admin.sock ] && break
+            sleep 0.2
+          done
+          if [ ! -S /tmp/vw_test_server/admin.sock ]; then
+            echo "vapourwaultd never created its admin socket:"
+            cat /tmp/vw_test_server/server.log
+            exit 1
+          fi
+
+          build/bin/vapourwault-server-cli \
+            --admin-socket /tmp/vw_test_server/admin.sock \
+            user-create androidtest2 'TestPass456!'
+
+          # TASK-243's SharingFlowTest grants a share to a second account
+          # (TestServerConfig.shareTargetUsername) — SHARE_GRANT rejects an
+          # unknown target username (vw_file_handlers.c's
+          # handle_share_grant), so this must exist before that suite runs,
+          # same as androidtest2 above.
+          build/bin/vapourwault-server-cli \
+            --admin-socket /tmp/vw_test_server/admin.sock \
+            user-create androidtest3 'TestPass456!'
+
+      # KVM perms + api-level/target/arch match this project's own local
+      # dev toolchain (see the "Android toolchain" notes this project's
+      # own memory keeps — ANDROID_HOME's system-images;android-34;default;
+      # x86_64) so this job exercises the same emulator configuration
+      # that's already been manually verified to work, not an unverified
+      # new combination.
+      - name: Run instrumented tests on emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          disable-animations: true
+          working-directory: android
+          # adb reverse must run after the emulator is up (this script
+          # runs post-boot) — forwards the emulator's own 127.0.0.1:4430
+          # to this runner's loopback, where vapourwaultd is already
+          # listening, matching the exact local dev pattern (WSL2 +
+          # `adb reverse`) this project's Android toolchain notes describe.
+          script: |
+            adb reverse tcp:4430 tcp:4430
+            ./gradlew connectedDebugAndroidTest --console=plain
+
+      - name: Server log (on failure)
+        if: failure()
+        run: cat /tmp/vw_test_server/server.log || true
+
+      - name: Instrumented test report (on failure)
+        if: failure()
+        run: |
+          find android/app/build/reports/androidTests -iname "*.html" -o -iname "*.xml" 2>/dev/null | \
+            xargs -I{} sh -c 'echo "=== {} ==="; cat "{}"' || true

@@ -92,6 +92,33 @@ typedef struct {
     time_t   locked_until;    /* 0 = not locked; else Unix time lockout ends  */
 } lockout_entry_t;
 
+/*
+ * TASK-238: pending email-OTP challenge per user, keyed by user_id — same
+ * fixed-size-table-with-eviction shape as lockout_table above, for the same
+ * reason (ephemeral, does not need to survive a restart, worker-thread-pool
+ * access needs a mutex).
+ *
+ * Why this exists: vw_auth_begin_login previously minted and emailed a brand
+ * new OTP on *every* AUTH_REQUEST for a 2FA account, unconditionally. Every
+ * 2FA-capable client (desktop daemon, Android) authenticates over a single
+ * connection per attempt and re-supplies an already-known OTP on a *second*
+ * connection rather than blocking the first connection open while the user
+ * reads their email — so the second connection's AUTH_REQUEST re-ran
+ * begin_login from scratch, minting code #2 and discarding the state that
+ * would have validated code #1 (the one actually shown to the user), making
+ * a real end-to-end email-OTP login structurally unreachable. This table
+ * lets a second AUTH_REQUEST within the same OTP window reuse the still-
+ * live challenge instead of clobbering it.
+ */
+#define PENDING_OTP_TABLE_SIZE 256
+
+typedef struct {
+    uint64_t user_id;        /* 0 = free/unused slot                          */
+    uint64_t window_start;   /* unix time the OTP was generated               */
+    uint32_t attempt_count;  /* failed AUTH_OTP attempts against this code    */
+    uint8_t  otp_hash[32];   /* SHA-256(otp_string)                           */
+} pending_otp_entry_t;
+
 /* ── Internal context ────────────────────────────────────────────────────── */
 
 struct vw_auth_ctx {
@@ -103,6 +130,11 @@ struct vw_auth_ctx {
     lockout_entry_t   lockout_table[LOCKOUT_TABLE_SIZE];
     vw_auth_mutex_t   lockout_mu;
     int               lockout_mu_init;
+
+    /* Pending email-OTP challenge table; see pending_otp_entry_t above. */
+    pending_otp_entry_t pending_otp_table[PENDING_OTP_TABLE_SIZE];
+    vw_auth_mutex_t     otp_mu;
+    int                 otp_mu_init;
 
     vw_notify_ctx_t  *notify; /* borrowed; NULL = lockout_spike alert disabled (TASK-208) */
 };
@@ -134,6 +166,9 @@ vw_err_t vw_auth_open(vw_store_t *store, const vw_smtp_cfg_t *smtp_cfg,
     auth_mutex_init(&ctx->lockout_mu);
     ctx->lockout_mu_init = 1;
 
+    auth_mutex_init(&ctx->otp_mu);
+    ctx->otp_mu_init = 1;
+
     *out_ctx = ctx;
     return VW_OK;
 }
@@ -142,6 +177,7 @@ void vw_auth_close(vw_auth_ctx_t *ctx)
 {
     if (!ctx) return;
     if (ctx->lockout_mu_init) auth_mutex_destroy(&ctx->lockout_mu);
+    if (ctx->otp_mu_init) auth_mutex_destroy(&ctx->otp_mu);
     free(ctx);
 }
 
@@ -392,6 +428,51 @@ static void lockout_reset(vw_auth_ctx_t *ctx, uint64_t user_id)
     }
 }
 
+/* ── Pending OTP challenge table (TASK-238) ─────────────────────────────── */
+
+/* Caller must hold ctx->otp_mu. */
+static pending_otp_entry_t *pending_otp_find(vw_auth_ctx_t *ctx, uint64_t user_id)
+{
+    for (int i = 0; i < PENDING_OTP_TABLE_SIZE; i++) {
+        if (ctx->pending_otp_table[i].user_id == user_id)
+            return &ctx->pending_otp_table[i];
+    }
+    return NULL;
+}
+
+/*
+ * Find user_id's existing entry, or claim a slot for a new one. Eviction
+ * preference mirrors lockout_find_or_evict: a genuinely free slot first,
+ * otherwise the stalest window_start — a live, still-guessable challenge is
+ * never evicted ahead of one already past its own window.
+ * Caller must hold ctx->otp_mu.
+ */
+static pending_otp_entry_t *pending_otp_find_or_evict(vw_auth_ctx_t *ctx,
+                                                        uint64_t user_id)
+{
+    pending_otp_entry_t *e = pending_otp_find(ctx, user_id);
+    if (e) return e;
+
+    pending_otp_entry_t *victim = &ctx->pending_otp_table[0];
+    for (int i = 0; i < PENDING_OTP_TABLE_SIZE; i++) {
+        pending_otp_entry_t *cand = &ctx->pending_otp_table[i];
+        if (cand->user_id == 0) { victim = cand; break; }
+        if (cand->window_start < victim->window_start) victim = cand;
+    }
+
+    secure_zero(victim, sizeof(*victim));
+    victim->user_id = user_id;
+    return victim;
+}
+
+/* Remove user_id's pending challenge, if any (consumed on success, or the
+ * account no longer needs one). Caller must hold ctx->otp_mu. */
+static void pending_otp_clear(vw_auth_ctx_t *ctx, uint64_t user_id)
+{
+    pending_otp_entry_t *e = pending_otp_find(ctx, user_id);
+    if (e) secure_zero(e, sizeof(*e));
+}
+
 /* ── vw_auth_begin_login ─────────────────────────────────────────────────── */
 
 vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
@@ -495,7 +576,40 @@ vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
         return VW_ERR_INVALID_ARG;
     }
 
-    /* Generate a 6-digit random OTP, SHA-256 it, email it to the user. */
+    /*
+     * TASK-238: reuse a still-live pending challenge instead of always
+     * minting and emailing a new one. Every 2FA-capable client
+     * re-authenticates over a *second* connection with an already-known
+     * code rather than blocking the first connection open while the user
+     * reads their email, so unconditionally minting here meant the second
+     * AUTH_REQUEST always discarded the very challenge the emailed code
+     * was valid against — see pending_otp_entry_t's comment for the full
+     * story. A pending challenge is only reused while it's within its OTP
+     * window and hasn't already exhausted its attempt budget; otherwise
+     * fall through and mint a fresh one exactly as before.
+     */
+    auth_mutex_lock(&ctx->otp_mu);
+    {
+        /* Real time, not vw_lockout_now() (the injectable clock used for the
+         * password-lockout table above) — this must stay on the same clock
+         * basis as out_state->window_start below and verify_2fa's own
+         * window-expiry check, both of which use time(NULL) directly. */
+        uint64_t otp_now = (uint64_t)time(NULL);
+        pending_otp_entry_t *pending = pending_otp_find(ctx, rec.user_id);
+        if (pending &&
+            otp_now - pending->window_start <= (uint64_t)ctx->cfg.otp_window_secs &&
+            pending->attempt_count < ctx->cfg.otp_max_attempts) {
+            out_state->window_start  = pending->window_start;
+            out_state->attempt_count = pending->attempt_count;
+            memcpy(out_state->otp_hash, pending->otp_hash, sizeof(out_state->otp_hash));
+            auth_mutex_unlock(&ctx->otp_mu);
+            return VW_ERR_AUTH_2FA_REQUIRED;
+        }
+    }
+    auth_mutex_unlock(&ctx->otp_mu);
+
+    /* No live challenge to reuse — generate a 6-digit random OTP, SHA-256
+     * it, email it to the user. */
     rc = vw_crypto_random(rand_buf, sizeof(rand_buf));
     if (rc != VW_OK) {
         memset(out_state, 0, sizeof(*out_state));
@@ -524,6 +638,17 @@ vw_err_t vw_auth_begin_login(vw_auth_ctx_t *ctx,
 
     memcpy(out_state->otp_hash, otp_hash, sizeof(otp_hash));
     secure_zero(otp_hash, sizeof(otp_hash));
+
+    /* Cache this challenge so a second connection's AUTH_REQUEST within the
+     * OTP window (TASK-238) reuses it above instead of minting another. */
+    auth_mutex_lock(&ctx->otp_mu);
+    {
+        pending_otp_entry_t *slot = pending_otp_find_or_evict(ctx, rec.user_id);
+        slot->window_start  = out_state->window_start;
+        slot->attempt_count = 0;
+        memcpy(slot->otp_hash, out_state->otp_hash, sizeof(slot->otp_hash));
+    }
+    auth_mutex_unlock(&ctx->otp_mu);
 
     return VW_ERR_AUTH_2FA_REQUIRED;
 }
@@ -554,6 +679,27 @@ vw_err_t vw_auth_verify_2fa(vw_auth_ctx_t *ctx,
      * timing side-channel on the comparison cannot be used to bypass the limit.
      */
     state->attempt_count++;
+
+    /*
+     * TASK-238: write the incremented count back into the pending-challenge
+     * table so a wrong guess still counts toward otp_max_attempts even if
+     * the *next* guess arrives over a fresh connection (whose begin_login
+     * call re-reads this same table rather than starting a local counter
+     * over at 0) — without this, a client that reconnects between guesses
+     * would get an unlimited number of attempts against one still-live
+     * code. Best-effort: if the entry is gone (e.g. concurrently evicted or
+     * consumed by another connection racing this one to a NEW cache-miss
+     * mint), there's nothing to update — this connection's own state->magic
+     * check below still enforces the limit for the rest of *this*
+     * connection either way.
+     */
+    auth_mutex_lock(&ctx->otp_mu);
+    {
+        pending_otp_entry_t *pending = pending_otp_find(ctx, state->user_id);
+        if (pending) pending->attempt_count = state->attempt_count;
+    }
+    auth_mutex_unlock(&ctx->otp_mu);
+
     if (state->attempt_count > ctx->cfg.otp_max_attempts) {
         state->magic = 0;
         return VW_ERR_AUTH_2FA_LOCKED;
@@ -570,7 +716,13 @@ vw_err_t vw_auth_verify_2fa(vw_auth_ctx_t *ctx,
 
     if (!match) return VW_ERR_AUTH_2FA_INVALID;
 
-    /* OTP verified — create session, then invalidate the auth state. */
+    /* OTP verified — consume the pending challenge (single-use: a captured
+     * copy of this code must not still work for a second, later login), then
+     * create the session, then invalidate the local auth state. */
+    auth_mutex_lock(&ctx->otp_mu);
+    pending_otp_clear(ctx, state->user_id);
+    auth_mutex_unlock(&ctx->otp_mu);
+
     rc = vw_auth_create_session(ctx, state->user_id, NULL, out_token);
 
     /* Zero state regardless of session-creation result to prevent token reuse. */

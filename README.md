@@ -104,3 +104,4 @@ For the GUI, cluster setup, packaging, and Windows instructions, see
 | [`docs/RELEASE.md`](docs/RELEASE.md) | How tagged releases are built and published |
 | [`docs/STYLE.md`](docs/STYLE.md) | C/C++ code style conventions |
 | [`VENDOR_SETUP.md`](VENDOR_SETUP.md) | Dependency vendoring and every CMake build option |
+| [`docs/ANDROID_BUILD.md`](docs/ANDROID_BUILD.md) | Android app toolchain (JDK/SDK/NDK) and local build steps |

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/savedProfilesLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/label_saved_profiles"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <!-- TASK-00241/TASK-00245/TASK-00246: `adb shell dumpsys activity`
+             (the real view tree, not the accessibility one UiAutomator
+             queries) shows this content was always laid out correctly —
+             TASK-00241/245's "RecyclerView-in-ScrollView measures wrong"
+             diagnosis was chasing UiAutomator's inability to see content
+             scrolled out of the viewport (see LoginProfileScaleTest's doc
+             comment and UiTestHelpers.swipeToBottom, the actual fix), not
+             a real layout defect. Switched away from RecyclerView anyway:
+             the saved-profile list is always small (a handful of
+             accounts, never a paginated/virtualized dataset), so there
+             was never a reason to pay for RecyclerView's recycling
+             machinery here, and a plain LinearLayout removes an entire
+             class of ScrollView-nesting footguns for no cost. -->
+        <LinearLayout
+            android:id="@+id/profileList"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#33000000"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/label_add_profile"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/hostField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_host"
+            android:inputType="textUri" />
+
+        <EditText
+            android:id="@+id/portField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_port"
+            android:inputType="number"
+            android:text="@string/default_port" />
+
+        <EditText
+            android:id="@+id/userField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_username"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/passField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_password"
+            android:inputType="textPassword" />
+
+        <EditText
+            android:id="@+id/otpField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_otp"
+            android:inputType="number"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/importCaCertButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/action_import_ca_cert" />
+
+        <TextView
+            android:id="@+id/caCertStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/status_no_ca_cert"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/connectButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/action_connect" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" />
+
+    </LinearLayout>
+</ScrollView>
