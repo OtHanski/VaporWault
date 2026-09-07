@@ -1,7 +1,18 @@
 # VaporWault — System Architecture
 
 **Owner**: ARCH.00  
-**Last updated**: 2026-09-04 (`TASK-00236` — closed the Android client
+**Last updated**: 2026-09-07 (`TASK-00152` closed — real install/uninstall/
+upgrade verification of the `TASK-00145` installer packaging milestone across
+both Linux packages and both Windows MSIs, on real machines/containers, not
+reasoned through. Found and fixed five real bugs along the way (`TASK-00247`–
+`00252`): the client MSI's per-user install scope was never real
+(`CPACK_WIX_INSTALL_SCOPE` doesn't exist as a CPack variable), the Windows
+service never reported `SERVICE_RUNNING`, `server.conf` was never templated
+by the server MSI, the server didn't exit on stop, and the client MSI's
+uninstall could leave its Scheduled Task orphaned. Architectural Decisions
+gained a new "Windows installer uninstall semantics" row recording that no
+Windows purge option is a permanent, owner-confirmed design choice, not a
+gap). Prior entry, 2026-09-04 (`TASK-00236` — closed the Android client
 milestone: Phase 21 moved from "in progress" to **complete** now that
 `TASK-00239`–`00246` are all `done`, with a closing narrative covering the
 release-signing decision, the CI instrumented-test job, and the RecyclerView
@@ -12,17 +23,11 @@ reconciling `TASK-00228`'s and `TASK-00246`'s opposite staging choices).
 Prior entry, 2026-09-03 (`TASK-00237`/`00238` — SRV.01 fixed `AUTH_LOGOUT`
 never invalidating a session server-side, and 2FA login being structurally
 unreachable due to the OTP-mint-on-every-AUTH_REQUEST bug; Phase 21's row and
-module map updated to reflect a full end-to-end 2FA login now working). Prior
-entry, 2026-09-02 (`TASK-00231`–`235` — sharing/account-self-service UI,
-Android CI build job, security review, and instrumented integration tests all `done`;
-Phase 21's row updated with what each found and fixed, plus follow-on tasks
-`TASK-00240`–`00243` filed for gaps disclosed along the way). Prior entry, 2026-08-31
-(`TASK-00224` — added the Android client design: module
-map, approved-deps addendum, and Architectural Decisions rows for the wire-protocol
-integration, sync model, credential storage, transfer storage/execution, UI toolkit,
-and team-ownership choices). Earlier entries (2026-08-26 `TASK-00204` task-status
-re-audit, 2026-08-05 `TASK-00118`) superseded here rather than kept verbatim, since
-`TODO/` is the trustworthy record of what shipped, not this header.)
+module map updated to reflect a full end-to-end 2FA login now working).
+Earlier entries (2026-09-02 `TASK-00231`–`235`, 2026-08-31 `TASK-00224`,
+2026-08-26 `TASK-00204` task-status re-audit, 2026-08-05 `TASK-00118`)
+superseded here rather than kept verbatim, since `TODO/` is the trustworthy
+record of what shipped, not this header.)
 
 ---
 
@@ -134,6 +139,7 @@ for this milestone (no continuous background sync to schedule).
 | Android team ownership | One role, `MOB.10`, owns both the native JNI layer and the Kotlin/UI layer | Unlike desktop's CLI.02/GUI.03 split (a genuinely separate GUI process talking IPC to a daemon), the Android app is one Gradle project with no separate GUI process — forcing an artificial two-agent split doesn't map the way "no protocol code in the GUI" does for a real second process (`TASK-00224`) |
 | Android release artifact & signing | Ship a debug-signed release-variant APK via `release.yml`'s new `build-android` job, documented explicitly as sideload-only — not a Play Store-distributed AAB with a real release signing identity | `TASK-00224`'s design didn't address distribution at all; the gap was only found when the milestone-closure review (`TASK-00236`) discovered Android was entirely missing from the release pipeline (filed and fixed as `TASK-00239`). Matches this project's existing distribution model for every other platform — raw binaries and installers users fetch and run themselves, no app-store review process or listing — rather than standing up Play Store infrastructure (a real signing key, a store listing, review turnaround) for exactly one target. `android/app/build.gradle`'s `release` buildType previously had no `signingConfig` at all, which would have produced an unsigned, uninstallable APK; debug signing was the pragmatic choice for a sideload artifact, recorded in `docs/RELEASE.md` as explicitly not production/Play-ready (`TASK-00239`) |
 | Web frontend: public-link redemption page | A query parameter (`?link=<64-hex-char token>`), not a path segment — nginx serves this frontend as a static, SPA-less page with no server-side routing (`WEB.09`'s own charter), so a query param needs no nginx change while a path segment would (a fallback rewrite to `index.html` that doesn't exist today). The token is stripped from the URL via `history.replaceState` before any redemption attempt, purely as hygiene. A password (when the link needs one) is only ever collected via the redemption view's own password field, sent as a POST body — never the URL, browser history, or a referrer header. **Scope decision**: once redemption succeeds, the existing logged-in browser view is reused completely unmodified for both VIEW- and EDIT-permission links — no client-side hiding/graying of actions by permission level, since no such pattern exists anywhere else in this frontend either (an ordinary VIEW-only share grant already relies entirely on server-side `effective_permission()` enforcement plus a clean error message on a disallowed action, e.g. `handleDelete`'s `showError` path) | `TASK-00190` (password support for public links) discovered the redemption page itself didn't exist at all — checked `main.ts`/`index.html` in full: no route ever called `POST /api/links/access`, despite the server side (`TASK-00134`/`00140`, gateway session-cookie issuance for a redeemed anonymous scoped session) having supported it all along, already end-to-end tested (`test_gateway.py::test_public_link_create_redeem_revoke`/`test_public_link_password_via_gateway`). Filed as `TASK-00216`, closed 2026-08-26 — building the page needed no backend change at all, only wiring the frontend to an already-complete, already-tested API |
+| Windows installer uninstall semantics | No "full purge" option on either Windows MSI (server or client) — `msiexec /x` always keeps `%ProgramData%\VaporWault` (server config/data) and `%APPDATA%\VaporWault` (client state), permanently, with no equivalent of DEB/RPM's separate purge path. Accepted by the project owner as the permanent design, not a gap to close later | `TASK-00152`'s real install/uninstall/upgrade verification found neither Windows package's WiX authoring exposes any data-removal custom action at all (confirmed by reading every `.wxs`/patch file, not inferred) — the DEB/RPM purge-vs-remove asymmetry `TASK-00150` documented has no Windows counterpart even by omission-that-should-be-fixed; it was never designed in the first place. Rather than treat this as an unimplemented feature, the owner confirmed keeping config/data on Windows uninstall is the desired behavior outright — recorded here so a future contributor doesn't "fix" this as a perceived gap. Disclosed to operators in `docs/RELEASE.md` |
 
 ---
 
