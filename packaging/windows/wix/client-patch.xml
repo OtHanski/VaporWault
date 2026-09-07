@@ -20,4 +20,25 @@
   <CPackWiXFragment Id="CM_C_client">
     <ComponentRef Id="CM_C_ClientTaskScript" />
   </CPackWiXFragment>
+
+  <!--
+    TASK-247: tried and abandoned. Patching CPack's auto-generated
+    per-binary Components to add an HKCU RegistryValue KeyPath (to satisfy
+    ICE38 for this per-user, LocalAppDataFolder-rooted install) turned out
+    to be impossible via CPACK_WIX_PATCH_FILE: a CPackWiXFragment can only
+    ADD new child elements to the element it matches by Id, never modify
+    or remove that element's own existing attributes. Confirmed
+    empirically: CNDL0005 "unexpected child element 'Component'"/"File"
+    when a patch fragment's own top-level element shared the matched
+    element's tag name, and CNDL0042 "multiple key paths" once a
+    RegistryValue KeyPath was added alongside the File's own
+    already `KeyPath="yes"`, which nothing can flip off from a patch.
+    Fixed instead via an explicit forced-cleanup custom action on
+    uninstall (`RemoveClientInstallDir` in client-extra.wxs) rather than
+    relying on MSI's native per-component file-removal tracking for these
+    three Components; see that action's own comment for why suppressing
+    ICE38/64/91 (in the cpack invocation, see docs/RELEASE.md) is safe
+    given that cleanup: those ICEs are static-analysis lint, not something
+    msiexec consults at actual install/uninstall time.
+  -->
 </CPackWiXPatch>

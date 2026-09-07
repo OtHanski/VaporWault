@@ -97,13 +97,38 @@ What each package does on install (maintainer scripts:
   `install.sh` always used).
 - **Client** (`.deb`/`.rpm`/`.msi`, no elevation required): installs the
   daemon/CLI binaries and a systemd **user** unit
-  (`/usr/lib/systemd/user/`, available to any user via `systemctl --user`)
-  or, on Windows, registers a per-user Scheduled Task (logon trigger) via
-  an MSI custom action. Since the daemon is a per-user service, the
-  package itself does not (and cannot, from a root-run install script)
-  start it for a specific user — run `systemctl --user enable --now
-  vapourwault-daemon` (Linux) yourself after installing, or let the
-  Windows Scheduled Task start at your next logon.
+  (`/usr/lib/systemd/user/`, available to any user via `systemctl --user`).
+  On Linux, run `systemctl --user enable --now vapourwault-daemon`
+  yourself after installing. On Windows, the MSI *attempts* to register a
+  per-user Scheduled Task (logon trigger) via a custom action, but this
+  currently does not work when run from inside the MSI transaction at
+  all (`TASK-250`): `Register-ScheduledTask`'s underlying API needs a
+  real interactive logon session, which an MSI deferred custom action
+  never has, regardless of impersonation. Until that's fixed, run
+  `packaging/windows/Install-VaporWaultClient.ps1` (the manual/advanced
+  path) to actually get the Scheduled Task registered, or register it
+  yourself after installing the MSI.
+- The Windows client MSI installs per-user, under
+  `%LOCALAPPDATA%\vaporwault <version>\`
+  (`CPACK_WIX_ROOT_FOLDER_ID=LocalAppDataFolder` — the CPack WIX
+  generator has no first-class per-user-install flag, so this is the
+  actual mechanism). CPack's auto-generated file components don't know
+  the install is per-user and so don't satisfy WiX's ICE38/64/91
+  (a per-user-profile file needs an HKCU registry key as its install
+  tracking key, not the file itself) — `CPACK_WIX_PATCH_FILE` can only
+  add to those components, not fix their KeyPath, so those three ICEs
+  are suppressed at build time and the client MSI instead force-deletes
+  its own install directory on full uninstall via an explicit custom
+  action, rather than relying on MSI's native per-user file-removal
+  tracking. Functionally equivalent to normal removal (verified with a
+  real non-elevated install/uninstall cycle); only affects the client
+  package, and only in how removal is implemented internally.
+
+**Windows `.msi` uninstall (`msiexec /x`, or Add/Remove Programs) always
+keeps config and data** (`%ProgramData%\VaporWault` for the server,
+`%APPDATA%\VaporWault` for the client) — there is currently no MSI
+equivalent of `apt purge`/RPM's full removal. Delete those folders
+yourself if you want a truly clean removal.
 
 **Removing a package — DEB and RPM behave differently, by design of each
 ecosystem, not a bug**:

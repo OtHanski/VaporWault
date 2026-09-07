@@ -8,6 +8,7 @@
 
 #ifdef _WIN32
 #  include <shlobj.h>   /* SHGetFolderPathA */
+#  include <windows.h>
 #else
 #  include <unistd.h>
 #  include <pwd.h>
@@ -37,6 +38,55 @@ static void default_state_dir(char *out, size_t outsz) {
     }
 #endif
 }
+
+#ifdef _WIN32
+/*
+ * TASK-250: the client MSI cannot register VaporWaultDaemon's Scheduled
+ * Task from inside its own install transaction — Register-ScheduledTask
+ * needs a real interactive logon session, which no MSI deferred custom
+ * action has (see packaging/windows/wix/client-extra.wxs's own comment
+ * for the full diagnosis; confirmed for real, not just reasoned through).
+ * By the time this daemon process is ever actually running — whether a
+ * user launched it directly, or the Scheduled Task itself already exists
+ * and is what's running it — it genuinely is in such a session, so it
+ * self-heals the registration here instead of relying on install-time
+ * registration that can't work. register-client-task.ps1 is itself
+ * idempotent (skips re-registering if the task already exists), so this
+ * is cheap to call unconditionally on every startup, not just the first.
+ * Best-effort and silent on failure by design, matching the MSI custom
+ * action's own Return="ignore" philosophy: a missing scheduled task
+ * should never prevent the daemon itself from running.
+ */
+static void ensure_scheduled_task_registered(void) {
+    char exe_path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
+    if (n == 0 || n >= sizeof(exe_path)) return;
+
+    char *slash = strrchr(exe_path, '\\');
+    if (!slash) return;
+    *slash = '\0'; /* exe_path is now the directory containing this .exe,
+                     * the same directory register-client-task.ps1 is
+                     * installed into alongside it. */
+
+    char cmdline[MAX_PATH + 128];
+    snprintf(cmdline, sizeof(cmdline),
+             "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\\register-client-task.ps1\"",
+             exe_path);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000); /* bounded; best-effort */
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+#endif
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -78,6 +128,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (!state_dir[0]) default_state_dir(state_dir, sizeof(state_dir));
+
+#ifdef _WIN32
+    ensure_scheduled_task_registered();
+#endif
 
     vw_daemon_cfg_t cfg;
     vw_err_t err = vw_daemon_cfg_load(state_dir, &cfg);

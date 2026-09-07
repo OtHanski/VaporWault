@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Extra WiX source for the `server` component MSI (TASK-147/249), linked in
+  via -D CPACK_WIX_EXTRA_SOURCES alongside CPack's auto-generated fragments
+  (same mechanism client-extra.wxs already uses for the client MSI).
+
+  TASK-249: the server MSI as originally shipped never created
+  server.conf at all. server-patch.xml only adds ServiceInstall/
+  ServiceControl/FirewallException, and CMakeLists.txt's own
+  server.conf.example install() rule is Linux-only (destined for
+  share/vapourwault, consumed by the DEB/RPM postinst scripts). Contrast
+  with the manual Install-VaporWault.ps1 path, which explicitly copies
+  server.conf.example to %ProgramData%\VaporWault\server.conf if absent.
+
+  FIRST ATTEMPT (abandoned): a Component/@NeverOverwrite="yes" File
+  installed directly to CommonAppDataFolder\VaporWault\server.conf. Built
+  and installed correctly in isolation (fresh install created the file;
+  a standalone reinstall of the same version left an edited copy alone),
+  but real upgrade testing (TASK-249/152: install 1.0.0, edit config,
+  install 1.0.1 with CPack's default `MajorUpgrade
+  Schedule="afterInstallInitialize"`) found it does NOT survive a real
+  major upgrade: the file was gone afterward, not just left alone. Log
+  analysis: the new version's own action-table computation resolves this
+  shared-GUID component to Action=Null (it sees the file already present,
+  owned by the related old product about to be removed, and decides
+  nothing needs installing) while the OLD version's nested
+  RemoveExistingProducts removal computes Action=Absent for the very same
+  component and deletes the file; neither side ends up owning/keeping
+  it. NeverOverwrite's documented semantics ("only for components
+  registered by the Registry table"... "does register itself as a client
+  of the component") are for components shared between *unrelated*
+  products, not a single product's own file surviving its own version
+  upgrades; it does not compose safely with CPack's early-scheduled
+  RemoveExistingProducts here. Not chasing MajorUpgrade's Schedule
+  attribute as an alternative fix: CPackWiXFragment can only add children
+  to an element it matches by Id, and <MajorUpgrade> has no Id to match
+  in the first place.
+
+  SECOND ATTEMPT (also abandoned): an IMMEDIATE CustomAction using a
+  [#FileId] token to copy server.conf.example (installed as an ordinary,
+  always-overwritten reference file) to server.conf if absent. No
+  deferred/CustomActionData two-step seemed necessary since this server
+  install is fully elevated throughout (no impersonation/session
+  boundary to work around, unlike the client's per-user Scheduled Task),
+  and immediate actions have full Property/File-table access. This also
+  failed a real test: the action ran before InstallFiles' own actual file
+  copy happened even though scheduled After="InstallFiles" (InstallFiles
+  is itself a deferred standard action, so "After" only orders entries in
+  the sequence table, not when each one's real file-system work
+  executes). The token resolved to a path, but nothing existed there
+  yet, so the copy failed every time.
+
+  FIX ACTUALLY USED: the CustomAction below is Execute="deferred" with
+  Directory="CM_DP_server.bin" (the real bin folder) as its working
+  directory, referencing server.conf.example by plain relative filename
+  once it's actually been copied there. A Directory attribute resolves
+  correctly for a deferred action even though a [Property]/
+  [CustomActionData] token inside ExeCommand does not (same fix TASK-247
+  verified for the client MSI). This sidesteps both MSI's component
+  reference-counting (the first attempt's problem) and the immediate/
+  deferred timing gap (the second attempt's problem), runs
+  deterministically on every install/upgrade/repair, and is what actually
+  survived a real upgrade test with an edited config in place.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <Fragment>
+    <DirectoryRef Id="CM_DP_server.bin">
+      <!-- Fixed GUID: must never change once shipped. (Deliberately a
+           fresh one, not reused from the abandoned NeverOverwrite
+           attempt above: that was a different directory, different
+           File, different semantics; reusing its GUID for an unrelated
+           component would only confuse anyone later tracing this GUID's
+           history.) -->
+      <Component Id="VWServerConfigExampleComponent" Guid="DE254733-4CF5-4003-A3A3-1B9BB7D5F2E7">
+        <File Id="VWServerConfigExampleFile"
+              Source="$(var.VW_WIX_DIR)\..\server.conf.example"
+              Name="server.conf.example"
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Execute="deferred", not immediate, and Directory="CM_DP_server.bin"
+         with a plain relative source filename instead of a [#FileId]
+         token: found for real that an IMMEDIATE custom action scheduled
+         After="InstallFiles" still runs before InstallFiles' own actual
+         file copy happens (InstallFiles is itself a deferred standard
+         action; "After" only orders entries in the sequence table, not
+         when each one's real file-system work executes). The
+         [#VWServerConfigExampleFile] token resolved to a path, but
+         nothing existed there yet, so the copy failed. A Directory
+         attribute, unlike a [Property]/[CustomActionData] token inside
+         ExeCommand, does resolve correctly for a deferred action (same
+         fix TASK-247 already verified for the client MSI), so this next
+         attempt sidesteps the token/path entirely by making the working
+         directory the real bin folder and referencing the file by plain
+         name once it's actually there. -->
+    <CustomAction Id="TemplateServerConfig"
+        Directory="CM_DP_server.bin"
+        Execute="deferred"
+        Return="ignore"
+        ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -Command &quot;New-Item -ItemType Directory -Force -Path 'C:\ProgramData\VaporWault' | Out-Null; if (-not (Test-Path 'C:\ProgramData\VaporWault\server.conf')) { Copy-Item 'server.conf.example' 'C:\ProgramData\VaporWault\server.conf' }&quot;" />
+
+    <InstallExecuteSequence>
+      <Custom Action="TemplateServerConfig" After="InstallFiles">NOT REMOVE</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+
+</Wix>

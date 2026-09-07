@@ -287,19 +287,42 @@ jobs:
           if (-not $msiVersion) { $msiVersion = "0.0.0" }
           Write-Host "PKG_VERSION=$env:PKG_VERSION -> MSI version=$msiVersion"
           Push-Location build
+          # TASK-249: CPACK_WIX_EXTRA_SOURCES/CANDLE_EXTRA_FLAGS add
+          # server-extra.wxs's server.conf templating (see that file's own
+          # header comment for why it needs a deferred custom action
+          # rather than CPack's native Component/@NeverOverwrite).
           cpack -G WIX `
             -D CPACK_COMPONENTS_ALL=server `
             -D CPACK_PACKAGE_VERSION=$msiVersion `
             -D CPACK_WIX_UPGRADE_GUID=5ADE0205-57FF-4286-849A-C112AF550215 `
             -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/server-patch.xml)" `
             -D CPACK_WIX_EXTENSIONS=WixFirewallExtension `
+            -D CPACK_WIX_EXTRA_SOURCES="$(Resolve-Path ../packaging/windows/wix/server-extra.wxs)" `
+            -D CPACK_WIX_CANDLE_EXTRA_FLAGS="-dVW_WIX_DIR=$(Resolve-Path ../packaging/windows/wix)" `
             -D CPACK_PACKAGE_FILE_NAME="vaporwault-server-$env:PKG_VERSION-win64"
           $serverExit = $LASTEXITCODE
+          # TASK-247: CPACK_WIX_INSTALL_SCOPE is not a real CPack variable
+          # (verified: absent from `cmake --help-variable-list` and the
+          # documented CPACK_WIX_* list) -- it silently did nothing, so
+          # this MSI has always installed to Program Files, not the
+          # per-user %LOCALAPPDATA% this package requires no elevation
+          # for. CPACK_WIX_ROOT_FOLDER_ID=LocalAppDataFolder is the real
+          # fix. That alone isn't enough either: CPack's own auto-generated
+          # Components for the three client binaries then fail WiX ICE38
+          # (a File KeyPath under a user-profile directory needs an HKCU
+          # registry KeyPath instead, which CPACK_WIX_PATCH_FILE cannot
+          # retrofit onto them -- it can only add children to an element,
+          # never modify its existing attributes). Those ICEs are
+          # suppressed; client-extra.wxs's own REMOVECLIENTINSTALLDIR
+          # custom action handles the real functional consequence
+          # (MSI's native per-user file-removal tracking not working for
+          # these three Components) deterministically instead.
           cpack -G WIX `
             -D CPACK_COMPONENTS_ALL=client `
             -D CPACK_PACKAGE_VERSION=$msiVersion `
             -D CPACK_WIX_UPGRADE_GUID=88FDD57B-FD91-4214-B6F5-B1343F75ABBB `
-            -D CPACK_WIX_INSTALL_SCOPE=perUser `
+            -D CPACK_WIX_ROOT_FOLDER_ID=LocalAppDataFolder `
+            -D "CPACK_WIX_LIGHT_EXTRA_FLAGS=-sice:ICE38;-sice:ICE64;-sice:ICE91" `
             -D CPACK_WIX_EXTRA_SOURCES="$(Resolve-Path ../packaging/windows/wix/client-extra.wxs)" `
             -D CPACK_WIX_PATCH_FILE="$(Resolve-Path ../packaging/windows/wix/client-patch.xml)" `
             -D CPACK_WIX_CANDLE_EXTRA_FLAGS="-dVW_WIX_DIR=$(Resolve-Path ../packaging/windows/wix)" `

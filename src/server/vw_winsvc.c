@@ -85,6 +85,24 @@ static DWORD WINAPI svc_handler(DWORD control, DWORD event_type,
 
 /* ── ServiceMain ─────────────────────────────────────────────────────────── */
 
+/*
+ * TASK-248: vw_server_main_run() blocks for the server's entire lifetime
+ * (config load, store open, GC thread, listen, then the accept loop) —
+ * previously nothing here ever reported SERVICE_RUNNING between the
+ * initial START_PENDING and the final STOPPED, so SCM always timed out
+ * waiting for the service to become ready and killed it. This callback is
+ * registered before vw_server_main_run() is called and fires only once
+ * the server has actually bound its listen socket and started its worker
+ * pool — see vw_server_main.c's vw_server_main_set_ready_callback() call
+ * site for exactly where. A genuine startup failure before that point
+ * still falls through to the ordinary SERVICE_STOPPED report below,
+ * rather than this ever firing falsely.
+ */
+static void on_server_ready(void)
+{
+    report_status(SERVICE_RUNNING, NO_ERROR, 0);
+}
+
 static VOID WINAPI svc_main(DWORD argc, LPSTR *argv)
 {
     (void)argc; (void)argv; /* SCM passes its own argc/argv; use g_argc/g_argv */
@@ -97,6 +115,8 @@ static VOID WINAPI svc_main(DWORD argc, LPSTR *argv)
     g_svc_status.dwServiceSpecificExitCode = 0;
 
     report_status(SERVICE_START_PENDING, NO_ERROR, 3000);
+
+    vw_server_main_set_ready_callback(on_server_ready);
 
     /* Run the server.  Blocks until shutdown or fatal error. */
     int rc = vw_server_main_run(g_argc, g_argv);

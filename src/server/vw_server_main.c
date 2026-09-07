@@ -190,8 +190,21 @@ static void log_init(const char *path) {
 static volatile int  g_running     = 1;
 static volatile int  g_reload_cert = 0;
 static vw_net_ctx_t *g_net_ctx     = NULL;
+static void        (*g_ready_cb)(void) = NULL;
 
-void vw_server_main_request_stop(void) { g_running = 0; }
+void vw_server_main_request_stop(void) {
+    g_running = 0;
+    /* TASK-251: the accept loop only checks g_running after
+     * vw_net_accept() returns, which blocks indefinitely with no client
+     * actively connecting — interrupt it directly rather than leaving
+     * shutdown to wait for a connection that may never come. g_net_ctx is
+     * NULL before the listener is up and after shutdown has already torn
+     * it down; either way there's nothing to interrupt. */
+    if (g_net_ctx)
+        vw_net_ctx_interrupt_listener(g_net_ctx);
+}
+
+void vw_server_main_set_ready_callback(void (*cb)(void)) { g_ready_cb = cb; }
 
 #ifdef _WIN32
 static BOOL WINAPI ctrl_handler(DWORD type) {
@@ -989,6 +1002,14 @@ int vw_server_main_run(int argc, char *argv[]) {
     vw_log(LOG_INFO, "VaporWault server listening on %s:%u (workers=%u)",
            cfg.listen_host[0] ? cfg.listen_host : "0.0.0.0",
            cfg.listen_port, n_workers);
+
+    /* Only now — listen socket bound, worker pool up — is the server
+     * actually ready to serve. vw_winsvc.c hooks this to report
+     * SERVICE_RUNNING; reporting it any earlier would claim success before
+     * a config/bind failure (goto shutdown, above) has had a chance to
+     * happen. */
+    if (g_ready_cb)
+        g_ready_cb();
 
     /* Accept loop — main thread enqueues; workers handle. */
     while (g_running) {

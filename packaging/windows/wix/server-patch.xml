@@ -37,10 +37,20 @@
         Account="LocalSystem"
         ErrorControl="normal"
         Arguments="--config &quot;[CommonAppDataFolder]VaporWault\server.conf&quot;" />
+    <!-- No Start="install": even now that TASK-249 templates server.conf,
+         it has no TLS cert configured out of the box (cert_pem_path/
+         key_pem_path in the template point at files the operator must
+         still provision), so vw_net_listen would still fail on a truly
+         fresh install. Forcing an immediate start here made the whole MSI
+         transaction fail and roll back on every fresh install, verified
+         for real (TASK-152). Start type stays "auto" (ServiceInstall
+         above) so the service still starts on next boot once configured —
+         matching Install-VaporWault.ps1's manual path, which likewise
+         registers but does not start the service, telling the operator to
+         edit the config and run Start-Service themselves. -->
     <ServiceControl
         Id="VaporWaultServerServiceControl"
         Name="VaporWault"
-        Start="install"
         Stop="both"
         Remove="uninstall"
         Wait="yes" />
@@ -51,5 +61,13 @@
         Port="4430"
         Protocol="tcp"
         Scope="any" />
+  </CPackWiXFragment>
+
+  <!-- Pulls server-extra.wxs's config-template Component into the install
+       (TASK-249). WiX drops any Component nothing references, same
+       "must be referenced or it's silently excluded" rule client-patch.xml
+       already documents for the client MSI's task-script component. -->
+  <CPackWiXFragment Id="CM_C_server">
+    <ComponentRef Id="VWServerConfigExampleComponent" />
   </CPackWiXFragment>
 </CPackWiXPatch>

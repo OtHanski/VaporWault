@@ -511,6 +511,37 @@ fail:
     return VW_ERR_NET_TLS;
 }
 
+/*
+ * TASK-251: vw_net_accept() (below) calls mbedtls_net_accept() with no
+ * timeout — a genuinely blocking accept() on the listening socket. A
+ * shutdown request only sets a flag the accept loop checks *after*
+ * accept() returns, so with no client actively connecting, the server
+ * never notices it should stop at all: confirmed for real, a plain TCP
+ * connect to the listen port immediately unblocked an otherwise-stuck
+ * shutdown. This closes the listening socket's underlying fd directly
+ * (shutdown()+close(), the standard technique for interrupting a peer
+ * thread blocked in accept() on that same socket) so the pending
+ * mbedtls_net_accept() call fails immediately and the accept loop's
+ * existing `if (accept_err == VW_ERR_NET_CONNECT) break;` handles the
+ * rest — no new shutdown path needed. Sets ctx->listen_net.fd = -1
+ * afterward so the later mbedtls_net_free() (via vw_net_ctx_close(),
+ * called once the accept loop has already exited) is a safe no-op for
+ * this socket instead of operating on an already-closed fd number.
+ */
+void vw_net_ctx_interrupt_listener(vw_net_ctx_t *ctx) {
+    if (!ctx) return;
+    int fd = ctx->listen_net.fd;
+    if (fd == -1) return;
+#ifdef _WIN32
+    shutdown(fd, SD_BOTH);
+    closesocket(fd);
+#else
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+#endif
+    ctx->listen_net.fd = -1;
+}
+
 void vw_net_ctx_close(vw_net_ctx_t *ctx) {
     if (!ctx) return;
     mbedtls_ssl_config_free(&ctx->conf);

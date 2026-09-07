@@ -84,6 +84,15 @@ vw_err_t vw_net_accept(vw_net_ctx_t *ctx, vw_conn_t **out_conn);
  */
 void vw_net_ctx_close(vw_net_ctx_t *ctx);
 
+/*
+ * TASK-251: close the listening socket only, to interrupt a concurrent
+ * thread blocked inside vw_net_accept() on this same ctx (mbedtls_net_accept
+ * has no timeout). Safe to call from a different thread than the one
+ * blocked in vw_net_accept(); safe to call before vw_net_ctx_close(), which
+ * will no-op on this already-closed listener afterward.
+ */
+void vw_net_ctx_interrupt_listener(vw_net_ctx_t *ctx);
+
 /* ── Client connection API ───────────────────────────────────────────────── */
 
 /*

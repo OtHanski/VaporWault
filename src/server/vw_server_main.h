@@ -80,6 +80,16 @@ int vw_server_main_run(int argc, char *argv[]);
  */
 void vw_server_main_request_stop(void);
 
+/*
+ * Register a callback invoked once vw_server_main_run() has actually bound
+ * its listen socket and started the worker pool — i.e. once the server is
+ * really ready to serve, not merely "config parsed OK". Must be called
+ * before vw_server_main_run(); has no effect afterward (TASK-248: this is
+ * what lets vw_winsvc.c report SERVICE_RUNNING at the right moment instead
+ * of never reporting it at all).
+ */
+void vw_server_main_set_ready_callback(void (*cb)(void));
+
 #ifdef __cplusplus
 }
 #endif
