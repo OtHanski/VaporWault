@@ -129,7 +129,11 @@
         Impersonate="yes"
         ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File register-client-task.ps1" />
 
-    <!-- Unregister (uninstall only, not upgrade/repair). -->
+    <!-- Unregister (uninstall only, not upgrade/repair). Same session-
+         boundary limitation as REGISTERCLIENTTASK above (TASK-250) also
+         hits Unregister-ScheduledTask here -- register-client-task.ps1's
+         own -Uninstall branch handles it with a queued per-user RunOnce
+         fallback rather than anything authored here (TASK-252). -->
     <CustomAction Id="UNREGISTERCLIENTTASK"
         Directory="CM_DP_client.bin"
         Execute="deferred"

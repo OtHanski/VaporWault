@@ -343,8 +343,19 @@ Tracked in `TASK-151`/`TASK-152.md` (installer packages, `TASK-145`):
   WiX fallback (§6 above) and the `gh release create`/`upload` step with the
   larger 8-artifact file list are both unverified against the real runner
   environment.
-- No automated test installs the Windows MSIs on a real Windows machine — that
-  remains manual/VM-based verification (`TASK-152`).
+- The Windows MSIs *have* since been installed, upgraded, and removed on a real
+  Windows machine (`TASK-152`/`247`-`252`) — real service/scheduled-task
+  registration, config templating, per-user install scope, and cleanup all
+  verified end-to-end, not just structurally. One narrow, disclosed edge case
+  remains in the client MSI's uninstall cleanup: if a user uninstalls, then
+  reinstalls before their next logon, then logs off/on, a queued
+  `RunOnce`-based cleanup command from the *first* uninstall can remove the
+  *second* install's freshly self-registered Scheduled Task (`TASK-252`) — the
+  queued command has no way to know a reinstall happened in between. Relaunching
+  the app once re-registers it, so this is self-correcting, not data loss.
+- Still not exercised automatically in CI: no automated test actually installs
+  either Windows MSI on a real machine as part of a workflow run — all of the
+  above was real but manual/local verification.
 
 Tracked in `TASK-142` (web gateway + frontend deployment docs):
 
