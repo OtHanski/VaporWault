@@ -498,6 +498,8 @@ Client                                Server
 
 The receiver must verify `SHA-256(data) == chunk_hash` and treat a mismatch as a fatal protocol error (close the connection). If the server does not have the requested chunk, it responds with an ERROR message (`VW_ERR_NOT_FOUND`).
 
+**Server-side integrity check (`TASK-254`):** before sending `CHUNK_DATA`, the server re-verifies `SHA-256(data) == chunk_hash` against the bytes it is about to send (chunk content is trusted at write time per `vw_storage.h`, but never re-checked again until this point — see the corruption-detection design in `ARCHITECTURE.md`, Phase 22). On mismatch the server responds with an ERROR message (`VW_ERR_CHUNK_CORRUPT`) instead of ever sending the corrupted bytes.
+
 ### 7.3 Version history
 
 | Code   | Name                 | Direction | Description                              |
@@ -1388,6 +1390,66 @@ protects chunk content from being deleted out from under a replica that
 hasn't caught up to the oplog position that existed when the current GC
 cycle started.
 
+**Chunk repair-fetch (Phase 22, `TASK-253`/`257`), reverses the fetch
+direction above:** `CLUSTER_CHUNK_QUERY`/`CLUSTER_CHUNK_FETCH` above only
+let a replica pull from the primary. Corruption detection (`TASK-254`/
+`255`, §10.1's `VW_ERR_CHUNK_CORRUPT`) needs the opposite: a primary that
+finds a still-referenced chunk corrupted on its own disk, asking one of
+its replicas for a clean copy. Two new messages, riding the *same
+already-authenticated connection* the replica opened for `NODE_HELLO`/
+`OPLOG_PULL` — no new credential, no new connection:
+
+| Code   | Name                        | Direction         | Description                          |
+|--------|-----------------------------|--------------------|----------------------------------------|
+| 0x0710 | CLUSTER_CHUNK_REPAIR_FETCH  | Primary → Replica  | Request one chunk's bytes for repair   |
+| 0x0711 | CLUSTER_CHUNK_REPAIR_DATA   | Replica → Primary  | That chunk's bytes, or an ERROR        |
+
+**CLUSTER_CHUNK_REPAIR_FETCH payload:** `chunk_hash` (bytes[32]). No
+session token (same reasoning as `CLUSTER_CHUNK_FETCH` above — this
+connection is already authenticated).
+
+**CLUSTER_CHUNK_REPAIR_DATA payload:** byte-identical to
+`CLUSTER_CHUNK_DATA` above (`chunk_hash` echo + `chunk_len` + `data`). The
+replica's handler must apply the exact same read-then-reverify discipline
+`handle_chunk_download` established for the client-facing path
+(`TASK-254`): read via `vw_storage_chunk_get`, re-hash, and only then
+reply — never trust its own on-disk bytes unconditionally just because
+this is server-to-server traffic. If the replica does not have the chunk
+at all, it responds with an ERROR (`VW_ERR_NOT_FOUND`); if it has bytes
+but they fail its own re-verify (its copy is *also* corrupted), it
+responds with an ERROR (`VW_ERR_CHUNK_CORRUPT`) rather than ever
+forwarding bad bytes onward — the primary's repair pipeline (`TASK-260`)
+treats both outcomes the same way (try the next replica), but the
+distinct codes keep the replica's own log/scrub findings consistent with
+what `handle_chunk_download` already reports for the identical situation
+on the client-facing side.
+
+**Direction is genuinely reversed, which matters for the implementation
+(`TASK-259`):** every other message on this connection is
+replica-initiated (the replica sends `OPLOG_PULL`/`CLUSTER_FILE_SYNC_*`/
+`CLUSTER_CHUNK_QUERY`/`CLUSTER_CHUNK_FETCH`; the primary only ever
+replies). `CLUSTER_CHUNK_REPAIR_FETCH` is the one message type the
+*primary* originates on this connection. `primary_repl_loop`'s
+per-connection handling must interleave sending it (and awaiting the
+`CLUSTER_CHUNK_REPAIR_DATA`/ERROR reply, matched by `chunk_hash`) with
+the replica's own request/response cycle — there is nothing else in
+flight from the primary side to conflict with, since the primary
+otherwise never originates traffic on this connection. This also means
+repair-fetch is only possible while that specific replica currently has a
+live connection open; a disconnected/not-yet-reconnected replica simply
+cannot be reached this way right now — `TASK-260`'s pipeline should treat
+"no live connection to this replica" the same as any other failure to
+obtain a clean copy from it (try the next one, or fall through to the
+unrepairable alert, `TASK-261`).
+
+**Trust boundary:** identical to every other `CLUSTER_*` message — see
+§7.9's "Handler reachability" row, which already covers `CLUSTER_CHUNK_*`
+by name pattern, so these two new opcodes are covered without needing an
+edit there. `TASK-259`'s SEC.07 review must specifically confirm the
+replica's handler answers only the primary node this exact connection's
+`NODE_HELLO` already authenticated as, and that this message is
+dispatched only on the `vw-cluster/1` ALPN listener, never `vw/1`.
+
 ---
 
 ## 7.9 Cluster Channel Security Model
@@ -2079,6 +2141,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 | 606  | `VW_ERR_READ_ONLY_REPLICA`   | File transfer  | Write-shaped request rejected: this server is a cluster replica (`TASK-179`) |
 | 607  | `VW_ERR_LINK_PASSWORD_REQUIRED` | File transfer | `LINK_ACCESS` against a password-protected link with no password supplied (`TASK-186`) |
 | 608  | `VW_ERR_LINK_PASSWORD_WRONG`  | File transfer | `LINK_ACCESS` against a password-protected link with an incorrect password (`TASK-186`) |
+| 609  | `VW_ERR_CHUNK_CORRUPT`        | File transfer | `CHUNK_DOWNLOAD_REQ` against a chunk whose on-disk bytes no longer hash to its own filename, detected at read time (`TASK-254`); distinct from the upload-time `VW_ERR_CHUNK_HASH_MISMATCH` |
 | 700  | `VW_ERR_IPC_NOT_RUNNING`     | IPC            | Daemon not listening on its IPC port (client-daemon transport only; never sent over `vw/1`) |
 | 800  | `VW_ERR_SYNC_TREE_TOO_LARGE` | Client-local   | Shared-folder BFS exceeded the client's resource ceiling for one sync cycle (`TASK-111`); never sent over the wire, daemon-internal/IPC only |
 | 801  | `VW_ERR_READ_ONLY_FALLBACK`  | Client-local   | Daemon rejected a write-shaped IPC request because this account is currently on its read-only fallback server (`TASK-173`); never sent over the wire, IPC-response only |
@@ -2117,6 +2180,8 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 32      | 2026-09-09 | PRT.04  | Phase 22 continued (`TASK-257`): new `CLUSTER_CHUNK_REPAIR_FETCH`/`_DATA` (0x0710/0x0711, §7.7) reversing the existing replica-pulls-from-primary chunk fetch direction so a primary can pull a clean chunk copy from a replica for repair. Rides the existing authenticated `NODE_HELLO` cluster session; no new credential, no new error codes (reuses `VW_ERR_NOT_FOUND`/`VW_ERR_CHUNK_CORRUPT`, both already normative per revision 31). Spec only — `TASK-259` implements the handlers; not yet wired into any repair pipeline (`TASK-260`). Purely additive; no protocol version bump required. |
+| 31      | 2026-09-09 | PRT.04  | Corruption detection & repair, Phase 22 design (`ARCHITECTURE.md`), part 1 of that phase (`TASK-254`): the server now re-verifies `SHA-256(data) == chunk_hash` on the `CHUNK_DOWNLOAD_REQ` reply path (§7.2) before sending `CHUNK_DATA`, rather than trusting on-disk bytes unconditionally after their write-time check — closes a real, previously-documented-but-unimplemented gap (`vw_storage.h`'s own comment claimed this re-verification already happened). New error code `VW_ERR_CHUNK_CORRUPT` (609, §10.1). Purely additive (new error code only, no existing byte layout changed); no protocol version bump required. The rest of Phase 22 (local Reed-Solomon reconstruction, cluster chunk-repair-fetch, `TASK-257`–`262`) is filed but not yet implemented — see `ARCHITECTURE.md`'s Phase 22 row. |
 | 30      | 2026-09-03 | PRT.04  | §8.1 (password transport) reworded, resolving `TASK-240` (a SEC.07 advisory filed during `TASK-234`'s Android review): the prior text presented "Argon2id locally" as a live client-side alternative to `SHA-256(password)`, which is structurally impossible under `AUTH_REQUEST`'s single-round-trip shape (no salt-exchange message exists for the client to learn the server's per-account salt before computing the token) — never actually implementable, not merely not-yet-implemented. Also replaced the stale "Phase 1 will define a proper SRP or client-side Argon2id derivation" note (open since `TASK-009`, Phase 0) — 20+ phases shipped since with no such change — with an explicit "not planned" framing. Verified against `src/server/vw_auth.c`'s actual verification call and `src/client/vw_client_core.c`'s implementation: every client (desktop, web, Android) sends `SHA-256(password)`; the server verifies it via Argon2id against its own stored hash+salt. Documentation-only; no wire format, message, or byte layout changed; no protocol version bump required (this table tracks spec-revision count, not wire version, per revision 16's own clarifying note). |
 | 29      | 2026-09-03 | SRV.01  | Documented `AUTH_LOGOUT` (§7.1) for the first time, resolving `TASK-237`: the message existed on the wire since Phase 1 but the server never handled it (a client-initiated logout never actually invalidated the session token — it just sat valid until natural expiry), so there was nothing correct to document until now. No payload; revokes the session token the connection authenticated with; wire-visible rejection codes for that revoked token match every other bad-token case (`AUTH_FAIL`/`VW_ERR_AUTH_BAD_CREDS` on `SESSION_RESUME`, `ERROR`/`VW_ERR_AUTH_REQUIRED` mid-session), per the existing anti-oracle invariant — verified empirically rather than assumed. Purely a behavior fix + doc addition, no existing byte layout changed; no protocol version bump required. |
 | 28      | 2026-08-27 | PRT.04  | Account self-service two-factor enrollment (§7.15), resolving `TASK-219`: new `ACCOUNT_2FA_SET`/`_SET_ACK` (0x0B05–0x0B06). Before this, there was no self-service or admin-driven way to change a user's 2FA enrollment after creation at all, so `TASK-207`'s `account_security_change` alert had no real trigger for its "2FA enabled/disabled" half. Requires re-proving the current password (same shape as `AUTH_REQUEST`'s `auth_token`) before touching the flag — a security-sensitive toggle, not a preference. Enabling with no email on file is rejected (`VW_ERR_INVALID_ARG`): 2FA codes are emailed, so enabling without one would lock the account out of every future login. Chose one parameterized `SET` over this task's own alternative of two separate `2FA_ENABLE`/`2FA_DISABLE` opcodes (identical re-auth handling and shape on both directions, differing only in one stored bit) while still avoiding its rejected alternative (reviving `USER_MODIFY` as a generic field-patch message) for the reason that task itself gave. Storage reuses the existing `otp_enabled` field via `vw_store_user_update_field` — already an explicitly-supported use per that function's own doc comment — no new store-layer setter needed. Entirely new message pair, no existing byte layout changed; no protocol version bump required. |

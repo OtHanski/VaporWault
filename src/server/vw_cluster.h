@@ -242,6 +242,42 @@ int vw_cluster_has_active_replicas(vw_cluster_t *ctx);
  */
 int vw_cluster_is_replica(const vw_cluster_t *ctx);
 
+/* ── Chunk repair-fetch (Phase 22, TASK-259) ─────────────────────────────── */
+
+/*
+ * Ask a specific, currently-connected replica node for a clean copy of
+ * chunk_hash, over its existing authenticated cluster connection, for
+ * local corruption repair on this (primary) server. A primary cannot
+ * originate unprompted traffic on this connection — the replica opened
+ * it — so this queues the request and blocks, polling in 100ms steps up
+ * to timeout_ms, until that replica's own next OPLOG_PULL check-in
+ * actually carries it (docs/PROTOCOL.md §7.7's "Direction is genuinely
+ * reversed" note). Recommend a timeout comfortably above
+ * cfg.replica_poll_interval_secs * 1000 (default poll interval 5 s) so a
+ * normally-connected replica has time to check in — e.g. 15000.
+ *
+ * Returns VW_OK and fills *out_data (malloc'd, caller frees) and
+ * *out_len on success; this function re-verifies the returned bytes' hash itself
+ * before accepting them, so a caller never receives unverified bytes
+ * from the wire even if the replica misbehaves.
+ * Returns VW_ERR_NOT_FOUND if the replica responded that it doesn't have
+ * a clean copy either (or responded with some other ERROR code, passed
+ * through as-is — e.g. VW_ERR_CHUNK_CORRUPT if the replica's own copy
+ * also failed its hash check).
+ * Returns VW_ERR_TIMEOUT if no primary_repl_loop thread for node_id
+ * checks in within timeout_ms — e.g. the replica is currently
+ * disconnected. Not distinguished on the wire from "the replica exists
+ * but is currently unreachable"; callers that need to know which should
+ * check vw_cluster_node_list's is_active/liveness state separately.
+ * Returns VW_ERR_ALREADY_EXISTS if a repair-fetch is already outstanding
+ * for node_id (one at a time per node in this MVP) or the small
+ * pending-request table (VW_CLUSTER_REPAIR_SLOTS) is full.
+ */
+vw_err_t vw_cluster_repair_fetch(vw_cluster_t *ctx, uint64_t node_id,
+                                  const uint8_t hash[VW_HASH_BYTES],
+                                  uint32_t timeout_ms,
+                                  uint8_t **out_data, uint32_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

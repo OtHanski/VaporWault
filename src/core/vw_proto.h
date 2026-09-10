@@ -98,6 +98,13 @@ typedef enum {
     VW_ERR_LINK_PASSWORD_WRONG = 608,  /* TASK-186: LINK_ACCESS against a
                                           password-protected link, wrong
                                           password supplied */
+    VW_ERR_CHUNK_CORRUPT       = 609,  /* TASK-254: CHUNK_DOWNLOAD_REQ against
+                                          a chunk whose on-disk bytes no
+                                          longer hash to its own filename
+                                          (bit rot / corruption at rest,
+                                          detected at read time — distinct
+                                          from VW_ERR_CHUNK_HASH_MISMATCH,
+                                          which is an upload-time reject) */
 
     /* IPC */
     VW_ERR_IPC_NOT_RUNNING     = 700,  /* daemon not listening on IPC port           */
@@ -231,6 +238,16 @@ typedef enum {
     VW_MSG_CLUSTER_CHUNK_QUERY_RESP    = 0x070D,  /* primary → replica: bitmask (same shape as CHUNK_QUERY_RESP) */
     VW_MSG_CLUSTER_CHUNK_FETCH         = 0x070E,  /* replica → primary: request one chunk's bytes     */
     VW_MSG_CLUSTER_CHUNK_DATA          = 0x070F,  /* primary → replica: chunk bytes (same shape as CHUNK_DATA) */
+
+    /* Chunk repair-fetch (Phase 22, TASK-253/257; docs/PROTOCOL.md §7.7).
+     * Reverses the fetch direction above: lets a primary pull a clean
+     * chunk copy from a replica to repair its own corrupted local copy.
+     * Rides the same authenticated connection as every message above —
+     * no new credential — but is the one message type the *primary*
+     * originates on it; see §7.7's "Direction is genuinely reversed"
+     * note for what that means for the implementation. */
+    VW_MSG_CLUSTER_CHUNK_REPAIR_FETCH  = 0x0710,  /* primary → replica: request one chunk's bytes for repair */
+    VW_MSG_CLUSTER_CHUNK_REPAIR_DATA   = 0x0711,  /* replica → primary: that chunk's bytes, or an ERROR */
 
     VW_MSG_NODE_HELLO_FAIL    = 0x07FF,  /* primary → replica: auth rejected */
 

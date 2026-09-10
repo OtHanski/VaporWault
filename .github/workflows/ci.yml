@@ -287,14 +287,27 @@ jobs:
             --test-cert   tests/integration/test.crt \
             --test-key    tests/integration/test.key
 
-      # Cluster tests stand up two real vapourwaultd instances and pair them
-      # (node-add + register-self, then poll for oplog replication), so they
-      # run noticeably slower than the rest of the suite (TASK-086) — kept as
-      # a separate step with its own generous timeout rather than folded into
-      # the main run above.
+      # Cluster tests stand up two (or more) real vapourwaultd instances and
+      # pair them (node-add + register-self, then poll for oplog
+      # replication), so they run noticeably slower than the rest of the
+      # suite (TASK-086) — kept as a separate step with its own generous
+      # timeout rather than folded into the main run above.
+      #
+      # TASK-265: this must target the whole tests/integration/ directory,
+      # not just test_cluster.py — every `cluster`-marked test lives across
+      # several files (test_cluster.py itself, test_cli_fallback.py,
+      # test_cli_version_fallback.py, test_gateway_fallback.py, and
+      # test_corruption_repair.py as of TASK-262), and pointing this step at
+      # a single file silently excluded all the others from CI entirely
+      # (the main "not cluster" step above also excludes them, via the
+      # marker) — confirmed via inspection this predated TASK-262, not
+      # introduced by it. The `-m "not cluster"` step above and this
+      # `-m cluster` step partition every collected test disjointly, so
+      # widening this step's target to the whole directory cannot cause
+      # test_cluster.py's own tests to run twice.
       - name: Run pytest cluster integration tests
         run: |
-          pytest tests/integration/test_cluster.py \
+          pytest tests/integration/ \
             -v -m cluster \
             --timeout=90 \
             --server-bin  build/bin/vapourwaultd \

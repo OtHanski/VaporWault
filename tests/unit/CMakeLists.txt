@@ -168,6 +168,7 @@ add_executable(test_vw_gc
     ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
@@ -190,6 +191,101 @@ if(UNIX)
 endif()
 
 add_test(NAME unit_vw_gc COMMAND test_vw_gc)
+
+# ── vw_scrub (TASK-255) ───────────────────────────────────────────────────
+#
+# vw_scrub.c only depends on vw_storage.c (chunk store). vw_storage.c in
+# turn references vw_store_quota_add (gated at runtime on st->store being
+# non-NULL, which this test never sets — but the symbol must still resolve
+# at link time), which pulls in vw_store.c, which itself calls
+# vw_oplog_append/_abort — hence vw_oplog.c. No vw_store_files.c, vw_smtp.c,
+# or vw_notify.c needed (unlike test_vw_gc, whose linked vw_gc.c itself
+# pulls those in for its file/chunk GC pass and TASK-208 notify checks).
+# vw_ecc.c (TASK-258) is a direct vw_storage.c dependency too — parity
+# group formation calls into it from chunk_put_impl's commit path.
+# vw_repair.c (TASK-260) is vw_scrub.c's own new dependency (the corrupt-
+# chunk callback drives the repair pipeline); it references
+# vw_cluster_node_list/vw_cluster_repair_fetch unconditionally at the
+# source level, but this target deliberately does NOT link the real
+# vw_cluster.c (same reasoning as vw_storage.c above) — test_vw_scrub.c
+# itself provides trivial stub definitions of just those two functions.
+add_executable(test_vw_scrub
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_scrub.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_scrub.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_repair.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
+)
+
+target_include_directories(test_vw_scrub PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_vw_scrub PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_scrub PRIVATE pthread)
+endif()
+
+add_test(NAME unit_vw_scrub COMMAND test_vw_scrub)
+
+# ── vw_ecc (TASK-258) ─────────────────────────────────────────────────────
+#
+# Pure GF(256)/Reed-Solomon math, no dependency on vw_storage, vw_store, or
+# any other server module — vw_ecc.c only needs <string.h> and the vw_err_t
+# enum (header-only, from vw_proto.h). No vw_core or pthread linkage needed.
+add_executable(test_vw_ecc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_ecc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
+)
+
+target_include_directories(test_vw_ecc PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+add_test(NAME unit_vw_ecc COMMAND test_vw_ecc)
+
+# ── vw_storage parity groups (TASK-258) ──────────────────────────────────
+#
+# Same minimal dependency set as test_vw_scrub (vw_storage.c pulls in
+# vw_store.c for the vw_store_quota_add symbol, which pulls in vw_oplog.c;
+# vw_ecc.c is vw_storage.c's own new Phase 22 dependency). Compiled with
+# VW_ECC_MAX_DATA_SHARDS overridden small so a group seals after a
+# handful of chunks instead of 16 — safe per-target since each target
+# compiles its own copy of vw_storage.c/vw_ecc.c with its own macros (same
+# pattern test_vw_gc already uses for VW_OPLOG_SEGMENT_MAX).
+add_executable(test_vw_storage_parity
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_storage_parity.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+)
+
+target_compile_definitions(test_vw_storage_parity PRIVATE
+    VW_ECC_MAX_DATA_SHARDS=4
+)
+
+target_include_directories(test_vw_storage_parity PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_vw_storage_parity PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_storage_parity PRIVATE pthread)
+endif()
+
+add_test(NAME unit_vw_storage_parity COMMAND test_vw_storage_parity)
 
 # ── vw_ipc (TASK-093: peer-UID verification) ─────────────────────────────
 #
@@ -286,6 +382,7 @@ add_executable(test_vw_file_handlers
     ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
@@ -294,6 +391,8 @@ add_executable(test_vw_file_handlers
     ${CMAKE_SOURCE_DIR}/src/server/vw_acme.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_ddns.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_scrub.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_repair.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_cluster.c

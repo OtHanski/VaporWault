@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from vw_client import VwClient, VwProtocolError, VW_ENTRY_DIR
+from vw_client import VwClient, VwProtocolError, VW_ENTRY_DIR, VW_ERR_CHUNK_CORRUPT
 
 PASSWORD = "TestP@ssw0rd!"
 CHUNK_4MIB = 4 * 1024 * 1024
@@ -81,6 +81,39 @@ def test_download_verify_sha256(server, admin_client, unique_username):
 
     assert hashlib.sha256(downloaded).digest() == original_hash
     assert downloaded == data
+
+    c.close()
+
+
+def test_chunk_download_detects_corruption(server, admin_client, unique_username):
+    """
+    TASK-254: a chunk whose on-disk bytes have been tampered with (bit rot /
+    corruption at rest, simulated here by flipping bytes directly in the
+    server's data_dir) must never be served — CHUNK_DOWNLOAD_REQ must fail
+    with VW_ERR_CHUNK_CORRUPT instead of returning the corrupted bytes.
+    """
+    c, token = _setup_user(admin_client, server, unique_username)
+    data = os.urandom(4096)
+    chunk_hash = hashlib.sha256(data).digest()
+
+    c.upload_file(token, "/corrupt-me.bin", data)
+
+    hexhash = chunk_hash.hex()
+    chunk_path = os.path.join(server.data_dir, "chunks", hexhash[:2], f"{hexhash}.chunk")
+    assert os.path.isfile(chunk_path), f"expected chunk file at {chunk_path}"
+
+    with open(chunk_path, "r+b") as f:
+        f.seek(0)
+        first_byte = f.read(1)
+        f.seek(0)
+        f.write(bytes([first_byte[0] ^ 0xFF]))
+
+    with pytest.raises(VwProtocolError) as exc_info:
+        c.chunk_download(token, chunk_hash)
+    assert exc_info.value.code == VW_ERR_CHUNK_CORRUPT, (
+        f"expected VW_ERR_CHUNK_CORRUPT ({VW_ERR_CHUNK_CORRUPT}), "
+        f"got code={exc_info.value.code}"
+    )
 
     c.close()
 

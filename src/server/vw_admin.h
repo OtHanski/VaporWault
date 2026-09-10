@@ -24,6 +24,7 @@
 #include "vw_oplog.h"
 #include "vw_cluster.h"
 #include "vw_conn_registry.h"
+#include "vw_scrub.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -58,6 +59,10 @@ typedef enum {
     VW_ADMIN_RESTORE_FILE_RESP = 0x9016,
     VW_ADMIN_SET_CAPS_REQ      = 0x9017,
     VW_ADMIN_SET_CAPS_RESP     = 0x9018,
+    VW_ADMIN_SCRUB_RUN_REQ     = 0x9019,
+    VW_ADMIN_SCRUB_RUN_RESP    = 0x901A,
+    VW_ADMIN_SCRUB_STATUS_REQ  = 0x901B,
+    VW_ADMIN_SCRUB_STATUS_RESP = 0x901C,
 } vw_admin_msg_t;
 
 /*
@@ -165,6 +170,30 @@ typedef enum {
  *                    see TASK-092's notes for why that channel is not
  *                    itself capability-gated.
  * SET_CAPS_RESP:     u32 error_code
+ *
+ * SCRUB_RUN_REQ:     (no payload)
+ *                    Runs one full chunk-store integrity scan synchronously
+ *                    (TASK-255/256) — re-hashes every chunk on disk against
+ *                    its own filename and reports what it found. Blocks
+ *                    until the pass completes (a full chunk store can take
+ *                    a while to re-read); this is why it is separate from
+ *                    SCRUB_STATUS_REQ rather than folded into it. Detection
+ *                    only — corrupt chunks are logged, not yet repaired
+ *                    (Phase 22's repair pipeline is TASK-260, not
+ *                    implemented yet). Returns VW_ERR_INVALID_ARG if the
+ *                    scrub module is unavailable (chunk store failed to
+ *                    open at server startup).
+ * SCRUB_RUN_RESP:    u32 error_code, u64 scanned, u64 corrupt, u64 tombstoned
+ *                    Counts are valid only if error_code==0.
+ *
+ * SCRUB_STATUS_REQ:  (no payload)
+ *                    Reports the results of the most recently completed
+ *                    pass (background or admin-triggered) without running
+ *                    a new one.
+ * SCRUB_STATUS_RESP: u32 error_code, i64 last_run_unix (0 = never run),
+ *                    u64 scanned, u64 corrupt, u64 tombstoned
+ *                    Fields are all-zero (last_run_unix==0) if no pass has
+ *                    ever completed, or if error_code != 0.
  */
 
 typedef struct {
@@ -173,6 +202,7 @@ typedef struct {
     vw_cluster_t       *cluster;       /* for node-add / cluster-status; NULL if cluster mode is disabled */
     vw_conn_registry_t *conn_registry; /* for list-connections; NULL if unavailable */
     vw_file_store_t    *file_store;    /* for list-deleted / restore-file; NULL if unavailable */
+    vw_scrub_ctx_t     *scrub;         /* for scrub run/status (TASK-256); NULL if unavailable */
 } vw_admin_ctx_t;
 
 typedef struct vw_admin_server vw_admin_server_t;

@@ -109,6 +109,7 @@ typedef struct {
     int      disk_capacity_enabled;
     int      lockout_spike_enabled;
     int      crash_recovery_enabled;
+    int      chunk_unrepairable_enabled;    /* Phase 22, TASK-261 */
     uint32_t replica_lag_threshold_entries; /* oplog entries a replica may lag by */
     uint32_t disk_capacity_threshold_pct;   /* 0-100 */
     uint32_t lockout_spike_threshold_count; /* lockouts within the window below */
@@ -167,6 +168,25 @@ void vw_notify_lockout_spike(vw_notify_ctx_t *ctx);
  * returned true. One-shot — tied to this single startup event.
  */
 void vw_notify_crash_recovery(vw_notify_ctx_t *ctx);
+
+/*
+ * chunk_unrepairable (Phase 22, TASK-261): call whenever vw_repair_chunk
+ * (vw_repair.c, TASK-260) exhausts both local Reed-Solomon reconstruction
+ * and every reachable replica for a corrupt chunk.
+ *
+ * Debounced per-hash, not a threshold edge-trigger like disk_capacity/
+ * replica_lag above (this is a discrete per-chunk event, not a
+ * continuous metric that recovers): fires once per distinct chunk hash
+ * per server run — vw_scrub's own periodic re-scan of the same
+ * still-broken chunk, or a client repeatedly retrying
+ * CHUNK_DOWNLOAD_REQ against it, does not re-alert. Debounce state is a
+ * small bounded in-memory ring (VW_NOTIFY_CHUNK_UNREPAIRABLE_RING_CAP,
+ * same fixed-cap-ring convention as lockout_spike's own state above),
+ * not persisted — re-arms on restart, same accepted simplification as
+ * this module's other in-memory debounce state.
+ */
+void vw_notify_chunk_unrepairable(vw_notify_ctx_t *ctx,
+                                   const uint8_t hash[VW_HASH_BYTES]);
 
 #ifdef __cplusplus
 }
