@@ -38,6 +38,11 @@ typedef struct {
  * per-account lockout table, TASK-078) rather than an unbounded list. */
 #define VW_NOTIFY_LOCKOUT_RING_CAP 256u
 
+/* Same fixed-cap-ring convention, for chunk_unrepairable's per-hash
+ * debounce (Phase 22, TASK-261) — "already alerted for this hash since
+ * the last restart" state, not a timestamp window. */
+#define VW_NOTIFY_CHUNK_UNREPAIRABLE_RING_CAP 256u
+
 struct vw_notify_ctx {
     vw_store_t           *store;    /* borrowed */
     const vw_smtp_cfg_t   *smtp_cfg; /* borrowed; NULL = email disabled */
@@ -56,6 +61,10 @@ struct vw_notify_ctx {
     uint8_t               lockout_spike_armed;
     time_t                lockout_ring[VW_NOTIFY_LOCKOUT_RING_CAP];
     size_t                lockout_ring_len;   /* next write position, wraps */
+
+    /* chunk_unrepairable (TASK-261) per-hash debounce ring. */
+    uint8_t               chunk_unrepairable_hashes[VW_NOTIFY_CHUNK_UNREPAIRABLE_RING_CAP][VW_HASH_BYTES];
+    size_t                chunk_unrepairable_ring_len; /* next write position, wraps */
 };
 
 /* ── Lifecycle ────────────────────────────────────────────────────────────── */
@@ -462,4 +471,59 @@ void vw_notify_crash_recovery(vw_notify_ctx_t *ctx)
     notify_send_admin_if_enabled(ctx, ctx->admin_cfg.crash_recovery_enabled,
                                   "VaporWault: server recovered from an unclean shutdown",
                                   body);
+}
+
+/* ── chunk_unrepairable (Phase 22, TASK-261) ──────────────────────────────── */
+
+void vw_notify_chunk_unrepairable(vw_notify_ctx_t *ctx,
+                                   const uint8_t hash[VW_HASH_BYTES])
+{
+    if (!ctx || !hash) return;
+
+    int already_alerted = 0;
+
+    notify_mutex_lock(&ctx->debounce_lock);
+    {
+        size_t scan_n = (ctx->chunk_unrepairable_ring_len < VW_NOTIFY_CHUNK_UNREPAIRABLE_RING_CAP)
+                        ? ctx->chunk_unrepairable_ring_len
+                        : VW_NOTIFY_CHUNK_UNREPAIRABLE_RING_CAP;
+        for (size_t i = 0; i < scan_n; i++) {
+            if (memcmp(ctx->chunk_unrepairable_hashes[i], hash, VW_HASH_BYTES) == 0) {
+                already_alerted = 1;
+                break;
+            }
+        }
+        if (!already_alerted) {
+            size_t slot = ctx->chunk_unrepairable_ring_len % VW_NOTIFY_CHUNK_UNREPAIRABLE_RING_CAP;
+            memcpy(ctx->chunk_unrepairable_hashes[slot], hash, VW_HASH_BYTES);
+            ctx->chunk_unrepairable_ring_len++;
+        }
+    }
+    notify_mutex_unlock(&ctx->debounce_lock);
+
+    if (already_alerted) return;
+
+    static const char hexch[] = "0123456789abcdef";
+    char hex[VW_HASH_BYTES * 2 + 1];
+    for (size_t i = 0; i < VW_HASH_BYTES; i++) {
+        hex[i * 2]     = hexch[hash[i] >> 4];
+        hex[i * 2 + 1] = hexch[hash[i] & 0xF];
+    }
+    hex[VW_HASH_BYTES * 2] = '\0';
+
+    char body[512];
+    snprintf(body, sizeof(body),
+              "A chunk could not be repaired: local Reed-Solomon "
+              "reconstruction and every reachable replica were both "
+              "tried and failed.\r\n\r\n"
+              "Chunk hash: %s\r\n\r\n"
+              "This chunk will keep failing to download until it is "
+              "restored manually (e.g. from an offline backup) or "
+              "becomes reachable from a replica again. Check the server "
+              "log around this hash for the corresponding scrub/"
+              "CHUNK_DOWNLOAD entry.",
+              hex);
+
+    notify_send_admin_if_enabled(ctx, ctx->admin_cfg.chunk_unrepairable_enabled,
+                                  "VaporWault: chunk could not be repaired", body);
 }

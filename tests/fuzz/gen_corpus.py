@@ -332,6 +332,49 @@ SEEDS = {
 
         'header_only': u32(8) + u16(VW_MSG_SEARCH) + u16(VW_PROTO_VERSION),
     },
+
+    # ── fuzz_ecc_decode (Phase 22, TASK-262) ──────────────────────────────────
+    #
+    # Own input format, not a wire frame — see fuzz_ecc_decode.c's own header
+    # comment: byte0=k_selector, byte1=missing_selector, byte2=shard_size_
+    # selector, remaining bytes=raw shard content (cycled/zero-padded).
+    # VW_ECC_MAX_DATA_SHARDS is 16 (the production default; the Fuzz build
+    # type does not override it).
+    'fuzz_ecc_decode': {
+        # k=1, missing=0 (the one data shard), shard_size=1 — smallest
+        # possible valid single-fault reconstruction.
+        'k1_shard1_missing_data': bytes([0, 0, 0]) + b'\x42',
+
+        # k=16 (VW_ECC_MAX_DATA_SHARDS), missing=16 (reconstruct the parity
+        # shard itself), shard_size=64 (the harness's own cap) — largest
+        # valid single-fault case this harness can express.
+        'k16_full_missing_parity':
+            bytes([15, 16, 63]) + bytes((i * 7 + 3) % 256 for i in range(16 * 64)),
+
+        # k=16, missing=3 (an ordinary data shard) — the common case.
+        'k16_missing_data_shard':
+            bytes([15, 3, 31]) + bytes((i * 13 + 1) % 256 for i in range(16 * 32)),
+
+        # k_selector=16 -> k=17, one past VW_ECC_MAX_DATA_SHARDS: must be
+        # rejected by vw_ecc_encode, never silently accepted.
+        'k_one_past_max': bytes([16, 0, 0]) + b'\x01\x02\x03\x04',
+
+        # k_selector=17 -> k=18, two past VW_ECC_MAX_DATA_SHARDS: same.
+        'k_two_past_max': bytes([17, 0, 0]) + b'\x01\x02\x03\x04',
+
+        # k=1, missing=2 (== k+1, deliberately out of range — 0 and 1==k
+        # are the only valid missing_index values for k=1): must be
+        # rejected by vw_ecc_decode_single.
+        'missing_index_out_of_range': bytes([0, 2, 0]) + b'\x99',
+
+        # Below the 3-byte header minimum — must return immediately, no
+        # out-of-bounds header read.
+        'truncated_header': bytes([0, 0]),
+
+        # Header only, no shard body at all — every shard byte falls back
+        # to zero-fill.
+        'header_only_no_body': bytes([15, 16, 63]),
+    },
 }
 
 

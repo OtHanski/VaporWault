@@ -35,6 +35,7 @@ TARGETS=(
     fuzz_oplog_replay
     fuzz_cluster_hello
     fuzz_admin_dispatch
+    fuzz_ecc_decode
 )
 
 RC=0

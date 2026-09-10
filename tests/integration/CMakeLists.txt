@@ -92,6 +92,7 @@ add_executable(test_file_list_vault_id
     ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
@@ -100,6 +101,8 @@ add_executable(test_file_list_vault_id
     ${CMAKE_SOURCE_DIR}/src/server/vw_acme.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_ddns.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_scrub.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_repair.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
     ${CMAKE_SOURCE_DIR}/src/server/vw_cluster.c
@@ -131,6 +134,117 @@ add_test(NAME integration_file_list_vault_id
 set_tests_properties(integration_file_list_vault_id PROPERTIES
     TIMEOUT 60
     LABELS  "integration;protocol;vault"
+)
+
+# test_cluster_repair_fetch (TASK-259): real primary+replica pair, real
+# TLS/NODE_HELLO/primary_repl_loop/replica_repl_session machinery — same
+# full server-module set as test_file_list_vault_id above (a proven-to-link
+# combination for anything pulling in vw_cluster.c), minus the client-only
+# vw_client_core.c this test doesn't need.
+add_executable(test_cluster_repair_fetch
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cluster_repair_fetch.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_server_core.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_file_handlers.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_admin.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_acme.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ddns.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_scrub.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_repair.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_cluster.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_conn_registry.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_vault.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
+)
+
+target_include_directories(test_cluster_repair_fetch PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_cluster_repair_fetch PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_cluster_repair_fetch PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_cluster_repair_fetch PRIVATE ws2_32)
+endif()
+add_test(NAME integration_cluster_repair_fetch COMMAND test_cluster_repair_fetch)
+set_tests_properties(integration_cluster_repair_fetch PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;cluster"
+)
+
+# test_repair_pipeline (TASK-260): full vw_repair_chunk pipeline against a
+# real primary+replica pair — same full server-module set as
+# test_cluster_repair_fetch above, plus VW_ECC_MAX_DATA_SHARDS overridden
+# small (same reasoning as test_vw_storage_parity's own override) so a
+# parity group seals after a handful of chunks. Safe to apply build-wide
+# for this target: vw_cluster.c/vw_file_handlers.c include vw_storage.h
+# (hence see the override) but never reference the macro's value
+# themselves.
+add_executable(test_repair_pipeline
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_repair_pipeline.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_server_core.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_file_handlers.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store_files.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_repair.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_auth_provider.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_smtp.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_admin.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_acme.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ddns.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_scrub.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_invite.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_recovery.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_cluster.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_conn_registry.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_share.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_vault.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_notify.c
+)
+
+target_compile_definitions(test_repair_pipeline PRIVATE
+    VW_ECC_MAX_DATA_SHARDS=4
+)
+
+target_include_directories(test_repair_pipeline PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_repair_pipeline PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_repair_pipeline PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_repair_pipeline PRIVATE ws2_32)
+endif()
+add_test(NAME integration_repair_pipeline COMMAND test_repair_pipeline)
+set_tests_properties(integration_repair_pipeline PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;cluster"
 )
 
 # test_vault_e2ee: TASK-099 client vault module, end-to-end against a real

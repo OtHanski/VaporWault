@@ -13,6 +13,7 @@ add_library(vw_server_lib STATIC
     vw_store.c
     vw_store_files.c
     vw_storage.c
+    vw_ecc.c
     vw_oplog.c
     vw_auth.c
     vw_auth_provider.c
@@ -21,6 +22,8 @@ add_library(vw_server_lib STATIC
     vw_acme.c
     vw_ddns.c
     vw_gc.c
+    vw_scrub.c
+    vw_repair.c
     vw_invite.c
     vw_recovery.c
     vw_cluster.c

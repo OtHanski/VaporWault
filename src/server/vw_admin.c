@@ -778,6 +778,53 @@ static void handle_cluster_status(vw_admin_server_t *srv, int fd)
     free(recs);
 }
 
+static void handle_scrub_run(vw_admin_server_t *srv, int fd)
+{
+    uint8_t resp[28]; /* u32 error_code + u64 scanned + u64 corrupt + u64 tombstoned */
+    memset(resp, 0, sizeof(resp));
+
+    if (!srv->ctx.scrub) {
+        w32le(resp, (uint32_t)VW_ERR_INVALID_ARG);
+        send_frame(fd, VW_ADMIN_SCRUB_RUN_RESP, resp, sizeof(resp));
+        return;
+    }
+
+    vw_err_t rc = vw_scrub_run_once(srv->ctx.scrub);
+    w32le(resp, (uint32_t)rc);
+    if (rc == VW_OK) {
+        vw_storage_scrub_stats_t stats;
+        int64_t last_run;
+        vw_scrub_get_last_stats(srv->ctx.scrub, &stats, &last_run);
+        w64le(resp + 4,  stats.scanned);
+        w64le(resp + 12, stats.corrupt);
+        w64le(resp + 20, stats.tombstoned);
+    }
+    send_frame(fd, VW_ADMIN_SCRUB_RUN_RESP, resp, sizeof(resp));
+}
+
+static void handle_scrub_status(vw_admin_server_t *srv, int fd)
+{
+    uint8_t resp[36]; /* u32 error_code + i64 last_run_unix + u64*3 stats */
+    memset(resp, 0, sizeof(resp));
+
+    if (!srv->ctx.scrub) {
+        w32le(resp, (uint32_t)VW_ERR_INVALID_ARG);
+        send_frame(fd, VW_ADMIN_SCRUB_STATUS_RESP, resp, sizeof(resp));
+        return;
+    }
+
+    vw_storage_scrub_stats_t stats;
+    int64_t last_run = 0;
+    vw_scrub_get_last_stats(srv->ctx.scrub, &stats, &last_run);
+
+    w32le(resp, (uint32_t)VW_OK);
+    w64le(resp + 4,  (uint64_t)last_run);
+    w64le(resp + 12, stats.scanned);
+    w64le(resp + 20, stats.corrupt);
+    w64le(resp + 28, stats.tombstoned);
+    send_frame(fd, VW_ADMIN_SCRUB_STATUS_RESP, resp, sizeof(resp));
+}
+
 /* ── Connection handler ────────────────────────────────────────────────────── */
 
 static void handle_admin_connection(vw_admin_server_t *srv, int fd)
@@ -815,6 +862,8 @@ static void handle_admin_connection(vw_admin_server_t *srv, int fd)
     case VW_ADMIN_LIST_DELETED_REQ:        handle_list_deleted(srv, fd, payload, plen);        break;
     case VW_ADMIN_RESTORE_FILE_REQ:        handle_restore_file(srv, fd, payload, plen);        break;
     case VW_ADMIN_SET_CAPS_REQ:            handle_set_admin_caps(srv, fd, payload, plen);      break;
+    case VW_ADMIN_SCRUB_RUN_REQ:           handle_scrub_run(srv, fd);                          break;
+    case VW_ADMIN_SCRUB_STATUS_REQ:        handle_scrub_status(srv, fd);                       break;
     default: break;
     }
 

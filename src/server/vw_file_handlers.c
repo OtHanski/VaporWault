@@ -1,6 +1,7 @@
 #include "vw_file_handlers.h"
 #include "vw_file_handlers_internal.h"
 #include "vw_cluster.h"
+#include "vw_repair.h"
 #include "vw_invite.h"
 #include "vw_share.h"
 #include "vw_vault.h"
@@ -840,6 +841,8 @@ static vw_err_t handle_chunk_download(vw_store_t       *store,
                                        vw_file_store_t  *fs,
                                        vw_storage_t     *cs,
                                        vw_share_store_t *ss,
+                                       vw_cluster_t     *cluster,
+                                       vw_notify_ctx_t  *notify,
                                        vw_conn_t        *conn,
                                        const uint8_t    *payload,
                                        uint32_t          plen)
@@ -865,6 +868,43 @@ static vw_err_t handle_chunk_download(vw_store_t       *store,
     err = vw_storage_chunk_get(cs, hash, &data, &data_len);
     if (err != VW_OK)
         return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
+
+    /* TASK-254: vw_storage_chunk_get does not itself re-verify the hash
+     * (vw_storage.h) — on-disk bytes are trusted after their write-time
+     * check and never re-checked again until now. Re-verify here, the one
+     * chokepoint every client-facing download goes through, so bit rot at
+     * rest is never silently served. */
+    {
+        uint8_t actual[VW_HASH_BYTES];
+        if (vw_crypto_sha256(data, data_len, actual) != VW_OK ||
+            memcmp(actual, hash, VW_HASH_BYTES) != 0) {
+            LOG_WARN("CHUNK_DOWNLOAD: on-disk hash mismatch, attempting repair");
+            free(data);
+            data = NULL;
+
+            /* TASK-260: try to repair before giving up — local
+             * Reed-Solomon reconstruction first, cluster replica-fetch
+             * fallback second (vw_repair_chunk handles the ordering).
+             * On success the corrected bytes are already durably
+             * written back; re-fetch and re-verify before serving them
+             * (defense in depth — never trust a repair result blindly,
+             * same posture as everywhere else in this chokepoint). */
+            if (vw_repair_chunk(cs, cluster, hash) == VW_OK &&
+                vw_storage_chunk_get(cs, hash, &data, &data_len) == VW_OK &&
+                vw_crypto_sha256(data, data_len, actual) == VW_OK &&
+                memcmp(actual, hash, VW_HASH_BYTES) == 0) {
+                LOG_WARN("CHUNK_DOWNLOAD: repaired chunk, serving corrected bytes");
+            } else {
+                LOG_WARN("CHUNK_DOWNLOAD: repair failed, chunk still corrupt");
+                free(data);
+                /* TASK-261: exhausted local RS reconstruction and every
+                 * reachable replica — raise the debounced admin alert
+                 * (no-op if notify is NULL or the category is disabled). */
+                if (notify) vw_notify_chunk_unrepairable(notify, hash);
+                return (send_error(conn, VW_ERR_CHUNK_CORRUPT), VW_OK);
+            }
+        }
+    }
 
     /* CHUNK_DATA: [chunk_hash 32][chunk_len u32][data chunk_len] */
     uint32_t resp_size = VW_HASH_BYTES + 4u + data_len;
@@ -3281,7 +3321,7 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
     case VW_MSG_CHUNK_UPLOAD:
         return handle_chunk_upload(store, cs, ss, conn, payload, plen);
     case VW_MSG_CHUNK_DOWNLOAD_REQ:
-        return handle_chunk_download(store, fs, cs, ss, conn, payload, plen);
+        return handle_chunk_download(store, fs, cs, ss, cluster, vw_server_ctx_notify(ctx), conn, payload, plen);
     case VW_MSG_FILE_COMMIT:
         return handle_file_commit(store, fs, cs, ss, vs, conn, payload, plen);
     case VW_MSG_FILE_DELETE:

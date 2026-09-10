@@ -68,3 +68,8 @@ fuzz_target(fuzz_admin_dispatch)
 # 6. SEARCH query parser + case-insensitive matcher (TASK-198/202; the
 #    matcher itself is an inline replication — see fuzz_search.c's own note)
 fuzz_target(fuzz_search)
+
+# 7. Reed-Solomon decode path (vw_ecc_encode/vw_ecc_decode_single, Phase 22
+#    TASK-262) — pure GF(256) math, no chunk-store or network dependency,
+#    but vw_server_lib already includes vw_ecc.c so no extra SRCS needed.
+fuzz_target(fuzz_ecc_decode)

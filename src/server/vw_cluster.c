@@ -80,6 +80,44 @@ typedef struct {
     time_t   first_fail_at;
 } rate_entry_t;
 
+/* ── Chunk repair-fetch pending-request table (Phase 22, TASK-259) ───────── */
+/*
+ * A primary cannot originate unprompted traffic on a connection the
+ * replica opened (docs/PROTOCOL.md §7.7's "Direction is genuinely
+ * reversed" note) — vw_cluster_repair_fetch (called from a thread that
+ * is NOT the target replica's own primary_repl_loop thread) queues a
+ * request here and polls for its result; primary_repl_loop notices a
+ * PENDING entry for its node_id right after each OPLOG_PULL it receives,
+ * services it inline (piggybacked on that connection's own poll cycle,
+ * before replying with the OPLOG_DATA the replica actually asked for),
+ * and fills in the result.
+ *
+ * One outstanding request per node_id at a time (matches TASK-259's own
+ * "iterates ... sends ... to each in turn" — sequential, not concurrent)
+ * — a small fixed table, no dynamic growth, node_id == 0 marks a free
+ * slot (0 is never a real node_id, see vw_node_record_t's own doc
+ * comment in vw_cluster.h).
+ */
+#define VW_CLUSTER_REPAIR_SLOTS 8u
+
+typedef enum {
+    REPAIR_SLOT_FREE = 0,
+    REPAIR_SLOT_PENDING,    /* queued; primary_repl_loop hasn't serviced it yet */
+    REPAIR_SLOT_DONE,       /* serviced; result_* valid, waiting caller hasn't picked it up */
+    REPAIR_SLOT_CANCELLED,  /* waiting caller timed out and left; primary_repl_loop must
+                              * free result_data itself and reset the slot when it finishes,
+                              * since nobody is coming back to consume it */
+} repair_slot_state_t;
+
+typedef struct {
+    uint64_t             node_id;   /* 0 = free */
+    uint8_t              hash[VW_HASH_BYTES];
+    repair_slot_state_t  state;
+    vw_err_t             result_rc;
+    uint8_t              *result_data;  /* malloc'd; ownership transfers to whoever consumes it */
+    uint32_t             result_len;
+} repair_slot_t;
+
 /* ── Cluster context ──────────────────────────────────────────────────────── */
 
 struct vw_cluster_ctx {
@@ -124,6 +162,10 @@ struct vw_cluster_ctx {
     /* IP rate-limit table (accessed only from accept thread; no lock needed) */
     rate_entry_t rate_table[RATE_TABLE_SIZE];
     uint32_t     rate_next_slot;  /* ring-buffer cursor */
+
+    /* Phase 22 (TASK-259): chunk repair-fetch pending-request table. */
+    vw_rwlock_t   repair_lock;
+    repair_slot_t repair_slots[VW_CLUSTER_REPAIR_SLOTS];
 };
 
 /* ── Logging ──────────────────────────────────────────────────────────────── */
@@ -453,6 +495,22 @@ static vw_err_t handle_cluster_chunk_query(vw_cluster_t *ctx, vw_conn_t *conn,
     return vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_QUERY_RESP, resp, roff);
 }
 
+/*
+ * Re-verify a chunk's bytes against its own hash before ever sending it
+ * over the wire — same chokepoint discipline TASK-254 established for
+ * handle_chunk_download (vw_file_handlers.c): vw_storage_chunk_get does
+ * not itself re-verify (vw_storage.h), so on-disk bit rot between write
+ * time and now would otherwise be forwarded blindly. A content-integrity
+ * check, not a secret comparison, so a plain memcmp is fine here — same
+ * reasoning TASK-254 used.
+ */
+static int chunk_bytes_verified(const uint8_t *hash, const uint8_t *data, uint32_t len)
+{
+    uint8_t actual[VW_HASH_BYTES];
+    if (vw_crypto_sha256(data, len, actual) != VW_OK) return 0;
+    return memcmp(actual, hash, VW_HASH_BYTES) == 0;
+}
+
 static vw_err_t handle_cluster_chunk_fetch(vw_cluster_t *ctx, vw_conn_t *conn,
                                            const uint8_t *payload, uint32_t plen)
 {
@@ -463,6 +521,15 @@ static vw_err_t handle_cluster_chunk_fetch(vw_cluster_t *ctx, vw_conn_t *conn,
     vw_err_t err = vw_storage_chunk_get(ctx->chunks, payload, &data, &data_len);
     if (err != VW_OK) return cluster_send_error(conn, VW_ERR_NOT_FOUND);
 
+    /* TASK-259 (found in passing — same class of gap TASK-254 fixed for
+     * handle_chunk_download, sitting right next to this new task's own
+     * repair-fetch handler below, which needs the identical check): never
+     * trust vw_storage_chunk_get's raw output unconditionally. */
+    if (!chunk_bytes_verified(payload, data, data_len)) {
+        free(data);
+        return cluster_send_error(conn, VW_ERR_CHUNK_CORRUPT);
+    }
+
     uint32_t resp_size = VW_HASH_BYTES + 4u + data_len;
     uint8_t *resp = (uint8_t *)malloc(resp_size);
     if (!resp) { free(data); return cluster_send_error(conn, VW_ERR_OOM); }
@@ -472,6 +539,43 @@ static vw_err_t handle_cluster_chunk_fetch(vw_cluster_t *ctx, vw_conn_t *conn,
     free(data);
 
     vw_err_t rc = vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_DATA, resp, resp_size);
+    free(resp);
+    return rc;
+}
+
+/*
+ * Replica-side handler for CLUSTER_CHUNK_REPAIR_FETCH (Phase 22,
+ * TASK-259; docs/PROTOCOL.md §7.7) — the mirror image of
+ * handle_cluster_chunk_fetch above, but running on the REPLICA (a
+ * primary asking one of its replicas for a clean chunk copy to repair
+ * its own corrupted local one), and always re-verifying before ever
+ * replying, since the whole point of this message is that the
+ * requester's own copy is already known-bad.
+ */
+static vw_err_t handle_cluster_chunk_repair_fetch(vw_cluster_t *ctx, vw_conn_t *conn,
+                                                    const uint8_t *payload, uint32_t plen)
+{
+    if (plen < VW_HASH_BYTES) return cluster_send_error(conn, VW_ERR_PROTO_TRUNCATED);
+
+    uint8_t *data = NULL;
+    uint32_t data_len = 0;
+    vw_err_t err = vw_storage_chunk_get(ctx->chunks, payload, &data, &data_len);
+    if (err != VW_OK) return cluster_send_error(conn, VW_ERR_NOT_FOUND);
+
+    if (!chunk_bytes_verified(payload, data, data_len)) {
+        free(data);
+        return cluster_send_error(conn, VW_ERR_CHUNK_CORRUPT);
+    }
+
+    uint32_t resp_size = VW_HASH_BYTES + 4u + data_len;
+    uint8_t *resp = (uint8_t *)malloc(resp_size);
+    if (!resp) { free(data); return cluster_send_error(conn, VW_ERR_OOM); }
+    memcpy(resp, payload, VW_HASH_BYTES);
+    vw_write_u32le(resp + VW_HASH_BYTES, data_len);
+    memcpy(resp + VW_HASH_BYTES + 4u, data, data_len);
+    free(data);
+
+    vw_err_t rc = vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_REPAIR_DATA, resp, resp_size);
     free(resp);
     return rc;
 }
@@ -536,6 +640,106 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
         uint32_t max_entries = vw_read_u32le(buf + 8);
         if (max_entries == 0 || max_entries > OPLOG_PULL_MAX_ENTRIES)
             max_entries = OPLOG_PULL_MAX_ENTRIES;
+
+        /* Phase 22 (TASK-259): service a queued repair-fetch for this
+         * node, if any, before answering the OPLOG_PULL itself — this is
+         * the one point the primary can originate
+         * CLUSTER_CHUNK_REPAIR_FETCH on this replica-opened connection
+         * (docs/PROTOCOL.md §7.7's "Direction is genuinely reversed"
+         * note). `buf`'s OPLOG_PULL payload is already fully consumed
+         * into from_eid/max_entries above, so reusing it for the
+         * repair-fetch round trip below is safe. */
+        {
+            uint8_t want_hash[VW_HASH_BYTES];
+            int     have_pending = 0;
+
+            rwlock_wrlock(&ctx->repair_lock);
+            for (unsigned i = 0; i < VW_CLUSTER_REPAIR_SLOTS; i++) {
+                if (ctx->repair_slots[i].node_id == node_id &&
+                    ctx->repair_slots[i].state == REPAIR_SLOT_PENDING) {
+                    memcpy(want_hash, ctx->repair_slots[i].hash, VW_HASH_BYTES);
+                    have_pending = 1;
+                    break;
+                }
+            }
+            rwlock_wrunlock(&ctx->repair_lock);
+
+            if (have_pending) {
+                vw_err_t  fetch_rc   = VW_OK;
+                uint8_t  *fetch_data = NULL;
+                uint32_t  fetch_len  = 0;
+
+                rc = vw_proto_send(conn, VW_MSG_CLUSTER_CHUNK_REPAIR_FETCH,
+                                    want_hash, VW_HASH_BYTES);
+                if (rc != VW_OK) {
+                    fetch_rc = rc;
+                } else {
+                    vw_msg_type_t reply_type;
+                    uint32_t      reply_plen = 0;
+                    rc = vw_proto_recv(conn, &reply_type, buf, VW_MAX_MSG_BYTES, &reply_plen);
+                    if (rc != VW_OK) {
+                        fetch_rc = rc;
+                    } else if (reply_type == VW_MSG_ERROR) {
+                        uint32_t    ecode    = (uint32_t)VW_ERR_NOT_FOUND;
+                        const char *emsg     = NULL;
+                        uint16_t    emsg_len = 0;
+                        (void)vw_proto_decode_error(buf, reply_plen, &ecode, &emsg, &emsg_len);
+                        fetch_rc = (vw_err_t)ecode;
+                    } else if (reply_type != VW_MSG_CLUSTER_CHUNK_REPAIR_DATA ||
+                               reply_plen < VW_HASH_BYTES + 4u) {
+                        fetch_rc = VW_ERR_PROTO_INVALID;
+                    } else {
+                        uint32_t rlen = vw_read_u32le(buf + VW_HASH_BYTES);
+                        if (reply_plen < VW_HASH_BYTES + 4u + rlen) {
+                            fetch_rc = VW_ERR_PROTO_TRUNCATED;
+                        } else if (!chunk_bytes_verified(want_hash, buf + VW_HASH_BYTES + 4u, rlen)) {
+                            /* The replica claimed success but the bytes
+                             * don't verify — never trust the wire; treat
+                             * exactly like a failure from that replica,
+                             * same as a NOT_FOUND. */
+                            fetch_rc = VW_ERR_CHUNK_CORRUPT;
+                        } else {
+                            fetch_data = (uint8_t *)malloc(rlen);
+                            if (!fetch_data) {
+                                fetch_rc = VW_ERR_OOM;
+                            } else {
+                                memcpy(fetch_data, buf + VW_HASH_BYTES + 4u, rlen);
+                                fetch_len = rlen;
+                            }
+                        }
+                    }
+                }
+
+                rwlock_wrlock(&ctx->repair_lock);
+                for (unsigned i = 0; i < VW_CLUSTER_REPAIR_SLOTS; i++) {
+                    if (ctx->repair_slots[i].node_id != node_id) continue;
+                    if (ctx->repair_slots[i].state == REPAIR_SLOT_CANCELLED) {
+                        /* Caller already gave up while we were waiting on
+                         * the network round trip — discard and free the
+                         * slot ourselves, nobody is coming back for it. */
+                        free(fetch_data);
+                        ctx->repair_slots[i].node_id = 0;
+                        ctx->repair_slots[i].state   = REPAIR_SLOT_FREE;
+                    } else if (ctx->repair_slots[i].state == REPAIR_SLOT_PENDING) {
+                        ctx->repair_slots[i].result_rc   = fetch_rc;
+                        ctx->repair_slots[i].result_data = fetch_data;
+                        ctx->repair_slots[i].result_len  = fetch_len;
+                        ctx->repair_slots[i].state       = REPAIR_SLOT_DONE;
+                    } else {
+                        free(fetch_data); /* defensive; shouldn't happen */
+                    }
+                    break;
+                }
+                rwlock_wrunlock(&ctx->repair_lock);
+
+                /* A transport-level failure above (rc != VW_OK from the
+                 * send/recv itself, not merely the replica replying
+                 * ERROR) almost always means this connection is dead —
+                 * no need to special-case it here; the normal OPLOG_PULL
+                 * handling below will discover the same failure the same
+                 * way it always does. */
+            }
+        }
 
         /* Read entries from oplog */
         uint8_t *entries_buf       = NULL;
@@ -767,6 +971,35 @@ static void handle_cluster_conn(vw_cluster_t *ctx, vw_conn_t *conn)
                 (unsigned long long)node_id, (int)rc);
         return;
     }
+
+    /* Phase 22 (TASK-262 follow-up): a repair-fetch request that was
+     * still PENDING when this node's PREVIOUS connection died (before
+     * that connection's own primary_repl_loop ever got back around to
+     * servicing it) is marked CANCELLED by vw_cluster_repair_fetch's own
+     * timeout path — but nothing else ever revisits a CANCELLED slot
+     * unless a live primary_repl_loop happens to still be mid-flight on
+     * it (see that function's own cleanup block). If the dead connection
+     * never even reached that point, the slot is orphaned: permanently
+     * CANCELLED, never freed, and — since vw_cluster_repair_fetch treats
+     * any non-FREE slot for a node_id as "one already outstanding" —
+     * silently blocks every future repair-fetch to this node_id forever,
+     * even after a brand-new connection like this one reconnects. A
+     * fresh, successfully-authenticated connection for this node_id is
+     * proof the old connection (and whatever thread was servicing it) is
+     * gone for good, so it's always safe to reclaim a leftover CANCELLED
+     * slot here — never a PENDING one, which could still have a live
+     * caller polling it on this same primary process. */
+    rwlock_wrlock(&ctx->repair_lock);
+    for (unsigned ri = 0; ri < VW_CLUSTER_REPAIR_SLOTS; ri++) {
+        if (ctx->repair_slots[ri].node_id == node_id &&
+            ctx->repair_slots[ri].state == REPAIR_SLOT_CANCELLED) {
+            free(ctx->repair_slots[ri].result_data);
+            ctx->repair_slots[ri].result_data = NULL;
+            ctx->repair_slots[ri].node_id     = 0;
+            ctx->repair_slots[ri].state       = REPAIR_SLOT_FREE;
+        }
+    }
+    rwlock_wrunlock(&ctx->repair_lock);
 
     /* Enter the primary-side replication loop for this replica. */
     primary_repl_loop(ctx, conn, node_id);
@@ -1380,9 +1613,22 @@ static void replica_repl_session(vw_cluster_t *ctx)
 
         /* Receive OPLOG_DATA */{
 
+        /* Phase 22 (TASK-259): the primary may interleave at most one
+         * CLUSTER_CHUNK_REPAIR_FETCH here before the OPLOG_DATA this
+         * OPLOG_PULL actually asked for — see primary_repl_loop's own
+         * comment and docs/PROTOCOL.md §7.7's "Direction is genuinely
+         * reversed" note for why this is the one point the primary can
+         * originate a message on this replica-opened connection. Service
+         * it inline (as the requested chunk's holder, using our own
+         * local store) and loop back for the real OPLOG_DATA reply. */
         vw_msg_type_t data_type;
         uint32_t data_plen = 0;
-        rc = vw_proto_recv(conn, &data_type, data_buf, VW_MAX_MSG_BYTES, &data_plen);
+        for (;;) {
+            rc = vw_proto_recv(conn, &data_type, data_buf, VW_MAX_MSG_BYTES, &data_plen);
+            if (rc != VW_OK) break;
+            if (data_type != VW_MSG_CLUSTER_CHUNK_REPAIR_FETCH) break;
+            (void)handle_cluster_chunk_repair_fetch(ctx, conn, data_buf, data_plen);
+        }
         if (rc != VW_OK || data_type != VW_MSG_OPLOG_DATA) {
             CL_WARN("replica: expected OPLOG_DATA, got rc=%d type=0x%04x",
                     (int)rc, (unsigned)data_type);
@@ -1554,6 +1800,7 @@ vw_err_t vw_cluster_open(const char *data_dir,
     }
 
     rwlock_init(&ctx->nodes_lock);
+    rwlock_init(&ctx->repair_lock);
 
     /* Initial index capacity */
     ctx->nid_to_slot_cap = 64;
@@ -1593,6 +1840,13 @@ void vw_cluster_close(vw_cluster_t *ctx)
     vw_cluster_stop(ctx);
     vw_net_ctx_close(ctx->net_ctx);
     free(ctx->nid_to_slot);
+    /* Defensive: free any repair result left unclaimed by a caller that
+     * never got to poll it out (shouldn't normally happen — every path
+     * in vw_cluster_repair_fetch and primary_repl_loop's servicing code
+     * frees/transfers ownership — but a stuck slot at shutdown should
+     * never leak). */
+    for (unsigned i = 0; i < VW_CLUSTER_REPAIR_SLOTS; i++)
+        free(ctx->repair_slots[i].result_data);
     free(ctx);
 }
 
@@ -1919,4 +2173,90 @@ int vw_cluster_is_replica(const vw_cluster_t *ctx)
 {
     if (!ctx) return 0;
     return ctx->cfg.is_replica ? 1 : 0;
+}
+
+vw_err_t vw_cluster_repair_fetch(vw_cluster_t *ctx, uint64_t node_id,
+                                  const uint8_t hash[VW_HASH_BYTES],
+                                  uint32_t timeout_ms,
+                                  uint8_t **out_data, uint32_t *out_len)
+{
+    if (!ctx || !hash || !out_data || !out_len || node_id == 0 || timeout_ms == 0)
+        return VW_ERR_INVALID_ARG;
+
+    /* Queue the request. One outstanding repair-fetch per node_id at a
+     * time (TASK-259's own "iterates ... to each in turn" — sequential,
+     * not concurrent); VW_ERR_ALREADY_EXISTS if one's already pending/
+     * done-but-unconsumed for this node, or the small table is full. */
+    repair_slot_t *slot = NULL;
+    rwlock_wrlock(&ctx->repair_lock);
+    {
+        int free_idx = -1;
+        for (unsigned i = 0; i < VW_CLUSTER_REPAIR_SLOTS; i++) {
+            if (ctx->repair_slots[i].node_id == node_id &&
+                ctx->repair_slots[i].state != REPAIR_SLOT_FREE) {
+                rwlock_wrunlock(&ctx->repair_lock);
+                return VW_ERR_ALREADY_EXISTS;
+            }
+            if (free_idx < 0 && ctx->repair_slots[i].node_id == 0) free_idx = (int)i;
+        }
+        if (free_idx < 0) {
+            rwlock_wrunlock(&ctx->repair_lock);
+            return VW_ERR_ALREADY_EXISTS; /* table full — same "try again later" signal */
+        }
+        slot = &ctx->repair_slots[free_idx];
+        slot->node_id     = node_id;
+        memcpy(slot->hash, hash, VW_HASH_BYTES);
+        slot->state        = REPAIR_SLOT_PENDING;
+        slot->result_rc     = VW_OK;
+        slot->result_data   = NULL;
+        slot->result_len    = 0;
+    }
+    rwlock_wrunlock(&ctx->repair_lock);
+
+    /* Poll for completion. primary_repl_loop services this the next time
+     * node_id's connection sends its own OPLOG_PULL (up to
+     * cfg.replica_poll_interval_secs apart) — a real condition-variable
+     * wait isn't worth the cross-platform timed-wait machinery it would
+     * need (see this task's own notes) when the actual latency floor
+     * here is that poll interval, not this loop's granularity. */
+    uint32_t waited = 0;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(100);
+#else
+        { struct timespec ts = {0, 100 * 1000 * 1000}; nanosleep(&ts, NULL); }
+#endif
+        waited += 100;
+
+        rwlock_wrlock(&ctx->repair_lock);
+        if (slot->state == REPAIR_SLOT_DONE) {
+            vw_err_t rc = slot->result_rc;
+            if (rc == VW_OK) {
+                *out_data = slot->result_data;
+                *out_len  = slot->result_len;
+            } else {
+                free(slot->result_data);
+            }
+            /* Either branch above has fully disposed of result_data
+             * (transferred ownership out, or freed it) — clear the
+             * pointer so vw_cluster_close's defensive cleanup loop over
+             * every slot can never free it a second time. */
+            slot->result_data = NULL;
+            slot->node_id = 0;
+            slot->state   = REPAIR_SLOT_FREE;
+            rwlock_wrunlock(&ctx->repair_lock);
+            return rc;
+        }
+        if (waited >= timeout_ms) {
+            /* Give up. primary_repl_loop may still be mid-flight on this
+             * request (or hasn't picked it up at all yet) — mark it
+             * CANCELLED rather than freeing the slot out from under it;
+             * whichever of them finishes it next frees result_data
+             * itself and resets the slot to FREE. */
+            slot->state = REPAIR_SLOT_CANCELLED;
+            rwlock_wrunlock(&ctx->repair_lock);
+            return VW_ERR_TIMEOUT;
+        }
+        rwlock_wrunlock(&ctx->repair_lock);
+    }
 }

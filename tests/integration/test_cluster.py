@@ -158,7 +158,8 @@ def _free_port():
 
 def _write_cluster_conf(path, data_dir, cert, key, admin_socket, port,
                          cluster_port, is_replica, primary_host, primary_port,
-                         gc_interval_secs=None, trash_retention_days=None):
+                         gc_interval_secs=None, trash_retention_days=None,
+                         extra_conf=""):
     extra = ""
     # TASK-178: only written when a caller actually wants fast/immediate GC
     # (the GC replica-safety regression test) — omitted otherwise so every
@@ -167,6 +168,13 @@ def _write_cluster_conf(path, data_dir, cert, key, admin_socket, port,
         extra += f"gc_interval_secs     = {gc_interval_secs}\n"
     if trash_retention_days is not None:
         extra += f"trash_retention_days = {trash_retention_days}\n"
+    # TASK-262: a free-form block for callers that need keys this helper
+    # doesn't otherwise expose (e.g. scrub_interval_secs, smtp_*, notify.*
+    # — see test_corruption_repair.py). Appended last, after this
+    # function's own `smtp_host =` default below, so a caller-supplied
+    # `smtp_host = ...` line here correctly wins (the config parser keeps
+    # whichever assignment of a given key it sees last).
+    extra += extra_conf
     with open(path, "w") as f:
         f.write(f"""\
 listen_host      = 127.0.0.1
@@ -192,7 +200,8 @@ class ClusterNode:
 
     def __init__(self, binaries, tmpdir, name, is_replica=False,
                  primary_host=None, primary_port=None,
-                 gc_interval_secs=None, trash_retention_days=None):
+                 gc_interval_secs=None, trash_retention_days=None,
+                 extra_conf=""):
         self.binaries = binaries
         self.tmpdir = os.path.join(tmpdir, name)
         self.data_dir = os.path.join(self.tmpdir, "data")
@@ -215,6 +224,7 @@ class ClusterNode:
             self.admin_socket, self.port, self.cluster_port,
             is_replica, primary_host, primary_port,
             gc_interval_secs=gc_interval_secs, trash_retention_days=trash_retention_days,
+            extra_conf=extra_conf,
         )
 
     def start(self, timeout=20):

@@ -764,6 +764,80 @@ static int cmd_cluster_status(int fd)
     return 0;
 }
 
+static void print_scrub_stats(uint32_t code, int64_t last_run_unix,
+                               uint64_t scanned, uint64_t corrupt, uint64_t tombstoned)
+{
+    if (code != 0) {
+        fprintf(stderr, "error: scrub: %s (code %u)\n", err_str(code), code);
+        return;
+    }
+    if (last_run_unix == 0) {
+        printf("no scrub pass has run yet\n");
+        return;
+    }
+    char timebuf[32];
+    time_t t = (time_t)last_run_unix;
+    struct tm *tmv = localtime(&t);
+    if (tmv) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tmv);
+    else     snprintf(timebuf, sizeof(timebuf), "%lld", (long long)last_run_unix);
+
+    printf("last run:   %s\n", timebuf);
+    printf("scanned:    %llu\n", (unsigned long long)scanned);
+    printf("corrupt:    %llu%s\n", (unsigned long long)corrupt,
+           corrupt > 0 ? "  (still referenced — see server logs; not yet auto-repaired)" : "");
+    printf("tombstoned: %llu  (ref_count==0 — not reported as an error)\n",
+           (unsigned long long)tombstoned);
+}
+
+static int cmd_scrub_run(int fd)
+{
+    uint16_t resp_type;
+    uint8_t *resp = NULL;
+    uint32_t resp_plen = 0;
+    if (admin_rpc(fd, (uint16_t)VW_ADMIN_SCRUB_RUN_REQ, NULL, 0,
+                   &resp_type, &resp, &resp_plen) < 0) return 1;
+
+    if (resp_plen < 28) { free(resp); fprintf(stderr, "error: truncated response\n"); return 1; }
+    uint32_t code = r32le(resp);
+    if (code != 0) {
+        free(resp);
+        fprintf(stderr, "error: scrub run failed: %s (code %u)\n", err_str(code), code);
+        return 1;
+    }
+    uint64_t scanned    = r64le(resp + 4);
+    uint64_t corrupt    = r64le(resp + 12);
+    uint64_t tombstoned = r64le(resp + 20);
+    free(resp);
+
+    print_scrub_stats(0, (int64_t)time(NULL), scanned, corrupt, tombstoned);
+    return 0;
+}
+
+static int cmd_scrub_status(int fd)
+{
+    uint16_t resp_type;
+    uint8_t *resp = NULL;
+    uint32_t resp_plen = 0;
+    if (admin_rpc(fd, (uint16_t)VW_ADMIN_SCRUB_STATUS_REQ, NULL, 0,
+                   &resp_type, &resp, &resp_plen) < 0) return 1;
+
+    if (resp_plen < 36) { free(resp); fprintf(stderr, "error: truncated response\n"); return 1; }
+    uint32_t code = r32le(resp);
+    if (code != 0) {
+        free(resp);
+        fprintf(stderr, "error: scrub status failed: %s (code %u)\n", err_str(code), code);
+        return 1;
+    }
+    int64_t  last_run   = (int64_t)r64le(resp + 4);
+    uint64_t scanned    = r64le(resp + 12);
+    uint64_t corrupt    = r64le(resp + 20);
+    uint64_t tombstoned = r64le(resp + 28);
+    free(resp);
+
+    print_scrub_stats(0, last_run, scanned, corrupt, tombstoned);
+    return 0;
+}
+
 /* ── Usage ─────────────────────────────────────────────────────────────────── */
 
 static void usage(const char *prog) {
@@ -791,6 +865,10 @@ static void usage(const char *prog) {
         "                                                  token from stdin instead of argv.\n"
         "  cluster status                                 List registered cluster nodes\n"
         "  cluster-status                                 Alias for 'cluster status' (v0.1.0 spelling)\n"
+        "  scrub run                                      Run one full chunk-store integrity scan now\n"
+        "                                                  (detection only — see docs/PROTOCOL.md and\n"
+        "                                                  ARCHITECTURE.md Phase 22 for repair status)\n"
+        "  scrub status                                   Report results of the most recent scan\n"
         "\n"
         "Options:\n"
         "  --admin-socket <path>  Admin Unix socket path (default: %s)\n"
@@ -958,6 +1036,22 @@ int vw_server_cli_main(int argc, char *argv[])
 
     } else if (strcmp(cmd, "cluster-status") == 0) {
         rc = cmd_cluster_status(fd);
+
+    } else if (strcmp(cmd, "scrub") == 0) {
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s scrub run\n"
+                            "       %s scrub status\n",
+                    argv[0], argv[0]);
+            goto done;
+        }
+        const char *sub = argv[argi++];
+        if (strcmp(sub, "run") == 0) {
+            rc = cmd_scrub_run(fd);
+        } else if (strcmp(sub, "status") == 0) {
+            rc = cmd_scrub_status(fd);
+        } else {
+            fprintf(stderr, "error: unknown scrub subcommand '%s'\n", sub);
+        }
 
     } else {
         fprintf(stderr, "error: unknown command '%s'\n", cmd);

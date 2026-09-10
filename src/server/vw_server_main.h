@@ -16,6 +16,7 @@
 #include "vw_smtp.h"
 #include "vw_acme.h"
 #include "vw_gc.h"
+#include "vw_scrub.h"
 #include "vw_cluster.h"
 #include "vw_notify.h"
 #include <stdint.h>
@@ -39,6 +40,7 @@ typedef struct {
     vw_smtp_cfg_t    smtp;               /* email config; smtp.host[0]=='\0' → disabled */
     vw_acme_cfg_t    acme;               /* ACME cert renewal; acme.enabled==0 → disabled */
     vw_gc_cfg_t      gc;                 /* GC thread; gc.interval_secs==0 → disabled    */
+    vw_scrub_cfg_t   scrub;              /* chunk scrub thread (Phase 22, TASK-255); scrub.interval_secs==0 → disabled */
     vw_cluster_cfg_t cluster;            /* cluster replication; cluster_port==0 → disabled */
     vw_notify_admin_cfg_t notify;         /* admin alert config (TASK-208); all *_enabled default off */
 } vw_server_main_cfg_t;

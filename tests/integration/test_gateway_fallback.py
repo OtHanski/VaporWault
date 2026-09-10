@@ -37,6 +37,7 @@ def test_gateway_login_fails_over_to_read_only_fallback(
     than attempted against the replica (TASK-176's third criterion).
     """
     binaries.require_server()
+    binaries.require_gateway()
     binaries.require_tls()
 
     tmpdir = str(tmp_path_factory.mktemp("vw_gw_fallback"))
@@ -144,6 +145,7 @@ def test_gateway_without_fallback_configured_is_unaffected(
     fixture (reused across the whole test_gateway.py suite), with no
     fallback configured."""
     binaries.require_server()
+    binaries.require_gateway()
     binaries.require_tls()
 
     gateway = GatewayInstance(binaries, server)  # fallback=None (default)

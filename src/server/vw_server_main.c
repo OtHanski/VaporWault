@@ -310,6 +310,7 @@ static void cfg_defaults(vw_server_main_cfg_t *c) {
     c->acme.renew_days  = VW_ACME_DEFAULT_RENEW_DAYS;
     c->gc.interval_secs             = VW_GC_DEFAULT_INTERVAL_SECS;
     c->gc.trash_retention_secs      = VW_GC_DEFAULT_TRASH_RETENTION_SECS;
+    c->scrub.interval_secs          = VW_SCRUB_DEFAULT_INTERVAL_SECS;
     c->cluster.cluster_port         = 9010;
     c->cluster.is_replica           = 0;
     c->cluster.replica_poll_interval_secs = 5;
@@ -385,6 +386,8 @@ vw_err_t vw_server_main_cfg_load(const char *path, vw_server_main_cfg_t *out) {
         if (!strcmp(key, "trash_retention_days")) {
             out->gc.trash_retention_secs =
                 (uint32_t)strtoul(val, NULL, 10) * 24u * 3600u; continue; }
+        if (!strcmp(key, "scrub_interval_secs")) {
+            out->scrub.interval_secs = (uint32_t)strtoul(val, NULL, 10); continue; }
         U(out->cluster.cluster_port,    "cluster_port")
         if (!strcmp(key, "cluster_is_replica")) {
             out->cluster.is_replica = (uint8_t)strtoul(val, NULL, 10); continue; }
@@ -408,6 +411,8 @@ vw_err_t vw_server_main_cfg_load(const char *path, vw_server_main_cfg_t *out) {
             out->notify.lockout_spike_enabled = (int)strtol(val, NULL, 10); continue; }
         if (!strcmp(key, "notify.crash_recovery")) {
             out->notify.crash_recovery_enabled = (int)strtol(val, NULL, 10); continue; }
+        if (!strcmp(key, "notify.chunk_unrepairable")) {
+            out->notify.chunk_unrepairable_enabled = (int)strtol(val, NULL, 10); continue; }
         if (!strcmp(key, "notify.replica_lag_threshold_entries")) {
             out->notify.replica_lag_threshold_entries = (uint32_t)strtoul(val, NULL, 10); continue; }
         if (!strcmp(key, "notify.disk_capacity_threshold_pct")) {
@@ -464,6 +469,11 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         "# How long a deleted file stays recoverable before GC purges it for good.\n"
         "# Set to 0 to purge immediately (no trash/recycle-bin grace period).\n"
         "trash_retention_days = %u\n\n"
+        "# Scrub (Phase 22, TASK-255): periodic chunk-store integrity scan,\n"
+        "# re-hashing every chunk on disk against its own filename to detect\n"
+        "# corruption at rest. Detection only for now (see ARCHITECTURE.md);\n"
+        "# set scrub_interval_secs = 0 to disable.\n"
+        "scrub_interval_secs = %u\n\n"
         "# Cluster: set cluster_port = 0 to disable cluster replication\n"
         "cluster_port              = %u\n"
         "cluster_is_replica        = 0\n"
@@ -480,6 +490,7 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         "notify.disk_capacity             = 0\n"
         "notify.lockout_spike             = 0\n"
         "notify.crash_recovery            = 0\n"
+        "notify.chunk_unrepairable        = 0\n"
         "# Thresholds below are optional; 0 (or omitted) uses the built-in\n"
         "# default noted in each comment.\n"
         "notify.replica_lag_threshold_entries   = 0  # default %u\n"
@@ -495,6 +506,7 @@ vw_err_t vw_server_main_cfg_write_defaults(const char *path,
         cfg->smtp.port,
         (unsigned)cfg->gc.interval_secs,
         (unsigned)(cfg->gc.trash_retention_secs / (24u * 3600u)),
+        (unsigned)cfg->scrub.interval_secs,
         (unsigned)cfg->cluster.cluster_port,
         (unsigned)cfg->cluster.replica_poll_interval_secs,
         (unsigned)VW_NOTIFY_REPLICA_LAG_THRESHOLD_ENTRIES_DEFAULT,
@@ -530,7 +542,8 @@ static int cfg_validate(const vw_server_main_cfg_t *c, int check_only) {
      * an intentional "notify nobody". */
     if ((c->notify.replica_lag_enabled || c->notify.acme_renewal_failure_enabled ||
          c->notify.disk_capacity_enabled || c->notify.lockout_spike_enabled ||
-         c->notify.crash_recovery_enabled) && c->notify.admin_email[0] == '\0') {
+         c->notify.crash_recovery_enabled || c->notify.chunk_unrepairable_enabled) &&
+        c->notify.admin_email[0] == '\0') {
         vw_log(LOG_ERROR, "config: a notify.* admin alert category is enabled "
                            "but notify.admin_email is empty");
         return 1;
@@ -779,6 +792,7 @@ int vw_server_main_run(int argc, char *argv[]) {
     vw_admin_server_t *admin_srv    = NULL;
     vw_acme_ctx_t     *acme_ctx     = NULL;
     vw_gc_ctx_t       *gc_ctx       = NULL;
+    vw_scrub_ctx_t    *scrub_ctx    = NULL;
     vw_cluster_t      *cluster      = NULL;
     vw_conn_registry_t *conn_registry = NULL;
     int                rc           = 1;
@@ -908,6 +922,22 @@ int vw_server_main_run(int argc, char *argv[]) {
         }
     }
 
+    /* Create and start the scrub thread before the admin server so its ctx
+     * can hand out a SCRUB_RUN/STATUS reference to it (same reasoning as
+     * cluster, above). chunks (opened earlier) must be non-NULL. cluster
+     * may be NULL (single-node mode) — TASK-260's repair pipeline then
+     * only ever tries local Reed-Solomon reconstruction. notify (opened
+     * above) drives TASK-261's chunk_unrepairable admin alert. */
+    if (vw_scrub_create(&cfg.scrub, chunks, cluster, vw_server_ctx_notify(sctx), &scrub_ctx) != VW_OK) {
+        vw_log(LOG_WARN, "scrub context allocation failed — running without corruption scanning");
+    } else if (vw_scrub_start(scrub_ctx) != VW_OK) {
+        vw_log(LOG_WARN, "scrub thread failed to start — running without corruption scanning");
+        vw_scrub_destroy(scrub_ctx);
+        scrub_ctx = NULL;
+    } else if (cfg.scrub.interval_secs > 0) {
+        vw_log(LOG_INFO, "scrub thread started (interval %u s)", cfg.scrub.interval_secs);
+    }
+
     {
         vw_admin_ctx_t actx;
         actx.store         = store;
@@ -915,6 +945,7 @@ int vw_server_main_run(int argc, char *argv[]) {
         actx.cluster       = cluster;
         actx.conn_registry = conn_registry;
         actx.file_store    = file_store;
+        actx.scrub         = scrub_ctx;
         if (vw_admin_server_start(cfg.admin_socket, &actx, &admin_srv) != VW_OK)
             vw_log(LOG_WARN, "admin IPC server failed to bind on '%s' — continuing without it",
                    cfg.admin_socket);
@@ -1061,6 +1092,8 @@ shutdown:
     vw_conn_registry_close(conn_registry);
     vw_gc_stop(gc_ctx);
     vw_gc_destroy(gc_ctx);
+    vw_scrub_stop(scrub_ctx);
+    vw_scrub_destroy(scrub_ctx);
     vw_acme_stop(acme_ctx);
     vw_acme_ctx_destroy(acme_ctx);
     g_net_ctx = NULL;
