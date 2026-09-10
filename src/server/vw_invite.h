@@ -68,38 +68,22 @@ vw_err_t vw_invite_create(vw_invite_store_t *s,
                            uint8_t  out_code[32]);
 
 /*
- * Look up an invite by code[32].
- * Returns VW_ERR_NOT_FOUND if:
- *   - code is unknown
- *   - invite is already used (is_used == 1)
- *   - invite is expired (expires_at != 0 && expires_at < now)
- * On success *out is populated.
- */
-vw_err_t vw_invite_get(vw_invite_store_t *s,
-                        const uint8_t code[32],
-                        vw_invite_record_t *out);
-
-/*
  * Atomically validate and consume an invite in a single write-locked operation.
- * Checks that the invite exists, is unused, and is not expired.  If valid,
+ * Checks that the invite exists, is unused, and is not expired. If valid,
  * writes is_used=1 to disk and populates *out.
  *
- * Use this instead of vw_invite_get + vw_invite_mark_used to prevent the
- * TOCTOU window where two concurrent INVITE_REDEEM requests can both observe
- * is_used=0 before either marks the invite used.
+ * TASK-00045: this replaced an earlier separate get-then-mark-used pair
+ * (vw_invite_get + vw_invite_mark_used) that had a TOCTOU window where two
+ * concurrent INVITE_REDEEM requests could both observe is_used=0 before
+ * either marked the invite used. Both were removed entirely (TASK-00270)
+ * once confirmed to have zero remaining call sites — this is the only way
+ * to read or consume an invite.
  *
  * Returns VW_ERR_NOT_FOUND if the code is unknown, already used, or expired.
  */
 vw_err_t vw_invite_claim(vw_invite_store_t *s,
                           const uint8_t code[32],
                           vw_invite_record_t *out);
-
-/*
- * Write is_used=1 to the on-disk record for code.
- * Returns VW_ERR_NOT_FOUND if the code is not in the index.
- * Prefer vw_invite_claim when both validation and marking are needed atomically.
- */
-vw_err_t vw_invite_mark_used(vw_invite_store_t *s, const uint8_t code[32]);
 
 #ifdef __cplusplus
 }

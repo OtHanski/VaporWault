@@ -11,7 +11,7 @@
  *
  * Security notes:
  *   - 128-bit random code (CSPRNG), base32-encoded → 26 printable chars.
- *   - Expiry and used-check happen under the read lock in vw_invite_get,
+ *   - Expiry and used-check happen under the write lock in vw_invite_claim,
  *     so callers do not observe time-of-check/time-of-use gaps.
  */
 
@@ -274,51 +274,6 @@ vw_err_t vw_invite_create(vw_invite_store_t *s,
     return VW_OK;
 }
 
-vw_err_t vw_invite_get(vw_invite_store_t *s,
-                        const uint8_t code[32],
-                        vw_invite_record_t *out)
-{
-    if (!s || !code || !out) return VW_ERR_INVALID_ARG;
-
-    inv_rwlock_rlock(&s->lock);
-
-    uint64_t slot = ht_find(s->ht, s->ht_cap, code);
-    if (slot == UINT64_MAX) {
-        inv_rwlock_runlock(&s->lock);
-        return VW_ERR_NOT_FOUND;
-    }
-
-    void  *buf  = NULL;
-    size_t blen = 0;
-    vw_err_t err = vw_fs_read_file(s->path, &buf, &blen);
-    if (err != VW_OK) {
-        inv_rwlock_runlock(&s->lock);
-        return err;
-    }
-
-    uint64_t byte_off = slot * (uint64_t)sizeof(vw_invite_record_t);
-    if (byte_off + sizeof(vw_invite_record_t) > blen) {
-        free(buf);
-        inv_rwlock_runlock(&s->lock);
-        return VW_ERR_NOT_FOUND;
-    }
-
-    vw_invite_record_t rec;
-    memcpy(&rec, (uint8_t *)buf + byte_off, sizeof(rec));
-    free(buf);
-
-    /* Check usability while still under the read lock. */
-    if (rec.is_used ||
-        (rec.expires_at != 0u && (uint64_t)time(NULL) >= rec.expires_at)) {
-        inv_rwlock_runlock(&s->lock);
-        return VW_ERR_NOT_FOUND;
-    }
-
-    *out = rec;
-    inv_rwlock_runlock(&s->lock);
-    return VW_OK;
-}
-
 vw_err_t vw_invite_claim(vw_invite_store_t *s,
                           const uint8_t code[32],
                           vw_invite_record_t *out)
@@ -373,27 +328,4 @@ vw_err_t vw_invite_claim(vw_invite_store_t *s,
 
     *out = rec;
     return VW_OK;
-}
-
-vw_err_t vw_invite_mark_used(vw_invite_store_t *s, const uint8_t code[32])
-{
-    if (!s || !code) return VW_ERR_INVALID_ARG;
-
-    inv_rwlock_wlock(&s->lock);
-
-    uint64_t slot = ht_find(s->ht, s->ht_cap, code);
-    if (slot == UINT64_MAX) {
-        inv_rwlock_wunlock(&s->lock);
-        return VW_ERR_NOT_FOUND;
-    }
-
-    uint64_t file_off = slot * (uint64_t)sizeof(vw_invite_record_t)
-                        + (uint64_t)offsetof(vw_invite_record_t, is_used);
-    const uint8_t used = 1u;
-    vw_err_t err = vw_fs_pwrite(s->path, file_off, &used, sizeof(used));
-    if (err == VW_OK)
-        err = vw_fs_sync_file(s->path);
-
-    inv_rwlock_wunlock(&s->lock);
-    return err;
 }

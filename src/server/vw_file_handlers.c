@@ -394,7 +394,7 @@ done:
      * stops, never touching the trailing block; a new client checks for
      * enough remaining bytes before reading it. No entry-length wrapper or
      * protocol version bump needed, unlike the per-entry-wrapping approach
-     * TODO/TASK-109.md originally sketched — a trailing parallel array
+     * TODO/done/TASK-00109.md originally sketched — a trailing parallel array
      * sidesteps that entirely because it doesn't interleave new data
      * inside each entry's own byte range.
      * TASK-156: followed by a second trailing, parallel array of all_len *
@@ -2824,6 +2824,41 @@ static vw_err_t handle_vault_list(vw_store_t *store, vw_vault_store_t *vs,
     return err;
 }
 
+/* VAULT_DELETE (TASK-00277): session_token[32] + vault_id(u64).
+ * ACK: error_code(u32). Refuses with VW_ERR_VAULT_NOT_EMPTY if any file
+ * version — current or superseded — still references this vault_id,
+ * since deleting it would strand that version's wrapped DEK and make its
+ * content permanently unrecoverable. vw_vault_delete() itself enforces
+ * "caller must be the vault's owner_id" (same convention as
+ * SHARE_REVOKE/LINK_REVOKE, §7.5). */
+static vw_err_t handle_vault_delete(vw_store_t *store, vw_file_store_t *fs,
+                                     vw_vault_store_t *vs, vw_conn_t *conn,
+                                     const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    uint64_t vault_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+
+    int in_use = 0;
+    err = vw_store_version_vault_in_use(fs, vault_id, &in_use);
+    if (err != VW_OK)
+        return (send_error(conn, err), VW_OK);
+    if (in_use)
+        return (send_error(conn, VW_ERR_VAULT_NOT_EMPTY), VW_OK);
+
+    err = vw_vault_delete(vs, vault_id, user_id);
+
+    uint8_t ack[4];
+    vw_write_u32le(ack, (uint32_t)(err == VW_OK ? 0u : (uint32_t)err));
+    return vw_proto_send(conn, VW_MSG_VAULT_DELETE_ACK, ack, sizeof(ack));
+}
+
 /* ── SEARCH (TASK-196/197/198; docs/PROTOCOL.md §7.12) ──────────────────────
  * Filename-only substring search across everything the caller can see.
  * There is no owner_id-indexed enumeration of "everything this user owns"
@@ -3234,6 +3269,7 @@ static int is_write_shaped_msg(vw_msg_type_t type)
     case VW_MSG_LINK_CREATE:
     case VW_MSG_LINK_REVOKE:
     case VW_MSG_VAULT_CREATE:
+    case VW_MSG_VAULT_DELETE:
     case VW_MSG_NOTIFY_PREFS_SET:
     case VW_MSG_ACCOUNT_EMAIL_SET:
     case VW_MSG_ACCOUNT_2FA_SET:
@@ -3354,6 +3390,8 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_vault_key_fetch(store, vs, conn, payload, plen);
     case VW_MSG_VAULT_LIST:
         return handle_vault_list(store, vs, conn, payload, plen);
+    case VW_MSG_VAULT_DELETE:
+        return handle_vault_delete(store, fs, vs, conn, payload, plen);
     case VW_MSG_SEARCH:
         return handle_search(store, fs, ss, conn, payload, plen);
     default:
