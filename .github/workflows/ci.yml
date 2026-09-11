@@ -260,6 +260,7 @@ jobs:
             -DVW_BUILD_GUI=OFF    \
             -DVW_BUILD_TOOLS=ON   \
             -DVW_BUILD_TESTS=ON   \
+            -DVW_BUILD_WEB_GATEWAY=ON \
             -DVW_WERROR=ON
 
       - name: Build
@@ -284,6 +285,7 @@ jobs:
             --timeout=60 \
             --server-bin  build/bin/vapourwaultd \
             --admin-cli   build/bin/vapourwault-server-cli \
+            --gateway-bin build/bin/vapourwault-web-gateway \
             --test-cert   tests/integration/test.crt \
             --test-key    tests/integration/test.key
 
@@ -312,6 +314,7 @@ jobs:
             --timeout=90 \
             --server-bin  build/bin/vapourwaultd \
             --admin-cli   build/bin/vapourwault-server-cli \
+            --gateway-bin build/bin/vapourwault-web-gateway \
             --test-cert   tests/integration/test.crt \
             --test-key    tests/integration/test.key
 
