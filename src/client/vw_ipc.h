@@ -116,6 +116,8 @@ typedef enum {
     VW_IPC_VAULT_UPLOAD_RESP  = 0x802A, /* D→C: error_code + file_id + version_id */
     VW_IPC_VAULT_DOWNLOAD_REQ = 0x802B, /* C→D: download+decrypt to a local path  */
     VW_IPC_VAULT_DOWNLOAD_RESP = 0x802C, /* D→C: error_code                       */
+    VW_IPC_VAULT_DELETE_REQ   = 0x802D, /* C→D: soft-delete a vault (TASK-00278)  */
+    VW_IPC_VAULT_DELETE_RESP  = 0x802E, /* D→C: error_code                        */
 
     /* TASK-106: add a sync folder rooted at a SHARED item (by file_id)
      * rather than an owned virtual path — a separate message pair rather
@@ -499,6 +501,17 @@ typedef enum {
  *   string local_path      destination path for the decrypted plaintext
  * VW_IPC_VAULT_DOWNLOAD_RESP:
  *   u32 error_code
+ *
+ * VW_IPC_VAULT_DELETE_REQ (TASK-00278):
+ *   u32    account_id
+ *   u64    vault_id        need not currently be unlocked — deletion only
+ *                          needs ownership, not the unwrapped VK
+ * VW_IPC_VAULT_DELETE_RESP:
+ *   u32 error_code         VW_ERR_VAULT_NOT_EMPTY if any file version still
+ *                          references this vault_id (docs/PROTOCOL.md
+ *                          §7.11.4). On success, vault_id is also dropped
+ *                          from this account's in-memory unlocked-vault
+ *                          registry if it was present there.
  *
  * VW_IPC_FOLDER_ADD_SHARED_REQ:
  *   u32    account_id

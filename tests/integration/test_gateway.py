@@ -235,6 +235,9 @@ class GatewayClient:
     def vault_list(self):
         return self.post("/api/vault/list", {})
 
+    def vault_delete(self, vault_id):
+        return self.post("/api/vault/delete", {"vault_id": vault_id})
+
 
 class ClientFactory:
     """Creates GatewayClients and guarantees every one of them is logged
@@ -972,6 +975,82 @@ def test_vault_passphrase_never_sent_to_gateway(server, clients, unique_username
     # (e.g. if a future refactor changes field names and the intersection
     # test above stops matching any recorded body).
     assert vault_shaped_bodies_checked >= 2  # vault_create + vault_key_fetch, at least
+
+
+# ── 2b. VAULT_DELETE (TASK-00280) ────────────────────────────────────────────
+
+def test_vault_delete_removes_it_from_list(server, clients, unique_username):
+    client = clients.login(unique_username, server=server)
+    r = client.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    folder_id = r.json()["dir_id"]
+
+    r = client.vault_create(folder_id, os.urandom(32).hex(), os.urandom(16).hex(), "")
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    r = client.vault_delete(vault_id)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+
+    r = client.vault_list()
+    assert r.status_code == 200
+    assert not any(v["vault_id"] == vault_id for v in r.json())
+
+    r = client.vault_key_fetch(vault_id)
+    assert r.status_code == 404, r.text
+
+
+def test_vault_delete_requires_ownership(server, clients, unique_username):
+    owner = clients.login(f"{unique_username}_owner", server=server)
+    stranger = clients.login(f"{unique_username}_stranger", server=server)
+
+    r = owner.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    folder_id = r.json()["dir_id"]
+    r = owner.vault_create(folder_id, os.urandom(32).hex(), os.urandom(16).hex(), "")
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    r = stranger.vault_delete(vault_id)
+    assert r.status_code == 403, r.text
+
+    # Untouched.
+    r = owner.vault_key_fetch(vault_id)
+    assert r.status_code == 200, r.text
+
+
+def test_vault_delete_rejects_while_a_version_still_references_it(server, clients, unique_username):
+    """Mirrors test_vault.py's server-level equivalent — the gateway's
+    send_file_op_error must map VW_ERR_VAULT_NOT_EMPTY to a real 409
+    business-logic response, not fall through to its default "evict the
+    session" branch (which would return 500 and log the browser out)."""
+    client = clients.login(unique_username, server=server)
+    r = client.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    folder_id = r.json()["dir_id"]
+
+    r = client.vault_create(folder_id, os.urandom(32).hex(), os.urandom(16).hex(), "")
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    data = b"opaque ciphertext-shaped payload"
+    h = hashlib.sha256(data).hexdigest()
+    r = client.upload_chunk(h, data)
+    assert r.status_code == 200, r.text
+    r = client.commit_file("/vault_home/secret.bin", len(data), [h],
+                            vault_id=vault_id, wrapped_dek_hex=os.urandom(48).hex())
+    assert r.status_code == 200, r.text
+
+    r = client.vault_delete(vault_id)
+    assert r.status_code == 409, r.text
+    assert r.json()["status"] == "vault_not_empty"
+
+    # Untouched, and the session must still be usable afterward — this is
+    # exactly the case that would incorrectly evict the session without
+    # the VW_ERR_VAULT_NOT_EMPTY case in send_file_op_error.
+    r = client.vault_key_fetch(vault_id)
+    assert r.status_code == 200, r.text
 
 
 def test_file_list_vault_id_survives_move_out_of_vault_folder(server, clients, unique_username):

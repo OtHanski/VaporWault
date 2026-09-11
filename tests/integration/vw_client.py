@@ -82,6 +82,8 @@ MSG_VAULT_KEY_FETCH       = 0x0803
 MSG_VAULT_KEY_FETCH_RESP  = 0x0804
 MSG_VAULT_LIST            = 0x0805
 MSG_VAULT_LIST_RESP       = 0x0806
+MSG_VAULT_DELETE          = 0x0807  # TASK-00274
+MSG_VAULT_DELETE_ACK      = 0x0808
 
 # Account self-service (TASK-219/222)
 MSG_ACCOUNT_EMAIL_SET     = 0x0B03
@@ -119,6 +121,7 @@ VW_ERR_RATE_LIMITED    = 605
 VW_ERR_LINK_PASSWORD_REQUIRED = 607  # TASK-186
 VW_ERR_LINK_PASSWORD_WRONG    = 608  # TASK-186
 VW_ERR_CHUNK_CORRUPT          = 609  # TASK-254
+VW_ERR_VAULT_NOT_EMPTY        = 610  # TASK-00274
 
 
 class VwProtocolError(RuntimeError):
@@ -826,6 +829,17 @@ class VwClient:
                 "created_at": created_at,
             })
         return vaults
+
+    def vault_delete(self, session_token, vault_id):
+        """Soft-delete a vault (TASK-00274). Raises VwProtocolError with
+        VW_ERR_VAULT_NOT_EMPTY if any file version still references it."""
+        payload = bytes(session_token) + struct.pack("<Q", vault_id)
+        self._send(MSG_VAULT_DELETE, payload)
+        mt, resp = self._recv()
+        self._expect(MSG_VAULT_DELETE_ACK, mt, resp)
+        error_code = struct.unpack_from("<I", resp, 0)[0]
+        if error_code != VW_OK:
+            raise VwProtocolError(error_code, "vault delete failed")
 
     # ── High-level helpers ──────────────────────────────────────────────────
 

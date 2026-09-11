@@ -639,6 +639,14 @@ static void send_file_op_error(vw_gateway_session_pool_t *pool, const char *cook
         case VW_ERR_DIR_NOT_EMPTY:
             send_error(conn, 409, "dir_not_empty");
             return;
+        case VW_ERR_VAULT_NOT_EMPTY:
+            /* TASK-00280: VAULT_DELETE against a vault a file version still
+             * references - as ordinary a business-logic outcome as
+             * VW_ERR_DIR_NOT_EMPTY above, not a connection-health signal.
+             * Without this case it would fall through to default below and
+             * incorrectly evict the session on every rejected delete. */
+            send_error(conn, 409, "vault_not_empty");
+            return;
         case VW_ERR_ALREADY_EXISTS:
             /* Found via TASK-141 testing: a plain name collision (e.g.
              * mkdir on an existing name) - as ordinary an outcome as
@@ -2124,6 +2132,36 @@ static void handle_vault_list(vw_gateway_session_pool_t *pool,
     free(buf);
 }
 
+/* TASK-00280: soft-delete a vault registration. Same "read the id, call
+ * the client-core wrapper, translate the result" shape as
+ * handle_share_revoke/handle_link_revoke above — vw_client_vault_delete
+ * already exists in vw_client_core.c (TASK-00278) for the desktop client
+ * to reuse, so the gateway needs no new client-core code, only this HTTP
+ * wrapper. send_file_op_error needed a new VW_ERR_VAULT_NOT_EMPTY case
+ * (added above) so this ordinary business-logic outcome doesn't fall
+ * through to the default "evict the session" branch. */
+static void handle_vault_delete(vw_gateway_session_pool_t *pool,
+                                 const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (reject_if_read_only(pool, cookie, conn)) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    uint64_t vault_id = 0;
+    if (get_json_uint_field(req, "vault_id", &vault_id) != VW_OK) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    vw_err_t err = vw_client_vault_delete(sess, vault_id);
+    if (err != VW_OK) {
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+    send_json_status(conn, 200, "ok", NULL);
+}
+
 /*
  * /api/accounts (TASK-164): which slots THIS browser currently has a live
  * session in, and each one's display username. Read entirely off the
@@ -2312,6 +2350,10 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/vault/list") == 0) {
         handle_vault_list(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/vault/delete") == 0) {
+        handle_vault_delete(pool, req, conn);
         return;
     }
 

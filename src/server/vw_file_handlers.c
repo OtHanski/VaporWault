@@ -2830,7 +2830,21 @@ static vw_err_t handle_vault_list(vw_store_t *store, vw_vault_store_t *vs,
  * since deleting it would strand that version's wrapped DEK and make its
  * content permanently unrecoverable. vw_vault_delete() itself enforces
  * "caller must be the vault's owner_id" (same convention as
- * SHARE_REVOKE/LINK_REVOKE, §7.5). */
+ * SHARE_REVOKE/LINK_REVOKE, §7.5).
+ *
+ * The not-empty/vw_vault_delete outcome is embedded in the ACK's
+ * error_code field, never sent via the generic send_error()/VW_MSG_ERROR
+ * path (unlike the plen/vs-null checks above, which are structural wire
+ * failures, not business-logic outcomes) — matching
+ * handle_share_or_link_revoke's exact convention. This was originally
+ * gotten wrong (send_error() used for the not-empty case) and broke any
+ * client using a fixed 4-byte ACK receive buffer sized for error_code
+ * alone: vw_proto_encode_error's VW_MSG_ERROR payload is 8 bytes
+ * (code + a zero message length), so vw_client_core.c's revoke_common()
+ * failed with VW_ERR_PROTO_TOO_LARGE trying to receive it into rbuf[4] —
+ * caught via a real gateway integration test (test_gateway.py), not the
+ * wire-level Python test (vw_client.py's generic large receive buffer
+ * never hit the size mismatch, masking the bug there). */
 static vw_err_t handle_vault_delete(vw_store_t *store, vw_file_store_t *fs,
                                      vw_vault_store_t *vs, vw_conn_t *conn,
                                      const uint8_t *payload, uint32_t plen)
@@ -2847,12 +2861,8 @@ static vw_err_t handle_vault_delete(vw_store_t *store, vw_file_store_t *fs,
 
     int in_use = 0;
     err = vw_store_version_vault_in_use(fs, vault_id, &in_use);
-    if (err != VW_OK)
-        return (send_error(conn, err), VW_OK);
-    if (in_use)
-        return (send_error(conn, VW_ERR_VAULT_NOT_EMPTY), VW_OK);
-
-    err = vw_vault_delete(vs, vault_id, user_id);
+    if (err == VW_OK && in_use) err = VW_ERR_VAULT_NOT_EMPTY;
+    if (err == VW_OK) err = vw_vault_delete(vs, vault_id, user_id);
 
     uint8_t ack[4];
     vw_write_u32le(ack, (uint32_t)(err == VW_OK ? 0u : (uint32_t)err));

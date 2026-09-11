@@ -30,6 +30,7 @@ import {
   vaultCreate,
   vaultKeyFetch,
   vaultList,
+  vaultDelete,
   uploadFileEncrypted,
   downloadFileEncrypted,
   search,
@@ -89,6 +90,7 @@ const vaultBanner = el<HTMLElement>("vault-banner");
 const vaultBannerText = el<HTMLElement>("vault-banner-text");
 const vaultUnlockBtn = el<HTMLButtonElement>("vault-unlock-btn");
 const vaultLockBtn = el<HTMLButtonElement>("vault-lock-btn");
+const vaultDeleteBtn = el<HTMLButtonElement>("vault-delete-btn");
 
 const historyView = el<HTMLElement>("history-view");
 const historyFileLabel = el<HTMLElement>("history-file-label");
@@ -493,6 +495,32 @@ vaultLockBtn.addEventListener("click", () => {
 vaultUnlockBtn.addEventListener("click", () => {
   void handleUnlockVault();
 });
+
+vaultDeleteBtn.addEventListener("click", () => {
+  void handleDeleteVault();
+});
+
+async function handleDeleteVault(): Promise<void> {
+  if (!currentFolderVaultId) return;
+  if (!window.confirm(
+    "Delete this vault registration? This does not delete any files - " +
+      "you must delete everything inside this folder first, or this will fail.",
+  )) return;
+
+  const result = await vaultDelete(currentFolderVaultId);
+  if (!result.ok) {
+    const status = result.data.status ?? "error";
+    showError(
+      browserError,
+      status === "vault_not_empty"
+        ? "Could not delete vault: this folder still has files in it. Delete them first."
+        : `Could not delete vault: ${status}`,
+    );
+    return;
+  }
+  lockVault();
+  await refreshVaultBanner();
+}
 
 async function handleUnlockVault(): Promise<void> {
   const passphrase = window.prompt(

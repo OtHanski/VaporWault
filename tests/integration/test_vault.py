@@ -35,7 +35,7 @@ import pytest
 
 from vw_client import (
     VwClient, VwProtocolError,
-    VW_ERR_NOT_FOUND, VW_ERR_PERMISSION, VW_ERR_INVALID_ARG,
+    VW_ERR_NOT_FOUND, VW_ERR_PERMISSION, VW_ERR_INVALID_ARG, VW_ERR_VAULT_NOT_EMPTY,
 )
 
 PASSWORD = "TestP@ssw0rd!"
@@ -311,3 +311,92 @@ def test_version_chunks_surfaces_vault_id_and_wrapped_dek(server, admin_client, 
         assert hashes2 == [chash2]
     finally:
         owner.close()
+
+
+# ── VAULT_DELETE (TASK-00274/00275) ──────────────────────────────────────────
+
+def test_vault_delete_removes_it_from_list_and_key_fetch(server, admin_client, unique_username):
+    owner, otoken = _setup_user(admin_client, server, unique_username)
+    try:
+        fid, _ = owner.upload_file(otoken, "/secret.bin", b"placeholder")
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+
+        owner.vault_delete(otoken, vault_id)
+
+        with pytest.raises(VwProtocolError) as exc_info:
+            owner.vault_key_fetch(otoken, vault_id)
+        assert exc_info.value.code == VW_ERR_NOT_FOUND
+
+        remaining = {v["vault_id"] for v in owner.vault_list(otoken)}
+        assert vault_id not in remaining
+    finally:
+        owner.close()
+
+
+def test_vault_delete_requires_ownership(server, admin_client, unique_username):
+    owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
+    stranger, stoken = _setup_user(admin_client, server, f"{unique_username}_stranger")
+    try:
+        fid, _ = owner.upload_file(otoken, "/secret.bin", b"placeholder")
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+
+        with pytest.raises(VwProtocolError) as exc_info:
+            stranger.vault_delete(stoken, vault_id)
+        assert exc_info.value.code == VW_ERR_PERMISSION
+
+        # Untouched — still fetchable by the real owner.
+        owner.vault_key_fetch(otoken, vault_id)
+    finally:
+        owner.close(); stranger.close()
+
+
+def test_vault_delete_unknown_or_already_deleted_not_found(server, admin_client, unique_username):
+    owner, otoken = _setup_user(admin_client, server, unique_username)
+    try:
+        with pytest.raises(VwProtocolError) as exc_info:
+            owner.vault_delete(otoken, 999999999)
+        assert exc_info.value.code == VW_ERR_NOT_FOUND
+
+        fid, _ = owner.upload_file(otoken, "/secret.bin", b"placeholder")
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+        owner.vault_delete(otoken, vault_id)
+
+        with pytest.raises(VwProtocolError) as exc_info:
+            owner.vault_delete(otoken, vault_id)
+        assert exc_info.value.code == VW_ERR_NOT_FOUND
+    finally:
+        owner.close()
+
+
+def test_vault_delete_rejects_while_a_version_still_references_it(server, admin_client, unique_username):
+    """A vault with at least one live encrypted version must not be
+    deletable — that version's wrapped_dek would become permanently
+    unrecoverable (docs/PROTOCOL.md §7.11.4)."""
+    owner, otoken = _setup_user(admin_client, server, unique_username)
+    try:
+        fid, _ = owner.upload_file(otoken, "/plain.bin", b"first version, unencrypted")
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+
+        data = b"second version, pretend-encrypted"
+        chash = hashlib.sha256(data).digest()
+        owner.chunk_upload(otoken, data)
+        owner.file_commit(otoken, "", [chash], file_id=fid, logical_size=len(data),
+                           vault_id=vault_id, wrapped_dek=os.urandom(48))
+
+        with pytest.raises(VwProtocolError) as exc_info:
+            owner.vault_delete(otoken, vault_id)
+        assert exc_info.value.code == VW_ERR_VAULT_NOT_EMPTY
+
+        # Untouched — still fully usable after the rejected delete.
+        owner.vault_key_fetch(otoken, vault_id)
+    finally:
+        owner.close()
+
+
+# Note: FILE_DELETE only soft-deletes (vw_store_file_soft_delete) — the
+# version record (and its vault_id) survives until vw_gc.c hard-deletes it
+# past trash_retention_days, so "delete becomes possible once the file is
+# deleted" isn't reproducible without a GC-tuned server fixture (see
+# test_cluster.py's gc_interval_secs/trash_retention_days server params).
+# That GC hard-delete path already has its own coverage; not duplicated
+# here.
