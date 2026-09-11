@@ -394,7 +394,7 @@ done:
      * stops, never touching the trailing block; a new client checks for
      * enough remaining bytes before reading it. No entry-length wrapper or
      * protocol version bump needed, unlike the per-entry-wrapping approach
-     * TODO/TASK-109.md originally sketched — a trailing parallel array
+     * TODO/done/TASK-00109.md originally sketched — a trailing parallel array
      * sidesteps that entirely because it doesn't interleave new data
      * inside each entry's own byte range.
      * TASK-156: followed by a second trailing, parallel array of all_len *
@@ -2779,6 +2779,10 @@ typedef struct {
 static int vault_list_cb(const vw_vault_record_t *rec, void *ud)
 {
     vault_list_ctx_t *c = (vault_list_ctx_t *)ud;
+    /* vw_vault_scan now returns every allocated record, deleted included
+     * (CQR.08 API-consistency fix, matches vw_share_scan's convention) —
+     * VAULT_LIST must filter deleted vaults out itself. */
+    if (rec->deleted) return 0;
     if (rec->owner_id != c->user_id) return 0;
 
     uint32_t entry_cap = 8u + 8u + 8u;
@@ -2822,6 +2826,79 @@ static vw_err_t handle_vault_list(vw_store_t *store, vw_vault_store_t *vs,
     err = vw_proto_send(conn, VW_MSG_VAULT_LIST_RESP, resp, 4u + c.len);
     free(resp);
     return err;
+}
+
+/* VAULT_DELETE (TASK-00277): session_token[32] + vault_id(u64).
+ * ACK: error_code(u32). Refuses with VW_ERR_VAULT_NOT_EMPTY if any file
+ * version — current or superseded — still references this vault_id,
+ * since deleting it would strand that version's wrapped DEK and make its
+ * content permanently unrecoverable. vw_vault_delete() itself enforces
+ * "caller must be the vault's owner_id" (same convention as
+ * SHARE_REVOKE/LINK_REVOKE, §7.5).
+ *
+ * The not-empty/vw_vault_delete outcome is embedded in the ACK's
+ * error_code field, never sent via the generic send_error()/VW_MSG_ERROR
+ * path (unlike the plen/vs-null checks above, which are structural wire
+ * failures, not business-logic outcomes) — matching
+ * handle_share_or_link_revoke's exact convention. This was originally
+ * gotten wrong (send_error() used for the not-empty case) and broke any
+ * client using a fixed 4-byte ACK receive buffer sized for error_code
+ * alone: vw_proto_encode_error's VW_MSG_ERROR payload is 8 bytes
+ * (code + a zero message length), so vw_client_core.c's revoke_common()
+ * failed with VW_ERR_PROTO_TOO_LARGE trying to receive it into rbuf[4] —
+ * caught via a real gateway integration test (test_gateway.py), not the
+ * wire-level Python test (vw_client.py's generic large receive buffer
+ * never hit the size mismatch, masking the bug there). */
+static vw_err_t handle_vault_delete(vw_store_t *store, vw_file_store_t *fs,
+                                     vw_vault_store_t *vs, vw_conn_t *conn,
+                                     const uint8_t *payload, uint32_t plen)
+{
+    uint64_t user_id, scope_share_id = 0;
+    vw_err_t err = validate_session(store, conn, payload, plen, &user_id, &scope_share_id);
+    if (err != VW_OK) return err;
+    if (reject_if_scoped(conn, scope_share_id)) return VW_OK;
+    if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
+
+    if (plen < VW_TOKEN_BYTES + 8u)
+        return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
+    uint64_t vault_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
+
+    /* SEC.07 review finding: ownership must be checked BEFORE the
+     * not-empty scan below. vw_store_version_vault_in_use() takes no
+     * caller identity and will happily report on any vault_id -- running
+     * it first let any authenticated user enumerate small vault_id
+     * integers and learn whether another user's vault currently holds
+     * live encrypted content (VAULT_NOT_EMPTY) vs. is empty or doesn't
+     * exist, with zero relationship to that vault. Mere vault_id
+     * existence is already an accepted oracle in this codebase
+     * (VAULT_KEY_FETCH's own comment: "vault_id is an opaque counter
+     * like share_id, not something whose mere existence needs hiding"),
+     * but content-presence is a real, additional leak that must require
+     * ownership first -- same vw_vault_get_by_id + owner-check pattern
+     * VAULT_KEY_FETCH already uses.
+     *
+     * Every outcome below funnels into the single ACK send at the bottom
+     * rather than an early send_error() return -- send_error() emits an
+     * 8-byte VW_MSG_ERROR payload that overflows vw_client_core.c's
+     * revoke_common(), which sizes its receive buffer for the real
+     * 4-byte ACK it expects (the exact bug TASK-00275's own correction
+     * note already documents for this same handler's not-empty path). */
+    vw_vault_record_t rec;
+    uint8_t *unused_vk = NULL, *unused_params = NULL;
+    err = vw_vault_get_by_id(vs, vault_id, &rec, &unused_vk, &unused_params);
+    free(unused_vk); free(unused_params);
+    if (err == VW_OK && rec.owner_id != user_id) err = VW_ERR_PERMISSION;
+
+    if (err == VW_OK) {
+        int in_use = 0;
+        err = vw_store_version_vault_in_use(fs, vault_id, &in_use);
+        if (err == VW_OK && in_use) err = VW_ERR_VAULT_NOT_EMPTY;
+    }
+    if (err == VW_OK) err = vw_vault_delete(vs, vault_id, user_id);
+
+    uint8_t ack[4];
+    vw_write_u32le(ack, (uint32_t)(err == VW_OK ? 0u : (uint32_t)err));
+    return vw_proto_send(conn, VW_MSG_VAULT_DELETE_ACK, ack, sizeof(ack));
 }
 
 /* ── SEARCH (TASK-196/197/198; docs/PROTOCOL.md §7.12) ──────────────────────
@@ -3234,6 +3311,7 @@ static int is_write_shaped_msg(vw_msg_type_t type)
     case VW_MSG_LINK_CREATE:
     case VW_MSG_LINK_REVOKE:
     case VW_MSG_VAULT_CREATE:
+    case VW_MSG_VAULT_DELETE:
     case VW_MSG_NOTIFY_PREFS_SET:
     case VW_MSG_ACCOUNT_EMAIL_SET:
     case VW_MSG_ACCOUNT_2FA_SET:
@@ -3354,6 +3432,8 @@ vw_err_t vw_server_dispatch_file_op(vw_server_ctx_t *ctx,
         return handle_vault_key_fetch(store, vs, conn, payload, plen);
     case VW_MSG_VAULT_LIST:
         return handle_vault_list(store, vs, conn, payload, plen);
+    case VW_MSG_VAULT_DELETE:
+        return handle_vault_delete(store, fs, vs, conn, payload, plen);
     case VW_MSG_SEARCH:
         return handle_search(store, fs, ss, conn, payload, plen);
     default:

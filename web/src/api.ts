@@ -545,6 +545,14 @@ export function vaultList(): Promise<ApiResult<VaultEntry[]>> {
   return apiPost("/api/vault/list", {});
 }
 
+// Soft-delete (TASK-00280; server: TASK-00277, docs/PROTOCOL.md §7.11.4).
+// Fails with status "vault_not_empty" (409) if any file version still
+// references this vault_id - the caller must delete every file under the
+// vault's folder first.
+export function vaultDelete(vaultId: number): Promise<ApiResult<StatusResponse>> {
+  return apiPost("/api/vault/delete", { vault_id: vaultId });
+}
+
 /*
  * Vault-encrypted upload/download (TASK-141): same chunk-transfer loop as
  * uploadFile/downloadFile above, but every chunk is encrypted/decrypted

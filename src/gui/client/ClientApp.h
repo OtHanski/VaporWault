@@ -141,6 +141,7 @@ public:
     int  ipc_vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id);
     int  ipc_vault_unlock(uint64_t vault_id, char *passphrase);
     bool ipc_vault_list(std::vector<VwGuiVaultEntry> *out, int *out_error_code);
+    int  ipc_vault_delete(uint64_t vault_id);
     int  ipc_vault_upload(uint64_t vault_id, uint64_t file_id,
                            const char *leaf_name, const char *local_path,
                            uint64_t *out_file_id, uint64_t *out_version_id);

@@ -2174,6 +2174,11 @@ vw_err_t vw_client_vault_list(vw_client_sess_t *sess,
     return VW_OK;
 }
 
+vw_err_t vw_client_vault_delete(vw_client_sess_t *sess, uint64_t vault_id)
+{
+    return revoke_common(sess, vault_id, VW_MSG_VAULT_DELETE, VW_MSG_VAULT_DELETE_ACK);
+}
+
 vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
                                  const uint8_t link_token[32],
                                  const char *password,

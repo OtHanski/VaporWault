@@ -306,6 +306,7 @@ vw_err_t vw_vault_get_by_id(vw_vault_store_t *s, uint64_t vault_id,
         return VW_ERR_IO;
     }
     if (rec.vault_id != vault_id) { vlt_rwlock_runlock(&s->lock); return VW_ERR_NOT_FOUND; }
+    if (rec.deleted) { vlt_rwlock_runlock(&s->lock); return VW_ERR_NOT_FOUND; }
 
     uint8_t *vk = NULL, *params = NULL;
     if (rec.wrapped_vk_len > 0) {
@@ -358,4 +359,46 @@ vw_err_t vw_vault_scan(vw_vault_store_t *s,
     free(buf);
     vlt_rwlock_runlock(&s->lock);
     return VW_OK;
+}
+
+vw_err_t vw_vault_delete(vw_vault_store_t *s, uint64_t vault_id,
+                          uint64_t caller_user_id)
+{
+    if (!s || vault_id == 0) return VW_ERR_INVALID_ARG;
+
+    vlt_rwlock_wlock(&s->lock);
+
+    if (vault_id >= s->vid_to_slot_cap || s->vid_to_slot[vault_id] == 0) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    uint64_t slot = s->vid_to_slot[vault_id];
+    uint64_t off  = slot * (uint64_t)sizeof(vw_vault_record_t);
+
+    vw_vault_record_t rec;
+    if (fs_pread(s->db_path, &rec, sizeof(rec), off) != 0 || rec.vault_id != vault_id) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    if (rec.deleted) { vlt_rwlock_wunlock(&s->lock); return VW_ERR_NOT_FOUND; }
+    if (rec.owner_id != caller_user_id) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_PERMISSION;
+    }
+
+    uint64_t eid = 0;
+    vw_err_t rc = vw_oplog_append(s->oplog, VW_OPLOG_VAULT_DELETE,
+                                   &rec.owner_id, (uint32_t)sizeof(rec.owner_id), &eid);
+    if (rc != VW_OK) { vlt_rwlock_wunlock(&s->lock); return rc; }
+
+    uint64_t field_off = off + (uint64_t)offsetof(vw_vault_record_t, deleted);
+    uint8_t one = 1u;
+    rc = vw_fs_pwrite(s->db_path, field_off, &one, sizeof(one));
+    if (rc == VW_OK) rc = vw_fs_sync_file(s->db_path);
+
+    if (rc == VW_OK) (void)vw_oplog_confirm(s->oplog, eid);
+    else             (void)vw_oplog_abort(s->oplog, eid);
+
+    vlt_rwlock_wunlock(&s->lock);
+    return rc;
 }

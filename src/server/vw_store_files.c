@@ -1173,6 +1173,29 @@ vw_err_t vw_store_version_list(vw_file_store_t *fs,
     return VW_OK;
 }
 
+vw_err_t vw_store_version_vault_in_use(vw_file_store_t *fs, uint64_t vault_id,
+                                        int *out_in_use)
+{
+    if (!fs || !out_in_use || vault_id == 0) return VW_ERR_INVALID_ARG;
+    *out_in_use = 0;
+
+    rwlock_rdlock(&fs->versions_lock);
+
+    uint64_t s;
+    for (s = 1; s < fs->version_slots; s++) {
+        vw_version_record_t rec;
+        uint64_t off = s * (uint64_t)sizeof(vw_version_record_t);
+        if (fs_pread(fs->versions_path, &rec, sizeof(rec), off) != 0) continue;
+        if (rec.version_id == 0) continue;
+        if (rec.vault_id != vault_id) continue;
+        *out_in_use = 1;
+        break;
+    }
+
+    rwlock_rdunlock(&fs->versions_lock);
+    return VW_OK;
+}
+
 /* ── File GC helpers ─────────────────────────────────────────────────────── */
 
 vw_err_t vw_store_file_scan_deleted(vw_file_store_t *fs,

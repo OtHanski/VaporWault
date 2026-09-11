@@ -376,7 +376,15 @@ How a feature moves from idea to complete across the full team.
 ### Step 1 — Design & decompose (ARCH.00)
 Architect writes the feature's API contract in `ARCHITECTURE.md` and creates a dependency
 graph of TASK files. Each task has exactly one assignee and lists its blockers. Review
-requirements and priority are set here.
+requirements and priority are set here. For any feature that touches the wire protocol,
+file the GUI.03 and WEB.09 integration tasks in this same breakdown, blocked on the
+relevant CLI.02 task, rather than leaving them to be filed reactively once someone later
+notices the GUI or web frontend never caught up (found missing in practice: a full-project
+review, `TASK-00269`, found GUI.03 and WEB.09 both sitting well behind SRV.01 in total task
+count, and several GUI views — audit log, search, version history — landing only after a
+gap was separately noticed post-launch, per `TASK-00277`). `TASK-00185`'s breakdown (public
+link password protection: protocol → server → client → GUI → web, all filed together) is
+the pattern to follow.
 
 ### Step 2 — Protocol spec (PRT.04)
 If the feature touches the wire, PRT.04 publishes the relevant `docs/PROTOCOL.md` section
@@ -408,6 +416,16 @@ ARCH.00 closes the milestone.
 ### Step 8 — Milestone closure (ARCH.00)
 Architect marks all feature tasks done, updates `ARCHITECTURE.md` with decisions that
 emerged during implementation, and opens the next feature's tasks to start the cycle.
+**Update `ARCHITECTURE.md`'s Implementation Phases table in this same change** — add or
+correct the feature's phase row now, not on a later backfill pass. This is not optional
+housekeeping: the same phase table drifted stale from actual `TODO/` state three separate
+times before this rule was written (an initial 2026-07-29 review, `TASK-00118`,
+`TASK-00204`), each time caught only by a manual audit weeks later, sometimes finding
+entire shipped phases missing a row entirely. A full-project review (`TASK-00269`)
+confirmed the pattern was still live and traced it to exactly this gap: the fix the
+document's own audit notes had already proposed was never written down anywhere an agent
+would see it before closing a milestone. Closing a milestone without this update is an
+incomplete milestone closure, not a deferred documentation task.
 
 ---
 

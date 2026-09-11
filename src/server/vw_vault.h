@@ -43,7 +43,12 @@ typedef struct {
     uint32_t wrapped_vk_len;
     uint32_t kdf_params_len;
     uint8_t  kdf_salt[16];     /* Argon2id salt; fixed size per §7.11.4         */
-    uint8_t  _pad[32];
+    uint8_t  deleted;          /* TASK-00277: soft-delete flag, same convention
+                                 * as vw_share_record_t.revoked — a record whose
+                                 * trailing bytes were always zero (every prior
+                                 * write path memset the old _pad[32] to 0) reads
+                                 * back deleted==0 for free, no migration needed */
+    uint8_t  _pad[31];
 } vw_vault_record_t;
 
 _Static_assert(sizeof(vw_vault_record_t) == 96,
@@ -100,14 +105,39 @@ vw_err_t vw_vault_get_by_id(vw_vault_store_t *vs, uint64_t vault_id,
                              uint8_t **out_wrapped_vk, uint8_t **out_kdf_params);
 
 /*
- * Scan every vault record. callback returning non-zero stops the scan.
- * Holds a read lock for the entire scan; the callback must NOT call any
- * other vw_vault_store_t function. Does not fetch blob contents — call
+ * Scan every allocated vault record, including soft-deleted ones —
+ * matching vw_share_scan's convention of returning everything and
+ * letting the caller filter (CQR.08 API-consistency finding, TASK-00275
+ * review pass), rather than vw_vault_scan silently deciding what counts
+ * as "gone" on every caller's behalf. Check rec->deleted in the callback
+ * if a caller wants live vaults only (handle_vault_list's vault_list_cb
+ * does exactly this). callback returning non-zero stops the scan. Holds
+ * a read lock for the entire scan; the callback must NOT call any other
+ * vw_vault_store_t function. Does not fetch blob contents — call
  * vw_vault_get_by_id for those if the scan's caller needs them.
  */
 vw_err_t vw_vault_scan(vw_vault_store_t *vs,
                         int (*callback)(const vw_vault_record_t *rec, void *ud),
                         void *userdata);
+
+/*
+ * Soft-delete a vault registration (TASK-00277). Only the vault's
+ * owner_id may delete it: returns VW_ERR_PERMISSION otherwise, and
+ * VW_ERR_NOT_FOUND if the vault doesn't exist or was already deleted.
+ *
+ * Does NOT check whether any file version still references this
+ * vault_id — the caller (handle_vault_delete) must confirm the vault is
+ * empty first via vw_store_version_vault_in_use(), the same cross-module
+ * ordering handle_file_commit already uses to validate a vault_id against
+ * a real vault before accepting a commit (vw_vault.c is deliberately kept
+ * free of any vw_store_files.h dependency).
+ *
+ * Once deleted, vw_vault_get_by_id() returns VW_ERR_NOT_FOUND for this
+ * vault_id and vw_vault_scan() no longer visits it — matching
+ * vw_share_revoke's "revoked reads as gone" convention (vw_share.c).
+ */
+vw_err_t vw_vault_delete(vw_vault_store_t *vs, uint64_t vault_id,
+                          uint64_t caller_user_id);
 
 #ifdef __cplusplus
 }

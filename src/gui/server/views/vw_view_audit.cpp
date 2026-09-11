@@ -78,6 +78,7 @@ const char *VwViewAudit::op_type_name(uint8_t op_type)
     case VW_OPLOG_SESSION_WRITE: return "Session Write";
     case VW_OPLOG_CHUNK_WRITE:   return "Chunk Write";
     case VW_OPLOG_VAULT_WRITE:   return "Vault Write";
+    case VW_OPLOG_VAULT_DELETE:  return "Vault Delete";
     case VW_OPLOG_FILE_CREATE:   return "File Create";
     case VW_OPLOG_FILE_UPDATE:   return "File Update";
     case VW_OPLOG_FILE_VERSION:  return "File Version";
@@ -124,11 +125,13 @@ bool VwViewAudit::render(ServerApp &app)
     static const char *kTypeNames[] = {
         "All types", "User Write", "File Create", "File Update", "File Version",
         "File Delete", "Perm Write", "Session Write", "Chunk Write", "Vault Write",
+        "Vault Delete",
     };
     static const uint8_t kTypeValues[] = {
         0, VW_OPLOG_USER_WRITE, VW_OPLOG_FILE_CREATE, VW_OPLOG_FILE_UPDATE,
         VW_OPLOG_FILE_VERSION, VW_OPLOG_FILE_DELETE, VW_OPLOG_PERM_WRITE,
         VW_OPLOG_SESSION_WRITE, VW_OPLOG_CHUNK_WRITE, VW_OPLOG_VAULT_WRITE,
+        VW_OPLOG_VAULT_DELETE,
     };
     int type_idx = 0;
     if (filter_op_type_ >= 0) {
@@ -266,7 +269,8 @@ bool VwViewAudit::parse_audit_resp(const uint8_t *buf, uint32_t len)
                      (unsigned long long)slot);
             /* Not a user id — a session slot index — so left unattributed
              * for the purposes of the user filter. */
-        } else if ((op_type == VW_OPLOG_PERM_WRITE || op_type == VW_OPLOG_VAULT_WRITE) &&
+        } else if ((op_type == VW_OPLOG_PERM_WRITE || op_type == VW_OPLOG_VAULT_WRITE ||
+                    op_type == VW_OPLOG_VAULT_DELETE) &&
                    plen >= 8) {
             uint64_t owner = vw_read_u64le(payload);
             snprintf(detail_buf, sizeof(detail_buf), "owner_id=%llu",

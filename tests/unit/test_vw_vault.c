@@ -115,8 +115,21 @@ typedef struct {
 static int count_by_owner_cb(const vw_vault_record_t *rec, void *ud)
 {
     scan_ctx_t *c = (scan_ctx_t *)ud;
+    /* vw_vault_scan visits every allocated record, deleted included
+     * (CQR.08 API-consistency fix, matches vw_share_scan's convention) —
+     * a "live vaults" counter must filter deleted itself, same as
+     * production's vault_list_cb does. */
+    if (rec->deleted) return 0;
     c->total++;
     if (rec->owner_id == c->owner_id) c->matched++;
+    return 0;
+}
+
+static int count_all_cb(const vw_vault_record_t *rec, void *ud)
+{
+    (void)rec;
+    uint32_t *count = (uint32_t *)ud;
+    (*count)++;
     return 0;
 }
 
@@ -248,6 +261,85 @@ VW_TEST_SUITE("vw_vault") {
             VW_ASSERT_OK(vw_vault_scan(s.vs, count_by_owner_cb, &c));
             VW_ASSERT_EQ(3, (int)c.total);
             VW_ASSERT_EQ(2, (int)c.matched);
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("delete removes a vault from get_by_id and scan (TASK-00277)") {
+        vault_stack_t s = {0};
+        stack_open(&s, "delete_basic");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 10));
+
+            vw_vault_record_t rec;
+            uint8_t *vk = NULL, *params = NULL;
+            VW_ASSERT_EQ((int)VW_ERR_NOT_FOUND,
+                (int)vw_vault_get_by_id(s.vs, vid, &rec, &vk, &params));
+
+            scan_ctx_t c = { 10, 0, 0 };
+            VW_ASSERT_OK(vw_vault_scan(s.vs, count_by_owner_cb, &c));
+            VW_ASSERT_EQ(0, (int)c.total);
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("scan still visits a deleted vault -- caller filters, matching vw_share_scan's convention") {
+        vault_stack_t s = {0};
+        stack_open(&s, "delete_scan_visits");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 10));
+
+            uint32_t total = 0;
+            VW_ASSERT_OK(vw_vault_scan(s.vs, count_all_cb, &total));
+            VW_ASSERT_EQ(1, (int)total);
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("delete rejects a non-owner caller with PERMISSION, leaving the vault intact") {
+        vault_stack_t s = {0};
+        stack_open(&s, "delete_permission");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+
+            VW_ASSERT_EQ((int)VW_ERR_PERMISSION, (int)vw_vault_delete(s.vs, vid, 999));
+
+            vw_vault_record_t rec;
+            uint8_t *vk = NULL, *params = NULL;
+            VW_ASSERT_OK(vw_vault_get_by_id(s.vs, vid, &rec, &vk, &params));
+            free(vk); free(params);
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("delete on an unknown or already-deleted vault returns NOT_FOUND, not a crash") {
+        vault_stack_t s = {0};
+        stack_open(&s, "delete_not_found");
+        {
+            VW_ASSERT_EQ((int)VW_ERR_NOT_FOUND, (int)vw_vault_delete(s.vs, 999999, 1));
+
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 1, 1, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 1));
+            VW_ASSERT_EQ((int)VW_ERR_NOT_FOUND, (int)vw_vault_delete(s.vs, vid, 1));
         }
         stack_close(&s);
     }
@@ -392,6 +484,51 @@ VW_TEST_SUITE("vw_vault") {
             uint64_t version_id = 0;
             VW_ASSERT_EQ((int)VW_ERR_INVALID_ARG,
                 (int)vw_store_version_create(fs, &ver, NULL, NULL, 0, &version_id));
+
+            vw_file_store_close(fs);
+            vw_oplog_close(oplog);
+        }
+        rm_rf(tmpdir);
+    }
+
+    VW_TEST_CASE("vw_store_version_vault_in_use finds a live reference and ignores unrelated vault_ids (TASK-00277)") {
+        char tmpdir[512];
+        make_tmpdir(tmpdir, sizeof(tmpdir), "vault_in_use");
+        {
+            vw_oplog_t *oplog = NULL;
+            vw_file_store_t *fs = NULL;
+            VW_ASSERT_OK(vw_oplog_open(tmpdir, &oplog));
+            VW_ASSERT_OK(vw_file_store_open(tmpdir, oplog, &fs));
+
+            vw_file_record_t frec;
+            memset(&frec, 0, sizeof(frec));
+            frec.owner_id   = 1;
+            frec.entry_type = VW_ENTRY_FILE;
+            snprintf(frec.name, sizeof(frec.name), "encrypted.bin");
+            uint64_t file_id = 0;
+            VW_ASSERT_OK(vw_store_file_create(fs, &frec, &file_id));
+
+            uint8_t chunk_hash[32] = {0};
+            uint8_t wrapped_dek[8] = {0};
+
+            vw_version_record_t ver;
+            memset(&ver, 0, sizeof(ver));
+            ver.file_id     = file_id;
+            ver.chunk_count = 1;
+            ver.vault_id    = 42;
+            uint64_t version_id = 0;
+            VW_ASSERT_OK(vw_store_version_create(fs, &ver, chunk_hash,
+                                                  wrapped_dek, sizeof(wrapped_dek), &version_id));
+
+            int in_use = -1;
+            VW_ASSERT_OK(vw_store_version_vault_in_use(fs, 42, &in_use));
+            VW_ASSERT_EQ(1, in_use);
+
+            /* An unrelated vault_id — including one that has never had any
+             * version at all — must read back as not in use. */
+            in_use = -1;
+            VW_ASSERT_OK(vw_store_version_vault_in_use(fs, 43, &in_use));
+            VW_ASSERT_EQ(0, in_use);
 
             vw_file_store_close(fs);
             vw_oplog_close(oplog);

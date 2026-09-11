@@ -608,6 +608,22 @@ static vw_vault_t *vault_registry_find(daemon_vault_registry_t *reg, uint64_t va
     return NULL;
 }
 
+/* Removes vault_id's entry if present, closing its unlocked vw_vault_t
+ * handle. A no-op (not an error) if vault_id was never unlocked this
+ * daemon session — VAULT_DELETE against a vault this process holds no
+ * in-memory handle for is a normal case, not a bug. */
+static void vault_registry_remove(daemon_vault_registry_t *reg, uint64_t vault_id) {
+    for (size_t i = 0; i < reg->count; i++) {
+        if (reg->entries[i].vault_id == vault_id) {
+            vw_vault_close(reg->entries[i].vault);
+            memmove(&reg->entries[i], &reg->entries[i + 1],
+                    (reg->count - i - 1) * sizeof(*reg->entries));
+            reg->count--;
+            return;
+        }
+    }
+}
+
 /* Takes ownership of `vault` (caller must not vw_vault_close it itself).
  * If vault_id is already registered, the old handle is closed and
  * replaced — VAULT_CREATE/_UNLOCK are idempotent from the caller's view. */
@@ -1743,6 +1759,29 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         free(entries);
         vw_ipc_send(conn, VW_IPC_VAULT_LIST_RESP, rbuf, roff);
         free(rbuf);
+        break;
+    }
+
+    case VW_IPC_VAULT_DELETE_REQ: {
+        if (plen < 12u) {
+            ipc_send_u32(conn, VW_IPC_VAULT_DELETE_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED);
+            break;
+        }
+        uint32_t account_id = vw_read_u32le(buf);
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            ipc_send_u32(conn, VW_IPC_VAULT_DELETE_RESP,
+                         (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+        if (account_is_read_only(a)) {
+            ipc_send_u32(conn, VW_IPC_VAULT_DELETE_RESP, (uint32_t)VW_ERR_READ_ONLY_FALLBACK);
+            break;
+        }
+        uint64_t vault_id = vw_read_u64le(buf + 4u);
+        vw_err_t rc = vw_client_vault_delete(a->sess, vault_id);
+        if (rc == VW_OK) vault_registry_remove(&a->vaults, vault_id);
+        ipc_send_u32(conn, VW_IPC_VAULT_DELETE_RESP, (uint32_t)rc);
         break;
     }
 

@@ -116,6 +116,8 @@ typedef enum {
     VW_IPC_VAULT_UPLOAD_RESP  = 0x802A, /* D→C: error_code + file_id + version_id */
     VW_IPC_VAULT_DOWNLOAD_REQ = 0x802B, /* C→D: download+decrypt to a local path  */
     VW_IPC_VAULT_DOWNLOAD_RESP = 0x802C, /* D→C: error_code                       */
+    VW_IPC_VAULT_DELETE_REQ   = 0x802D, /* C→D: soft-delete a vault (TASK-00278)  */
+    VW_IPC_VAULT_DELETE_RESP  = 0x802E, /* D→C: error_code                        */
 
     /* TASK-106: add a sync folder rooted at a SHARED item (by file_id)
      * rather than an owned virtual path — a separate message pair rather
@@ -206,6 +208,31 @@ typedef enum {
     VW_IPC_ACCOUNT_2FA_SET_ACK  = 0x804C, /* D→C: error_code + otp_enabled       */
     VW_IPC_ACCOUNT_2FA_GET_REQ  = 0x804D, /* C→D: account_id                    */
     VW_IPC_ACCOUNT_2FA_GET_RESP = 0x804E, /* D→C: error_code + otp_enabled      */
+
+    /* TASK-00281/00282 (full-project review, TASK-00269): live, file_id-
+     * addressed folder listing for a shared item the caller has no
+     * owner-namespaced path for — the desktop GUI's "shared with me" view
+     * has been flat-list-only for lack of exactly this, even though
+     * nothing on the wire ever needed it: FILE_LIST's existing
+     * `dir_file_id` field (TASK-106) plus `vw_share_resolve_permission`'s
+     * ancestor-chain walk (`is_file_or_ancestor`, `vw_share.c`) already
+     * let a grant-holder list ANY descendant directory of a shared folder,
+     * to unbounded depth, with correct permission inheritance — the sync
+     * engine already relies on exactly this (`vw_sync.c`'s shared-folder
+     * BFS calls `vw_client_file_list_by_id` directly). The only real gap
+     * was that no daemon IPC message exposed this live (non-cache) lookup
+     * to a GUI/CLI caller — `VW_IPC_FILE_LIST_REQ` above only ever queries
+     * the local sync *cache*, which has no entries for a shared folder the
+     * user hasn't explicitly added as a sync target
+     * (`VW_IPC_FOLDER_ADD_SHARED_REQ`). No `docs/PROTOCOL.md` change of
+     * any kind was needed — same shape as `VW_IPC_VERSION_LIST_BY_ID_REQ`
+     * above: a thin daemon-IPC passthrough to an already-existing,
+     * already-used client-core function. `recursive` mirrors
+     * `vw_client_file_list_by_id`'s own parameter — 0 for one directory
+     * level (what a browsing UI wants per click), left available for a
+     * future caller that wants a full subtree in one round trip. */
+    VW_IPC_SHARED_FOLDER_LIST_REQ  = 0x804F, /* C→D: account_id + dir_file_id + recursive(u8) */
+    VW_IPC_SHARED_FOLDER_LIST_RESP = 0x8050, /* D→C: error_code + count + vw_file_entry_t-shaped entries (see payload doc below) */
 } vw_ipc_msg_t;
 
 /*
@@ -500,6 +527,17 @@ typedef enum {
  * VW_IPC_VAULT_DOWNLOAD_RESP:
  *   u32 error_code
  *
+ * VW_IPC_VAULT_DELETE_REQ (TASK-00278):
+ *   u32    account_id
+ *   u64    vault_id        need not currently be unlocked — deletion only
+ *                          needs ownership, not the unwrapped VK
+ * VW_IPC_VAULT_DELETE_RESP:
+ *   u32 error_code         VW_ERR_VAULT_NOT_EMPTY if any file version still
+ *                          references this vault_id (docs/PROTOCOL.md
+ *                          §7.11.4). On success, vault_id is also dropped
+ *                          from this account's in-memory unlocked-vault
+ *                          registry if it was present there.
+ *
  * VW_IPC_FOLDER_ADD_SHARED_REQ:
  *   u32    account_id
  *   string local_root      local filesystem directory to sync into
@@ -629,6 +667,46 @@ typedef enum {
  *   u32 error_code         vw_err_t; 0 = VW_OK. Works while on fallback
  *                          (read-only) since this is a read.
  *   u8  otp_enabled
+ *
+ * VW_IPC_SHARED_FOLDER_LIST_REQ (TASK-00281/00282):
+ *   u32    account_id
+ *   u64    dir_file_id     a shared folder's own file_id (from SHARE_LIST
+ *                          mode=1 / VW_IPC_SHARE_LIST_RESP), or any
+ *                          directory file_id previously returned by this
+ *                          same message — the caller descends one level
+ *                          at a time by re-issuing this with the clicked
+ *                          subfolder's file_id.
+ *   u8     recursive       0 = this directory's immediate children only
+ *                          (what a browsing UI wants per click); 1 = the
+ *                          whole subtree in one call (mirrors
+ *                          vw_client_file_list_by_id's own parameter,
+ *                          unused by the initial GUI consumer but free to
+ *                          expose since the client-core function already
+ *                          supports it).
+ * VW_IPC_SHARED_FOLDER_LIST_RESP:
+ *   u32    error_code      vw_err_t; 0 = VW_OK. VW_ERR_NOT_FOUND if the
+ *                          caller has no access at all to dir_file_id;
+ *                          VW_ERR_INVALID_ARG if dir_file_id names a file,
+ *                          not a directory (same ordering/anti-enumeration
+ *                          behavior as FILE_LIST's own dir_file_id path,
+ *                          docs/PROTOCOL.md §7.2 — permission is checked
+ *                          before entry_type). Works while on fallback
+ *                          (read-only) since this is a read.
+ *   u32    count
+ *   count * entry, each:
+ *     u8     entry_type    0=file, 1=dir
+ *     u64    file_id
+ *     u64    size_bytes
+ *     i64    mtime_unix
+ *     u64    version_id    current HEAD version; 0 if directory
+ *     string name          leaf name
+ *     u64    vault_id      0 = unencrypted or a directory
+ *   (same field set as vw_file_entry_t, src/client/vw_client_core.h — a
+ *   live remote listing, not a vw_cache_entry_t row, so it carries no
+ *   virtual_path/local_path/sync_state/local_mtime: those describe this
+ *   daemon's own local sync cache, which has no entries for a shared
+ *   folder the caller hasn't explicitly added as a sync target via
+ *   VW_IPC_FOLDER_ADD_SHARED_REQ)
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

@@ -145,14 +145,47 @@ no gentler removal option on the RPM side. An in-place **upgrade**
 deletes config or data on either format, and an admin-edited `server.conf`
 is never overwritten by a reinstall or upgrade on any package format.
 
-**These packages are unsigned.** No code-signing certificate or GPG
+**These packages are unsigned today.** No code-signing certificate or GPG
 signing key currently exists for this project. Installing them will
 trigger the normal OS warnings for unsigned software — `apt`/`dnf` will
 warn about an unsigned package (still installable, since these aren't
 pulled from a signed repository at all), and Windows will show its usual
-SmartScreen/unknown-publisher prompt for the `.msi`. This is an accepted
-gap, not an oversight — revisit if/when this project sets up
-code-signing infrastructure.
+SmartScreen/unknown-publisher prompt for the `.msi`.
+
+**`TASK-00287` investigation and decision (2026-09-11), re-raised by a
+full-project review after the `v0.5.0` release-build break exposed how
+little the release pipeline itself was being exercised end-to-end:**
+
+- **Linux `.deb`/`.rpm` — GPG signing: approved, follow-up task filed
+  (`TASK-00288`).** A self-issued GPG key has no ongoing cost and is the
+  standard mechanism `apt`/`dnf` repositories already expect; low
+  effort relative to the credibility gained.
+- **Windows `.msi` — Authenticode: staying unsigned, deliberately, not
+  revisited as a live gap anymore.** A real code-signing certificate
+  carries a real ongoing cost (roughly $100–500/yr depending on
+  issuer/type for a standard OV cert; an EV cert — needed to avoid
+  SmartScreen's reputation-building period entirely — costs more and
+  requires verified business identity, which a personal project doesn't
+  have). The project owner decided this isn't worth it for a hobby
+  project's release cadence. Recorded here as a permanent decision, the
+  same way the Windows installer's uninstall-data-retention behavior
+  above is a permanent decision, not a to-revisit item — don't treat an
+  unsigned `.msi` as an oversight to fix later without a real change in
+  circumstances (e.g. this project acquiring a real organizational
+  identity).
+- **Android APK — a real release keystore: approved, follow-up task
+  filed (`TASK-00289`).** Free to generate, no Play Store presence
+  needed, and meaningfully better than every contributor's shared Gradle
+  debug key even for a sideload-only artifact — see the APK section
+  below, which already anticipated exactly this follow-up.
+
+**CI secret-handling implications, flagged for SEC.07 review before either
+follow-up task's implementation lands:** a signing key living in GitHub
+Actions secrets is itself new attack surface — a compromised CI config or
+a malicious PR from a fork with workflow write access could exfiltrate
+or misuse it. Neither `TASK-00288` nor `TASK-00289` should be marked
+`done` without SEC.07 sign-off on how the key is stored, scoped, and
+rotated.
 
 ### Android APK (`vaporwault-<tag>-android.apk`)
 
@@ -176,12 +209,12 @@ worse than one that's clearly labeled. Concretely, this means:
   project — anyone can locally rebuild and produce a byte-for-byte
   equivalent signature. Do not treat this artifact's signature as an
   authenticity guarantee the way the `.sha256` checksum is.
-- If this project ever gets a Play Store presence (or otherwise needs a
-  real release identity), generate a dedicated release keystore, wire it
-  into this job via GitHub Actions secrets (matching how `SDL2_ZIP_SHA256`/
-  `WIX_ZIP_SHA256`-style supply-chain-sensitive material is already
-  handled), and update `android/app/build.gradle`'s `release` build type to
-  use it instead of `signingConfigs.debug`. Track that as a follow-up task
+- **Decided (`TASK-00287`, 2026-09-11): generate a dedicated release
+  keystore now**, even with no Play Store presence — `TASK-00289` covers
+  wiring it into this job via GitHub Actions secrets (matching how
+  `SDL2_ZIP_SHA256`/`WIX_ZIP_SHA256`-style supply-chain-sensitive material
+  is already handled) and updating `android/app/build.gradle`'s `release`
+  build type to use it instead of `signingConfigs.debug`
   against BLD.05 when it becomes relevant — not attempted here.
 
 ## 2. Cutting a release

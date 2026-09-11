@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 29 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 34 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -1222,17 +1222,27 @@ If `count == 0` the replica must wait for `replica_poll_interval_secs` (default 
 
 The replica must verify the CRC32 embedded in each `vw_oplog_entry_t` header before applying the entry. A CRC mismatch is treated as a fatal protocol error: the replica logs a WARN, discards the batch, and reconnects from the last ACK'd watermark.
 
-**OPLOG_ACK payload (new in v6):**
+**OPLOG_ACK payload (new in v6; `client_conn_count` added `TASK-00284`):**
 
 | Field              | Type   | Notes |
 |--------------------|--------|-------|
 | confirmed_entry_id | uint64 | Last oplog entry_id durably applied and fsync'd by this replica |
+| client_conn_count  | uint32 | `TASK-00284`: this replica's live `vw_conn_registry` count at send time — see below |
 
-The primary updates the stored `sync_watermark` for this node in `nodes.db` upon receiving OPLOG_ACK. The GC uses `min(sync_watermark)` across all active replicas as the safe truncation watermark.
+The primary updates the stored `sync_watermark` for this node in `nodes.db` upon receiving OPLOG_ACK. The GC uses `min(sync_watermark)` across all active replicas as the safe truncation watermark. Since `TASK-00284`, the primary also stores the received `client_conn_count` per node (in-memory only, not persisted to `nodes.db` — it is a live gauge, not durable state) for `CLUSTER_STATUS_RESP` to report.
+
+**`client_conn_count` (`TASK-00284`, replica-fallback visibility):** full-project review (`TASK-00269`) found no real signal existed for "N accounts currently running against a fallback replica" — only the approximate `replica_lag` admin alert. Design:
+
+- **Reporting path**: piggybacked onto the existing `OPLOG_PULL`/`_ACK` cycle, the same pattern `TASK-00170`'s `CLUSTER_RECORD_FETCH` and `TASK-00259`'s `CLUSTER_CHUNK_REPAIR_FETCH` both already established for reusing the authenticated `NODE_HELLO` cluster session instead of a new credential or connection. No new message pair needed — `OPLOG_ACK` already flows from every active replica to the primary roughly every `replica_poll_interval_secs` (default 5s), which is a fine-enough cadence for an admin-facing gauge.
+- **What the count actually means**: a replica's `vw_conn_registry` (`vw_conn_registry_list`, already used by the admin `CONN_LIST` query) tracks every live connection on that server's normal client-facing `vw/1` listener — and *only* that listener; the admin socket (`vw_admin.c`, a separate `AF_UNIX` path per `CLAUDE.md`'s server domain) is never in this registry. Since a replica is never anyone's configured primary target under this project's fallback design (`ARCHITECTURE.md`'s "Client-side automatic fallback" decision row) — every daemon/gateway account is configured with exactly one primary and, optionally, one fallback — a live `vw/1` connection to a replica **is**, definitionally, a client currently parked on fallback. No new bookkeeping or session-tagging needed to distinguish "fallback" connections from "ordinary" ones: on a replica, they're the same thing.
+- **Staleness**: bounded by the poll interval (≤ ~5s old at steady state, matching every other `CLUSTER_STATUS_RESP` field's own freshness bound — `sync_watermark`/`lag_entries` are exactly as stale). A session that fails back to the primary mid-window simply stops appearing in the *next* `OPLOG_ACK`, the same eventual-consistency shape `lag_entries` already has. No attempt to make this instantaneous — an admin dashboard gauge, not a correctness-critical signal.
+- **Implementation surface** (`TASK-00285`, not this task): `vw_cluster_open()` gains a new borrowed `vw_conn_registry_t *conn_registry` parameter (same borrowed-handle pattern already used for `store`/`file_store`/`chunks`/`share_store`/`vault_store`) — `vw_server_main.c` already opens the registry before calling `vw_cluster_open`, so no init-ordering change needed. The replica-side `OPLOG_ACK` send site (`vw_cluster.c`) reads `vw_conn_registry_list`'s count at send time; the primary-side receive path stores it per-node for `CLUSTER_STATUS_RESP` (below) to surface.
+
+Purely additive — no protocol version bump. An old replica (pre-`TASK-00284`) sends a 8-byte `OPLOG_ACK` the primary reads as `confirmed_entry_id` with `client_conn_count` defaulting to 0 (not misread as anything else — the primary checks the received length before reading the trailing field, same as every other optional-trailing-field convention in this document); an old primary simply never reads past `confirmed_entry_id`.
 
 **CLUSTER_STATUS payload:** No payload (request only).
 
-**CLUSTER_STATUS_RESP payload (new in v6):**
+**CLUSTER_STATUS_RESP payload (new in v6; `client_conn_count` added `TASK-00284`):**
 
 | Field      | Type   | Notes |
 |------------|--------|-------|
@@ -1242,13 +1252,14 @@ The primary updates the stored `sync_watermark` for this node in `nodes.db` upon
 
 Each node entry:
 
-| Field           | Type   | Notes |
-|-----------------|--------|-------|
-| node_id         | uint64 | |
-| is_active       | uint8  | 1 = currently connected and replicating |
-| sync_watermark  | uint64 | Last confirmed entry_id from this node |
-| lag_entries     | uint64 | primary current_last_entry_id − sync_watermark |
-| hostname        | string | Human-readable label (max 127 bytes) |
+| Field              | Type   | Notes |
+|--------------------|--------|-------|
+| node_id            | uint64 | |
+| is_active          | uint8  | 1 = currently connected and replicating |
+| sync_watermark     | uint64 | Last confirmed entry_id from this node |
+| lag_entries        | uint64 | primary current_last_entry_id − sync_watermark |
+| hostname           | string | Human-readable label (max 127 bytes) |
+| client_conn_count  | uint32 | `TASK-00284`: that node's most recently reported `OPLOG_ACK` client connection count — 0 for a node that has never sent one (pre-upgrade replica, or `is_active == 0`), not a real "zero clients" claim in that case |
 
 `auth_token` is **never** included in CLUSTER_STATUS_RESP. Only fields required for the admin UI are present.
 
@@ -1640,6 +1651,8 @@ right, distinct from any implementation bug.
 | 0x0804 | VAULT_KEY_FETCH_RESP  | S → C     | Wrapped VK blob returned            |
 | 0x0805 | VAULT_LIST            | C → S     | List my vaults                      |
 | 0x0806 | VAULT_LIST_RESP       | S → C     | Vault entries (opaque blobs never included) |
+| 0x0807 | VAULT_DELETE          | C → S     | Soft-delete a vault registration (TASK-00277) |
+| 0x0808 | VAULT_DELETE_ACK      | S → C     | Deletion result                     |
 
 **VAULT_CREATE payload:**
 
@@ -1670,6 +1683,32 @@ never reads that far.
 `folder_file_id`, `created_at` — never the wrapped-key material itself
 (no legitimate client need to enumerate other vaults' key blobs in a list
 view).
+
+**VAULT_DELETE payload (TASK-00277, finalized 2026-09-10):** `session_token[32]`,
+`vault_id` (uint64). **VAULT_DELETE_ACK payload:** `error_code` (uint32).
+
+A vault record was previously write-only — nothing could ever remove one
+once created, so records accumulated forever (`ARCHITECTURE.md`'s Phase 21
+closure note). This is a plain soft-delete: the server flags the vault
+record rather than reclaiming its slot, mirroring `SHARE_REVOKE`/
+`LINK_REVOKE`'s `revoked` convention (§7.5) rather than `vw_store_files.c`'s
+hard-delete GC path. Only the vault's `owner_id` may delete it
+(`VW_ERR_PERMISSION` otherwise, same as `VAULT_KEY_FETCH`).
+
+The server refuses with `VW_ERR_VAULT_NOT_EMPTY` (§10.1) if any file
+version — current or superseded — still carries this `vault_id`, since that
+version's `wrapped_dek` lives nowhere else; deleting the vault out from
+under it would make that version's content permanently unrecoverable. A
+client must ensure every file under the vault's folder has actually been
+deleted (and, in the future, purged past any trash-retention window) before
+`VAULT_DELETE` will succeed. Once deleted, `VAULT_KEY_FETCH` against the
+same `vault_id` returns `VW_ERR_NOT_FOUND`, and it no longer appears in
+`VAULT_LIST_RESP`.
+
+Purely additive, no protocol version bump — an old client simply never
+sends `VAULT_DELETE`, and an old server not built with TASK-00277 would
+reject it as an unrecognized message type, exactly like any other new
+message added since v6.
 
 **FILE_COMMIT extension (finalized 2026-07-31, `TASK-098`):** `FILE_COMMIT`
 (§7.2) gains two optional trailing fields, appended after the existing
@@ -2142,6 +2181,7 @@ All application-level errors are reported with an `ERROR` message (`0x00FF`). Th
 | 607  | `VW_ERR_LINK_PASSWORD_REQUIRED` | File transfer | `LINK_ACCESS` against a password-protected link with no password supplied (`TASK-186`) |
 | 608  | `VW_ERR_LINK_PASSWORD_WRONG`  | File transfer | `LINK_ACCESS` against a password-protected link with an incorrect password (`TASK-186`) |
 | 609  | `VW_ERR_CHUNK_CORRUPT`        | File transfer | `CHUNK_DOWNLOAD_REQ` against a chunk whose on-disk bytes no longer hash to its own filename, detected at read time (`TASK-254`); distinct from the upload-time `VW_ERR_CHUNK_HASH_MISMATCH` |
+| 610  | `VW_ERR_VAULT_NOT_EMPTY`      | File transfer | `VAULT_DELETE` against a vault still referenced by at least one file version's `wrapped_dek` (`TASK-00277`) |
 | 700  | `VW_ERR_IPC_NOT_RUNNING`     | IPC            | Daemon not listening on its IPC port (client-daemon transport only; never sent over `vw/1`) |
 | 800  | `VW_ERR_SYNC_TREE_TOO_LARGE` | Client-local   | Shared-folder BFS exceeded the client's resource ceiling for one sync cycle (`TASK-111`); never sent over the wire, daemon-internal/IPC only |
 | 801  | `VW_ERR_READ_ONLY_FALLBACK`  | Client-local   | Daemon rejected a write-shaped IPC request because this account is currently on its read-only fallback server (`TASK-173`); never sent over the wire, IPC-response only |
@@ -2156,7 +2196,7 @@ logic is named after: `vw_server_dispatch_file_op`'s single dispatch
 choke point (`vw_file_handlers.c`) rejects every write-shaped message
 (`FILE_COMMIT`, `CHUNK_UPLOAD`, `FILE_DELETE`, `FILE_MOVE`, `FILE_MKDIR`,
 `VERSION_RESTORE`, `SHARE_GRANT`/`REVOKE`, `LINK_CREATE`/`REVOKE`,
-`VAULT_CREATE`, `USER_SUSPEND`, `QUOTA_ADJUST`, `INVITE_CREATE`) with this
+`VAULT_CREATE`, `VAULT_DELETE`, `USER_SUSPEND`, `QUOTA_ADJUST`, `INVITE_CREATE`) with this
 code, before the corresponding handler runs — no on-disk state is
 mutated. Every read-shaped message (`FILE_LIST`/`STAT`,
 `CHUNK_DOWNLOAD_REQ`, `SHARE_LIST`, `LINK_LIST`, `VERSION_LIST`/`CHUNKS`,
@@ -2180,6 +2220,8 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 34      | 2026-09-11 | PRT.04  | Replica-fallback visibility (§7.7), resolving `TASK-00284` — full-project review (`TASK-00269`) found no real signal existed for "N accounts currently on a fallback replica," only the approximate `replica_lag` alert. New `client_conn_count` (uint32) field on both `OPLOG_ACK` (replica → primary, its live `vw_conn_registry` count at send time) and `CLUSTER_STATUS_RESP`'s per-node entry (the primary's most recently received value per node). Piggybacked on the existing `OPLOG_PULL`/`_ACK` cycle rather than a new message pair, following the same reuse-the-authenticated-cluster-session pattern `TASK-00170`/`TASK-00259` already established. A replica's `vw_conn_registry` only ever tracks its normal client-facing `vw/1` listener (never the separate admin socket), and a replica is never anyone's configured primary target under this project's fallback design — so a live connection to a replica is, by definition, a client currently on fallback; no new connection-tagging needed. Staleness bounded by `replica_poll_interval_secs` (default 5s), same freshness bound `sync_watermark`/`lag_entries` already have. `TASK-00285` implements the server/admin-visibility side; not yet wired into any admin CLI/GUI view. Purely additive; no protocol version bump required. |
+| 33      | 2026-09-10 | PRT.04  | `VAULT_DELETE`/`_ACK` (§7.11.4, 0x0807/0x0808), resolving `TASK-00276` — a vault registration was previously write-only (`ARCHITECTURE.md`'s Phase 21 closure note: "there is no `VAULT_DELETE` wire message at all... vault records accumulate forever"), flagged during a full-project review (`TASK-00269`–`00287`). A plain soft-delete, same `revoked`-flag shape as `SHARE_REVOKE`/`LINK_REVOKE` rather than `vw_store_files.c`'s hard-delete GC path; only the vault's `owner_id` may delete it. New error code `VW_ERR_VAULT_NOT_EMPTY` (610, §10.1): the server refuses deletion while any file version — current or superseded — still carries this `vault_id`, since that version's `wrapped_dek` exists nowhere else and would become permanently unrecoverable. `TASK-00277` implements the storage-layer soft-delete and the server dispatch handler; client/CLI (`TASK-00278`), GUI (`TASK-00279`), and web gateway (`TASK-00280`) consumption of the new message are separate follow-on tasks — this revision is the wire contract only. Purely additive; no protocol version bump required. |
 | 32      | 2026-09-09 | PRT.04  | Phase 22 continued (`TASK-257`): new `CLUSTER_CHUNK_REPAIR_FETCH`/`_DATA` (0x0710/0x0711, §7.7) reversing the existing replica-pulls-from-primary chunk fetch direction so a primary can pull a clean chunk copy from a replica for repair. Rides the existing authenticated `NODE_HELLO` cluster session; no new credential, no new error codes (reuses `VW_ERR_NOT_FOUND`/`VW_ERR_CHUNK_CORRUPT`, both already normative per revision 31). Spec only — `TASK-259` implements the handlers; not yet wired into any repair pipeline (`TASK-260`). Purely additive; no protocol version bump required. |
 | 31      | 2026-09-09 | PRT.04  | Corruption detection & repair, Phase 22 design (`ARCHITECTURE.md`), part 1 of that phase (`TASK-254`): the server now re-verifies `SHA-256(data) == chunk_hash` on the `CHUNK_DOWNLOAD_REQ` reply path (§7.2) before sending `CHUNK_DATA`, rather than trusting on-disk bytes unconditionally after their write-time check — closes a real, previously-documented-but-unimplemented gap (`vw_storage.h`'s own comment claimed this re-verification already happened). New error code `VW_ERR_CHUNK_CORRUPT` (609, §10.1). Purely additive (new error code only, no existing byte layout changed); no protocol version bump required. The rest of Phase 22 (local Reed-Solomon reconstruction, cluster chunk-repair-fetch, `TASK-257`–`262`) is filed but not yet implemented — see `ARCHITECTURE.md`'s Phase 22 row. |
 | 30      | 2026-09-03 | PRT.04  | §8.1 (password transport) reworded, resolving `TASK-240` (a SEC.07 advisory filed during `TASK-234`'s Android review): the prior text presented "Argon2id locally" as a live client-side alternative to `SHA-256(password)`, which is structurally impossible under `AUTH_REQUEST`'s single-round-trip shape (no salt-exchange message exists for the client to learn the server's per-account salt before computing the token) — never actually implementable, not merely not-yet-implemented. Also replaced the stale "Phase 1 will define a proper SRP or client-side Argon2id derivation" note (open since `TASK-009`, Phase 0) — 20+ phases shipped since with no such change — with an explicit "not planned" framing. Verified against `src/server/vw_auth.c`'s actual verification call and `src/client/vw_client_core.c`'s implementation: every client (desktop, web, Android) sends `SHA-256(password)`; the server verifies it via Argon2id against its own stored hash+salt. Documentation-only; no wire format, message, or byte layout changed; no protocol version bump required (this table tracks spec-revision count, not wire version, per revision 16's own clarifying note). |

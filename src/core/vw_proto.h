@@ -105,6 +105,13 @@ typedef enum {
                                           detected at read time — distinct
                                           from VW_ERR_CHUNK_HASH_MISMATCH,
                                           which is an upload-time reject) */
+    VW_ERR_VAULT_NOT_EMPTY     = 610,  /* TASK-00277: VAULT_DELETE against a
+                                          vault that still has at least one
+                                          file version referencing it —
+                                          deleting it would strand that
+                                          version's wrapped DEK, same
+                                          "children still exist" shape as
+                                          VW_ERR_DIR_NOT_EMPTY above */
 
     /* IPC */
     VW_ERR_IPC_NOT_RUNNING     = 700,  /* daemon not listening on IPC port           */
@@ -260,6 +267,8 @@ typedef enum {
     VW_MSG_VAULT_KEY_FETCH_RESP = 0x0804,
     VW_MSG_VAULT_LIST           = 0x0805,  /* list my vaults                       */
     VW_MSG_VAULT_LIST_RESP      = 0x0806,
+    VW_MSG_VAULT_DELETE         = 0x0807,  /* TASK-00277: soft-delete a vault registration */
+    VW_MSG_VAULT_DELETE_ACK     = 0x0808,
 
     /* Filename search (TASK-196/197; docs/PROTOCOL.md §7.12). Server-side,
      * scoped to exactly what FILE_LIST/effective_permission() already let

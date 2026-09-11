@@ -107,6 +107,11 @@ typedef enum {
     VW_OPLOG_FILE_CREATE   = 0x08,  /* file created; payload = owner_id (uint64 LE)  */
     VW_OPLOG_FILE_UPDATE   = 0x09,  /* file renamed/metadata updated; payload = file_id (uint64 LE) */
     VW_OPLOG_FILE_VERSION  = 0x0A,  /* new file version written; payload = file_id (uint64 LE) */
+    VW_OPLOG_VAULT_DELETE  = 0x0B,  /* vault (TASK-00277) deleted; payload = owner_id (uint64 LE).
+                                        Deliberately a distinct op type from VW_OPLOG_VAULT_WRITE
+                                        rather than reusing it for both create and delete — see
+                                        VW_OPLOG_FILE_WRITE's own retirement above for why an
+                                        ambiguous shared op type is the mistake this avoids. */
 } vw_oplog_op_t;
 
 /* ── Opaque context ────────────────────────────────────────────────────────── */
