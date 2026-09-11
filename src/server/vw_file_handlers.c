@@ -2859,9 +2859,37 @@ static vw_err_t handle_vault_delete(vw_store_t *store, vw_file_store_t *fs,
         return (send_error(conn, VW_ERR_PROTO_TRUNCATED), VW_ERR_PROTO_TRUNCATED);
     uint64_t vault_id = vw_read_u64le(payload + VW_TOKEN_BYTES);
 
-    int in_use = 0;
-    err = vw_store_version_vault_in_use(fs, vault_id, &in_use);
-    if (err == VW_OK && in_use) err = VW_ERR_VAULT_NOT_EMPTY;
+    /* SEC.07 review finding: ownership must be checked BEFORE the
+     * not-empty scan below. vw_store_version_vault_in_use() takes no
+     * caller identity and will happily report on any vault_id -- running
+     * it first let any authenticated user enumerate small vault_id
+     * integers and learn whether another user's vault currently holds
+     * live encrypted content (VAULT_NOT_EMPTY) vs. is empty or doesn't
+     * exist, with zero relationship to that vault. Mere vault_id
+     * existence is already an accepted oracle in this codebase
+     * (VAULT_KEY_FETCH's own comment: "vault_id is an opaque counter
+     * like share_id, not something whose mere existence needs hiding"),
+     * but content-presence is a real, additional leak that must require
+     * ownership first -- same vw_vault_get_by_id + owner-check pattern
+     * VAULT_KEY_FETCH already uses.
+     *
+     * Every outcome below funnels into the single ACK send at the bottom
+     * rather than an early send_error() return -- send_error() emits an
+     * 8-byte VW_MSG_ERROR payload that overflows vw_client_core.c's
+     * revoke_common(), which sizes its receive buffer for the real
+     * 4-byte ACK it expects (the exact bug TASK-00275's own correction
+     * note already documents for this same handler's not-empty path). */
+    vw_vault_record_t rec;
+    uint8_t *unused_vk = NULL, *unused_params = NULL;
+    err = vw_vault_get_by_id(vs, vault_id, &rec, &unused_vk, &unused_params);
+    free(unused_vk); free(unused_params);
+    if (err == VW_OK && rec.owner_id != user_id) err = VW_ERR_PERMISSION;
+
+    if (err == VW_OK) {
+        int in_use = 0;
+        err = vw_store_version_vault_in_use(fs, vault_id, &in_use);
+        if (err == VW_OK && in_use) err = VW_ERR_VAULT_NOT_EMPTY;
+    }
     if (err == VW_OK) err = vw_vault_delete(vs, vault_id, user_id);
 
     uint8_t ack[4];

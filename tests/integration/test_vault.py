@@ -350,6 +350,37 @@ def test_vault_delete_requires_ownership(server, admin_client, unique_username):
         owner.close(); stranger.close()
 
 
+def test_vault_delete_ownership_checked_before_not_empty_leaks_nothing(server, admin_client, unique_username):
+    """SEC.07 regression: handle_vault_delete originally ran the
+    not-empty scan (which takes no caller identity) before the ownership
+    check, so a non-owner probing a vault_id that happens to have live
+    encrypted content got VW_ERR_VAULT_NOT_EMPTY back instead of
+    VW_ERR_PERMISSION -- leaking that content exists in someone else's
+    vault before any permission check ever ran. A non-owner must always
+    see PERMISSION here, regardless of the target vault's actual
+    empty/non-empty state."""
+    owner, otoken = _setup_user(admin_client, server, f"{unique_username}_owner")
+    stranger, stoken = _setup_user(admin_client, server, f"{unique_username}_stranger")
+    try:
+        fid, _ = owner.upload_file(otoken, "/plain.bin", b"first version, unencrypted")
+        vault_id = owner.vault_create(otoken, fid, os.urandom(32), os.urandom(16), b"")
+
+        data = b"encrypted version - this vault is deliberately non-empty"
+        chash = hashlib.sha256(data).digest()
+        owner.chunk_upload(otoken, data)
+        owner.file_commit(otoken, "", [chash], file_id=fid, logical_size=len(data),
+                           vault_id=vault_id, wrapped_dek=os.urandom(48))
+
+        with pytest.raises(VwProtocolError) as exc_info:
+            stranger.vault_delete(stoken, vault_id)
+        assert exc_info.value.code == VW_ERR_PERMISSION
+
+        # Untouched.
+        owner.vault_key_fetch(otoken, vault_id)
+    finally:
+        owner.close(); stranger.close()
+
+
 def test_vault_delete_unknown_or_already_deleted_not_found(server, admin_client, unique_username):
     owner, otoken = _setup_user(admin_client, server, unique_username)
     try:
