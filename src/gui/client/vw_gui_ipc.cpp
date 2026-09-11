@@ -751,16 +751,12 @@ bool VwGuiIpc::vault_list(uint32_t account_id, std::vector<VwGuiVaultEntry> *out
 }
 
 int VwGuiIpc::vault_delete(uint32_t account_id, uint64_t vault_id) {
-    uint8_t req[12]; uint32_t off = 0;
-    vw_write_u32le(req, account_id); off += 4u;
-    vw_write_u64le(req + off, vault_id); off += 8u;
-
-    uint8_t resp[4]; uint32_t rlen;
-    vw_err_t err = one_shot(VW_IPC_VAULT_DELETE_REQ, req, off, VW_IPC_VAULT_DELETE_RESP,
-                             resp, sizeof(resp), &rlen);
-    if (err != VW_OK) return (int)err;
-    if (rlen < 4) return (int)VW_ERR_IO;
-    return (int)read_u32_le(resp);
+    /* CQR.08 finding: this used to hand-roll one_shot() + response
+     * decoding — same u32 account_id + u64 id request, u32 error_code
+     * response shape share_revoke/link_revoke already share via
+     * simple_req_resp() above. */
+    uint8_t req[12]; vw_write_u32le(req, account_id); vw_write_u64le(req + 4u, vault_id);
+    return simple_req_resp(VW_IPC_VAULT_DELETE_REQ, VW_IPC_VAULT_DELETE_RESP, req, sizeof(req));
 }
 
 int VwGuiIpc::vault_upload(uint32_t account_id, uint64_t vault_id, uint64_t file_id,

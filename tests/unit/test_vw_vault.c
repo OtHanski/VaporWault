@@ -115,8 +115,21 @@ typedef struct {
 static int count_by_owner_cb(const vw_vault_record_t *rec, void *ud)
 {
     scan_ctx_t *c = (scan_ctx_t *)ud;
+    /* vw_vault_scan visits every allocated record, deleted included
+     * (CQR.08 API-consistency fix, matches vw_share_scan's convention) —
+     * a "live vaults" counter must filter deleted itself, same as
+     * production's vault_list_cb does. */
+    if (rec->deleted) return 0;
     c->total++;
     if (rec->owner_id == c->owner_id) c->matched++;
+    return 0;
+}
+
+static int count_all_cb(const vw_vault_record_t *rec, void *ud)
+{
+    (void)rec;
+    uint32_t *count = (uint32_t *)ud;
+    (*count)++;
     return 0;
 }
 
@@ -272,6 +285,24 @@ VW_TEST_SUITE("vw_vault") {
             scan_ctx_t c = { 10, 0, 0 };
             VW_ASSERT_OK(vw_vault_scan(s.vs, count_by_owner_cb, &c));
             VW_ASSERT_EQ(0, (int)c.total);
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("scan still visits a deleted vault -- caller filters, matching vw_share_scan's convention") {
+        vault_stack_t s = {0};
+        stack_open(&s, "delete_scan_visits");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 10));
+
+            uint32_t total = 0;
+            VW_ASSERT_OK(vw_vault_scan(s.vs, count_all_cb, &total));
+            VW_ASSERT_EQ(1, (int)total);
         }
         stack_close(&s);
     }

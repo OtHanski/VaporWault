@@ -811,10 +811,15 @@ static int cmd_share(vw_ipc_conn_t *conn, uint32_t account_id, const char *path,
     return 0;
 }
 
-/* SHARE_REVOKE_REQ / LINK_REVOKE_REQ: u32 account_id, u64 share_id.
- * RESP: u32 error_code. */
+/* SHARE_REVOKE_REQ / LINK_REVOKE_REQ / VAULT_DELETE_REQ: u32 account_id,
+ * u64 id. RESP: u32 error_code. result_word lets callers with the same
+ * wire shape but a different real-world action ("revoked" vs. "deleted")
+ * share this one implementation (CQR.08 finding: a separate
+ * cmd_delete_vault used to duplicate this whole function just to print
+ * "deleted" instead of "revoked"). */
 static int cmd_revoke(vw_ipc_conn_t *conn, uint32_t account_id, uint64_t share_id,
-                       vw_ipc_msg_t req_type, vw_ipc_msg_t resp_type, const char *cmd_name) {
+                       vw_ipc_msg_t req_type, vw_ipc_msg_t resp_type, const char *cmd_name,
+                       const char *result_word) {
     uint8_t req[12];
     vw_write_u32le(req, account_id);
     vw_write_u64le(req + 4u, share_id);
@@ -824,26 +829,7 @@ static int cmd_revoke(vw_ipc_conn_t *conn, uint32_t account_id, uint64_t share_i
     vw_err_t err = ipc_rpc(conn, req_type, req, sizeof(req), resp_type, resp, sizeof(resp), &rlen);
     if (err != VW_OK) { fprintf(stderr, "%s: IPC error %d\n", cmd_name, (int)err); return 1; }
     if (check_u32_resp(resp, rlen, cmd_name)) return 1;
-    printf("revoked\n");
-    return 0;
-}
-
-/* VAULT_DELETE_REQ: u32 account_id, u64 vault_id. RESP: u32 error_code.
- * Same wire shape as cmd_revoke's target messages, but "deleted" reads
- * better than "revoked" for this operation — kept as its own small
- * function rather than adding a message-text parameter to cmd_revoke. */
-static int cmd_delete_vault(vw_ipc_conn_t *conn, uint32_t account_id, uint64_t vault_id) {
-    uint8_t req[12];
-    vw_write_u32le(req, account_id);
-    vw_write_u64le(req + 4u, vault_id);
-
-    uint8_t resp[4];
-    uint32_t rlen = 0;
-    vw_err_t err = ipc_rpc(conn, VW_IPC_VAULT_DELETE_REQ, req, sizeof(req),
-                             VW_IPC_VAULT_DELETE_RESP, resp, sizeof(resp), &rlen);
-    if (err != VW_OK) { fprintf(stderr, "delete-vault: IPC error %d\n", (int)err); return 1; }
-    if (check_u32_resp(resp, rlen, "delete-vault")) return 1;
-    printf("deleted\n");
+    printf("%s\n", result_word);
     return 0;
 }
 
@@ -1909,7 +1895,7 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
-        int rc = cmd_revoke(c, account_id, share_id, VW_IPC_SHARE_REVOKE_REQ, VW_IPC_SHARE_REVOKE_RESP, "unshare");
+        int rc = cmd_revoke(c, account_id, share_id, VW_IPC_SHARE_REVOKE_REQ, VW_IPC_SHARE_REVOKE_RESP, "unshare", "revoked");
         vw_ipc_conn_close(c);
         return rc;
     }
@@ -1965,7 +1951,7 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
-        int rc = cmd_revoke(c, account_id, share_id, VW_IPC_LINK_REVOKE_REQ, VW_IPC_LINK_REVOKE_RESP, "revoke-link");
+        int rc = cmd_revoke(c, account_id, share_id, VW_IPC_LINK_REVOKE_REQ, VW_IPC_LINK_REVOKE_RESP, "revoke-link", "revoked");
         vw_ipc_conn_close(c);
         return rc;
     }
@@ -1981,7 +1967,7 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
-        int rc = cmd_delete_vault(c, account_id, vault_id);
+        int rc = cmd_revoke(c, account_id, vault_id, VW_IPC_VAULT_DELETE_REQ, VW_IPC_VAULT_DELETE_RESP, "delete-vault", "deleted");
         vw_ipc_conn_close(c);
         return rc;
     }

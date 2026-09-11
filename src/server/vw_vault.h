@@ -105,10 +105,16 @@ vw_err_t vw_vault_get_by_id(vw_vault_store_t *vs, uint64_t vault_id,
                              uint8_t **out_wrapped_vk, uint8_t **out_kdf_params);
 
 /*
- * Scan every non-deleted vault record. callback returning non-zero stops
- * the scan. Holds a read lock for the entire scan; the callback must NOT
- * call any other vw_vault_store_t function. Does not fetch blob contents —
- * call vw_vault_get_by_id for those if the scan's caller needs them.
+ * Scan every allocated vault record, including soft-deleted ones —
+ * matching vw_share_scan's convention of returning everything and
+ * letting the caller filter (CQR.08 API-consistency finding, TASK-00275
+ * review pass), rather than vw_vault_scan silently deciding what counts
+ * as "gone" on every caller's behalf. Check rec->deleted in the callback
+ * if a caller wants live vaults only (handle_vault_list's vault_list_cb
+ * does exactly this). callback returning non-zero stops the scan. Holds
+ * a read lock for the entire scan; the callback must NOT call any other
+ * vw_vault_store_t function. Does not fetch blob contents — call
+ * vw_vault_get_by_id for those if the scan's caller needs them.
  */
 vw_err_t vw_vault_scan(vw_vault_store_t *vs,
                         int (*callback)(const vw_vault_record_t *rec, void *ud),

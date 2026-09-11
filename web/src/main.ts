@@ -518,7 +518,11 @@ async function handleDeleteVault(): Promise<void> {
     );
     return;
   }
-  lockVault();
+  // Only lock if the deleted vault is the one currently unlocked - a
+  // different, unrelated vault may be unlocked while browsing this one
+  // (CQR.08 finding: this used to call lockVault() unconditionally,
+  // wiping an unrelated unlocked vault's VK from memory).
+  if (unlockedVault?.vaultId === currentFolderVaultId) lockVault();
   await refreshVaultBanner();
 }
 

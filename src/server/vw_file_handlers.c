@@ -2779,6 +2779,10 @@ typedef struct {
 static int vault_list_cb(const vw_vault_record_t *rec, void *ud)
 {
     vault_list_ctx_t *c = (vault_list_ctx_t *)ud;
+    /* vw_vault_scan now returns every allocated record, deleted included
+     * (CQR.08 API-consistency fix, matches vw_share_scan's convention) —
+     * VAULT_LIST must filter deleted vaults out itself. */
+    if (rec->deleted) return 0;
     if (rec->owner_id != c->user_id) return 0;
 
     uint32_t entry_cap = 8u + 8u + 8u;

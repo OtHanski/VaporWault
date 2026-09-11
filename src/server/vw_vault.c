@@ -352,7 +352,7 @@ vw_err_t vw_vault_scan(vw_vault_store_t *s,
     for (uint64_t i = 0; i < n; i++) {
         vw_vault_record_t rec;
         memcpy(&rec, (uint8_t *)buf + i * sizeof(rec), sizeof(rec));
-        if (rec.vault_id == 0 || rec.deleted) continue;
+        if (rec.vault_id == 0) continue;
         if (callback(&rec, userdata) != 0) break;
     }
 
