@@ -750,6 +750,19 @@ bool VwGuiIpc::vault_list(uint32_t account_id, std::vector<VwGuiVaultEntry> *out
     return true;
 }
 
+int VwGuiIpc::vault_delete(uint32_t account_id, uint64_t vault_id) {
+    uint8_t req[12]; uint32_t off = 0;
+    vw_write_u32le(req, account_id); off += 4u;
+    vw_write_u64le(req + off, vault_id); off += 8u;
+
+    uint8_t resp[4]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_VAULT_DELETE_REQ, req, off, VW_IPC_VAULT_DELETE_RESP,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 4) return (int)VW_ERR_IO;
+    return (int)read_u32_le(resp);
+}
+
 int VwGuiIpc::vault_upload(uint32_t account_id, uint64_t vault_id, uint64_t file_id,
                             const char *leaf_name, const char *local_path,
                             uint64_t *out_file_id, uint64_t *out_version_id) {

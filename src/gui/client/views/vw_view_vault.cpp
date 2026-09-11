@@ -25,6 +25,13 @@ static bool        s_needs_refresh = true;
 static char        s_error_msg[160] = "";
 static std::set<uint64_t> s_unlocked_vaults; /* see vw_view_vault.h's doc comment */
 
+/* Delete confirmation (TASK-00279). Deleting is a soft-delete server-side
+ * but not something to act on from a first click — same "pending id,
+ * explicit confirm" convention as vw_view_browser.cpp's version-restore
+ * confirmation. 0 = no pending confirmation. */
+static uint64_t    s_pending_delete_vault_id = 0;
+static char        s_delete_status[220] = "";
+
 /* Setup wizard */
 static bool s_setup_open = false;
 static char s_setup_dirname[64]  = "";
@@ -75,6 +82,8 @@ void vw_view_vault_invalidate() {
     s_needs_refresh = true;
     s_vaults.clear();
     s_unlocked_vaults.clear();
+    s_pending_delete_vault_id = 0;
+    s_delete_status[0] = '\0';
 }
 
 /* ── Warnings block — shared verbatim by the setup wizard; do not soften
@@ -320,6 +329,35 @@ void vw_view_vault_render(const VwIpcStatus & /*status*/, ClientApp &app) {
         ImGui::Separator();
     }
 
+    if (s_pending_delete_vault_id != 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+            "Delete vault #%llu's registration? This does not delete any "
+            "files — every file under its folder must already be deleted, "
+            "or this will fail.",
+            (unsigned long long)s_pending_delete_vault_id);
+        if (ImGui::Button("Confirm delete##vault")) {
+            int rc = app.ipc_vault_delete(s_pending_delete_vault_id);
+            if (rc == 0) {
+                s_unlocked_vaults.erase(s_pending_delete_vault_id);
+                s_delete_status[0] = '\0';
+                refresh(app);
+            } else if (rc == (int)VW_ERR_VAULT_NOT_EMPTY) {
+                snprintf(s_delete_status, sizeof(s_delete_status),
+                         "This vault still has files in it — delete them first.");
+            } else {
+                vw_gui_format_action_error(s_delete_status, sizeof(s_delete_status), "Delete", rc);
+            }
+            s_pending_delete_vault_id = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##vault_delete")) s_pending_delete_vault_id = 0;
+        ImGui::Separator();
+    }
+    if (s_delete_status[0]) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "%s", s_delete_status);
+        ImGui::Separator();
+    }
+
     if (ImGui::BeginTable("##vaults", 5,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("Vault ID");
@@ -347,6 +385,11 @@ void vw_view_vault_render(const VwIpcStatus & /*status*/, ClientApp &app) {
                 if (ImGui::SmallButton("Encrypt & Upload...")) open_upload_dialog(v.vault_id);
             } else {
                 if (ImGui::SmallButton("Unlock")) open_unlock_modal(v.vault_id);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Delete")) {
+                s_pending_delete_vault_id = v.vault_id;
+                s_delete_status[0] = '\0';
             }
             ImGui::PopID();
         }

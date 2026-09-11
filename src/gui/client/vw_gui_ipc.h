@@ -339,6 +339,14 @@ public:
     bool vault_list(uint32_t account_id, std::vector<VwGuiVaultEntry> *out, int *out_error_code);
 
     /*
+     * Soft-delete a vault registration (TASK-00279; server: TASK-00277,
+     * docs/PROTOCOL.md §7.11.4). Need not currently be unlocked. Returns
+     * VW_ERR_VAULT_NOT_EMPTY (encoded as int) if any file version still
+     * references this vault_id.
+     */
+    int vault_delete(uint32_t account_id, uint64_t vault_id);
+
+    /*
      * Encrypt local_path and upload it into vault_id (which must already
      * be unlocked — vault_create or vault_unlock first). file_id == 0
      * creates a new file named leaf_name inside the vault's folder;
