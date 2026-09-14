@@ -344,9 +344,10 @@ No framework, no bundler, no linter beyond the compiler's own settings (`web/tsc
 
 ### Module structure
 
-Three files, one job each — keep new code in the file matching its job rather than growing a fourth:
+One job per file — keep new code in the file matching its job rather than growing an unrelated one:
 - `api.ts` — thin `fetch()` wrappers over the gateway's `/api/*` endpoints. No DOM access, no UI logic. Every exported function returns `Promise<ApiResult<T>>` (see below) or, for the chunked transfer helpers, throws on a genuinely exceptional condition (see Error handling below).
 - `vault-crypto.ts` — the in-browser half of the E2EE vault. Every primitive here is documented as cross-verified byte-for-byte against its native counterpart (`src/core/vw_crypto.c`/`src/client/vw_vault.c`) in the file's own header comment — do the same cross-check before changing one of these functions, not just a "looks equivalent" read of both implementations.
+- `transfer-registry.ts` (TASK-00283) — `localStorage`-backed bookkeeping for in-progress uploads/downloads, so a page reload doesn't lose track of one. UX metadata only: no chunk hashes (re-hashing a re-selected file is cheap and correctness-safe; trusting a stale cache isn't) and no key material (a vault DEK is never persisted, matching `vault-crypto.ts`'s own invariant). No DOM access, no `fetch()` calls.
 - `main.ts` — DOM wiring and view orchestration. Organized internally into `// ── Section Name (TASK-NNN) ──` banner comments, one per feature view (login, browser, search, sharing, settings, ...) — add a new banner for a new view rather than interleaving its functions among an existing one's.
 
 Naming: files are `kebab-case.ts`; functions/variables are `camelCase`; `interface`s are `PascalCase`; a true constant is `SCREAMING_SNAKE_CASE` (`CHUNK_SIZE`), mutable module-level state stays `camelCase` (`activeSlot`) — the same functions-vs-constants-vs-mutable-state split C uses (§2), just with JS's own casing.

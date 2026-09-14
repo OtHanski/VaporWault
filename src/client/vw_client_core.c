@@ -676,6 +676,72 @@ vw_err_t vw_client_chunk_upload_if_missing(vw_client_sess_t *sess,
     return ec != 0 ? (vw_err_t)ec : VW_OK;
 }
 
+/*
+ * TASK-00283: batched CHUNK_QUERY for up to `count` hashes, in rounds of
+ * up to 1024 (docs/PROTOCOL.md §7.2's CHUNK_QUERY cap), extracted out of
+ * upload_chunks's own Pass 2 below so a caller that already has a full
+ * hash list — the web gateway's new /api/chunks/query endpoint, TASK-00283
+ * — can ask "which of these does the server already have" in one or a
+ * few round trips without also reading/uploading anything itself. Every
+ * other batched-CHUNK_QUERY caller in this codebase (upload_chunks) now
+ * goes through this same function instead of duplicating the wire logic.
+ *
+ * *out_missing_bitmask must be caller-allocated, at least (count+7)/8
+ * bytes, and is fully overwritten by this function (every bit set or
+ * cleared, not just the ones that differ from a prior call) — bit i
+ * (MSB-first within its byte, matching CHUNK_QUERY_RESP's own
+ * convention) set means hash i is NOT present server-side yet.
+ */
+vw_err_t vw_client_chunk_query_batch(vw_client_sess_t *sess,
+                                      const uint8_t (*hashes)[VW_HASH_BYTES],
+                                      uint32_t count,
+                                      uint8_t *out_missing_bitmask)
+{
+    if (!sess || (!hashes && count > 0) || !out_missing_bitmask) return VW_ERR_INVALID_ARG;
+
+    size_t bitmask_bytes = ((size_t)count + 7u) / 8u;
+    memset(out_missing_bitmask, 0, bitmask_bytes ? bitmask_bytes : 1u);
+
+    for (uint32_t base = 0; base < count; base += CHUNK_QUERY_MAX) {
+        uint16_t batch = (uint16_t)VW_MIN(CHUNK_QUERY_MAX, count - base);
+        uint32_t qplen = VW_TOKEN_BYTES + 2u + (uint32_t)batch * VW_HASH_BYTES;
+        uint8_t *qbuf  = malloc(qplen);
+        if (!qbuf) return VW_ERR_OOM;
+
+        uint8_t *wp = qbuf;
+        memcpy(wp, sess->session_token, VW_TOKEN_BYTES); wp += VW_TOKEN_BYTES;
+        vw_write_u16le(wp, batch); wp += 2;
+        memcpy(wp, hashes + base, (size_t)batch * VW_HASH_BYTES);
+
+        vw_err_t err = vw_proto_send(sess->conn, VW_MSG_CHUNK_QUERY, qbuf, qplen);
+        free(qbuf);
+        if (err != VW_OK) return err;
+
+        uint8_t rbuf[2u + ((CHUNK_QUERY_MAX + 7u) / 8u)];
+        uint32_t rplen;
+        err = recv_expect(sess->conn, VW_MSG_CHUNK_QUERY_RESP, rbuf, sizeof(rbuf), &rplen);
+        if (err != VW_OK) return err;
+
+        if (rplen < 2u) return VW_ERR_PROTO_TRUNCATED;
+        uint16_t resp_count = vw_read_u16le(rbuf);
+        if (resp_count != batch) return VW_ERR_PROTO_INVALID;
+
+        uint16_t resp_bitmask_bytes = (uint16_t)((batch + 7u) / 8u);
+        if (rplen < 2u + resp_bitmask_bytes) return VW_ERR_PROTO_TRUNCATED;
+
+        /* bit=0 → server does NOT have the chunk → caller needs to upload */
+        for (uint16_t i = 0; i < batch; i++) {
+            uint32_t global_i = base + i;
+            uint8_t  byte_val = rbuf[2u + i / 8u];
+            uint8_t  bit      = (uint8_t)(byte_val >> (7u - (i % 8u))) & 1u;
+            if (!bit)
+                out_missing_bitmask[global_i / 8u] |= (uint8_t)(1u << (7u - (global_i % 8u)));
+        }
+    }
+
+    return VW_OK;
+}
+
 static vw_err_t upload_chunks(vw_client_sess_t *sess, const char *local_path,
                                uint8_t **out_hashes, uint32_t *out_chunk_count,
                                uint64_t *out_logical_size,
@@ -733,48 +799,9 @@ cleanup_pass1:
     uint8_t *need_upload = calloc(1, bitmask_bytes ? bitmask_bytes : 1);
     if (!need_upload) { free(hashes); return VW_ERR_OOM; }
 
-    /* Send CHUNK_QUERY rounds (up to 1024 hashes each). */
-    for (uint32_t base = 0; base < chunk_count; base += CHUNK_QUERY_MAX) {
-        uint16_t batch = (uint16_t)VW_MIN(CHUNK_QUERY_MAX, chunk_count - base);
-        uint32_t qplen = VW_TOKEN_BYTES + 2u + (uint32_t)batch * VW_HASH_BYTES;
-        uint8_t *qbuf  = malloc(qplen);
-        if (!qbuf) { err = VW_ERR_OOM; goto cleanup_upload; }
-
-        uint8_t *wp = qbuf;
-        memcpy(wp, sess->session_token, VW_TOKEN_BYTES); wp += VW_TOKEN_BYTES;
-        vw_write_u16le(wp, batch); wp += 2;
-        memcpy(wp, hashes + (size_t)base * VW_HASH_BYTES,
-               (size_t)batch * VW_HASH_BYTES);
-
-        err = vw_proto_send(sess->conn, VW_MSG_CHUNK_QUERY, qbuf, qplen);
-        free(qbuf);
-        if (err != VW_OK) goto cleanup_upload;
-
-        uint8_t rbuf[2u + ((CHUNK_QUERY_MAX + 7u) / 8u)];
-        uint32_t rplen;
-        err = recv_expect(sess->conn, VW_MSG_CHUNK_QUERY_RESP,
-                           rbuf, sizeof(rbuf), &rplen);
-        if (err != VW_OK) goto cleanup_upload;
-
-        if (rplen < 2u) { err = VW_ERR_PROTO_TRUNCATED; goto cleanup_upload; }
-        uint16_t resp_count = vw_read_u16le(rbuf);
-        if (resp_count != batch) { err = VW_ERR_PROTO_INVALID; goto cleanup_upload; }
-
-        uint16_t resp_bitmask_bytes = (uint16_t)((batch + 7u) / 8u);
-        if (rplen < 2u + resp_bitmask_bytes) {
-            err = VW_ERR_PROTO_TRUNCATED;
-            goto cleanup_upload;
-        }
-
-        /* bit=0 → server does NOT have the chunk → we need to upload */
-        for (uint16_t i = 0; i < batch; i++) {
-            uint32_t global_i = base + i;
-            uint8_t  byte_val = rbuf[2u + i / 8u];
-            uint8_t  bit      = (uint8_t)(byte_val >> (7u - (i % 8u))) & 1u;
-            if (!bit)
-                need_upload[global_i / 8u] |= (uint8_t)(1u << (7u - (global_i % 8u)));
-        }
-    }
+    err = vw_client_chunk_query_batch(sess, (const uint8_t (*)[VW_HASH_BYTES])hashes,
+                                       chunk_count, need_upload);
+    if (err != VW_OK) goto cleanup_upload;
 
     /* Re-open local file and upload missing chunks. */
     chunk_buf = malloc(VW_CHUNK_SIZE);

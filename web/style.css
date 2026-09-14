@@ -238,6 +238,34 @@ button:hover {
   color: var(--text);
 }
 
+/* Interrupted-transfer banner (TASK-00283): same visual language as
+ * .vault-banner (a list of them, one per leftover transfer found on page
+ * load), not a distinct style. */
+#interrupted-transfers-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.interrupted-transfer-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.9rem;
+}
+
+.interrupted-transfer-item span {
+  flex: 1;
+  color: var(--text);
+}
+
 #file-table, #version-table, #share-table, #link-table {
   width: 100%;
   border-collapse: collapse;

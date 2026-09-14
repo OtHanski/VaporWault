@@ -489,6 +489,25 @@ vw_err_t vw_client_chunk_upload_if_missing(vw_client_sess_t *sess,
                                             const void *data, uint32_t len);
 
 /*
+ * TASK-00283: batched CHUNK_QUERY for `count` hashes, in rounds of up to
+ * 1024 (docs/PROTOCOL.md §7.2's cap) — no upload, query only. Extracted
+ * out of vw_client_file_upload's own internal Pass 2 so a caller that
+ * already has a full hash list and just needs to know which chunks the
+ * server has (the web gateway's `/api/chunks/query` endpoint, to let the
+ * browser skip transmitting a chunk body it doesn't need to resend) can
+ * ask in one or a few round trips.
+ *
+ * *out_missing_bitmask must be caller-allocated, at least (count+7)/8
+ * bytes, and is fully overwritten (every bit set or cleared): bit i
+ * (MSB-first within its byte, matching CHUNK_QUERY_RESP's own
+ * convention) set means hash i is NOT present server-side yet.
+ */
+vw_err_t vw_client_chunk_query_batch(vw_client_sess_t *sess,
+                                      const uint8_t (*hashes)[VW_HASH_BYTES],
+                                      uint32_t count,
+                                      uint8_t *out_missing_bitmask);
+
+/*
  * Send FILE_COMMIT and decode FILE_COMMIT_ACK directly — the same
  * wire-encoding vw_client_file_upload/_to_id/_into_folder use internally,
  * exposed so vw_vault.c can commit an encrypted version with a real

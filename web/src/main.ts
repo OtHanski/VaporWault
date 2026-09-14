@@ -47,6 +47,13 @@ import {
   type AccountSlot,
   type SearchEntry,
 } from "./api.js";
+import {
+  type TransferRecord,
+  listTransfersForSlot,
+  startTransfer,
+  updateTransferProgress,
+  removeTransfer,
+} from "./transfer-registry.js";
 
 // ── Element lookups ─────────────────────────────────────────────────────────
 
@@ -82,6 +89,8 @@ const browserError = el<HTMLElement>("browser-error");
 const uploadBtn = el<HTMLButtonElement>("upload-btn");
 const uploadInput = el<HTMLInputElement>("upload-input");
 const transferList = el<HTMLUListElement>("transfer-list");
+const interruptedTransfersList = el<HTMLUListElement>("interrupted-transfers-list");
+const resumeUploadInput = el<HTMLInputElement>("resume-upload-input");
 const vaultCreateBtn = el<HTMLButtonElement>("vault-create-btn");
 const searchInput = el<HTMLInputElement>("search-input");
 const searchClearBtn = el<HTMLButtonElement>("search-clear-btn");
@@ -146,6 +155,11 @@ let currentFolderId = 0;
 // persistence anywhere, cleared on lock/logout/tab close). Nothing here
 // is ever sent to the gateway.
 let unlockedVault: { vaultId: number; folderFileId: number; vk: Uint8Array } | null = null;
+
+// Which interrupted-transfer record the hidden resume-upload-input's next
+// change event should try to match against (TASK-00283) - set just before
+// resumeUploadInput.click(), consumed and cleared by its change handler.
+let resumeUploadTarget: TransferRecord | null = null;
 
 // ── Multi-account state (TASK-166) ──────────────────────────────────────
 //
@@ -369,6 +383,7 @@ async function enterBrowserView(): Promise<void> {
   shareView.hidden = true;
   settingsView.hidden = true;
   renderAccountSwitcher();
+  renderInterruptedTransfers();
   currentPath = "/";
   await refreshFileList();
 }
@@ -989,43 +1004,100 @@ async function handleUpload(files: File[]): Promise<void> {
   await refreshFileList();
 }
 
+/* Runs the actual upload HTTP calls for one already-registered transfer
+ * (transferId already exists in transfer-registry.ts) against a known
+ * path/vault target - shared by a fresh uploadOne() call, a same-session
+ * Retry, and a cross-reload Resume (TASK-00283), so all three exercise
+ * the exact same dedup-aware path (api.ts's uploadFile query-before-
+ * upload flow skips any chunk the server already has from an earlier
+ * attempt). */
+async function runUpload(
+  file: File,
+  path: string,
+  vault: { vaultId: number; vk: Uint8Array } | null,
+  transferId: string,
+): Promise<void> {
+  const handle = createTransferItem(`Uploading ${file.name}`);
+  try {
+    const result = vault
+      ? await uploadFileEncrypted(
+          path,
+          file,
+          vault.vaultId,
+          vault.vk,
+          (done, total) => handle.setProgress(done, total),
+          (done, total) => updateTransferProgress(transferId, done, total),
+        )
+      : await uploadFile(
+          path,
+          file,
+          (done, total) => handle.setProgress(done, total),
+          (done, total) => updateTransferProgress(transferId, done, total),
+        );
+    if (!result.ok) {
+      // No partial/corrupt commit is possible here: uploadFile only
+      // calls FILE_COMMIT after every chunk has landed, so a mid-upload
+      // failure just leaves the file's prior state untouched - retrying
+      // is always safe to re-run, and reuses transferId so a plaintext
+      // retry's own dedup query picks up right where this attempt left
+      // off instead of re-uploading chunks that already landed.
+      handle.setFailed(`Failed: ${result.data.status ?? "error"}`, () =>
+        void runUpload(file, path, vault, transferId),
+      );
+      return;
+    }
+    removeTransfer(transferId);
+    renderInterruptedTransfers();
+    handle.setProgress(file.size, file.size || 1);
+    setTimeout(() => handle.remove(), 1500);
+    await refreshFileList();
+  } catch (err) {
+    handle.setFailed(err instanceof Error ? err.message : "Upload failed", () =>
+      void runUpload(file, path, vault, transferId),
+    );
+  }
+}
+
 async function uploadOne(file: File): Promise<void> {
   const path = joinPath(currentPath, file.name);
-  const handle = createTransferItem(`Uploading ${file.name}`);
 
   // currentFolderVaultId != 0 means THIS folder is a registered vault -
   // uploads here must always be encrypted, never fall back to plaintext
   // just because the vault happens to be locked right now (that would
   // silently write unencrypted content into a vault folder).
   if (currentFolderVaultId !== 0 && !(unlockedVault?.vaultId === currentFolderVaultId)) {
-    handle.setFailed("This folder is a locked vault - unlock it before uploading.");
+    createTransferItem(`Uploading ${file.name}`).setFailed(
+      "This folder is a locked vault - unlock it before uploading.",
+    );
     return;
   }
   const vault = currentFolderVaultId !== 0 ? unlockedVault : null;
 
-  try {
-    const result = vault
-      ? await uploadFileEncrypted(path, file, vault.vaultId, vault.vk, (done, total) =>
-          handle.setProgress(done, total),
-        )
-      : await uploadFile(path, file, (done, total) => handle.setProgress(done, total));
-    if (!result.ok) {
-      // No partial/corrupt commit is possible here: uploadFile only
-      // calls FILE_COMMIT after every chunk has landed, so a mid-upload
-      // failure just leaves the file's prior state untouched - retrying
-      // is always safe to re-run from scratch.
-      handle.setFailed(`Failed: ${result.data.status ?? "error"}`, () => void uploadOne(file));
-      return;
-    }
-    handle.setProgress(file.size, file.size || 1);
-    setTimeout(() => handle.remove(), 1500);
-    await refreshFileList();
-  } catch (err) {
-    handle.setFailed(err instanceof Error ? err.message : "Upload failed", () => void uploadOne(file));
-  }
+  const transferId = startTransfer({
+    slot: getActiveSlot(),
+    direction: "upload",
+    fileName: file.name,
+    fileSize: file.size,
+    fileLastModified: file.lastModified,
+    path,
+    versionId: 0,
+    vaultId: vault ? vault.vaultId : 0,
+    // A vault upload's DEK is fresh per attempt and never persisted (see
+    // api.ts's uploadFileEncrypted doc comment) - a page reload can't be
+    // resumed for these, only discarded and restarted from scratch.
+    resumable: vault === null,
+    totalChunks: 0,
+  });
+  await runUpload(file, path, vault, transferId);
 }
 
-async function handleDownload(entry: FileEntry): Promise<void> {
+// A superset of FileEntry's fields is not needed here - a downloaded
+// target reconstructed from transfer-registry.ts (resuming after a
+// reload, TASK-00283) doesn't carry entry_type/file_id/mtime_unix, only
+// what the download call and its progress bookkeeping actually use.
+type DownloadTarget = Pick<FileEntry, "name" | "vault_id" | "version_id" | "size_bytes">;
+
+async function handleDownload(entry: DownloadTarget, existingTransferId?: string): Promise<void> {
   const handle = createTransferItem(`Downloading ${entry.name}`);
   // The entry's own vault_id (TASK-156/TASK-159), not currentFolderVaultId -
   // an encrypted file keeps its vault_id after being moved out of the
@@ -1036,13 +1108,41 @@ async function handleDownload(entry: FileEntry): Promise<void> {
     return;
   }
   const vault = entry.vault_id !== 0 ? unlockedVault : null;
+
+  // Unlike an upload, a download never dedups against a prior partial
+  // attempt (there is no server-side benefit to query for - every chunk
+  // has to be fetched regardless) - resuming one just means "run it
+  // again"; the transfer record exists so a reload can still offer that
+  // one-click retry instead of the user having to re-find the file.
+  const transferId =
+    existingTransferId ??
+    startTransfer({
+      slot: getActiveSlot(),
+      direction: "download",
+      fileName: entry.name,
+      fileSize: entry.size_bytes,
+      fileLastModified: 0,
+      path: entry.name,
+      versionId: entry.version_id,
+      vaultId: entry.vault_id,
+      resumable: true,
+      totalChunks: 0,
+    });
+
   try {
     const blob = vault
-      ? await downloadFileEncrypted(entry.version_id, entry.size_bytes, vault.vk, (done, total) =>
-          handle.setProgress(done, total),
+      ? await downloadFileEncrypted(
+          entry.version_id,
+          entry.size_bytes,
+          vault.vk,
+          (done, total) => handle.setProgress(done, total),
+          (done, total) => updateTransferProgress(transferId, done, total),
         )
-      : await downloadFile(entry.version_id, entry.size_bytes, (done, total) =>
-          handle.setProgress(done, total),
+      : await downloadFile(
+          entry.version_id,
+          entry.size_bytes,
+          (done, total) => handle.setProgress(done, total),
+          (done, total) => updateTransferProgress(transferId, done, total),
         );
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1050,13 +1150,102 @@ async function handleDownload(entry: FileEntry): Promise<void> {
     a.download = entry.name;
     a.click();
     URL.revokeObjectURL(url);
+    removeTransfer(transferId);
+    renderInterruptedTransfers();
     setTimeout(() => handle.remove(), 1500);
   } catch (err) {
     handle.setFailed(err instanceof Error ? err.message : "Download failed", () =>
-      void handleDownload(entry),
+      void handleDownload(entry, transferId),
     );
   }
 }
+
+// ── Interrupted transfer recovery (TASK-00283) ──────────────────────────
+//
+// A reload silently drops any in-flight upload/download - there is no way
+// to intercept that (nothing meaningful to do in beforeunload for an
+// in-progress fetch, and the whole point is the page itself is about to
+// be gone). What this recovers is bookkeeping, not bytes already in
+// flight: transfer-registry.ts's records survive in localStorage, so
+// entering the browser view can tell the user a transfer was left running
+// and offer to continue it - a real byte-skipping resume for plaintext
+// uploads (via uploadFile's dedup query), a plain restart for downloads
+// and vault uploads (see runUpload's resumable=false handling above for
+// why vault uploads can't do better).
+function renderInterruptedTransfers(): void {
+  interruptedTransfersList.textContent = "";
+  const records = listTransfersForSlot(getActiveSlot());
+  interruptedTransfersList.hidden = records.length === 0;
+  for (const rec of records) {
+    const item = document.createElement("li");
+    item.className = "interrupted-transfer-item";
+
+    const label = document.createElement("span");
+    const pct = rec.totalChunks > 0 ? Math.round((rec.doneChunks / rec.totalChunks) * 100) : 0;
+    const verb = rec.direction === "upload" ? "Upload" : "Download";
+    label.textContent = rec.resumable
+      ? `${verb} of "${rec.fileName}" was interrupted (${pct}% done) - resume?`
+      : `${verb} of "${rec.fileName}" was interrupted and can't be resumed (a vault upload always starts with a fresh key) - discard it?`;
+    item.appendChild(label);
+
+    if (rec.resumable) {
+      const resumeBtn = document.createElement("button");
+      resumeBtn.textContent = "Resume";
+      resumeBtn.addEventListener("click", () => {
+        if (rec.direction === "upload") {
+          resumeUploadTarget = rec;
+          resumeUploadInput.click();
+        } else {
+          void handleDownload(
+            {
+              name: rec.fileName,
+              vault_id: rec.vaultId,
+              version_id: rec.versionId,
+              size_bytes: rec.fileSize,
+            },
+            rec.id,
+          );
+        }
+      });
+      item.appendChild(resumeBtn);
+    }
+
+    const discardBtn = document.createElement("button");
+    discardBtn.textContent = "Discard";
+    discardBtn.addEventListener("click", () => {
+      removeTransfer(rec.id);
+      renderInterruptedTransfers();
+    });
+    item.appendChild(discardBtn);
+
+    interruptedTransfersList.appendChild(item);
+  }
+}
+
+// A browser File handle from before the reload is gone (TASK-00283's core
+// constraint) - resuming an upload means the user re-picks the file here,
+// matched back to the interrupted record by name/size/lastModified before
+// anything is sent, so a wrong pick can't silently upload to the wrong
+// target or under the wrong path.
+resumeUploadInput.addEventListener("change", () => {
+  const files = resumeUploadInput.files;
+  const target = resumeUploadTarget;
+  resumeUploadTarget = null;
+  resumeUploadInput.value = "";
+  if (!files || files.length === 0 || !target) return;
+  const file = files[0];
+  if (
+    file.name !== target.fileName ||
+    file.size !== target.fileSize ||
+    file.lastModified !== target.fileLastModified
+  ) {
+    window.alert(
+      `Selected file does not match "${target.fileName}" - pick the original file to resume, or Discard instead.`,
+    );
+    return;
+  }
+  void runUpload(file, target.path, null, target.id);
+});
 
 // ── Version history view (TASK-140) ─────────────────────────────────────
 

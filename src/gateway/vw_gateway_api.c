@@ -1469,6 +1469,95 @@ static void handle_file_commit(vw_gateway_session_pool_t *pool,
     vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
 }
 
+/*
+ * POST /api/chunks/query (TASK-00283) - batched hash-presence check so the
+ * browser can skip re-uploading a chunk body the server already has,
+ * mirroring the native client's own upload_chunks Pass 2 (now shared via
+ * vw_client_chunk_query_batch). Request: {"chunk_hashes": [hex, ...]},
+ * same shape and decode path as FILE_COMMIT's chunk_hashes field. Response:
+ * {"missing": [bool, ...]} in request order - true means the browser still
+ * needs to upload that chunk.
+ */
+static void handle_chunk_query(vw_gateway_session_pool_t *pool,
+                                const vw_http_request_t *req, vw_http_conn_t *conn) {
+    vw_client_sess_t *sess;
+    char cookie[VW_GATEWAY_COOKIE_HEX_LEN + 1];
+    if (require_session(pool, req, conn, &sess, cookie) != VW_OK) return;
+    if (req->body == NULL) { send_error(conn, 400, "bad_request"); return; }
+
+    vw_json_value_t arr;
+    if (vw_json_object_get((const char *)req->body, req->body_len, "chunk_hashes", &arr) != VW_OK ||
+        arr.kind != VW_JSON_ARRAY) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint32_t chunk_count = 0;
+    if (vw_json_array_foreach(arr.start, arr.len, count_array_elem_cb, &chunk_count) != VW_OK ||
+        chunk_count == 0 || chunk_count > VW_GATEWAY_MAX_CHUNK_COUNT) {
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint8_t *hashes = malloc((size_t)chunk_count * VW_HASH_BYTES);
+    if (hashes == NULL) { send_error(conn, 500, "error"); return; }
+
+    chunk_hash_decode_ctx_t ctx = { hashes, 0, chunk_count, 0 };
+    if (vw_json_array_foreach(arr.start, arr.len, decode_chunk_hash_cb, &ctx) != VW_OK ||
+        ctx.error || ctx.count != chunk_count) {
+        free(hashes);
+        send_error(conn, 400, "bad_request");
+        return;
+    }
+
+    uint8_t *bitmask = calloc(((size_t)chunk_count + 7u) / 8u, 1);
+    if (bitmask == NULL) {
+        free(hashes);
+        send_error(conn, 500, "error");
+        return;
+    }
+
+    vw_err_t err = vw_client_chunk_query_batch(sess, (const uint8_t (*)[VW_HASH_BYTES])hashes,
+                                                chunk_count, bitmask);
+    free(hashes);
+    if (err != VW_OK) {
+        free(bitmask);
+        send_file_op_error(pool, cookie, conn, err);
+        return;
+    }
+
+    /* Each entry is "true,"/"false," (6 bytes worst case) plus a fixed
+     * allowance for the object's own framing. */
+    size_t cap = (size_t)chunk_count * 6u + 256u;
+    char *buf = malloc(cap);
+    if (buf == NULL) {
+        free(bitmask);
+        send_error(conn, 500, "error");
+        return;
+    }
+    vw_json_writer_t w;
+    vw_json_writer_init(&w, buf, cap);
+    vw_json_write_object_start(&w);
+    vw_json_write_key(&w, "missing");
+    vw_json_write_array_start(&w);
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        int is_missing = (bitmask[i / 8u] >> (7u - (i % 8u))) & 1u;
+        vw_json_write_bool(&w, is_missing != 0);
+    }
+    vw_json_write_array_end(&w);
+    vw_json_write_object_end(&w);
+    free(bitmask);
+
+    size_t len = 0;
+    if (vw_json_writer_result(&w, &len) != VW_OK) {
+        free(buf);
+        send_error(conn, 500, "response_too_large");
+        return;
+    }
+    vw_http_send_response(conn, 200, "application/json", NULL, buf, (uint32_t)len);
+    free(buf);
+}
+
 static void handle_version_chunks(vw_gateway_session_pool_t *pool,
                                    const vw_http_request_t *req, vw_http_conn_t *conn) {
     vw_client_sess_t *sess;
@@ -2306,6 +2395,10 @@ void vw_gateway_dispatch(vw_gateway_session_pool_t *pool,
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/chunks/download") == 0) {
         handle_chunk_download(pool, req, conn);
+        return;
+    }
+    if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/chunks/query") == 0) {
+        handle_chunk_query(pool, req, conn);
         return;
     }
     if (req->method == VW_HTTP_POST && strcmp(req->path, "/api/files/commit") == 0) {

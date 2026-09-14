@@ -378,31 +378,75 @@ export function getVersionChunks(versionId: number): Promise<ApiResult<ChunkList
   return apiPost("/api/versions/chunks", { version_id: versionId });
 }
 
-export type ProgressCb = (bytesDone: number, bytesTotal: number) => void;
+export interface QueryChunksResponse {
+  missing: boolean[]; // same order as the request's chunk_hashes
+}
 
-/* Uploads file to `path`, chunk by chunk, reporting cumulative byte
- * progress. Fails cleanly (returns the failing chunk's error, uploads
- * nothing further) rather than committing a partial file. */
+// Batched hash-presence check (TASK-00283; gateway: vw_client_chunk_query_batch,
+// docs/PROTOCOL.md §7.2's CHUNK_QUERY) - lets the browser skip re-uploading a
+// chunk body the server already has, without needing a persisted resume
+// cursor: re-hashing the source is cheap, so a fresh query on every attempt
+// (including after a page reload, once the same File is re-selected) is
+// always correct and never trusts stale client-side state.
+export function queryChunks(hashes: string[]): Promise<ApiResult<QueryChunksResponse>> {
+  return apiPost("/api/chunks/query", { chunk_hashes: hashes });
+}
+
+export type ProgressCb = (bytesDone: number, bytesTotal: number) => void;
+// Chunk-count (not byte) progress, reported after each chunk is confirmed
+// present server-side (whether by dedup-skip or a fresh upload) - the unit
+// transfer-registry.ts persists progress in, since a byte count alone can't
+// tell a caller which of the fixed-size chunks still need re-sending.
+export type ChunkProgressCb = (chunksDone: number, chunksTotal: number) => void;
+
+/* Uploads file to `path` in three passes - hash every chunk, ask the
+ * server which of those hashes it already has (queryChunks), then upload
+ * only the missing ones - so that re-running this on the same File after a
+ * failure or a page reload (TASK-00283) never re-transmits a chunk body
+ * the server already received, matching the native client's own
+ * upload_chunks Pass 2/3 split (vw_client_core.c). Reports cumulative byte
+ * progress via onProgress and chunk-count progress via onChunkDone. Fails
+ * cleanly (returns the failing chunk's error, uploads nothing further)
+ * rather than committing a partial file. */
 export async function uploadFile(
   path: string,
   file: File,
   onProgress?: ProgressCb,
+  onChunkDone?: ChunkProgressCb,
 ): Promise<ApiResult<CommitResponse>> {
   const totalSize = file.size;
   const chunkHashes: string[] = [];
-  let bytesDone = 0;
-
   for (let offset = 0; offset < totalSize; offset += CHUNK_SIZE) {
     const chunk = file.slice(offset, Math.min(offset + CHUNK_SIZE, totalSize));
     const buf = await chunk.arrayBuffer();
-    const hash = await sha256Hex(buf);
-    const result = await uploadChunk(hash, buf);
-    if (!result.ok) {
-      return { ok: false, status: result.status, data: result.data };
+    chunkHashes.push(await sha256Hex(buf));
+  }
+
+  // A query failure (network hiccup, etc.) just means no dedup savings
+  // this round - falling back to "everything missing" is always correct,
+  // never a correctness risk, since the actual upload step still confirms
+  // each chunk lands before FILE_COMMIT is sent.
+  let missing = chunkHashes.map(() => true);
+  if (chunkHashes.length > 0) {
+    const queried = await queryChunks(chunkHashes);
+    if (queried.ok) missing = queried.data.missing;
+  }
+
+  let bytesDone = 0;
+  for (let i = 0; i < chunkHashes.length; i++) {
+    const offset = i * CHUNK_SIZE;
+    const end = Math.min(offset + CHUNK_SIZE, totalSize);
+    if (missing[i]) {
+      const chunk = file.slice(offset, end);
+      const buf = await chunk.arrayBuffer();
+      const result = await uploadChunk(chunkHashes[i], buf);
+      if (!result.ok) {
+        return { ok: false, status: result.status, data: result.data };
+      }
     }
-    chunkHashes.push(hash);
-    bytesDone += buf.byteLength;
+    bytesDone += end - offset;
     onProgress?.(bytesDone, totalSize);
+    onChunkDone?.(i + 1, chunkHashes.length);
   }
 
   return commitFile({ path, logicalSize: totalSize, chunkHashes });
@@ -416,6 +460,7 @@ export async function downloadFile(
   versionId: number,
   totalSize: number,
   onProgress?: ProgressCb,
+  onChunkDone?: ChunkProgressCb,
 ): Promise<Blob> {
   const chunksResult = await getVersionChunks(versionId);
   if (!chunksResult.ok) {
@@ -427,11 +472,13 @@ export async function downloadFile(
 
   const parts: ArrayBuffer[] = [];
   let bytesDone = 0;
-  for (const hash of chunksResult.data.chunk_hashes) {
-    const buf = await downloadChunk(hash);
+  const total = chunksResult.data.chunk_hashes.length;
+  for (let i = 0; i < total; i++) {
+    const buf = await downloadChunk(chunksResult.data.chunk_hashes[i]);
     parts.push(buf);
     bytesDone += buf.byteLength;
     onProgress?.(bytesDone, totalSize);
+    onChunkDone?.(i + 1, total);
   }
   return new Blob(parts);
 }
@@ -566,6 +613,16 @@ export function vaultDelete(vaultId: number): Promise<ApiResult<StatusResponse>>
  * here would silently produce a different chunk count than the native
  * client would for the same file, which is still byte-correct after
  * reassembly but worth keeping identical to avoid any doubt.
+ *
+ * Deliberately NOT restructured to uploadFile's hash/query/upload-missing
+ * three-pass flow (TASK-00283): the DEK is randomFresh per call and is
+ * never persisted (a hard security requirement - see vault-crypto.ts), so
+ * every chunk's ciphertext, and therefore its hash, is different on every
+ * attempt. A query against a prior attempt's hashes would always report
+ * "missing" - there is nothing to dedup against, whether the retry
+ * follows a page reload or just a same-session failure. Cross-reload
+ * resume for vault uploads is therefore not offered; see
+ * transfer-registry.ts's `resumable: false` handling for this direction.
  */
 const VAULT_PLAINTEXT_CHUNK_SIZE = CHUNK_SIZE - 16;
 
@@ -580,6 +637,7 @@ export async function uploadFileEncrypted(
   vaultId: number,
   vk: Uint8Array,
   onProgress?: ProgressCb,
+  onChunkDone?: ChunkProgressCb,
 ): Promise<ApiResult<CommitResponse>> {
   const { randomDek, encryptChunk, wrapKey, bytesToHex: vaultBytesToHex } = await import(
     "./vault-crypto.js"
@@ -588,6 +646,7 @@ export async function uploadFileEncrypted(
   const totalSize = file.size;
   const dek = randomDek();
   const chunkHashes: string[] = [];
+  const totalChunks = Math.max(1, Math.ceil(totalSize / VAULT_PLAINTEXT_CHUNK_SIZE));
   let bytesDone = 0;
   let chunkIndex = 0;
   let offset = 0;
@@ -609,6 +668,7 @@ export async function uploadFileEncrypted(
     chunkIndex++;
     offset = end;
     onProgress?.(bytesDone, totalSize);
+    onChunkDone?.(chunkIndex, totalChunks);
   } while (offset < totalSize);
 
   const wrappedDek = await wrapKey(vk, dek);
@@ -632,6 +692,7 @@ export async function downloadFileEncrypted(
   totalSize: number,
   vk: Uint8Array,
   onProgress?: ProgressCb,
+  onChunkDone?: ChunkProgressCb,
 ): Promise<Blob> {
   const { unwrapKey, decryptChunk, hexToBytes: vaultHexToBytes } = await import(
     "./vault-crypto.js"
@@ -651,6 +712,7 @@ export async function downloadFileEncrypted(
   const parts: ArrayBuffer[] = [];
   let bytesDone = 0;
   let chunkIndex = 0;
+  const total = chunksResult.data.chunk_hashes.length;
   for (const hash of chunksResult.data.chunk_hashes) {
     const ciphertextBuf = await downloadChunk(hash);
     const plaintextBuf = await decryptChunk(dek, chunkIndex, ciphertextBuf);
@@ -658,6 +720,7 @@ export async function downloadFileEncrypted(
     bytesDone += plaintextBuf.byteLength;
     chunkIndex++;
     onProgress?.(bytesDone, totalSize);
+    onChunkDone?.(chunkIndex, total);
   }
   // Same DEK-zeroing discipline as uploadFileEncrypted above - every chunk
   // is already decrypted at this point, so the DEK is no longer needed.
