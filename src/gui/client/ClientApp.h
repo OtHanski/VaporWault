@@ -122,6 +122,8 @@ public:
     bool ipc_account_2fa_get(uint8_t *out_enabled);
     int  ipc_account_2fa_set(const std::string &password, bool enable, uint8_t *out_enabled);
     bool ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *out);
+    bool ipc_shared_folder_list(uint64_t dir_file_id, uint8_t recursive,
+                                 std::vector<VwGuiRemoteFileEntry> *out, int *out_error_code);
     bool ipc_search(const char *query, std::vector<VwGuiSearchEntry> *out,
                      uint8_t *out_truncated, int *out_error_code);
 

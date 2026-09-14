@@ -425,6 +425,53 @@ bool VwGuiIpc::file_list(uint32_t account_id, const char *prefix, std::vector<Vw
     return true;
 }
 
+bool VwGuiIpc::shared_folder_list(uint32_t account_id, uint64_t dir_file_id, uint8_t recursive,
+                                   std::vector<VwGuiRemoteFileEntry> *out, int *out_error_code) {
+    uint8_t req[13];
+    vw_write_u32le(req, account_id);
+    vw_write_u64le(req + 4, dir_file_id);
+    req[12] = recursive;
+
+    static const uint32_t kRespCap = 65536;
+    std::vector<uint8_t> resp(kRespCap);
+    uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_SHARED_FOLDER_LIST_REQ, req, sizeof(req),
+                             VW_IPC_SHARED_FOLDER_LIST_RESP, resp.data(), kRespCap, &rlen);
+    if (err != VW_OK) { if (out_error_code) *out_error_code = (int)err; return false; }
+    if (rlen < 8) { if (out_error_code) *out_error_code = (int)VW_ERR_IO; return false; }
+
+    uint32_t ec = read_u32_le(resp.data());
+    if (out_error_code) *out_error_code = (int)ec;
+    if (ec != 0) return false;
+
+    uint32_t count = read_u32_le(resp.data() + 4);
+    uint32_t off = 8;
+    std::vector<VwGuiRemoteFileEntry> entries;
+    entries.reserve(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 1u + 8u + 8u + 8u + 8u > rlen) break;
+        VwGuiRemoteFileEntry e;
+        e.entry_type  = resp[off++];
+        e.file_id     = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.size_bytes  = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+        e.mtime_unix  = read_i64_le(resp.data() + off); off += 8;
+        e.version_id  = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+
+        const char *name = nullptr; uint16_t nlen = 0;
+        if (vw_ipc_read_str(resp.data(), rlen, &off, &name, &nlen) != VW_OK) break;
+        e.name.assign(name, nlen);
+
+        if (off + 8u > rlen) break;
+        e.vault_id = (uint64_t)read_i64_le(resp.data() + off); off += 8;
+
+        entries.push_back(std::move(e));
+    }
+
+    *out = std::move(entries);
+    return true;
+}
+
 bool VwGuiIpc::search(uint32_t account_id, const char *query, std::vector<VwGuiSearchEntry> *out,
                        uint8_t *out_truncated, int *out_error_code) {
     uint8_t req[4u + 2u + 256u]; uint32_t off = 0;

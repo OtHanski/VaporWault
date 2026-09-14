@@ -55,6 +55,24 @@ struct VwGuiFileEntry {
     uint64_t    vault_id     = 0; /* TASK-158: 0 = unencrypted or unknown */
 };
 
+/*
+ * TASK-00281/00282: a live remote directory listing (VW_IPC_SHARED_
+ * FOLDER_LIST_RESP), not a vw_cache_entry_t row — no virtual_path/
+ * local_path/sync_state/local_mtime, since this describes a folder the
+ * caller has no local sync cache entries for (a share they haven't
+ * separately added as a sync target). Field-for-field the same shape
+ * vapourwault-cli's `browse` decodes.
+ */
+struct VwGuiRemoteFileEntry {
+    uint8_t     entry_type  = 0;  /* 0 = file, 1 = dir (VW_ENTRY_FILE/_DIR) */
+    uint64_t    file_id     = 0;
+    uint64_t    size_bytes  = 0;
+    int64_t     mtime_unix  = 0;
+    uint64_t    version_id  = 0;  /* current HEAD version; 0 if directory */
+    std::string name;
+    uint64_t    vault_id    = 0;  /* 0 = unencrypted or a directory */
+};
+
 /* Sharing (TASK-096; library: TASK-095, docs/PROTOCOL.md §7.5). Mirrors
  * VW_IPC_SHARE_LIST_RESP / VW_IPC_LINK_LIST_RESP per-entry fields exactly
  * (see vw_ipc.h's payload doc comments), field-for-field the same shape
@@ -281,6 +299,19 @@ public:
      * and repopulated); false on IPC failure (out is left unchanged).
      */
     bool file_list(uint32_t account_id, const char *prefix, std::vector<VwGuiFileEntry> *out);
+
+    /*
+     * TASK-00281/00282: live remote listing of a directory by file_id,
+     * NOT the local sync cache file_list above reads — the only way to
+     * browse into a shared folder's subtree the caller hasn't separately
+     * added as a sync target. recursive=1 returns the whole subtree in
+     * one call. Returns true on success (out cleared and repopulated);
+     * false on IPC failure or a nonzero error_code (out_error_code set
+     * either way — VW_ERR_NOT_FOUND if the caller has no access at all,
+     * VW_ERR_INVALID_ARG if dir_file_id names a file, not a directory).
+     */
+    bool shared_folder_list(uint32_t account_id, uint64_t dir_file_id, uint8_t recursive,
+                             std::vector<VwGuiRemoteFileEntry> *out, int *out_error_code);
 
     /*
      * Filename search (TASK-199/200; docs/PROTOCOL.md §7.12). Returns
