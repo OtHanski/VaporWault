@@ -1,7 +1,7 @@
-# VaporWault C/C++ Style Guide
+# VaporWault Style Guide
 
-**Owner:** CQR.08  
-**Applies to:** All `.c`, `.h`, and `.cpp` files in the repository
+**Owner:** CQR.08
+**Applies to:** All `.c`, `.h`, and `.cpp` files in the repository (§1–16); Kotlin under `android/` (§17, owned day-to-day by MOB.10) and TypeScript under `web/src/` (§18, owned day-to-day by WEB.09) as of `TASK-00276`
 
 ---
 
@@ -122,6 +122,8 @@ fail:
 - Functions that return heap-allocated buffers (`*out_buf`) document the caller's responsibility to `free()` in the header comment.
 - No VLAs. Fixed-size stack buffers with explicit size checks.
 - Zero out sensitive data before freeing: `memset(secret, 0, len); free(secret);`
+- **Borrowed pointers**: a module that needs another module's already-open handle for its whole lifetime (e.g. `vw_cluster_open`'s `store`/`file_store`/`chunks`/`share_store`/`vault_store`/`conn_registry` parameters) takes it as a plain pointer documented as *borrowed* in the header comment — "same lifetime contract as X above", or similar — never takes ownership, and never frees it. The caller opens it first and closes it after the borrower. An optional dependency (the borrower still works with reduced functionality if it's absent) is documented as "may be NULL" in the same comment rather than silently changing behavior with no signal in the API surface (`vw_vault_store_t`/`vw_share_store_t` in `vw_cluster_open`, `vw_conn_registry_t` likewise). This is the standing pattern for cross-module dependencies in this codebase — checked and confirmed still accurate as of `TASK-00285` (2026-09-14), which added a sixth borrowed parameter to `vw_cluster_open` on top of the five `TASK-172` already established.
+- **In-memory-only auxiliary arrays alongside a persisted slot index**: when a module needs to track a piece of state that must NOT be persisted (a live gauge, a transient pin/lock count — never written to the module's own on-disk record format) but is naturally indexed the same way an existing on-disk-backed slot index already is, add a second array grown/freed in lockstep with the first (same capacity, same `_ensure`-style growth function, updated in the same commit that grows the first) rather than a separate side table with its own capacity to keep synchronized. Two independent instances of this same idiom: `vw_vault.c`'s `pin_counts` beside `vid_to_slot` (`TASK-00290`) and `vw_cluster.c`'s `client_conn_counts` beside `nid_to_slot` (`TASK-00285`) — the second was modeled directly on the first.
 
 ---
 
@@ -270,9 +272,102 @@ Rules:
 
 ---
 
+## 17. Kotlin (Android client)
+
+**Owner:** MOB.10
+**Applies to:** `android/app/src/main/java/com/vaporwault/client/**/*.kt`
+
+This section documents conventions already consistently followed by the shipped code (`TASK-224`–`251`), derived by reading it rather than imposed from outside — see each rule's citation. Standardize on these for new code; flag a genuine inconsistency to MOB.10/CQR.08 rather than picking a third way.
+
+### Naming
+
+| Entity                          | Convention                          | Example |
+|----------------------------------|--------------------------------------|---------|
+| Classes                          | `PascalCase`                        | `VwClient`, `VwSecureStore`, `FileEntryAdapter` |
+| Functions / properties           | `camelCase`                         | `listFiles`, `folderFileId` |
+| Constants (`companion object`)   | `SCREAMING_SNAKE_CASE`               | `VwSecureStore.KEY_ALIAS`, `VwClient.ERR_AUTH_2FA_REQUIRED` |
+| JNI external declarations        | `native` + `PascalCase` verb-noun    | `nativeFileList`, `nativeVaultSetup` (`VwNative.kt`) |
+| Private backing field for a public getter | same name + `Field` suffix | `VwClient.handleField` backs `VwClient.handle` (`VwClient.kt`) |
+
+No leading-underscore backing-field convention (`_foo`/`foo`) anywhere — use the `Field` suffix instead. `native*` is the one systematic prefix in this codebase: it marks "this call crosses into C," the Kotlin equivalent of the C-side `vw_` prefix rule (§2).
+
+### Null safety
+
+- `!!` is effectively banned by precedent: one occurrence exists in the entire tree. Use `?.let { }`, `?:`, or an explicit `if (x != null)` check instead.
+- The dominant idiom at the JNI boundary is `nativeFoo(...)?.let(::decodeFoo)` — a fetch-shaped native call returns a nullable `ByteArray?`/`String?` and the Kotlin wrapper decodes only on success. An action-shaped native call instead returns a non-nullable `Int`/`Long`/`Boolean` sentinel (0/negative = failure) — never a nullable success flag. Keep this split when adding a new native declaration to `VwNative.kt`: nullable return for "fetched something," non-nullable sentinel for "did something."
+- A `Long` native handle uses `0L` as its own null sentinel rather than `Long?` — see `VwClient.handle`'s getter, which throws via `error(...)` if the backing field is `0L`.
+- `lateinit var` is reserved for Activity fields populated in `onCreate` that are never plausibly read before it runs. Don't reach for it as a general "avoid a nullable type" escape hatch.
+
+### Error handling
+
+- No exceptions and no sealed `Result` type on the native-facing API surface. A fetch-shaped method returns `null` on failure; an action-shaped method returns a nonzero/negative sentinel. Either way, the caller retrieves the actual `vw_err_t` via `VwClient.lastError()` / `VwVault.lastError()`, which read a native thread-local slot.
+- **Known footgun, worth repeating for new code**: `lastError()` must be captured on the same background thread that made the failing call, *before* posting the result to `runOnUiThread` — capture it into a local (`val lastError = if (x == null) VwClient.lastError() else 0`) at the point of failure, not inside the UI-thread callback. `VwClient.kt`'s own doc comment on this function calls it out as a mistake this codebase has made more than once.
+- Real exceptions are fine at a boundary where the underlying JDK/Android API's own convention already throws — don't invent a null/error-code wrapper just for consistency with the rule above. `VwSecureStore.decrypt` deliberately lets `AEADBadTagException` propagate (matches `javax.crypto`'s own idiom); `getOrCreateKey` catches `StrongBoxUnavailableException` specifically to fall back to a software key.
+
+### Threading
+
+- No coroutines anywhere in this codebase (no `suspend`, no `Flow`) — don't introduce them in isolation for one new feature. Use `kotlin.concurrent.thread { }` + `runOnUiThread { }` for a simple fire-and-forget background action; use `TransferManager`'s `JobScheduler`/User-Initiated-Data-Transfer path (with a foreground-service fallback below API 34) for anything that should survive the Activity going away.
+- Cross-thread state uses plain `java.util.concurrent` primitives (`ConcurrentHashMap`, `AtomicBoolean`, `AtomicInteger`), not a coroutine-flavored equivalent — `TransferManager`'s cancel-flag table and work-id counter are the reference example.
+
+### File / module structure
+
+- One public class per file, filename matching the class name. Small, tightly-coupled supporting types (DTOs a class produces, private decode helpers it uses) live in the same file rather than being split out — `VwClient.kt` holds `VwClient` plus its seven small `data class` results and a block of file-scope `private fun ByteBuffer.readX()` extensions below the class.
+- No sealed classes anywhere — the nullable-return convention above already covers what a sealed `Result` type would otherwise be for. Don't introduce one for a single new call site.
+- Four flat packages under `com.vaporwault.client`: root (native bridge + wrappers), `accounts`, `transfer`, `ui`. No further nesting.
+
+### Comments
+
+- KDoc (`/** */`) on every public class/function, and on a private helper too if its behavior isn't obvious from its name. Plain prose only — no `@param`/`@return` tags, cross-reference other symbols with `[SquareBrackets]` instead. This matches the C-side "plain prose, no Doxygen tags" rule (§10) — kept the same across both languages deliberately, not a coincidence.
+- Document a non-obvious invariant right next to the code it constrains (a `ByteBuffer` position/limit gotcha, an API-level gate's reasoning), not only in the file's header comment. Cite the task that found it when there is one — this codebase already does that consistently and it's worth keeping.
+
+### Android-specific idioms
+
+- `RecyclerView.Adapter`: a nested `ViewHolder` class with `findViewById` calls as `val` properties, an `update(newEntries)` method calling `notifyDataSetChanged()` (not `DiffUtil`), and constructor-injected callback lambdas for row actions rather than a listener interface.
+- Activities extend `AppCompatActivity`, wire views via `findViewById` in `onCreate` (no ViewBinding/DataBinding), and use `registerForActivityResult(ActivityResultContracts.OpenDocument())` for Storage Access Framework picker flows.
+- A `content://` URI from SAF is never passed to native code directly. Every native-facing path takes a real POSIX path — code holding a picked URI stages it through `filesDir`/cache first (`LoginActivity.copyCaCert` is the reference example).
+
+### Native-bridge idioms (the JNI boundary specifically)
+
+- A class wrapping one native handle (`VwClient`, `VwVault`) is `class ... private constructor(handle: Long) : AutoCloseable`, with a private `handleField`, a public `close()` (or a domain-named alias like `logout()`) that zeroes it and is safe to call twice, and every method reading the handle through a getter that throws `IllegalStateException` via `error(...)` once closed. This exact shape is intentionally duplicated between `VwClient` and `VwVault` rather than factored into a shared base — keep duplicating it for a third such class rather than introducing an abstraction for two examples.
+- Hold exactly one native handle per wrapper object. When a C function needs two handles (e.g. a vault operation needs both the vault's own handle and the owning session's), pass the second one in explicitly as a parameter (`VwVault`'s methods take `client.rawHandle()`) rather than nesting one wrapper inside another. `rawHandle()` is `internal`, never `public` — a caller outside this module has no business touching a raw native handle.
+- Decode a flat wire record via a `private fun ByteBuffer.readX()` extension reading fields in the exact C struct order, using a shared `leBuffer()` helper that sets `ByteOrder.LITTLE_ENDIAN` once rather than per call. A `count`-prefixed array decodes as `List(count) { buf.readX() }`.
+- A secret crossing the JNI boundary (password, passphrase) is always `ByteArray`, never `String` — `String` interning on the JVM defeats zeroing it afterward. Build it from an `Editable` directly (`.toString().toCharArray()` is exactly the mistake this rule exists to prevent — it round-trips through an interned `String` first). Zero the buffer on both sides of the boundary independently: the native side zeroes its own copy before returning, and the Kotlin wrapper separately zeroes whatever intermediate encoding buffer it built — one side zeroing its copy is never a substitute for the other doing the same for its own.
+
+---
+
+## 18. TypeScript (web frontend)
+
+**Owner:** WEB.09
+**Applies to:** `web/src/*.ts`
+
+No framework, no bundler, no linter beyond the compiler's own settings (`web/tsconfig.json`'s `"strict": true`, `noUnusedLocals`, `noUnusedParameters`, `noImplicitReturns` — the actual enforcement mechanism; there is no ESLint config in this project). `tsc` compiles straight to static `.js` served by nginx (`package.json`'s own description) — there is no bundling step to hide file-extension mismatches, so **every relative import must use the `.js` extension the compiled output will actually have**, never `.ts` and never bare (`import { login } from "./api.js"`, not `"./api"` or `"./api.ts"`) — this is a compile-time-invisible mistake (`tsc` accepts either) that only breaks at runtime in the browser, so it's worth stating explicitly rather than assuming it's obvious.
+
+### Module structure
+
+Three files, one job each — keep new code in the file matching its job rather than growing a fourth:
+- `api.ts` — thin `fetch()` wrappers over the gateway's `/api/*` endpoints. No DOM access, no UI logic. Every exported function returns `Promise<ApiResult<T>>` (see below) or, for the chunked transfer helpers, throws on a genuinely exceptional condition (see Error handling below).
+- `vault-crypto.ts` — the in-browser half of the E2EE vault. Every primitive here is documented as cross-verified byte-for-byte against its native counterpart (`src/core/vw_crypto.c`/`src/client/vw_vault.c`) in the file's own header comment — do the same cross-check before changing one of these functions, not just a "looks equivalent" read of both implementations.
+- `main.ts` — DOM wiring and view orchestration. Organized internally into `// ── Section Name (TASK-NNN) ──` banner comments, one per feature view (login, browser, search, sharing, settings, ...) — add a new banner for a new view rather than interleaving its functions among an existing one's.
+
+Naming: files are `kebab-case.ts`; functions/variables are `camelCase`; `interface`s are `PascalCase`; a true constant is `SCREAMING_SNAKE_CASE` (`CHUNK_SIZE`), mutable module-level state stays `camelCase` (`activeSlot`) — the same functions-vs-constants-vs-mutable-state split C uses (§2), just with JS's own casing.
+
+### Error handling
+
+- A network/API call returns a discriminated union, never throws for an ordinary failure: `ApiResult<T> = { ok: true; status; data: T } | { ok: false; status; data: StatusResponse }`. Callers branch on `.ok` and get real compile-time narrowing of `.data`'s shape in each branch — this is deliberately not `{ data: T | null }`, which would lie about the error case's actual shape. Follow this shape for any new `api.ts` endpoint wrapper.
+- Reserve a thrown `Error` for a condition the caller cannot reasonably branch on and recover from inline (a malformed response, an unsupported combination the UI should never have been able to trigger) — the chunked upload/download helpers in `api.ts` throw for exactly this class of failure, not for an ordinary rejected request.
+- An `async` function called from an event listener (not `await`ed by anything) is invoked as `void handleX()`, never bare — makes the deliberately-unawaited promise visible at the call site instead of looking like an oversight.
+- A DOM element expected to exist because it's in the page's own HTML is looked up once through the `el<T extends HTMLElement>(id)` helper, which throws immediately if missing — a hard, loud failure at startup for a wiring bug, distinct from the `ApiResult` pattern above for genuinely-fallible runtime calls. Don't add a second "maybe this element exists" pattern next to it.
+
+### Comments
+
+Plain `/* ... */` or `//` prose explaining *why*, referencing the originating `TASK-NNN` where there is one — no JSDoc tags. Same rule as the C side (§10) and Kotlin (§17), kept consistent across all three languages in this repository deliberately.
+
+---
+
 ## Version history
 
 | Date       | Author  | Change                        |
 |------------|---------|-------------------------------|
 | 2026-06-23 | CQR.08  | Initial guide                 |
 | 2026-07-13 | CQR.08  | Added §14 endian helpers, §15 sensitive-data zeroing, §16 test conventions |
+| 2026-09-14 | CQR.08  | `TASK-00276`: added §17 Kotlin (Android client) and §18 TypeScript (web frontend) — derived from reading the actual shipped code (`TASK-224`–`251`, `TASK-136`–`141`/`164`–`166`/`198`–`222`), not written from generic best practice. §6 (Memory) gained two entries found during the same drift review: the "borrowed pointer" convention (already used ~30 times across this codebase, most recently `vw_cluster_open`'s sixth parameter, `TASK-00285`) and the in-memory-only-auxiliary-array-in-lockstep-with-a-slot-index idiom (`vw_vault.c`'s `pin_counts`, `TASK-00290`; `vw_cluster.c`'s `client_conn_counts`, `TASK-00285`). Sections 1–16 spot-checked against code shipped since 2026-07-13 (cluster replication, vault/E2EE, web gateway, Android, corruption detection/repair) and found still accurate as written — no other changes needed there. |
