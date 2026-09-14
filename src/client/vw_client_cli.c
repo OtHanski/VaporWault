@@ -1095,6 +1095,63 @@ static int cmd_version_restore_by_id(vw_ipc_conn_t *conn, uint32_t account_id,
     return 0;
 }
 
+/* ── Subcommand: list-folder (TASK-00281; docs/vw_ipc.h's own payload doc) ─
+ * Lists a directory by file_id via the live remote listing IPC path (not
+ * the local sync cache VW_IPC_FILE_LIST_REQ reads) — the only way to
+ * browse into a shared folder's subtree, which the local cache has no
+ * entries for unless the caller separately added it as a sync target. */
+
+/* SHARED_FOLDER_LIST_REQ: u32 account_id, u64 dir_file_id, u8 recursive.
+ * _RESP: u32 error_code, u32 count,
+ * count * { u8 entry_type, u64 file_id, u64 size_bytes, i64 mtime_unix,
+ *           u64 version_id, string name, u64 vault_id }. */
+static int cmd_shared_folder_list(vw_ipc_conn_t *conn, uint32_t account_id,
+                                   uint64_t dir_file_id, uint8_t recursive) {
+    uint8_t req[13];
+    vw_write_u32le(req, account_id);
+    vw_write_u64le(req + 4, dir_file_id);
+    req[12] = recursive;
+
+    uint8_t *resp = malloc(65536);
+    if (!resp) { fprintf(stderr, "list-folder: out of memory\n"); return 1; }
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_SHARED_FOLDER_LIST_REQ, req, sizeof(req),
+                             VW_IPC_SHARED_FOLDER_LIST_RESP, resp, 65536, &rlen);
+    if (err != VW_OK) { fprintf(stderr, "list-folder: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "list-folder")) { free(resp); return 1; }
+    if (rlen < 8u) { free(resp); return 0; }
+
+    uint32_t count = vw_read_u32le(resp + 4u);
+    uint32_t roff  = 8u;
+
+    printf("%-10s  %-4s  %-12s  %-19s  %s\n", "FILE_ID", "TYPE", "SIZE", "MODIFIED (UTC)", "NAME");
+    for (uint32_t i = 0; i < count; i++) {
+        if (roff + 1u + 8u + 8u + 8u + 8u > rlen) break;
+        uint8_t  entry_type = resp[roff++];
+        uint64_t file_id    = vw_read_u64le(resp + roff); roff += 8u;
+        uint64_t size_bytes = vw_read_u64le(resp + roff); roff += 8u;
+        int64_t  mtime_unix = (int64_t)vw_read_u64le(resp + roff); roff += 8u;
+        roff += 8u; /* version_id: not shown in this column layout — see "version list --file-id" */
+
+        const char *name; uint16_t name_len;
+        if (vw_ipc_read_str(resp, rlen, &roff, &name, &name_len) != VW_OK) break;
+        char name_buf[64];
+        uint16_t nc = name_len < sizeof(name_buf) - 1u ? name_len : (uint16_t)(sizeof(name_buf) - 1u);
+        memcpy(name_buf, name, nc); name_buf[nc] = '\0';
+
+        if (roff + 8u > rlen) break;
+        roff += 8u; /* vault_id: not shown here, matching "search"'s own column layout */
+
+        char ts_buf[24]; format_ts(mtime_unix, ts_buf, sizeof(ts_buf), 0);
+        printf("%-10llu  %-4s  %-12llu  %-19s  %s\n",
+               (unsigned long long)file_id, entry_type == 1u ? "dir" : "file",
+               (unsigned long long)size_bytes, ts_buf, name_buf);
+    }
+
+    free(resp);
+    return 0;
+}
+
 /* ── Subcommand: search (TASK-199; docs/PROTOCOL.md §7.12) ───────────────── */
 
 /* SEARCH_REQ: u32 account_id, string query. SEARCH_RESP: u32 error_code,
@@ -1429,6 +1486,12 @@ static void print_usage(const char *prog) {
         "                                (requires an EDIT grant, not just VIEW)\n"
         "  search <query>                Search filenames across everything visible\n"
         "                                (owned + shared); case-insensitive substring\n"
+        "  list-folder <file_id> [--recursive]\n"
+        "                                Browse a directory's live contents by id —\n"
+        "                                the only way to descend into a shared\n"
+        "                                folder's subtree (get the top-level id from\n"
+        "                                list-shares); unlike \"list\", not limited to\n"
+        "                                what's in the local sync cache\n"
         "  notify list                   Show your email notification preferences\n"
         "  notify set <category> on|off  Toggle one notification category\n"
         "  shutdown                      Ask the daemon to stop\n"
@@ -1995,6 +2058,31 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         vw_ipc_conn_t *c = cli_connect(ipc_port);
         if (!c) return 1;
         int rc = cmd_search(c, account_id, query);
+        vw_ipc_conn_close(c);
+        return rc;
+    }
+
+    if (strcmp(cmd, "list-folder") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s list-folder <file_id> [--recursive]\n", argv[0]);
+            return 1;
+        }
+        /* TASK-00281: browses a directory by file_id via the live remote
+         * listing path, not the local sync cache "list" command above —
+         * the only way to descend into a shared folder's subtree (see
+         * "list-shares" for the top-level file_id to start from). */
+        uint64_t dir_file_id = strtoull(argv[argi++], NULL, 10);
+        uint8_t recursive = 0;
+        if (argi < argc && strcmp(argv[argi], "--recursive") == 0) {
+            recursive = 1;
+            argi++;
+        }
+        uint32_t account_id = 0;
+        if (resolve_account_id(ipc_port, account_arg, &account_id)) return 1;
+        vw_ipc_conn_t *c = cli_connect(ipc_port);
+        if (!c) return 1;
+        int rc = cmd_shared_folder_list(c, account_id, dir_file_id, recursive);
         vw_ipc_conn_close(c);
         return rc;
     }

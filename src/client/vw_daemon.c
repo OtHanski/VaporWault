@@ -2136,6 +2136,47 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    case VW_IPC_SHARED_FOLDER_LIST_REQ: {
+        if (plen < 13u) { ipc_send_u32(conn, VW_IPC_SHARED_FOLDER_LIST_RESP, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
+        uint32_t account_id  = vw_read_u32le(buf);
+        uint64_t dir_file_id = vw_read_u64le(buf + 4);
+        uint8_t  recursive   = buf[12];
+        vw_account_ctx_t *a = account_find(dc->accounts, account_id);
+        if (!a || !a->sess) {
+            ipc_send_u32(conn, VW_IPC_SHARED_FOLDER_LIST_RESP,
+                         (uint32_t)(!a ? VW_ERR_INVALID_ARG : VW_ERR_AUTH_REQUIRED));
+            break;
+        }
+
+        vw_file_entry_t *entries = NULL; uint32_t count = 0;
+        vw_err_t rc = vw_client_file_list_by_id(a->sess, dir_file_id, recursive, &entries, &count);
+        uint8_t *rbuf = malloc(65536);
+        if (!rbuf) { free(entries); ipc_send_u32(conn, VW_IPC_SHARED_FOLDER_LIST_RESP, (uint32_t)VW_ERR_OOM); break; }
+        uint32_t roff = 0;
+        vw_write_u32le(rbuf + roff, (uint32_t)rc); roff += 4;
+        uint32_t count_off = roff; roff += 4; /* patched below once written is known */
+        uint32_t written = 0;
+        if (rc == VW_OK) {
+            for (uint32_t i = 0; i < count && roff + 2048u < 65536u; i++) {
+                const vw_file_entry_t *e = &entries[i];
+                rbuf[roff++] = e->entry_type;
+                vw_write_u64le(rbuf + roff, e->file_id);     roff += 8;
+                vw_write_u64le(rbuf + roff, e->size_bytes);  roff += 8;
+                vw_write_u64le(rbuf + roff, (uint64_t)e->mtime_unix); roff += 8;
+                vw_write_u64le(rbuf + roff, e->version_id);  roff += 8;
+                uint16_t nlen = (uint16_t)strnlen(e->name, sizeof(e->name));
+                vw_ipc_write_str(rbuf, 65536, &roff, e->name, nlen);
+                vw_write_u64le(rbuf + roff, e->vault_id);    roff += 8;
+                written++;
+            }
+        }
+        vw_write_u32le(rbuf + count_off, written);
+        free(entries);
+        vw_ipc_send(conn, VW_IPC_SHARED_FOLDER_LIST_RESP, rbuf, roff);
+        free(rbuf);
+        break;
+    }
+
     case VW_IPC_ACCOUNT_2FA_SET_REQ: {
         uint32_t off = 0;
         if (off + 4u > plen) { ipc_send_u32(conn, VW_IPC_ACCOUNT_2FA_SET_ACK, (uint32_t)VW_ERR_PROTO_TRUNCATED); break; }
