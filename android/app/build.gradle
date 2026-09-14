@@ -3,6 +3,17 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// TASK-00289: real release signing, sourced entirely from environment
+// variables so the actual keystore file/passwords never touch this file
+// or git history. release.yml's build-android job decodes its
+// base64-encoded keystore secret to a runner-temp file and sets these
+// four env vars for the assembleRelease step only. A local build without
+// them set (no contributor has a copy of the real keystore) falls back to
+// signingConfigs.debug below, matching TASK-239's original reasoning that
+// an unsigned release APK can't install at all.
+def releaseKeystorePath = System.getenv("ANDROID_RELEASE_KEYSTORE_PATH")
+def hasReleaseSigning = releaseKeystorePath != null && file(releaseKeystorePath).exists()
+
 android {
     namespace "com.vaporwault.client"
     compileSdk 34
@@ -37,15 +48,25 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseKeystorePath)
+                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TASK-239: signed with the standard Gradle debug key, not a real
-            // release keystore -- this project has neither a signing keystore
-            // nor a Play Store presence yet (see docs/RELEASE.md). Without an
-            // explicit signingConfig here, AGP produces an unsigned release
-            // APK that can't be installed at all. Revisit once real signing
-            // infrastructure exists; do not mistake this for production signing.
-            signingConfig signingConfigs.debug
+            // TASK-00289: this project's own dedicated release keystore
+            // when available (CI, or a local build with the four env vars
+            // above set by hand), the standard Gradle debug key otherwise.
+            // See docs/RELEASE.md's Android APK section for the real
+            // certificate's fingerprint and how the keystore is stored.
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
             minifyEnabled false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }

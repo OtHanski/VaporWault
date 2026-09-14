@@ -37,6 +37,11 @@ env:
   # `run:` block.
   TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
   REPO: ${{ github.repository }}
+  # Public (not secret) - the key ID to sign with, so `--local-user` is
+  # unambiguous even if the signing keyring is ever extended with a second
+  # key. See docs/RELEASE.md's signing section for the full fingerprint
+  # and the committed public key (packaging/signing/vaporwault-releases-pubkey.asc).
+  GPG_SIGNING_KEY_ID: "AC739FC370A352F6"
 
 jobs:
   build-linux:
@@ -122,6 +127,31 @@ jobs:
           sha256sum *.deb *.rpm > linux-packages.sha256
           cat linux-packages.sha256
 
+      # TASK-00288: detached GPG signatures over the .deb/.rpm artifacts and
+      # the checksum manifest, so a downloader can verify both file
+      # integrity (sha256) and real provenance (gpg) — see docs/RELEASE.md's
+      # signing section for the fingerprint, public key location, and
+      # verification steps. The private key/passphrase exist only as
+      # GitHub Actions secrets, imported into this ephemeral runner's
+      # keyring for this job's duration and discarded with it — never
+      # written to a committed file or build artifact. GitHub Actions
+      # masks both secrets automatically in log output since they're only
+      # ever referenced via `secrets.*`.
+      - name: Import GPG release signing key
+        env:
+          GPG_SIGNING_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_PRIVATE_KEY }}
+        run: echo "$GPG_SIGNING_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign .deb/.rpm packages
+        env:
+          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: |
+          for f in *.deb *.rpm linux-packages.sha256; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --local-user "$GPG_SIGNING_KEY_ID" \
+                --passphrase-fd 0 --detach-sign --armor "$f" <<< "$GPG_SIGNING_PASSPHRASE"
+          done
+
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -131,6 +161,7 @@ jobs:
             vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz.sha256
             *.deb
             *.rpm
+            *.asc
             linux-packages.sha256
           if-no-files-found: error
 
@@ -386,14 +417,36 @@ jobs:
             "platforms;android-34" "build-tools;34.0.0" \
             "cmake;3.22.1" "ndk;28.2.13676358"
 
+      # TASK-00289: materialize the release keystore from its base64-encoded
+      # secret into a runner-temp file for this job only. Never committed,
+      # never a build artifact — removed again once the build step below
+      # finishes, regardless of outcome (the "if: always()" cleanup step).
+      - name: Decode Android release keystore
+        env:
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+        run: echo "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/vaporwault-release.keystore"
+
+      # android/app/build.gradle's signingConfigs.release reads these four
+      # env vars directly (see that file's own comment) — no keystore
+      # path/password ever lives in a Gradle property file or the repo.
       - name: Build (assembleRelease)
         working-directory: android
+        env:
+          ANDROID_RELEASE_KEYSTORE_PATH: ${{ runner.temp }}/vaporwault-release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew assembleRelease --console=plain
 
-      # TASK-239: this project has no release signing keystore or Play Store
-      # presence yet, so the release buildType (android/app/build.gradle) is
-      # signed with the standard Gradle debug key — sideload/testing only,
-      # not a production release artifact. Staged/named/checksummed the same
+      - name: Remove decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/vaporwault-release.keystore"
+
+      # TASK-00289: signed with this project's own dedicated release
+      # keystore (see docs/RELEASE.md's Android APK section for the
+      # certificate fingerprint) — no longer the shared Gradle debug key
+      # TASK-239 originally shipped. Still sideload-only: no Play Store
+      # presence, no update mechanism. Staged/named/checksummed the same
       # way as the Linux/Windows archives (TAG comes from workflow-level
       # `env:`, never interpolated directly into a `${{ }}` expression).
       - name: Stage release artifact

@@ -145,21 +145,51 @@ no gentler removal option on the RPM side. An in-place **upgrade**
 deletes config or data on either format, and an admin-edited `server.conf`
 is never overwritten by a reinstall or upgrade on any package format.
 
-**These packages are unsigned today.** No code-signing certificate or GPG
-signing key currently exists for this project. Installing them will
-trigger the normal OS warnings for unsigned software — `apt`/`dnf` will
-warn about an unsigned package (still installable, since these aren't
-pulled from a signed repository at all), and Windows will show its usual
-SmartScreen/unknown-publisher prompt for the `.msi`.
+**Linux `.deb`/`.rpm` packages are GPG-signed; the Windows `.msi` stays
+unsigned permanently (see below).** `apt`/`dnf` will still warn about
+installing from an unverified source — these aren't served from a real
+signed repository, just individually-signed files — but each
+`.deb`/`.rpm`, and the `linux-packages.sha256` manifest, now carries a
+detached signature a downloader can actually verify. Windows still shows
+its usual SmartScreen/unknown-publisher prompt for the `.msi`.
 
 **`TASK-00287` investigation and decision (2026-09-11), re-raised by a
 full-project review after the `v0.5.0` release-build break exposed how
 little the release pipeline itself was being exercised end-to-end:**
 
-- **Linux `.deb`/`.rpm` — GPG signing: approved, follow-up task filed
-  (`TASK-00288`).** A self-issued GPG key has no ongoing cost and is the
-  standard mechanism `apt`/`dnf` repositories already expect; low
-  effort relative to the credibility gained.
+- **Linux `.deb`/`.rpm` — GPG signing: implemented (`TASK-00288`).** A
+  project-dedicated ed25519 signing key, User ID `VaporWault Releases`,
+  fingerprint:
+
+  ```
+  5579 7E48 447A 57F4 6DD6  6099 AC73 9FC3 70A3 52F6
+  ```
+
+  (expires 2029-09-13 — extend it with `gpg --edit-key`/`expire` before
+  then, or generate a fresh key and update this section if it ever
+  lapses unextended). The public key is committed at
+  `packaging/signing/vaporwault-releases-pubkey.asc`. `release.yml`'s
+  `build-linux` job imports the private key from a `GPG_SIGNING_PRIVATE_KEY`
+  GitHub Actions secret (passphrase in a separate `GPG_SIGNING_PASSPHRASE`
+  secret) fresh for each run, produces a detached, ASCII-armored `.asc`
+  signature for every `.deb`/`.rpm` and for `linux-packages.sha256`, and
+  the imported key is discarded with the ephemeral runner at job end —
+  neither secret is ever written to a committed file or a build artifact,
+  and GitHub Actions masks both automatically in workflow log output
+  since they're only ever referenced via `secrets.*`.
+
+  To verify a downloaded package:
+
+  ```sh
+  gpg --import packaging/signing/vaporwault-releases-pubkey.asc
+  gpg --verify vaporwault-server_X.Y.Z_amd64.deb.asc vaporwault-server_X.Y.Z_amd64.deb
+  ```
+
+  A successful check prints `Good signature from "VaporWault Releases"` —
+  also compare the fingerprint GPG reports against the one above, since a
+  "good signature" only means *some* imported key signed it, not
+  necessarily this project's.
+
 - **Windows `.msi` — Authenticode: staying unsigned, deliberately, not
   revisited as a live gap anymore.** A real code-signing certificate
   carries a real ongoing cost (roughly $100–500/yr depending on
@@ -173,19 +203,34 @@ little the release pipeline itself was being exercised end-to-end:**
   unsigned `.msi` as an oversight to fix later without a real change in
   circumstances (e.g. this project acquiring a real organizational
   identity).
-- **Android APK — a real release keystore: approved, follow-up task
-  filed (`TASK-00289`).** Free to generate, no Play Store presence
-  needed, and meaningfully better than every contributor's shared Gradle
-  debug key even for a sideload-only artifact — see the APK section
-  below, which already anticipated exactly this follow-up.
+- **Android APK — a real release keystore: implemented (`TASK-00289`).**
+  See the APK section below.
 
-**CI secret-handling implications, flagged for SEC.07 review before either
-follow-up task's implementation lands:** a signing key living in GitHub
-Actions secrets is itself new attack surface — a compromised CI config or
-a malicious PR from a fork with workflow write access could exfiltrate
-or misuse it. Neither `TASK-00288` nor `TASK-00289` should be marked
-`done` without SEC.07 sign-off on how the key is stored, scoped, and
-rotated.
+**CI secret-handling and rotation (SEC.07-reviewed, both `TASK-00288` and
+`TASK-00289`):** the GPG private key/passphrase and the Android release
+keystore/passwords (see below) live only in this repository's GitHub
+Actions secrets, referenced only by `release.yml`'s
+`build-linux`/`build-android` jobs — no other workflow reads them, and
+neither is ever written to a file this repository tracks. A compromised
+CI config or a malicious fork PR with workflow-write access is the
+realistic threat model for both; a fork PR cannot read another
+repository's secrets under GitHub's own model, so the practical exposure
+is limited to someone with write access to this repository's workflow
+files or settings.
+
+- **GPG key**: freely rotatable — generate a new key, replace both
+  secrets, replace the committed public key, and note the old
+  fingerprint as retired in this section. A GPG signature only gates
+  manual verification, nothing structural, so rotation has no
+  compatibility cost.
+- **Android keystore**: cannot be rotated without breaking Android's own
+  update-continuity guarantee (a package's updates must always be signed
+  by the *same* certificate) — moot today since this project has no
+  update mechanism at all yet (sideload-only, no Play Store). If it's
+  ever suspected compromised, treat it as a full incident, not a simple
+  rotation: a new keystore is a new app identity as far as Android is
+  concerned, and anyone holding a build signed with the old one has no
+  in-app path to a build signed with the new one.
 
 ### Android APK (`vaporwault-<tag>-android.apk`)
 
@@ -193,29 +238,50 @@ Since `TASK-239`, `build-android` cross-compiles the client core via the NDK
 (same toolchain `ci.yml`'s `build-android` job — `TASK-233` — validates on
 every push) and runs `./gradlew assembleRelease` from `android/`.
 
-**This APK is debug-signed, not production-signed.** The project has no
-release signing keystore and no Play Store presence today, so
-`android/app/build.gradle`'s `release` build type is deliberately wired to
-`signingConfigs.debug` (the standard Gradle-generated debug key) rather than
-left unsigned — an unsigned release APK can't be installed at all, and a
-silently-shipped "release" build that looks production-signed would be
-worse than one that's clearly labeled. Concretely, this means:
+**This APK is signed with a dedicated project release keystore
+(`TASK-00289`), not the shared Gradle debug key.** `android/app/build.gradle`
+defines a `signingConfigs.release` sourced entirely from environment
+variables — `ANDROID_RELEASE_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` — never a checked-in file or
+value. `release.yml`'s `build-android` job decodes the keystore from a
+base64 `ANDROID_RELEASE_KEYSTORE_BASE64` GitHub Actions secret into a
+runner-temp file (removed again once the build step finishes, regardless
+of outcome) and supplies the three password/alias secrets
+(`ANDROID_KEYSTORE_PASSWORD`/`ANDROID_KEY_ALIAS`/`ANDROID_KEY_PASSWORD`)
+as env vars for that one step — the same secrets-only-in-`release.yml`
+handling `SDL2_ZIP_SHA256`/`WIX_ZIP_SHA256`-style supply-chain-sensitive
+material already gets. **No copy of the real keystore exists on any
+contributor's machine or in this repository** — a local build without
+those four env vars set falls back to `signingConfigs.debug` automatically
+(see the `build.gradle` comment), matching `TASK-239`'s original
+reasoning that an unsigned release APK can't install at all.
+
+Certificate details (public — safe to publish, this is what `apksigner
+verify --print-certs` or an installed app's signing-certificate viewer
+will show):
+
+- Alias: `vaporwault-release`
+- Algorithm: RSA 4096 / SHA256withRSA
+- Validity: 2026-09-14 to 2056-09-06 (30 years — chosen so this cert
+  outlives any plausible project lifetime; there is no rotation path
+  that preserves update continuity, see the rotation note above)
+- SHA-256 fingerprint:
+  `C2:47:CD:F2:05:35:08:B7:A4:A8:EF:D1:3E:E6:BB:7B:51:38:90:57:85:F1:F1:75:07:A8:B3:E8:8B:2A:03:2E`
+
+Concretely, this means:
 
 - The APK installs fine via `adb install` or direct sideload (with the
   device's "install unknown apps" setting enabled) — it is **not** listed
   on any app store and has no auto-update mechanism.
-- It is signed with the same debug key every contributor's local Android
-  Studio/Gradle install already generates, **not** a secret unique to this
-  project — anyone can locally rebuild and produce a byte-for-byte
-  equivalent signature. Do not treat this artifact's signature as an
-  authenticity guarantee the way the `.sha256` checksum is.
-- **Decided (`TASK-00287`, 2026-09-11): generate a dedicated release
-  keystore now**, even with no Play Store presence — `TASK-00289` covers
-  wiring it into this job via GitHub Actions secrets (matching how
-  `SDL2_ZIP_SHA256`/`WIX_ZIP_SHA256`-style supply-chain-sensitive material
-  is already handled) and updating `android/app/build.gradle`'s `release`
-  build type to use it instead of `signingConfigs.debug`
-  against BLD.05 when it becomes relevant — not attempted here.
+- The signature is now a genuine authenticity signal for this project's
+  own builds (unlike the old debug-signed artifact, which anyone could
+  reproduce byte-for-byte) — compare the fingerprint above against
+  `apksigner verify --print-certs vaporwault-<tag>-android.apk` if you
+  need to confirm a downloaded APK came from this project's own release
+  pipeline, the same way you'd check the GPG signature on a `.deb`/`.rpm`.
+- This still does not mean Play Store distribution or an update
+  mechanism — see `ARCHITECTURE.md`'s "Android release artifact &
+  signing" decision row for that scope boundary, unchanged by this task.
 
 ## 2. Cutting a release
 
