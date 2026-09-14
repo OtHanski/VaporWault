@@ -1950,15 +1950,20 @@ static vw_err_t handle_audit_query(vw_store_t *store, vw_oplog_t *oplog,
 /*
  * Request:  session_token(32)
  * Response: role(u8) + node_count(u32 LE) +
- *           per-node: node_id(u64) + is_active(u8) + sync_watermark(u64) +
- *                     lag_entries(u64) + hostname(128 bytes, NUL-padded)
- * Per-node wire size: 8+1+8+8+128 = 153 bytes.
+ *           per-node: node_id(u64) + is_active(u8) + role(u8) +
+ *                     sync_watermark(u64) + lag_entries(u64) +
+ *                     hostname(128 bytes, NUL-padded) +
+ *                     client_conn_count(u32, TASK-00284/00285)
+ * Per-node wire size: 8+1+1+8+8+128+4 = 158 bytes. (Fixed a stale comment
+ * here that predates this field and didn't even count the `role` byte
+ * the code already wrote — CLUSTER_NODE_ENTRY_SIZE below was correct,
+ * this prose comment wasn't.)
  *
  * SECURITY: auth_token is NEVER included in the response.
  * If cluster is NULL (single-node mode), returns role=1, node_count=0.
  */
 
-#define CLUSTER_NODE_ENTRY_SIZE 154u  /* node_id(8)+is_active(1)+role(1)+swm(8)+lag(8)+host(128) */
+#define CLUSTER_NODE_ENTRY_SIZE 158u  /* node_id(8)+is_active(1)+role(1)+swm(8)+lag(8)+host(128)+conn_count(4) */
 
 static vw_err_t handle_cluster_status(vw_store_t    *store,
                                        vw_cluster_t  *cluster,
@@ -2027,6 +2032,11 @@ static vw_err_t handle_cluster_status(vw_store_t    *store,
         vw_write_u64le(p + 10, n->sync_watermark);
         vw_write_u64le(p + 18, lag);
         memcpy(p + 26, n->hostname, 128);
+        /* TASK-00284/00285: this node's most recently reported OPLOG_ACK
+         * client_conn_count — 0 for a pre-upgrade replica, an inactive
+         * node, or (on a single-node/no-cluster server, handled above)
+         * never reached here at all. */
+        vw_write_u32le(p + 154, vw_cluster_node_client_conn_count(cluster, n->node_id));
         p += CLUSTER_NODE_ENTRY_SIZE;
     }
 

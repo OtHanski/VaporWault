@@ -18,6 +18,7 @@
 #include "vw_storage.h"
 #include "vw_share.h"
 #include "vw_vault.h"
+#include "vw_conn_registry.h"
 #include "../core/vw_net.h"
 #include "../core/vw_crypto.h"
 #include "../core/vw_fs.h"
@@ -139,6 +140,10 @@ struct vw_cluster_ctx {
     vw_share_store_t *share_store;
     vw_vault_store_t *vault_store;
 
+    /* TASK-00284/00285: borrowed, may be NULL — see vw_cluster_open's own
+     * doc comment. */
+    vw_conn_registry_t *conn_registry;
+
     /* Node store */
     char         nodes_path[600];  /* {data_dir}/cluster/nodes.db */
     vw_rwlock_t  nodes_lock;
@@ -148,6 +153,16 @@ struct vw_cluster_ctx {
     uint64_t   nid_to_slot_cap;  /* length of nid_to_slot array */
     uint64_t   node_slots;       /* total slots on disk (including free) */
     uint64_t   next_node_id;     /* monotonic counter for new nodes */
+
+    /*
+     * TASK-00284/00285: primary-side, in-memory-only (never persisted to
+     * nodes.db — a live gauge, not durable state) record of each node's
+     * most recently reported OPLOG_ACK client_conn_count. Dense-indexed
+     * by node_id in lockstep with nid_to_slot (same capacity, grown
+     * together in index_ensure, never independently) — the same pattern
+     * vw_vault.c's pin_counts uses alongside vid_to_slot.
+     */
+    uint32_t  *client_conn_counts;
 
     /* Primary-mode accept thread */
     vw_net_ctx_t    *net_ctx;
@@ -257,12 +272,23 @@ static vw_err_t index_ensure(vw_cluster_t *ctx, uint64_t node_id)
     if (node_id < ctx->nid_to_slot_cap) return VW_OK;
     uint64_t new_cap = ctx->nid_to_slot_cap ? ctx->nid_to_slot_cap * 2 : 64;
     while (new_cap <= node_id) new_cap *= 2;
+
     uint32_t *p = realloc(ctx->nid_to_slot, (size_t)new_cap * sizeof(uint32_t));
     if (!p) return VW_ERR_OOM;
+    ctx->nid_to_slot = p; /* keep the new pointer even if the array below fails */
+
+    uint32_t *cp = realloc(ctx->client_conn_counts, (size_t)new_cap * sizeof(uint32_t));
+    if (!cp) return VW_ERR_OOM; /* nid_to_slot_cap not bumped yet: old (smaller)
+                                  * region of the just-grown nid_to_slot stays the
+                                  * only part in use, so nothing is left inconsistent. */
+
     memset(p + ctx->nid_to_slot_cap, 0,
            (size_t)(new_cap - ctx->nid_to_slot_cap) * sizeof(uint32_t));
-    ctx->nid_to_slot     = p;
-    ctx->nid_to_slot_cap = new_cap;
+    memset(cp + ctx->nid_to_slot_cap, 0,
+           (size_t)(new_cap - ctx->nid_to_slot_cap) * sizeof(uint32_t));
+    ctx->client_conn_counts = cp;
+    ctx->nid_to_slot        = p;
+    ctx->nid_to_slot_cap    = new_cap;
     return VW_OK;
 }
 
@@ -794,8 +820,15 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
             break;
         }
 
-        /* If no entries sent, skip waiting for OPLOG_ACK (replica will retry). */
-        if (entries_count == 0) continue;
+        /* TASK-00284: unlike the pre-TASK-00284 behavior (skip waiting for
+         * OPLOG_ACK entirely when entries_count == 0 — the replica will
+         * just retry next poll, and there was nothing new to acknowledge
+         * anyway), this now always waits: it's the only round trip
+         * client_conn_count rides on, and the replica side now always
+         * sends one even for an empty batch (see replica_send_oplog_ack's
+         * call site for entry_count == 0) specifically so this field
+         * stays within its documented one-poll-interval staleness bound
+         * even while the primary is otherwise completely idle. */
 
         /* TASK-172: between OPLOG_DATA and this batch's OPLOG_ACK, the
          * replica may run a whole file/chunk sync pass — any number of
@@ -804,6 +837,7 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
          * until OPLOG_ACK arrives. */
         int      got_ack      = 0;
         uint64_t confirmed_eid = 0;
+        uint32_t client_conn_count = 0;
         while (!got_ack) {
             rc = vw_proto_recv(conn, &msg_type, buf, VW_MAX_MSG_BYTES, &plen);
             if (rc != VW_OK) {
@@ -813,12 +847,16 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
             }
             switch (msg_type) {
             case VW_MSG_OPLOG_ACK:
-                if (plen != 8) {
+                /* TASK-00284: client_conn_count is an optional trailing u32
+                 * — a pre-upgrade replica sends exactly 8 bytes and it
+                 * defaults to 0 (checked-before-read, not misparsed). */
+                if (plen < 8) {
                     CL_WARN("primary: OPLOG_ACK bad len %u from node %llu", plen,
                             (unsigned long long)node_id);
                     goto conn_done;
                 }
                 confirmed_eid = vw_read_u64le(buf);
+                if (plen >= 12) client_conn_count = vw_read_u32le(buf + 8);
                 got_ack = 1;
                 break;
             case VW_MSG_CLUSTER_FILE_SYNC_LIST:
@@ -845,8 +883,20 @@ static void primary_repl_loop(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t node_
         }
 
         vw_cluster_node_update_watermark(ctx, node_id, confirmed_eid);
-        CL_DEBUG("primary: node %llu acked entry_id %llu",
-                 (unsigned long long)node_id, (unsigned long long)confirmed_eid);
+
+        /* TASK-00284/00285: store the live gauge in-memory only (never
+         * nodes.db — see struct vw_cluster_ctx's own doc comment on
+         * client_conn_counts). node_id is already indexed by this point
+         * (vw_cluster_node_update_watermark just operated on it above),
+         * so nid_to_slot_cap already covers it — no index_ensure needed. */
+        rwlock_wrlock(&ctx->nodes_lock);
+        if (node_id < ctx->nid_to_slot_cap)
+            ctx->client_conn_counts[node_id] = client_conn_count;
+        rwlock_wrunlock(&ctx->nodes_lock);
+
+        CL_DEBUG("primary: node %llu acked entry_id %llu (client_conn_count=%u)",
+                 (unsigned long long)node_id, (unsigned long long)confirmed_eid,
+                 (unsigned)client_conn_count);
     }
 
 conn_done:
@@ -1490,6 +1540,31 @@ static vw_err_t replica_run_chunk_sync_pass(vw_cluster_t *ctx, vw_conn_t *conn,
     return rc;
 }
 
+/*
+ * TASK-00284/00285: send OPLOG_ACK for `watermark`, with this replica's
+ * live client_conn_count piggybacked (0 if conn_registry wasn't given).
+ * Factored out so it can be called both after actually applying a batch
+ * AND on an empty (entry_count == 0, primary caught up) poll response —
+ * see the two call sites' own comments for why the empty-batch case
+ * matters: docs/PROTOCOL.md's own staleness claim for this field
+ * ("bounded by the poll interval") only holds if every poll cycle sends
+ * an ACK, not just ones with real oplog activity to acknowledge.
+ */
+static vw_err_t replica_send_oplog_ack(vw_cluster_t *ctx, vw_conn_t *conn, uint64_t watermark)
+{
+    uint8_t ack_payload[12];
+    vw_write_u64le(ack_payload, watermark);
+    uint32_t conn_count = 0;
+    if (ctx->conn_registry) {
+        vw_conn_info_t *conns = NULL; uint32_t nconns = 0;
+        if (vw_conn_registry_list(ctx->conn_registry, &conns, &nconns) == VW_OK)
+            conn_count = nconns;
+        free(conns);
+    }
+    vw_write_u32le(ack_payload + 8, conn_count);
+    return vw_proto_send(conn, VW_MSG_OPLOG_ACK, ack_payload, 12);
+}
+
 static void replica_repl_session(vw_cluster_t *ctx)
 {
     /* Connect to primary (TLS 1.3, certificate verification required).
@@ -1640,7 +1715,23 @@ static void replica_repl_session(vw_cluster_t *ctx)
         uint64_t batch_last  = vw_read_u64le(data_buf + 4);
 
         if (entry_count == 0) {
-            /* Primary is caught up; wait before polling again. */
+            /* Primary is caught up — still send OPLOG_ACK (re-acknowledging
+             * the same watermark) rather than skipping the round trip
+             * entirely: this is the ONLY exchange client_conn_count rides
+             * on, and TASK-00284's own design promises it stays fresh to
+             * within one poll interval even when otherwise idle. Skipping
+             * here (the pre-TASK-00284 behavior, sensible when OPLOG_ACK
+             * carried only a watermark nothing new had changed) would
+             * silently leave that gauge stale for as long as the primary
+             * saw no write activity at all — found via a real end-to-end
+             * test (tests/integration/test_cluster.py) rather than
+             * assumed, since this is exactly the steady-state case the
+             * whole feature exists to cover. */
+            rc = replica_send_oplog_ack(ctx, conn, my_watermark);
+            if (rc != VW_OK) {
+                CL_WARN("replica: OPLOG_ACK (empty batch) send failed: %d", (int)rc);
+                break;
+            }
             replica_sleep_ms(ctx, ctx->cfg.replica_poll_interval_secs * 1000u);
             continue;
         }
@@ -1703,10 +1794,9 @@ static void replica_repl_session(vw_cluster_t *ctx)
 
         my_watermark = last_applied;
 
-        /* Send OPLOG_ACK */
-        uint8_t ack_payload[8];
-        vw_write_u64le(ack_payload, my_watermark);
-        rc = vw_proto_send(conn, VW_MSG_OPLOG_ACK, ack_payload, 8);
+        /* Send OPLOG_ACK — see replica_send_oplog_ack's own doc comment
+         * for the client_conn_count field it piggybacks. */
+        rc = replica_send_oplog_ack(ctx, conn, my_watermark);
         if (rc != VW_OK) {
             CL_WARN("replica: OPLOG_ACK send failed: %d", (int)rc);
             break;
@@ -1766,6 +1856,7 @@ vw_err_t vw_cluster_open(const char *data_dir,
                           vw_storage_t *chunks,
                           vw_share_store_t *share_store,
                           vw_vault_store_t *vault_store,
+                          vw_conn_registry_t *conn_registry,
                           vw_cluster_t **out)
 {
     if (!data_dir || !cfg || !cert_pem_path || !key_pem_path || !oplog || !out ||
@@ -1775,13 +1866,14 @@ vw_err_t vw_cluster_open(const char *data_dir,
     vw_cluster_t *ctx = (vw_cluster_t *)calloc(1, sizeof(*ctx));
     if (!ctx) return VW_ERR_OOM;
 
-    ctx->cfg         = *cfg;
-    ctx->oplog       = oplog;
-    ctx->store       = store;
-    ctx->file_store  = file_store;
-    ctx->chunks      = chunks;
-    ctx->share_store = share_store;
-    ctx->vault_store = vault_store;
+    ctx->cfg           = *cfg;
+    ctx->oplog         = oplog;
+    ctx->store         = store;
+    ctx->file_store    = file_store;
+    ctx->chunks        = chunks;
+    ctx->share_store   = share_store;
+    ctx->vault_store   = vault_store;
+    ctx->conn_registry = conn_registry;
     snprintf(ctx->cert_pem_path, sizeof(ctx->cert_pem_path), "%s", cert_pem_path);
     snprintf(ctx->key_pem_path,  sizeof(ctx->key_pem_path),  "%s", key_pem_path);
     snprintf(ctx->data_dir,      sizeof(ctx->data_dir),      "%s", data_dir);
@@ -1806,6 +1898,8 @@ vw_err_t vw_cluster_open(const char *data_dir,
     ctx->nid_to_slot_cap = 64;
     ctx->nid_to_slot = (uint32_t *)calloc((size_t)ctx->nid_to_slot_cap, sizeof(uint32_t));
     if (!ctx->nid_to_slot) { free(ctx); return VW_ERR_OOM; }
+    ctx->client_conn_counts = (uint32_t *)calloc((size_t)ctx->nid_to_slot_cap, sizeof(uint32_t));
+    if (!ctx->client_conn_counts) { free(ctx->nid_to_slot); free(ctx); return VW_ERR_OOM; }
 
     /* Scan existing records to build the index */
     uint64_t file_size = 0;
@@ -1822,6 +1916,7 @@ vw_err_t vw_cluster_open(const char *data_dir,
         rc = index_ensure(ctx, rec.node_id);
         if (rc != VW_OK) {
             free(ctx->nid_to_slot);
+            free(ctx->client_conn_counts);
             free(ctx);
             return rc;
         }
@@ -1840,6 +1935,7 @@ void vw_cluster_close(vw_cluster_t *ctx)
     vw_cluster_stop(ctx);
     vw_net_ctx_close(ctx->net_ctx);
     free(ctx->nid_to_slot);
+    free(ctx->client_conn_counts);
     /* Defensive: free any repair result left unclaimed by a caller that
      * never got to poll it out (shouldn't normally happen — every path
      * in vw_cluster_repair_fetch and primary_repl_loop's servicing code
@@ -2126,6 +2222,18 @@ vw_err_t vw_cluster_node_list(vw_cluster_t *ctx,
     *out_recs  = arr;
     *out_count = count;
     return VW_OK;
+}
+
+uint32_t vw_cluster_node_client_conn_count(vw_cluster_t *ctx, uint64_t node_id)
+{
+    if (!ctx) return 0;
+
+    rwlock_rdlock(&ctx->nodes_lock);
+    uint32_t count = 0;
+    if (node_id < ctx->nid_to_slot_cap)
+        count = ctx->client_conn_counts[node_id];
+    rwlock_rdunlock(&ctx->nodes_lock);
+    return count;
 }
 
 /* ── GC helpers ────────────────────────────────────────────────────────────── */

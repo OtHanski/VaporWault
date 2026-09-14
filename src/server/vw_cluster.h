@@ -40,6 +40,7 @@ struct vw_file_store;   typedef struct vw_file_store vw_file_store_t;
 struct vw_storage;      typedef struct vw_storage vw_storage_t;
 struct vw_share_store;  typedef struct vw_share_store vw_share_store_t;
 struct vw_vault_store;  typedef struct vw_vault_store vw_vault_store_t;
+struct vw_conn_registry; typedef struct vw_conn_registry vw_conn_registry_t;
 
 /* ── On-disk node record ────────────────────────────────────────────────────── */
 
@@ -115,6 +116,21 @@ typedef struct {
  * file_store, and chunks must be non-NULL — they are load-bearing for the
  * base feature set on every server regardless of cluster role.
  *
+ * conn_registry (TASK-00284/00285, docs/PROTOCOL.md §7.7 revision 34):
+ * this server's own already-opened vw_conn_registry_t (borrowed — same
+ * lifetime contract as oplog/store/etc. above), used two ways:
+ *   - On a replica: the OPLOG_ACK send site reads conn_registry's live
+ *     connection count and reports it as client_conn_count — a live
+ *     connection to a replica's normal client-facing vw/1 listener is,
+ *     by this project's fallback design, definitionally a client
+ *     currently parked on fallback (see the protocol doc's own note).
+ *   - On a primary: unused directly — client_conn_count is read FROM
+ *     each replica's OPLOG_ACK instead, not computed locally.
+ * May be NULL (a caller that hasn't opened a registry, or doesn't care
+ * about this feature) — client_conn_count then always reports 0, the
+ * same value a pre-TASK-00284 replica already produces by omitting the
+ * field entirely.
+ *
  * Returns VW_OK and sets *out on success; VW_ERR_IO on file errors;
  * VW_ERR_OOM on allocation failure.
  */
@@ -128,6 +144,7 @@ vw_err_t vw_cluster_open(const char *data_dir,
                           vw_storage_t *chunks,
                           vw_share_store_t *share_store,
                           vw_vault_store_t *vault_store,
+                          vw_conn_registry_t *conn_registry,
                           vw_cluster_t **out);
 
 /*
@@ -218,6 +235,20 @@ vw_err_t vw_cluster_node_set_active(vw_cluster_t *ctx,
 vw_err_t vw_cluster_node_list(vw_cluster_t *ctx,
                                vw_node_record_t **out_recs,
                                uint32_t *out_count);
+
+/*
+ * TASK-00284/00285 (docs/PROTOCOL.md §7.7 revision 34): that node's most
+ * recently reported OPLOG_ACK client_conn_count — a primary-side, live,
+ * in-memory-only gauge (never persisted to nodes.db, never stale by more
+ * than one replica_poll_interval_secs at steady state). Returns 0 for a
+ * node that has never sent one (a pre-TASK-00284 replica, a node that
+ * isn't currently active, or an unknown node_id) — not a real "zero
+ * clients" claim in that case, same caveat CLUSTER_STATUS_RESP's own
+ * field carries. Meaningless (always 0) called on a replica's own ctx —
+ * this reports what the PRIMARY has received FROM replicas, not a
+ * node's own count of itself.
+ */
+uint32_t vw_cluster_node_client_conn_count(vw_cluster_t *ctx, uint64_t node_id);
 
 /* ── GC helpers (used by vw_gc, TASK-050) ────────────────────────────────────── */
 

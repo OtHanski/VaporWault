@@ -353,13 +353,21 @@ def _cluster_status(node):
         parts = line.split()
         if len(parts) < 5:
             continue
-        entries.append({
+        entry = {
             "node_id": int(parts[0]),
             "role": parts[1],
             "active": parts[2] == "yes",
             "hostname": parts[3],
             "sync_watermark": int(parts[4]),
-        })
+        }
+        # TASK-00284/00285: "--" for the primary's own self-record
+        # (client_conn_count is only ever reported by a replica's own
+        # OPLOG_ACK — see vw_cluster_node_client_conn_count's doc comment).
+        if len(parts) >= 6 and parts[5] != "--":
+            entry["fallback_clients"] = int(parts[5])
+        else:
+            entry["fallback_clients"] = None
+        entries.append(entry)
     return entries
 
 
@@ -588,6 +596,82 @@ def test_replica_authenticates_synced_user(cluster_pair):
         f"replica never accepted the synced user's credentials (last_err={last_err}) — "
         f"primary log:\n{primary.log_contents()}\nreplica log:\n{replica.log_contents()}"
     )
+
+
+@pytest.mark.slow
+def test_cluster_status_reports_live_fallback_client_count(cluster_pair):
+    """
+    TASK-00284/00285 (docs/PROTOCOL.md §7.7 revision 34): `cluster status`'s
+    FALLBACK_CLIENTS column reflects a real, live count of connections to
+    the replica's normal client-facing vw/1 listener — not an approximation,
+    and not just "present in the response at all" (the weaker thing a naive
+    test might settle for). A live connection to a replica is, by this
+    project's fallback design, definitionally a client currently on
+    fallback (no replica is ever anyone's configured primary target).
+
+    Drives the count through all three states in one test — 0 before any
+    connection, 1 while a real client is connected, back to 0 after it
+    disconnects — since a test that only checked "eventually nonzero" could
+    pass against a counter that never decrements (a real bug this feature
+    could plausibly have; the protocol doc explicitly calls out this must
+    behave as a live gauge, not a sticky one).
+    """
+    primary, replica = cluster_pair
+    node_id = _pair_nodes(primary, replica)
+    time.sleep(2)
+
+    primary.create_user("fallbackclienttest", "TestP@ssw0rd!")
+
+    # Wait for the user to actually replicate down (same retry-login
+    # pattern test_replica_authenticates_synced_user uses) before using it
+    # to open the persistent connection this test actually cares about.
+    deadline = time.monotonic() + 20
+    replicated = False
+    while time.monotonic() < deadline:
+        try:
+            if _vw_auth(replica.host, replica.port, "fallbackclienttest", "TestP@ssw0rd!"):
+                replicated = True
+                break
+        except (ConnectionError, OSError, AssertionError):
+            pass
+        time.sleep(0.5)
+    assert replicated, "user never replicated to the replica in time"
+
+    def _fallback_count():
+        entries = _cluster_status(primary)
+        for e in entries:
+            if e["node_id"] == node_id:
+                return e["fallback_clients"]
+        raise AssertionError(f"node {node_id} missing from primary cluster-status: {entries}")
+
+    def _wait_for_count(expected, timeout=15):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = _fallback_count()
+            if last == expected:
+                return True
+            time.sleep(0.3)
+        pytest.fail(f"fallback_clients never reached {expected} (last seen: {last})")
+
+    # Before any client connects: 0.
+    _wait_for_count(0)
+
+    # A real, persistent connection straight to the replica's listener —
+    # exactly what a daemon on client-side fallback does; cluster_poll_
+    # interval_secs=1 in this test file's own server.conf (see
+    # _write_cluster_conf) means the next OPLOG_ACK reporting it is at
+    # most ~1s away.
+    client = VwClient(replica.host, replica.port, replica.cert)
+    try:
+        client.login("fallbackclienttest", "TestP@ssw0rd!")
+        _wait_for_count(1)
+    finally:
+        client.close()
+
+    # After disconnecting: back to 0 — proves this is a live gauge, not a
+    # counter that only ever goes up.
+    _wait_for_count(0)
 
 
 @pytest.mark.slow
