@@ -88,6 +88,17 @@ void vw_storage_close(vw_storage_t *st);
  */
 void vw_storage_set_store(vw_storage_t *st, vw_store_t *store);
 
+/*
+ * TASK-00266: test-only override of the grace period (default 30s) that
+ * vw_storage_gc_run's Phase A gives a freshly-uploaded, not-yet-committed
+ * chunk (ref_count == 0) before it becomes GC-eligible — see
+ * vw_storage.c's gc_grace_entry_t doc comment for the race this prevents.
+ * Mirrors vw_gc_config_t's trash_retention_secs testing pattern: set a
+ * small value, then use a real sleep() to force real expiry rather than
+ * mocking time. Not meant to be called by production code.
+ */
+void vw_storage_set_gc_grace_secs_for_test(vw_storage_t *st, unsigned secs);
+
 /* ── Chunk operations ────────────────────────────────────────────────────── */
 
 /*

@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef _WIN32
 #   define WIN32_LEAN_AND_MEAN
@@ -72,6 +73,37 @@ typedef struct {
     uint64_t slot;                 /* 0-based slot in refcounts.db */
     uint64_t owner_user_id;        /* first uploader (for GC quota decrement) */
 } rc_ht_entry_t;
+
+/*
+ * TASK-00266: GC grace period for a freshly-uploaded, not-yet-committed
+ * chunk. A real client upload leaves its chunk at ref_count == 0 between
+ * CHUNK_UPLOAD and the FILE_COMMIT that addrefs it (TASK-180, intentional
+ * — see chunk_put_impl's own doc comment). vw_storage_gc_run's Phase A
+ * would otherwise be free to collect that same chunk on its very next
+ * pass, which is only safe if gc_interval_secs comfortably exceeds every
+ * real CHUNK_UPLOAD -> FILE_COMMIT round trip; under load (or a
+ * deliberately short gc_interval_secs, as several integration tests use)
+ * that assumption can fail, and GC collecting a chunk still genuinely
+ * in flight fails the pending FILE_COMMIT and silently decrements quota
+ * out from under it.
+ *
+ * A small in-memory (never persisted — on-disk refcount_record_t is
+ * unchanged) side-table records, per hash, the time before which Phase A
+ * must not collect it even though ref_count == 0. Entries are added only
+ * by chunk_put_impl's real-upload (establish_own_ref == 0) paths and
+ * removed as soon as the chunk earns a real reference via
+ * vw_storage_chunk_addref, or once Phase A actually collects it (grace
+ * expired, genuinely abandoned) — so it never grows past the number of
+ * chunks currently mid-flight between upload and commit. A replicated
+ * write never touches this table: it always inserts with ref_count == 1
+ * immediately (see chunk_put_impl), never GC-eligible in the first place.
+ */
+typedef struct {
+    uint8_t hash[VW_HASH_BYTES];
+    time_t  eligible_at;
+} gc_grace_entry_t;
+
+#define VW_CHUNK_GC_GRACE_SECS 30
 
 /* ── Parity group member record (Phase 22, TASK-258) ─────────────────────── */
 
@@ -272,6 +304,17 @@ struct vw_storage {
     uint64_t rc_slots;      /* total slots in refcounts.db (incl. guard) */
     vw_store_t *store;      /* optional; for GC quota decrement; may be NULL */
 
+    /* TASK-00266: GC grace period for not-yet-committed uploads — see
+     * gc_grace_entry_t's own doc comment. gc_grace_secs defaults to
+     * VW_CHUNK_GC_GRACE_SECS at open; vw_storage_set_gc_grace_secs_for_test
+     * overrides it (test-only — mirrors vw_gc_config_t's trash_retention_secs
+     * pattern in tests/unit/test_vw_gc.c: a small real value plus a real
+     * sleep(), not mocked time). */
+    gc_grace_entry_t *grace;
+    size_t grace_len;
+    size_t grace_cap;
+    unsigned gc_grace_secs;
+
     /* Phase 22 (TASK-258): parity groups. */
     char parity_dir[512];   /* {chunks_dir}/parity */
     char pgdb_path[512];    /* {chunks_dir}/parity_groups.db */
@@ -394,6 +437,54 @@ static void ht_rebuild(struct vw_storage *st)
     size_t i;
     for (i = 0; i < st->ht_cap; i++)
         if (!hash_is_zero(st->ht[i].hash)) st->ht_len++;
+}
+
+/* ── GC grace period (TASK-00266) ─────────────────────────────────────────── */
+/* See gc_grace_entry_t's doc comment. All three helpers are called only
+ * while st->lock is already held (write lock) by the caller. */
+
+static void grace_set(struct vw_storage *st, const uint8_t *hash, time_t eligible_at)
+{
+    size_t i;
+    for (i = 0; i < st->grace_len; i++) {
+        if (memcmp(st->grace[i].hash, hash, VW_HASH_BYTES) == 0) {
+            st->grace[i].eligible_at = eligible_at;
+            return;
+        }
+    }
+    if (st->grace_len >= st->grace_cap) {
+        size_t nc = st->grace_cap ? st->grace_cap * 2 : 16;
+        gc_grace_entry_t *p = (gc_grace_entry_t *)realloc(st->grace, nc * sizeof(*p));
+        if (!p) return; /* best-effort: OOM just means no grace protection for this one */
+        st->grace = p;
+        st->grace_cap = nc;
+    }
+    memcpy(st->grace[st->grace_len].hash, hash, VW_HASH_BYTES);
+    st->grace[st->grace_len].eligible_at = eligible_at;
+    st->grace_len++;
+}
+
+static void grace_clear(struct vw_storage *st, const uint8_t *hash)
+{
+    size_t i;
+    for (i = 0; i < st->grace_len; i++) {
+        if (memcmp(st->grace[i].hash, hash, VW_HASH_BYTES) == 0) {
+            st->grace[i] = st->grace[st->grace_len - 1];
+            st->grace_len--;
+            return;
+        }
+    }
+}
+
+/* Returns 1 if hash is still within its grace window (GC must not collect
+ * it yet), 0 otherwise (no grace entry, or it has expired). */
+static int grace_active(struct vw_storage *st, const uint8_t *hash, time_t now)
+{
+    size_t i;
+    for (i = 0; i < st->grace_len; i++)
+        if (memcmp(st->grace[i].hash, hash, VW_HASH_BYTES) == 0)
+            return now < st->grace[i].eligible_at;
+    return 0;
 }
 
 /* ── Parity groups (Phase 22, TASK-258) ───────────────────────────────────── */
@@ -888,6 +979,7 @@ vw_err_t vw_storage_open(const char *data_dir, vw_storage_t **out)
     st->pg_ht = (pg_ht_entry_t *)calloc(PG_HT_INITIAL_CAP, sizeof(*st->pg_ht));
     if (!st->pg_ht) { vw_storage_close(st); return VW_ERR_OOM; }
     st->pg_ht_cap = PG_HT_INITIAL_CAP;
+    st->gc_grace_secs = VW_CHUNK_GC_GRACE_SECS;
     st->open_group_id = 1; /* group_id 0 reserved/unused, mirrors refcounts.db's guard-slot-0 convention */
 
     /* Create refcounts.db with guard if needed. */
@@ -979,6 +1071,7 @@ void vw_storage_close(vw_storage_t *st)
     rwlock_destroy(&st->lock);
     free(st->ht);
     free(st->pg_ht);
+    free(st->grace);
     free(st);
 }
 
@@ -1009,9 +1102,14 @@ void vw_storage_close(vw_storage_t *st)
  *     CHUNK_UPLOAD and its FILE_COMMIT is now genuinely ref_count==0 and
  *     therefore GC-eligible — intentional (an uploaded-but-abandoned
  *     chunk must eventually be collectible, the flip side of this same
- *     fix), and bounded by gc_interval_secs (1800s default): a real
- *     client's FILE_COMMIT normally follows CHUNK_UPLOAD within the same
- *     round trip, well inside any reasonable interval.
+ *     fix). TASK-00266: relying solely on gc_interval_secs being "well
+ *     inside any reasonable round trip" turned out not to hold under load
+ *     or a short interval (several integration tests need one) — GC could
+ *     collect a chunk genuinely still in flight, failing its pending
+ *     FILE_COMMIT. Fixed with an explicit grace period (gc_grace_entry_t)
+ *     independent of gc_interval_secs: GC's Phase A now leaves a
+ *     ref_count==0 chunk alone until VW_CHUNK_GC_GRACE_SECS after upload,
+ *     regardless of how often it runs.
  *   - Replicated writes (vw_storage_chunk_put_replicated, charge_quota=0):
  *     UNCHANGED by this fix. A replica has no FILE_COMMIT/addref call of
  *     its own — replicated content only ever arrives through this
@@ -1112,26 +1210,31 @@ static vw_err_t chunk_put_impl(vw_storage_t *st,
     }
 
     if (entry && entry->ref_count == 0) {
-        /* Previously GC'd entry — reuse its slot.  Chunk is new from quota perspective:
-         * charge atomically under the write lock so no concurrent upload can double-charge. */
-        if (charge_quota && st->store) {
-            vw_err_t qrc = vw_store_quota_add(st->store, owner_user_id, (int64_t)len);
-            if (qrc != VW_OK) {
-                /* Quota exceeded — chunk stays on disk as a dark orphan; GC cleans it. */
-                rwlock_wrunlock(&st->lock);
-                return qrc;
-            }
+        /*
+         * NOT a "previously GC'd entry" (a genuinely GC'd hash is fully
+         * erased from ht by vw_storage_gc_run's Phase A — memset(hash, 0)
+         * makes it invisible to ht_find, so a GC'd-and-reused hash always
+         * takes the "truly new" append path below, with its own slot).
+         * The only way ht_find can return a non-NULL entry with
+         * ref_count == 0 is a race against ANOTHER chunk_put_impl call for
+         * this exact brand-new hash: that call already inserted this entry
+         * (via the "truly new" path, or this same branch) and already
+         * charged its quota — charging again here would double-charge a
+         * single logical upload. Handle it exactly like the ref_count > 0
+         * race branch above: a no-op presence-check for a real upload
+         * (establish_own_ref == 0), a bump for the replicated path.
+         */
+        if (!establish_own_ref) {
+            rwlock_wrunlock(&st->lock);
+            return VW_OK;
         }
-        entry->ref_count = establish_own_ref ? 1u : 0u;
-        entry->owner_user_id = owner_user_id;
+        entry->ref_count++;
         refcount_record_t rec;
         memcpy(rec.hash, hash, VW_HASH_BYTES);
         rec.ref_count = entry->ref_count;
         rec._pad = 0;
-        rec.owner_user_id = owner_user_id;
+        rec.owner_user_id = entry->owner_user_id;
         rc = rcdb_write(st, entry->slot, &rec);
-        if (rc != VW_OK && charge_quota && st->store)
-            (void)vw_store_quota_add(st->store, owner_user_id, -(int64_t)len);
         rwlock_wrunlock(&st->lock);
         return rc;
     }
@@ -1172,6 +1275,14 @@ static vw_err_t chunk_put_impl(vw_storage_t *st,
         rwlock_wrunlock(&st->lock);
         return VW_ERR_OOM;
     }
+
+    /* TASK-00266: a real upload leaves this chunk at ref_count == 0 until
+     * FILE_COMMIT's addref — protect it from vw_storage_gc_run's Phase A
+     * until then (see gc_grace_entry_t's doc comment). Not needed for the
+     * replicated path: it inserted with ref_count == 1 above, never
+     * GC-eligible in the first place. */
+    if (!establish_own_ref)
+        grace_set(st, hash, time(NULL) + (time_t)st->gc_grace_secs);
 
     /* Phase 22 (TASK-258, revised — see register_parity_member's own doc
      * comment for the incident this addresses): only the replicated write
@@ -1269,6 +1380,12 @@ vw_err_t vw_storage_chunk_addref(vw_storage_t *st,
         rwlock_wrunlock(&st->lock);
         return VW_ERR_NOT_FOUND;
     }
+
+    /* TASK-00266: this chunk just earned its first real reference — it no
+     * longer needs (or should keep) its upload grace period; see
+     * gc_grace_entry_t's doc comment. */
+    if (entry->ref_count == 0)
+        grace_clear(st, hash);
 
     entry->ref_count++;
     refcount_record_t rec;
@@ -1496,9 +1613,16 @@ vw_err_t vw_storage_gc_run(vw_storage_t *st)
     rwlock_wrlock(&st->lock);
 
     size_t i;
+    time_t now = time(NULL);
     for (i = 0; i < st->ht_cap; i++) {
         if (hash_is_zero(st->ht[i].hash)) continue;
         if (st->ht[i].ref_count != 0) continue;
+
+        /* TASK-00266: a chunk still within its upload grace period is
+         * genuinely a real upload awaiting FILE_COMMIT's addref, not an
+         * abandoned one — see gc_grace_entry_t's doc comment. Leave it for
+         * a later GC pass. */
+        if (grace_active(st, st->ht[i].hash, now)) continue;
 
         char cpath[768];
         uint64_t chunk_len = 0;
@@ -1520,6 +1644,10 @@ vw_err_t vw_storage_gc_run(vw_storage_t *st)
         (void)vw_fs_pwrite(st->rcdb_path,
                            st->ht[i].slot * (uint64_t)sizeof(zero),
                            &zero, sizeof(zero));
+
+        /* Drop any (expired, by construction) grace entry so the side
+         * table never outlives the chunk it was tracking. */
+        grace_clear(st, st->ht[i].hash);
 
         /* Clear in-memory entry (will break probe chains; rebuild fixes it). */
         memset(st->ht[i].hash, 0, VW_HASH_BYTES);
@@ -1661,5 +1789,15 @@ void vw_storage_set_store(vw_storage_t *st, vw_store_t *store)
     if (!st) return;
     rwlock_wrlock(&st->lock);
     st->store = store;
+    rwlock_wrunlock(&st->lock);
+}
+
+/* ── vw_storage_set_gc_grace_secs_for_test (TASK-00266) ──────────────────── */
+
+void vw_storage_set_gc_grace_secs_for_test(vw_storage_t *st, unsigned secs)
+{
+    if (!st) return;
+    rwlock_wrlock(&st->lock);
+    st->gc_grace_secs = secs;
     rwlock_wrunlock(&st->lock);
 }
