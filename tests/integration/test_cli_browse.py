@@ -1,12 +1,12 @@
 """
-test_cli_list_folder.py — integration test for TASK-00281's daemon IPC
-(VW_IPC_SHARED_FOLDER_LIST_REQ/RESP) and the `vapourwault-cli list-folder`
+test_cli_browse.py — integration test for TASK-00281's daemon IPC
+(VW_IPC_SHARED_FOLDER_LIST_REQ/RESP) and the `vapourwault-cli browse`
 subcommand.
 
 Same style as test_cli_version_history.py's file_id-based tests: a grantee
 has no owner-namespaced path into content they don't own, so browsing has
 to go through file_id instead — `list-shares --to-me` for the top-level
-shared folder, then `list-folder <file_id>` to descend, one level (or the
+shared folder, then `browse <file_id>` to descend, one level (or the
 whole subtree with --recursive) at a time. This is the actual gap TASK-00281
 closed: the wire protocol and permission model (unbounded-depth inheritance
 down a shared folder's subtree) already worked; no daemon IPC message ever
@@ -50,8 +50,8 @@ def _list_shares_to_me(cli_bin, ipc_port, account, name):
     raise AssertionError(f"no share named {name!r} found in list-shares --to-me output:\n{out}")
 
 
-def _parse_list_folder(out):
-    """Returns {name: (file_id, is_dir)} from `list-folder`'s output."""
+def _parse_browse(out):
+    """Returns {name: (file_id, is_dir)} from `browse`'s output."""
     rows = {}
     for line in out.strip().splitlines()[1:]:  # skip header
         cols = line.split()
@@ -64,7 +64,7 @@ def _parse_list_folder(out):
     return rows
 
 
-def test_cli_list_folder_descends_into_a_shared_folders_nested_subfolder(
+def test_cli_browse_descends_into_a_shared_folders_nested_subfolder(
         binaries, tmp_path_factory, cli_bin, running_daemon, unique_username):
     binaries.require_server()
     binaries.require_tls()
@@ -113,13 +113,13 @@ def test_cli_list_folder_descends_into_a_shared_folders_nested_subfolder(
         assert rc == 0, f"account add (grantee) failed: {out}\n{err}"
 
         # ── The grantee has no owner-namespaced path to shared_dir at all —
-        # this is exactly the case list-folder exists for. ──
+        # this is exactly the case browse exists for. ──
         top_id = _list_shares_to_me(cli_bin, running_daemon, grantee, "shared_dir")
 
         rc, out, err = _cli(cli_bin, running_daemon, "--account", grantee,
-                             "list-folder", str(top_id))
-        assert rc == 0, f"list-folder (top) failed: {out}\n{err}"
-        top_entries = _parse_list_folder(out)
+                             "browse", str(top_id))
+        assert rc == 0, f"browse (top) failed: {out}\n{err}"
+        top_entries = _parse_browse(out)
         assert "top.txt" in top_entries, f"expected top.txt in {top_entries}"
         assert "nested" in top_entries, f"expected nested/ in {top_entries}"
         assert top_entries["top.txt"][1] is False, "top.txt must be listed as a file"
@@ -130,17 +130,17 @@ def test_cli_list_folder_descends_into_a_shared_folders_nested_subfolder(
         # an unbounded-depth subtree with no separate grant needed. ──
         nested_id = top_entries["nested"][0]
         rc, out, err = _cli(cli_bin, running_daemon, "--account", grantee,
-                             "list-folder", str(nested_id))
-        assert rc == 0, f"list-folder (nested) failed: {out}\n{err}"
-        nested_entries = _parse_list_folder(out)
+                             "browse", str(nested_id))
+        assert rc == 0, f"browse (nested) failed: {out}\n{err}"
+        nested_entries = _parse_browse(out)
         assert "deep.txt" in nested_entries, f"expected deep.txt in {nested_entries}"
         assert nested_entries["deep.txt"][1] is False
 
         # ── --recursive from the top returns the whole subtree in one call. ──
         rc, out, err = _cli(cli_bin, running_daemon, "--account", grantee,
-                             "list-folder", str(top_id), "--recursive")
-        assert rc == 0, f"list-folder --recursive failed: {out}\n{err}"
-        recursive_entries = _parse_list_folder(out)
+                             "browse", str(top_id), "--recursive")
+        assert rc == 0, f"browse --recursive failed: {out}\n{err}"
+        recursive_entries = _parse_browse(out)
         assert "top.txt" in recursive_entries
         assert "deep.txt" in recursive_entries, (
             f"--recursive must include the nested subtree: {recursive_entries}"
@@ -155,7 +155,7 @@ def test_cli_list_folder_descends_into_a_shared_folders_nested_subfolder(
                              "--ca-cert", server.cert, "--label", stranger)
         assert rc == 0, f"account add (stranger) failed: {out}\n{err}"
         rc, out, err = _cli(cli_bin, running_daemon, "--account", stranger,
-                             "list-folder", str(top_id))
+                             "browse", str(top_id))
         assert rc != 0, (
             f"an unrelated user must not be able to list a folder they have "
             f"no grant on: {out}\n{err}"

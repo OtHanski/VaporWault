@@ -1095,7 +1095,7 @@ static int cmd_version_restore_by_id(vw_ipc_conn_t *conn, uint32_t account_id,
     return 0;
 }
 
-/* ── Subcommand: list-folder (TASK-00281; docs/vw_ipc.h's own payload doc) ─
+/* ── Subcommand: browse (TASK-00281; docs/vw_ipc.h's own payload doc) ─
  * Lists a directory by file_id via the live remote listing IPC path (not
  * the local sync cache VW_IPC_FILE_LIST_REQ reads) — the only way to
  * browse into a shared folder's subtree, which the local cache has no
@@ -1113,12 +1113,12 @@ static int cmd_shared_folder_list(vw_ipc_conn_t *conn, uint32_t account_id,
     req[12] = recursive;
 
     uint8_t *resp = malloc(65536);
-    if (!resp) { fprintf(stderr, "list-folder: out of memory\n"); return 1; }
+    if (!resp) { fprintf(stderr, "browse: out of memory\n"); return 1; }
     uint32_t rlen = 0;
     vw_err_t err = ipc_rpc(conn, VW_IPC_SHARED_FOLDER_LIST_REQ, req, sizeof(req),
                              VW_IPC_SHARED_FOLDER_LIST_RESP, resp, 65536, &rlen);
-    if (err != VW_OK) { fprintf(stderr, "list-folder: IPC error %d\n", (int)err); free(resp); return 1; }
-    if (check_u32_resp(resp, rlen, "list-folder")) { free(resp); return 1; }
+    if (err != VW_OK) { fprintf(stderr, "browse: IPC error %d\n", (int)err); free(resp); return 1; }
+    if (check_u32_resp(resp, rlen, "browse")) { free(resp); return 1; }
     if (rlen < 8u) { free(resp); return 0; }
 
     uint32_t count = vw_read_u32le(resp + 4u);
@@ -1486,7 +1486,7 @@ static void print_usage(const char *prog) {
         "                                (requires an EDIT grant, not just VIEW)\n"
         "  search <query>                Search filenames across everything visible\n"
         "                                (owned + shared); case-insensitive substring\n"
-        "  list-folder <file_id> [--recursive]\n"
+        "  browse <file_id> [--recursive]\n"
         "                                Browse a directory's live contents by id —\n"
         "                                the only way to descend into a shared\n"
         "                                folder's subtree (get the top-level id from\n"
@@ -2062,10 +2062,10 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
         return rc;
     }
 
-    if (strcmp(cmd, "list-folder") == 0) {
+    if (strcmp(cmd, "browse") == 0) {
         HELP_IF_REQUESTED();
         if (argi >= argc) {
-            fprintf(stderr, "Usage: %s list-folder <file_id> [--recursive]\n", argv[0]);
+            fprintf(stderr, "Usage: %s browse <file_id> [--recursive]\n", argv[0]);
             return 1;
         }
         /* TASK-00281: browses a directory by file_id via the live remote
