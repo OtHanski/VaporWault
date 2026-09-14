@@ -1228,6 +1228,14 @@ static vw_err_t chunk_put_impl(vw_storage_t *st,
             rwlock_wrunlock(&st->lock);
             return VW_OK;
         }
+        /* Not reachable today (establish_own_ref == 1 implies
+         * charge_quota == 0, and only a real upload — charge_quota == 1 —
+         * ever leaves an entry at ref_count == 0 in the first place), but
+         * clear defensively for the same reason vw_storage_chunk_addref
+         * does: any entry leaving ref_count == 0 for good must not keep a
+         * stale grace deadline that could wrongly protect it from GC (or
+         * wrongly fail to) on some future decref back to 0. */
+        grace_clear(st, hash);
         entry->ref_count++;
         refcount_record_t rec;
         memcpy(rec.hash, hash, VW_HASH_BYTES);

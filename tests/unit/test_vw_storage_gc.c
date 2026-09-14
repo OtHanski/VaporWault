@@ -51,11 +51,12 @@
 #else
 #  include <unistd.h>
 #  include <sys/stat.h>
+#  include <dirent.h>
 #  define VW_PID() ((unsigned)getpid())
 #  define VW_SLEEP_SECS(n) sleep(n)
 #endif
 
-/* ── Temp-dir helper (same pattern as test_vw_storage_parity.c) ──────────── */
+/* ── Temp-dir helpers (same pattern as test_vw_storage_parity.c) ─────────── */
 
 static void make_tmpdir(char *out, size_t sz, const char *label)
 {
@@ -67,6 +68,48 @@ static void make_tmpdir(char *out, size_t sz, const char *label)
 #else
     snprintf(out, sz, "/tmp/vw_storagegctest_%u_%s", VW_PID(), label);
     mkdir(out, 0700);
+#endif
+}
+
+static void rm_rf(const char *dir)
+{
+#ifdef _WIN32
+    char pat[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof(pat), "%s\\*", dir);
+    h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            char child[MAX_PATH];
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+                continue;
+            snprintf(child, sizeof(child), "%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                rm_rf(child);
+            else
+                DeleteFileA(child);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(dir);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char child[512];
+        struct stat st;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        snprintf(child, sizeof(child), "%s/%s", dir, e->d_name);
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode))
+            rm_rf(child);
+        else
+            remove(child);
+    }
+    closedir(d);
+    rmdir(dir);
 #endif
 }
 
@@ -139,6 +182,7 @@ VW_TEST_SUITE("vw_storage_gc") {
         vw_storage_close(st);
         vw_store_close(store);
         vw_oplog_close(oplog);
+        rm_rf(tmpdir);
     }
 
     VW_TEST_CASE("GC does not collect a not-yet-committed chunk within its grace period") {
@@ -187,6 +231,7 @@ VW_TEST_SUITE("vw_storage_gc") {
         vw_storage_close(st);
         vw_store_close(store);
         vw_oplog_close(oplog);
+        rm_rf(tmpdir);
     }
 
     VW_TEST_CASE("GC collects a genuinely abandoned chunk once its grace period expires") {
@@ -236,6 +281,7 @@ VW_TEST_SUITE("vw_storage_gc") {
         vw_storage_close(st);
         vw_store_close(store);
         vw_oplog_close(oplog);
+        rm_rf(tmpdir);
     }
 
     VW_TEST_CASE("a real delete is immediately GC-eligible even under a long upload grace period") {
@@ -280,6 +326,7 @@ VW_TEST_SUITE("vw_storage_gc") {
         vw_storage_close(st);
         vw_store_close(store);
         vw_oplog_close(oplog);
+        rm_rf(tmpdir);
     }
 }
 VW_TEST_SUITE_END()
