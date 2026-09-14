@@ -1149,17 +1149,27 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
      * The server never inspects wrapped_dek's content — only its presence
      * and size ceiling (already checked above) — it is opaque bytes
      * stored alongside the version, exactly like wrapped_vk/kdf_params in
-     * vw_vault.c. */
+     * vw_vault.c.
+     *
+     * TASK-00290: pin the vault (vw_vault_pin_if_exists, not the plain
+     * vw_vault_get_by_id this replaced) from here until the version
+     * record either becomes durable or this commit is abandoned — every
+     * exit path below this point until vw_store_version_create returns
+     * must call vw_vault_unpin exactly once. This closes the race where a
+     * concurrent VAULT_DELETE lands after this check but before the
+     * version write: vw_vault_delete refuses while pinned, even though
+     * vw_store_version_vault_in_use's own scan can't see this commit's
+     * version yet. See vw_vault_pin_if_exists's own doc comment. */
     if (vault_id != 0) {
         if (!vs) return (send_error(conn, VW_ERR_NOT_IMPL), VW_ERR_NOT_IMPL);
         vw_vault_record_t vault_rec;
-        uint8_t *unused_vk = NULL, *unused_params = NULL;
-        err = vw_vault_get_by_id(vs, vault_id, &vault_rec, &unused_vk, &unused_params);
-        free(unused_vk); free(unused_params);
+        err = vw_vault_pin_if_exists(vs, vault_id, &vault_rec);
         if (err != VW_OK)
             return (send_error(conn, VW_ERR_NOT_FOUND), VW_OK);
-        if (vault_rec.owner_id != file_rec.owner_id)
+        if (vault_rec.owner_id != file_rec.owner_id) {
+            vw_vault_unpin(vs, vault_id);
             return (send_error(conn, VW_ERR_PERMISSION), VW_OK);
+        }
     }
 
     /* Create the version record. */
@@ -1180,6 +1190,7 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
         if (err != VW_OK) {
             for (uint32_t c = 0; c < chunk_count; c++)
                 (void)vw_storage_chunk_decref(cs, chunk_hashes + (size_t)c * VW_HASH_BYTES);
+            if (vault_id != 0) vw_vault_unpin(vs, vault_id);
             return (send_error(conn, err), VW_OK);
         }
         ver_rec.file_id = new_file_id;
@@ -1188,6 +1199,12 @@ static vw_err_t handle_file_commit(vw_store_t       *store,
     err = vw_store_version_create(fs, &ver_rec, chunk_hashes,
                                    (const uint8_t *)wrapped_dek, wrapped_dek_len,
                                    &new_version_id);
+    /* Pinned window ends here regardless of outcome: on success the
+     * version record (with its vault_id) is now durable, so
+     * vw_store_version_vault_in_use's ordinary scan protects the vault
+     * from here on; on failure nothing was written that references the
+     * vault, so there is nothing left to protect. */
+    if (vault_id != 0) vw_vault_unpin(vs, vault_id);
     if (err != VW_OK) {
         for (uint32_t c = 0; c < chunk_count; c++)
             (void)vw_storage_chunk_decref(cs, chunk_hashes + (size_t)c * VW_HASH_BYTES);

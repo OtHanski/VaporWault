@@ -344,6 +344,120 @@ VW_TEST_SUITE("vw_vault") {
         stack_close(&s);
     }
 
+    VW_TEST_CASE("pin_if_exists returns NOT_FOUND for an unknown or already-deleted vault_id") {
+        vault_stack_t s = {0};
+        stack_open(&s, "pin_not_found");
+        {
+            vw_vault_record_t rec;
+            VW_ASSERT_EQ((int)VW_ERR_NOT_FOUND,
+                (int)vw_vault_pin_if_exists(s.vs, 999999, &rec));
+
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 10));
+            VW_ASSERT_EQ((int)VW_ERR_NOT_FOUND,
+                (int)vw_vault_pin_if_exists(s.vs, vid, &rec));
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("pin_if_exists populates owner_id; unpin on a never-pinned vault_id is a safe no-op") {
+        vault_stack_t s = {0};
+        stack_open(&s, "pin_owner_id");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 42, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+
+            vw_vault_record_t rec;
+            memset(&rec, 0, sizeof(rec));
+            VW_ASSERT_OK(vw_vault_pin_if_exists(s.vs, vid, &rec));
+            VW_ASSERT_EQ((int)42, (int)rec.owner_id);
+            vw_vault_unpin(s.vs, vid);
+
+            /* Never pinned at all (a different, real vault_id) — must not
+             * crash or corrupt any other vault_id's count. */
+            uint64_t vid2 = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 42, 101, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid2));
+            vw_vault_unpin(s.vs, vid2);
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid2, 42));
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("TASK-00290: delete refuses VAULT_NOT_EMPTY while pinned, "
+                 "succeeds once unpinned -- closes the FILE_COMMIT/VAULT_DELETE race") {
+        vault_stack_t s = {0};
+        stack_open(&s, "pin_blocks_delete");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+
+            /* Simulates handle_file_commit pinning the vault right after
+             * validating vault_id, before its version record is durable —
+             * the exact window TASK-00290 is about. */
+            vw_vault_record_t rec;
+            VW_ASSERT_OK(vw_vault_pin_if_exists(s.vs, vid, &rec));
+
+            /* A concurrent VAULT_DELETE landing in that window must not
+             * succeed, even though vw_store_version_vault_in_use's own
+             * (separate, caller-side) scan would find nothing yet —
+             * vw_vault_delete's own pin check is what actually closes
+             * this race, independent of that scan. */
+            VW_ASSERT_EQ((int)VW_ERR_VAULT_NOT_EMPTY,
+                (int)vw_vault_delete(s.vs, vid, 10));
+
+            /* Vault must still be fully intact after the refused delete. */
+            vw_vault_record_t still;
+            uint8_t *vk = NULL, *params = NULL;
+            VW_ASSERT_OK(vw_vault_get_by_id(s.vs, vid, &still, &vk, &params));
+            free(vk); free(params);
+
+            /* Simulates the pinning FILE_COMMIT finishing (its version now
+             * durable, or the commit failed outright — either way nothing
+             * left needing protection). */
+            vw_vault_unpin(s.vs, vid);
+
+            /* Now a real, no-longer-racing delete succeeds normally. */
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 10));
+        }
+        stack_close(&s);
+    }
+
+    VW_TEST_CASE("TASK-00290: pin count is a real counter -- two pins need two unpins before delete succeeds") {
+        vault_stack_t s = {0};
+        stack_open(&s, "pin_counter");
+        {
+            uint8_t wrapped_vk[8] = {0};
+            uint8_t kdf_salt[16] = {0};
+            uint64_t vid = 0;
+            VW_ASSERT_OK(vw_vault_create(s.vs, 10, 100, wrapped_vk, sizeof(wrapped_vk),
+                                          kdf_salt, NULL, 0, &vid));
+
+            /* Two concurrent FILE_COMMITs both referencing the same vault_id. */
+            vw_vault_record_t rec1, rec2;
+            VW_ASSERT_OK(vw_vault_pin_if_exists(s.vs, vid, &rec1));
+            VW_ASSERT_OK(vw_vault_pin_if_exists(s.vs, vid, &rec2));
+
+            vw_vault_unpin(s.vs, vid); /* first one finishes */
+            VW_ASSERT_EQ((int)VW_ERR_VAULT_NOT_EMPTY,
+                (int)vw_vault_delete(s.vs, vid, 10)); /* second still outstanding */
+
+            vw_vault_unpin(s.vs, vid); /* second one finishes */
+            VW_ASSERT_OK(vw_vault_delete(s.vs, vid, 10));
+        }
+        stack_close(&s);
+    }
+
     VW_TEST_CASE("store reopen rebuilds the vault_id index and continues numbering correctly") {
         char tmpdir[512];
         make_tmpdir(tmpdir, sizeof(tmpdir), "reopen");
