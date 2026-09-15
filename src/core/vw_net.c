@@ -18,7 +18,10 @@
 #ifdef _WIN32
 #   include <winsock2.h>
 #   include <ws2tcpip.h>
+#   include <wincrypt.h>   /* TASK-00296: CertOpenStore et al. for
+                               load_system_ca_chain() below */
 #   pragma comment(lib, "ws2_32.lib")
+#   pragma comment(lib, "crypt32.lib")
 /* Platform shims for recv_timeout_ms atomics (MSVC C mode lacks stdatomic). */
 #   define VW_RECV_TIMEOUT_TYPE           volatile LONG
 #   define vw_recv_timeout_load(p)        ((uint32_t)InterlockedCompareExchange((volatile LONG *)(p), 0, 0))
@@ -115,6 +118,12 @@ typedef struct {
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     int                     ca_loaded;
+#ifdef _WIN32
+    /* TASK-00296: hostname for win32_verify_cert_cb's SSL chain-policy
+     * check (VW_CERT_VERIFY_SYSTEM_STORE only) — must outlive the
+     * handshake, so it lives here rather than a stack buffer. */
+    wchar_t                 hostname_w[256];
+#endif
 } vw_client_tls_t;
 
 /* ── Connection structure ────────────────────────────────────────────────── */
@@ -178,12 +187,49 @@ static int conn_recv_timeout(void *ctx, unsigned char *buf, size_t len,
 
 /* ── Non-blocking TCP connect with optional timeout ───────────────────────── */
 
+#ifdef _WIN32
+/*
+ * TASK-00296 fix: mbedtls_net_connect() (the timeout_ms==0 path just
+ * below) internally calls mbedTLS's own net_prepare(), which lazily calls
+ * WSAStartup() on Windows — but the non-blocking branch below talks to
+ * raw Winsock (socket/connect/select) directly and never did, relying
+ * entirely on WSAStartup having already happened as a side effect of some
+ * *other* mbedtls_net_connect() call (or one of the handful of other
+ * ad-hoc WSAStartup call sites in this codebase — vw_client_cli.c,
+ * vw_ipc.c, vw_smtp.c) earlier in the process. That was always true for
+ * every caller before TASK-00296 (this project's own client/server code
+ * always passes conn_opts=NULL, i.e. timeout_ms==0, for every connection
+ * except the new outbound update-check fetch), but a client auto-update
+ * check can legitimately be the very first network call a fresh daemon
+ * process ever makes (headless auto-policy, zero configured accounts —
+ * see vw_update.c's design), so this branch needs its own guaranteed
+ * one-time init rather than depending on load-bearing call-order luck
+ * elsewhere in the process. Found via a real DNS-resolution failure
+ * (WSANOTINITIALISED) in a from-scratch process during TASK-00296's own
+ * manual GitHub-fetch verification — not theoretical.
+ */
+static INIT_ONCE   s_wsa_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK wsa_once_cb(PINIT_ONCE o, PVOID p, PVOID *ctx) {
+    (void)o; (void)p; (void)ctx;
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    return TRUE;
+}
+static void ensure_wsa_started(void) {
+    InitOnceExecuteOnce(&s_wsa_once, wsa_once_cb, NULL, NULL);
+}
+#endif
+
 static int connect_with_timeout(mbedtls_net_context *net,
                                  const char *host, const char *port_str,
                                  uint32_t timeout_ms)
 {
     if (timeout_ms == 0)
         return mbedtls_net_connect(net, host, port_str, MBEDTLS_NET_PROTO_TCP);
+
+#ifdef _WIN32
+    ensure_wsa_started();
+#endif
 
     struct addrinfo hints, *res = NULL, *ai;
     memset(&hints, 0, sizeof(hints));
@@ -278,6 +324,154 @@ static vw_err_t configure_ssl_defaults(mbedtls_ssl_config *conf,
     }
     return VW_OK;
 }
+
+#ifndef _WIN32
+/*
+ * TASK-00296 (Linux/POSIX): load the OS trust store (NOT a project-pinned
+ * PEM) into chain, for vw_net_connect_generic()'s
+ * VW_CERT_VERIFY_SYSTEM_STORE path — outbound connections to a public,
+ * non-VaporWault-controlled host (the client auto-update feature's only
+ * current caller). Returns 0 on success, nonzero on failure.
+ *
+ * Deliberately reads the LIVE OS trust store on every call rather than
+ * embedding a fixed, project-pinned root set: a public CDN's chain can
+ * rotate roots/intermediates over this key's lifetime, and a hardcoded
+ * set would silently bit-rot into hard-to-diagnose update-check failures
+ * years later. Same guarantee a browser gets from the OS keeping its own
+ * trust store current.
+ *
+ * Windows does NOT use this function — see win32_verify_cert_cb below for
+ * why the same "parse every store cert into one mbedtls_x509_crt chain"
+ * strategy doesn't work there.
+ */
+static int load_system_ca_chain(mbedtls_x509_crt *chain) {
+    /* Standard system CA bundle locations across common Linux
+     * distributions (Debian/Ubuntu, RHEL/Fedora, Alpine/others) — same
+     * approach curl and other minimal C tools use, no new dependency. */
+    static const char *candidates[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (mbedtls_x509_crt_parse_file(chain, candidates[i]) == 0)
+            return 0;
+    }
+    return -1;
+}
+#endif /* !_WIN32 */
+
+#ifdef _WIN32
+/*
+ * TASK-00296 (Windows): a fixed, self-signed, VaporWault-internal
+ * placeholder certificate — NOT a real CA, never matches any real peer's
+ * chain — loaded purely to satisfy mbedTLS's TLS 1.3 client code, which
+ * hard-requires a non-empty ca_chain to exist whenever authmode is
+ * REQUIRED (independent of whether a verify callback is also registered).
+ * See the VW_CERT_VERIFY_SYSTEM_STORE branch below for how the real trust
+ * decision is made instead (win32_verify_cert_cb, via Windows' own chain
+ * engine) — this placeholder grants no trust by itself.
+ */
+static const char VW_NET_PLACEHOLDER_CA_PEM[] =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBiDCCAS+gAwIBAgIUOw4bN+Qy08iH92/Z1kabLuEvRL8wCgYIKoZIzj0EAwIw\n"
+    "GjEYMBYGA1UEAwwPVmFwb3JXYXVsdCBUZXN0MB4XDTI2MDcwNzA5NTkzOVoXDTM2\n"
+    "MDcwNDA5NTkzOVowGjEYMBYGA1UEAwwPVmFwb3JXYXVsdCBUZXN0MFkwEwYHKoZI\n"
+    "zj0CAQYIKoZIzj0DAQcDQgAEBzR5n+n1kbN6f2goisc6aFUwkdNbxwGqXJ3yO3ra\n"
+    "cWQ/eUC+wivPwa0nLByWqF5WcAJgyP/mk38QgzCn9Xd7EaNTMFEwHQYDVR0OBBYE\n"
+    "FDZWT/P4PsQJMxNdcpFZSalt59sKMB8GA1UdIwQYMBaAFDZWT/P4PsQJMxNdcpFZ\n"
+    "Salt59sKMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgWLzqbWKg\n"
+    "aDH/Ml+h9ShTBu1Nk2MDdW0rwKU1xJRKfHUCIDbD63boc0KQ+VV07cNm/fJdXnk5\n"
+    "5NO/rLH3Clxrw7G+\n"
+    "-----END CERTIFICATE-----\n";
+
+/*
+ * TASK-00296 (Windows): verify the peer's certificate against the Windows
+ * trust store using Windows' OWN chain-building/verification engine
+ * (CertGetCertificateChain + CertVerifyCertificateChainPolicy), instead of
+ * enumerating every cert in the "ROOT" store and handing them to mbedTLS's
+ * own X.509 engine as a ca_chain.
+ *
+ * That enumerate-everything approach was tried first and empirically
+ * fails: the Windows ROOT store holds a large, heterogeneous mix of CAs
+ * accumulated over the OS's lifetime, and mbedTLS's certificate-chain
+ * verification walk can hard-abort the ENTIRE handshake — not just skip
+ * one unusable anchor — the moment it touches a stored certificate whose
+ * signature algorithm its own OID table doesn't recognize
+ * (MBEDTLS_ERR_X509_INVALID_ALG "unsupported OID" was reproduced live
+ * against a real github.com connection during this task's manual
+ * verification pass, immediately after WSAStartup and DNS/connect were
+ * fixed — not theoretical). Using Windows' own, natively-maintained
+ * verification engine sidesteps this entirely: it never needs to hand
+ * mbedTLS a store certificate to parse at all, and is the same class of
+ * mechanism other cross-platform tools use to validate TLS peers against
+ * the OS store on Windows rather than fighting a foreign X.509 stack.
+ *
+ * Registered via mbedtls_ssl_conf_verify() instead of
+ * mbedtls_ssl_conf_ca_chain() — no ca_chain is configured on Windows at
+ * all, so mbedTLS's own internal path-building always marks every
+ * candidate untrusted; this callback is the sole source of trust.
+ */
+static int win32_verify_cert_cb(void *p_vrfy, mbedtls_x509_crt *crt,
+                                 int depth, uint32_t *flags) {
+    if (depth != 0) {
+        /* Only the leaf (depth 0) is evaluated — CertGetCertificateChain
+         * builds its own path to a trusted root using Windows' own
+         * store/AIA fetching from just the leaf, so intermediate/root
+         * certs the peer sent need no separate check here. Clear
+         * whatever mbedTLS's own CA-chain-less internal walk set for
+         * this depth; the leaf-depth verdict below is authoritative. */
+        *flags = 0;
+        return 0;
+    }
+
+    const wchar_t *hostname_w = (const wchar_t *)p_vrfy;
+    int trusted = 0;
+
+    PCCERT_CONTEXT leaf = CertCreateCertificateContext(
+        X509_ASN_ENCODING, crt->raw.p, (DWORD)crt->raw.len);
+    if (leaf) {
+        CERT_CHAIN_PARA chain_para;
+        memset(&chain_para, 0, sizeof(chain_para));
+        chain_para.cbSize = sizeof(chain_para);
+
+        PCCERT_CHAIN_CONTEXT chain_ctx = NULL;
+        BOOL got_chain = CertGetCertificateChain(
+            NULL, leaf, NULL, NULL, &chain_para,
+            0, /* deliberately no online revocation check — see the
+                  function-level comment on why */
+            NULL, &chain_ctx);
+
+        if (got_chain && chain_ctx) {
+            SSL_EXTRA_CERT_CHAIN_POLICY_PARA extra;
+            memset(&extra, 0, sizeof(extra));
+            extra.cbSize = sizeof(extra);
+            extra.dwAuthType = AUTHTYPE_SERVER;
+            extra.pwszServerName = (wchar_t *)hostname_w;
+
+            CERT_CHAIN_POLICY_PARA policy_para;
+            memset(&policy_para, 0, sizeof(policy_para));
+            policy_para.cbSize = sizeof(policy_para);
+            policy_para.pvExtraPolicyPara = &extra;
+
+            CERT_CHAIN_POLICY_STATUS policy_status;
+            memset(&policy_status, 0, sizeof(policy_status));
+            policy_status.cbSize = sizeof(policy_status);
+
+            if (CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain_ctx,
+                                                  &policy_para, &policy_status) &&
+                policy_status.dwError == 0) {
+                trusted = 1;
+            }
+            CertFreeCertificateChain(chain_ctx);
+        }
+        CertFreeCertificateContext(leaf);
+    }
+
+    *flags = trusted ? 0 : MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+    return 0; /* the callback itself never hard-fails; trust is conveyed via *flags */
+}
+#endif /* _WIN32 */
 
 /* Read a PEM file into a NUL-terminated heap buffer.
  * mbedTLS PEM parsers require the buffer to be NUL-terminated; len includes it. */
@@ -603,9 +797,43 @@ static vw_err_t net_connect_impl(const char *host, uint16_t port,
                                 MBEDTLS_SSL_IS_CLIENT,
                                 alpn_protos) != VW_OK)
         goto fail;
-
     if (verify == VW_CERT_VERIFY_NONE) {
         mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_NONE);
+    } else if (verify == VW_CERT_VERIFY_SYSTEM_STORE) {
+        mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        diag_step = 3;
+#ifdef _WIN32
+        /* mbedTLS's TLS 1.3 client code hard-requires SOME ca_chain
+         * object to exist when authmode is REQUIRED — with none
+         * configured at all it fails outright ("No CA Chain is set, but
+         * required to operate") before win32_verify_cert_cb ever runs.
+         * VW_NET_PLACEHOLDER_CA_PEM below is loaded purely to satisfy
+         * that structural requirement; it can never actually match a
+         * real peer's chain (it's a fixed, VaporWault-internal
+         * self-signed test cert, not a real CA), so it grants no trust
+         * by itself. The verify callback unconditionally OVERWRITES
+         * *flags (not ORs into it) based on Windows' own
+         * CertVerifyCertificateChainPolicy verdict — the placeholder's
+         * own non-match is irrelevant to the actual trust decision. */
+        if ((diag_rc = mbedtls_x509_crt_parse(&tls->ca_cert,
+                (const unsigned char *)VW_NET_PLACEHOLDER_CA_PEM,
+                sizeof(VW_NET_PLACEHOLDER_CA_PEM))) != 0)
+            goto fail;
+        tls->ca_loaded = 1;
+        mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->ca_cert, NULL);
+
+        if (MultiByteToWideChar(CP_UTF8, 0, host, -1,
+                                 tls->hostname_w,
+                                 (int)(sizeof(tls->hostname_w) / sizeof(wchar_t))) == 0) {
+            diag_rc = -1;
+            goto fail;
+        }
+        mbedtls_ssl_conf_verify(&tls->conf, win32_verify_cert_cb, tls->hostname_w);
+#else
+        if ((diag_rc = load_system_ca_chain(&tls->ca_cert)) != 0) goto fail;
+        tls->ca_loaded = 1;
+        mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->ca_cert, NULL);
+#endif
     } else {
         mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
         if (ca_cert_pem_path) {
@@ -702,6 +930,15 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
                          vw_conn_t **out_conn) {
     return net_connect_impl(host, port, verify, ca_cert_pem_path, opts,
                              VW_ALPN_CLIENT, out_conn);
+}
+
+vw_err_t vw_net_connect_generic(const char *host, uint16_t port,
+                                 vw_cert_verify_t verify,
+                                 const char *ca_cert_pem_path,
+                                 const vw_conn_opts_t *opts,
+                                 vw_conn_t **out_conn) {
+    return net_connect_impl(host, port, verify, ca_cert_pem_path, opts,
+                             NULL /* no ALPN */, out_conn);
 }
 
 vw_err_t vw_net_connect_cluster(const char *host, uint16_t port,

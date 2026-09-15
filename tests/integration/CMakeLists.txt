@@ -79,6 +79,42 @@ set_tests_properties(integration_proto_recv_drain PROPERTIES
     LABELS  "integration;protocol"
 )
 
+# test_update_net: TASK-00296 — outbound HTTPS GET client for the client
+# auto-update feature. Compiles its own copy of vw_update_net.c with
+# VW_UPDATE_NET_TEST_HOOKS (redirects the connect step at a local
+# self-signed test server instead of the real system-trust-store path,
+# which no local server can satisfy) and a short VW_UPDATE_RECV_TIMEOUT_MS
+# (same VW_ECC_MAX_DATA_SHARDS-style override convention as
+# test_repair_pipeline) so the timeout-enforcement case is fast.
+
+add_executable(test_update_net
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+)
+target_compile_definitions(test_update_net PRIVATE
+    VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATE_RECV_TIMEOUT_MS=1500
+    VW_UPDATE_CONNECT_TIMEOUT_MS=2000
+    VW_UPDATE_TOTAL_READ_DEADLINE_SECS=3
+)
+target_include_directories(test_update_net PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_update_net PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_update_net PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_update_net PRIVATE ws2_32)
+endif()
+add_test(NAME integration_update_net COMMAND test_update_net)
+set_tests_properties(integration_update_net PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
 # test_proto_update_hint: TASK-00292 — HELLO_OK/VERSION_REJECT's new optional
 # trailing update-hint block. Only needs vw_core (vw_proto.c + vw_net.c) —
 # no server/auth stack, same rationale as test_proto_recv_drain above.

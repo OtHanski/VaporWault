@@ -119,8 +119,23 @@
 /** SHA-256 (used in TLS 1.3 handshake, certificate verification). */
 #define MBEDTLS_SHA256_C
 
-/** SHA-512 (used in certificate chains with SHA-384 signatures). */
+/** SHA-512. */
 #define MBEDTLS_SHA512_C
+
+/*
+ * SHA-384 (used in certificate chains with SHA-384 signatures, e.g. many
+ * real-world public CAs' intermediates — found necessary, not
+ * theoretical, during TASK-00296's manual verification against a real
+ * github.com connection: without this, mbedTLS cannot even PARSE an
+ * ecdsa-with-SHA384-signed certificate the peer sends mid-chain, which
+ * surfaces as a generic "X509 - Signature algorithm (oid) is unsupported"
+ * error rather than anything mentioning SHA-384 specifically). This is a
+ * genuinely separate opt-in from MBEDTLS_SHA512_C in this mbedTLS
+ * version (3.6.x split them; the comment above pre-dates that split and
+ * was never updated) — SHA-512 support alone does NOT imply SHA-384
+ * support, despite sharing the same underlying compression function.
+ */
+#define MBEDTLS_SHA384_C
 
 /** SHA-1 (required for HOTP/TOTP HMAC-SHA1; not used for TLS). */
 #define MBEDTLS_SHA1_C

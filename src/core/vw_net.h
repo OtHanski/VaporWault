@@ -27,8 +27,16 @@ typedef struct vw_conn     vw_conn_t;      /* one client/server connection */
 /* ── Certificate verification mode ──────────────────────────────────────── */
 
 typedef enum {
-    VW_CERT_VERIFY_REQUIRED = 0,   /* default: verify peer certificate */
-    VW_CERT_VERIFY_NONE     = 1,   /* disable verification (testing only) */
+    VW_CERT_VERIFY_REQUIRED     = 0,   /* default: verify peer certificate against
+                                           an explicit, caller-supplied, pinned PEM */
+    VW_CERT_VERIFY_NONE         = 1,   /* disable verification (testing only) */
+    VW_CERT_VERIFY_SYSTEM_STORE = 2,   /* TASK-00296: verify against the OS trust
+                                           store instead of a pinned PEM — for
+                                           connecting to a public, non-VaporWault
+                                           host whose cert chain isn't ours to pin
+                                           (e.g. github.com). Never used for the
+                                           VaporWault wire protocol itself; only
+                                           via vw_net_connect_generic() below. */
 } vw_cert_verify_t;
 
 /* ── Connection options ──────────────────────────────────────────────────── */
@@ -119,6 +127,26 @@ vw_err_t vw_net_connect(const char *host, uint16_t port,
  * kinds don't accept each other's protocol string.
  */
 vw_err_t vw_net_connect_cluster(const char *host, uint16_t port,
+                                 vw_cert_verify_t verify,
+                                 const char *ca_cert_pem_path,
+                                 const vw_conn_opts_t *opts,
+                                 vw_conn_t **out_conn);
+
+/*
+ * TASK-00296: like vw_net_connect, but with NO forced ALPN — offers none
+ * at all, rather than "vw/1" — and supports
+ * verify == VW_CERT_VERIFY_SYSTEM_STORE (see that enum value's doc
+ * comment). ca_cert_pem_path is ignored when verify is SYSTEM_STORE or
+ * NONE, same as vw_net_connect.
+ *
+ * This is for connecting to a generic public HTTPS host that doesn't
+ * speak the VaporWault wire protocol at all — currently only
+ * src/client/vw_update_net.c's GitHub Releases fetch for the client
+ * auto-update feature. Every VaporWault-protocol connection (client↔server,
+ * cluster↔cluster) still goes through vw_net_connect/_cluster's pinned-ALPN,
+ * pinned-CA path unchanged — this function is never used for those.
+ */
+vw_err_t vw_net_connect_generic(const char *host, uint16_t port,
                                  vw_cert_verify_t verify,
                                  const char *ca_cert_pem_path,
                                  const vw_conn_opts_t *opts,
