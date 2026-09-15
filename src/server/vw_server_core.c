@@ -44,6 +44,9 @@ struct vw_server_ctx {
     vw_vault_store_t    *vault_store;     /* NULL = vaults disabled             */
     uint32_t             auth_timeout_ms;
     vw_notify_ctx_t     *notify;          /* owned; NULL until vw_server_ctx_set_notify */
+    const char          *server_version;  /* TASK-00294: borrowed (a string-literal
+                                              lifetime, e.g. VW_VERSION_STRING, is
+                                              expected); NULL = advertise nothing */
 };
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
@@ -840,6 +843,20 @@ void vw_server_ctx_set_recovery(vw_server_ctx_t       *ctx,
  * vw_server_main.c manage its lifetime separately. smtp_cfg itself is
  * still only ever borrowed (vw_notify_ctx_open never copies it).
  */
+/*
+ * TASK-00294: the software version this server advertises to clients via
+ * HELLO_OK/VERSION_REJECT's update-hint extension (docs/PROTOCOL.md §6.4).
+ * version is borrowed — pass VW_VERSION_STRING (a string-literal lifetime,
+ * generated/vw_version.h), never a stack or heap buffer that could be
+ * freed before this ctx. NULL (the default, never called) omits the
+ * extension entirely — pre-TASK-00292 wire behavior.
+ */
+void vw_server_ctx_set_version(vw_server_ctx_t *ctx, const char *version)
+{
+    if (!ctx) return;
+    ctx->server_version = version;
+}
+
 void vw_server_ctx_set_notify(vw_server_ctx_t *ctx, const vw_smtp_cfg_t *smtp_cfg)
 {
     if (!ctx) return;
@@ -960,7 +977,7 @@ vw_err_t vw_server_conn_handle(vw_server_ctx_t *ctx,
     if (err != VW_OK) return err;
 
     uint16_t version;
-    err = vw_proto_negotiate(conn, 1 /*is_server*/, &version, NULL, NULL);
+    err = vw_proto_negotiate(conn, 1 /*is_server*/, &version, ctx->server_version, NULL);
     if (err != VW_OK) return err;
 
     vw_msg_type_t type;

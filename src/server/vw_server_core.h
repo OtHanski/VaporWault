@@ -113,6 +113,15 @@ void vw_server_ctx_set_notify(vw_server_ctx_t *ctx, const vw_smtp_cfg_t *smtp_cf
 vw_notify_ctx_t *vw_server_ctx_notify(const vw_server_ctx_t *ctx);
 
 /*
+ * Set the software version this server advertises to connecting clients
+ * (TASK-00294, docs/PROTOCOL.md §6.4's update-hint extension on
+ * HELLO_OK/VERSION_REJECT). version is borrowed — pass a string-literal
+ * lifetime value such as VW_VERSION_STRING. NULL (the default) omits the
+ * extension entirely.
+ */
+void vw_server_ctx_set_version(vw_server_ctx_t *ctx, const char *version);
+
+/*
  * Attach the share store (TASK-094). Borrowed; caller keeps it alive until
  * vw_server_ctx_close. May be NULL — sharing messages return VW_ERR_NOT_IMPL
  * and LINK_ACCESS in the pre-auth phase is rejected like an unknown token.
