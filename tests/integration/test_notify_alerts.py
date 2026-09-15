@@ -182,7 +182,21 @@ def _notify_conf(smtp: MockSmtpServer, **notify_overrides) -> str:
     whatever notify.* keys the caller wants. gc_interval_secs is set very
     short so admin categories only checked once per GC cycle
     (disk_capacity) don't need the test to wait out the 30-minute
-    production default.
+    production default - and the quota_warning test below also relies on
+    it to reclaim quota promptly after deleting a file (quota is only
+    ever freed when GC actually deletes a zero-ref chunk from disk, see
+    vw_storage_gc_run's Phase A), within its own wait window.
+
+    TASK-00266: this short interval used to let GC race a chunk that was
+    merely uploaded-but-not-yet-committed (ref_count==0 by design between
+    CHUNK_UPLOAD and FILE_COMMIT, TASK-180) if FILE_COMMIT was delayed
+    past gc_interval_secs under CI load - collecting it out from under
+    the in-flight upload, decrementing quota (silent re-arm), and letting
+    the client's retry cross the quota_warning threshold a second time
+    (2 emails instead of 1). Fixed at the source in chunk_put_impl/
+    vw_storage_gc_run (a grace period before a zero-ref chunk becomes
+    GC-eligible) rather than by weakening this config, since the fast
+    interval is otherwise exactly what this file's tests need.
     """
     lines = [
         f"smtp_host = {smtp.host}",

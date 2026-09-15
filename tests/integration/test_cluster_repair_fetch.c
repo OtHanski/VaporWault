@@ -198,7 +198,7 @@ static void node_stack_open(node_stack_t *n, const char *label,
 
     VW_ASSERT_OK(vw_cluster_open(data_dir, cfg, cert_path, key_path,
                                   n->oplog, n->store, n->file_store, n->chunks,
-                                  NULL, NULL, &n->cluster));
+                                  NULL, NULL, NULL, &n->cluster));
 }
 
 static void node_stack_close(node_stack_t *n)

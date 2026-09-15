@@ -10,8 +10,9 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 
-/* Per-node entry wire size: node_id(8)+is_active(1)+role(1)+swm(8)+lag(8)+hostname(128) = 154 */
-static constexpr uint32_t CLUSTER_NODE_ENTRY = 154u;
+/* Per-node entry wire size: node_id(8)+is_active(1)+role(1)+swm(8)+lag(8)+
+ * hostname(128)+client_conn_count(4, TASK-00284/00285) = 158 */
+static constexpr uint32_t CLUSTER_NODE_ENTRY = 158u;
 
 void VwViewCluster::on_connected()
 {
@@ -43,6 +44,7 @@ bool VwViewCluster::parse_resp(const uint8_t *buf, uint32_t len)
         e.lag_entries    = vw_read_u64le(p + 18);
         memcpy(e.hostname, p + 26, 128);
         e.hostname[128]  = '\0';
+        e.client_conn_count = vw_read_u32le(p + 154);
         nodes_.push_back(e);
         p += CLUSTER_NODE_ENTRY;
     }
@@ -149,7 +151,7 @@ bool VwViewCluster::render(ServerApp &app)
 
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
-    if (ImGui::BeginTable("##cluster_table", 6, flags, ImVec2(0, -40))) {
+    if (ImGui::BeginTable("##cluster_table", 7, flags, ImVec2(0, -40))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Node ID",        ImGuiTableColumnFlags_WidthFixed,   90);
         ImGui::TableSetupColumn("Hostname",        ImGuiTableColumnFlags_WidthStretch);
@@ -157,6 +159,10 @@ bool VwViewCluster::render(ServerApp &app)
         ImGui::TableSetupColumn("Status",          ImGuiTableColumnFlags_WidthFixed,   70);
         ImGui::TableSetupColumn("Sync Watermark",  ImGuiTableColumnFlags_WidthFixed,  120);
         ImGui::TableSetupColumn("Lag (entries)",   ImGuiTableColumnFlags_WidthFixed,  100);
+        /* TASK-00284/00285: real per-replica fallback-client count,
+         * replacing lag_entries as the only (approximate) signal for
+         * "N accounts currently running against this replica". */
+        ImGui::TableSetupColumn("Fallback Clients", ImGuiTableColumnFlags_WidthFixed, 110);
         ImGui::TableHeadersRow();
 
         for (const auto &n : nodes_) {
@@ -194,6 +200,19 @@ bool VwViewCluster::render(ServerApp &app)
             ImGui::PushStyleColor(ImGuiCol_Text, lag_colour);
             ImGui::Text("%llu entries", (unsigned long long)n.lag_entries);
             ImGui::PopStyleColor();
+
+            ImGui::TableSetColumnIndex(6);
+            /* Only a replica ever reports this (via its own OPLOG_ACK) —
+             * a primary/self row's count is always 0 and not meaningful,
+             * same "not a real zero claim" caveat the wire field itself
+             * carries for a pre-upgrade or inactive replica. */
+            if (n.role == 1) {
+                ImGui::TextDisabled("--");
+            } else if (!n.is_active) {
+                ImGui::TextDisabled("-- (inactive)");
+            } else {
+                ImGui::Text("%u", (unsigned)n.client_conn_count);
+            }
         }
         ImGui::EndTable();
     }

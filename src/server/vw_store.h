@@ -579,6 +579,17 @@ vw_err_t vw_store_version_list(vw_file_store_t *fs,
                                 vw_version_record_t **out_records,
                                 uint32_t *out_count);
 
+/*
+ * TASK-00277 (VAULT_DELETE safety check): does any version record — across
+ * every file, current or superseded — still reference vault_id? Full-table
+ * scan of versions.db, same accepted O(n) tradeoff already on record for
+ * vw_share_scan/vw_vault_scan at this project's scale. Used by
+ * handle_vault_delete to refuse deleting a vault that would strand a
+ * still-referenced wrapped DEK.
+ */
+vw_err_t vw_store_version_vault_in_use(vw_file_store_t *fs, uint64_t vault_id,
+                                        int *out_in_use);
+
 /* ── Quota management (Phase 3) ──────────────────────────────────────────── */
 
 /*

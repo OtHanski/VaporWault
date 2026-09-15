@@ -43,7 +43,12 @@ typedef struct {
     uint32_t wrapped_vk_len;
     uint32_t kdf_params_len;
     uint8_t  kdf_salt[16];     /* Argon2id salt; fixed size per §7.11.4         */
-    uint8_t  _pad[32];
+    uint8_t  deleted;          /* TASK-00277: soft-delete flag, same convention
+                                 * as vw_share_record_t.revoked — a record whose
+                                 * trailing bytes were always zero (every prior
+                                 * write path memset the old _pad[32] to 0) reads
+                                 * back deleted==0 for free, no migration needed */
+    uint8_t  _pad[31];
 } vw_vault_record_t;
 
 _Static_assert(sizeof(vw_vault_record_t) == 96,
@@ -100,14 +105,81 @@ vw_err_t vw_vault_get_by_id(vw_vault_store_t *vs, uint64_t vault_id,
                              uint8_t **out_wrapped_vk, uint8_t **out_kdf_params);
 
 /*
- * Scan every vault record. callback returning non-zero stops the scan.
- * Holds a read lock for the entire scan; the callback must NOT call any
- * other vw_vault_store_t function. Does not fetch blob contents — call
+ * TASK-00290: atomically check that vault_id exists and is not deleted,
+ * and pin it if so (incrementing an in-memory-only count) — a single
+ * critical section combining what would otherwise be a
+ * check-then-separately-mutate TOCTOU. Unlike vw_vault_get_by_id, does
+ * NOT fetch wrapped_vk/kdf_params (callers pinning don't need the blob,
+ * only *out_rec's owner_id for their own ownership check) and returns
+ * VW_ERR_NOT_FOUND for the same cases vw_vault_get_by_id does.
+ *
+ * Call vw_vault_unpin exactly once for every successful
+ * vw_vault_pin_if_exists, as soon as whatever made the vault's
+ * continued existence load-bearing either becomes durable (so the
+ * ordinary not-empty check in vw_store_version_vault_in_use now protects
+ * it instead) or is abandoned. handle_file_commit is the only caller
+ * today: pins right before validating+using a FILE_COMMIT's vault_id,
+ * unpins immediately after vw_store_version_create returns (success or
+ * failure) — see that function's own comments for exactly where.
+ *
+ * While pinned, vw_vault_delete refuses with VW_ERR_VAULT_NOT_EMPTY even
+ * though the vault has no version referencing it yet — see
+ * vw_vault_delete's own doc comment for why this is the fix for the
+ * race TASK-00290 exists to close, and struct vw_vault_store's doc
+ * comment (vw_vault.c) for why it introduces no deadlock risk.
+ */
+vw_err_t vw_vault_pin_if_exists(vw_vault_store_t *vs, uint64_t vault_id,
+                                 vw_vault_record_t *out_rec);
+
+/*
+ * Release one pin taken by vw_vault_pin_if_exists. Safe to call on a
+ * vault_id with no outstanding pin (a no-op) — never returns an error,
+ * matching vw_storage_chunk_decref-adjacent "release" calls elsewhere in
+ * this codebase that callers should never need to check.
+ */
+void vw_vault_unpin(vw_vault_store_t *vs, uint64_t vault_id);
+
+/*
+ * Scan every allocated vault record, including soft-deleted ones —
+ * matching vw_share_scan's convention of returning everything and
+ * letting the caller filter (CQR.08 API-consistency finding, TASK-00275
+ * review pass), rather than vw_vault_scan silently deciding what counts
+ * as "gone" on every caller's behalf. Check rec->deleted in the callback
+ * if a caller wants live vaults only (handle_vault_list's vault_list_cb
+ * does exactly this). callback returning non-zero stops the scan. Holds
+ * a read lock for the entire scan; the callback must NOT call any other
+ * vw_vault_store_t function. Does not fetch blob contents — call
  * vw_vault_get_by_id for those if the scan's caller needs them.
  */
 vw_err_t vw_vault_scan(vw_vault_store_t *vs,
                         int (*callback)(const vw_vault_record_t *rec, void *ud),
                         void *userdata);
+
+/*
+ * Soft-delete a vault registration (TASK-00277). Only the vault's
+ * owner_id may delete it: returns VW_ERR_PERMISSION otherwise, and
+ * VW_ERR_NOT_FOUND if the vault doesn't exist or was already deleted.
+ *
+ * Does NOT check whether any file version already references this
+ * vault_id — the caller (handle_vault_delete) must confirm the vault is
+ * empty first via vw_store_version_vault_in_use(), the same cross-module
+ * ordering handle_file_commit already uses to validate a vault_id against
+ * a real vault before accepting a commit (vw_vault.c is deliberately kept
+ * free of any vw_store_files.h dependency). This function DOES, however,
+ * refuse with VW_ERR_VAULT_NOT_EMPTY (TASK-00290) if the vault is
+ * currently pinned (vw_vault_pin_if_exists) — a FILE_COMMIT mid-flight
+ * validating this vault_id has no version record yet for the caller's
+ * versions.db scan to find, so this is the layer that actually closes
+ * that race; the caller's own not-empty check alone only catches an
+ * already-completed commit.
+ *
+ * Once deleted, vw_vault_get_by_id() and vw_vault_pin_if_exists() both
+ * return VW_ERR_NOT_FOUND for this vault_id, and vw_vault_scan() still
+ * visits it (rec->deleted set) — matching vw_share_scan's "caller
+ * filters" convention (vw_share.c), not vw_share_revoke's.
+ */
+vw_err_t vw_vault_delete(vw_vault_store_t *vs, uint64_t vault_id,
+                          uint64_t caller_user_id);
 
 #ifdef __cplusplus
 }

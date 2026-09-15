@@ -138,14 +138,14 @@ vw_err_t vw_share_link_verify_password(const vw_share_record_t *share,
 
 /* Fetch by share_id. Returns VW_ERR_NOT_FOUND if absent (including a
  * revoked or expired row is still "found" — callers check revoked/expires_at
- * themselves; this mirrors vw_store_file_get_by_id, not vw_invite_get). */
+ * themselves; this mirrors vw_store_file_get_by_id, not vw_invite_claim). */
 vw_err_t vw_share_get_by_id(vw_share_store_t *ss, uint64_t share_id,
                              vw_share_record_t *out);
 
 /*
  * Fetch by link_token. Unlike vw_share_get_by_id, this DOES apply the
- * revoked/expired check internally (matching vw_invite_get's convention for
- * the unauthenticated LINK_ACCESS path) — returns VW_ERR_NOT_FOUND for an
+ * revoked/expired check internally (matching vw_invite_claim's convention
+ * for the unauthenticated LINK_ACCESS path) — returns VW_ERR_NOT_FOUND for an
  * unknown, revoked, or expired token, indistinguishably (anti-enumeration).
  */
 vw_err_t vw_share_get_by_token(vw_share_store_t *ss, const uint8_t token[32],

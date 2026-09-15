@@ -150,6 +150,9 @@ class GatewayClient:
     def download_chunk(self, chunk_hash_hex):
         return self.post("/api/chunks/download", {"hash": chunk_hash_hex})
 
+    def query_chunks(self, chunk_hashes):
+        return self.post("/api/chunks/query", {"chunk_hashes": chunk_hashes})
+
     def commit_file(self, path, logical_size, chunk_hashes, vault_id=None, wrapped_dek_hex=None):
         body = {"path": path, "logical_size": logical_size, "chunk_hashes": chunk_hashes}
         if vault_id:
@@ -234,6 +237,9 @@ class GatewayClient:
 
     def vault_list(self):
         return self.post("/api/vault/list", {})
+
+    def vault_delete(self, vault_id):
+        return self.post("/api/vault/delete", {"vault_id": vault_id})
 
 
 class ClientFactory:
@@ -464,6 +470,93 @@ def test_upload_download_multi_chunk_round_trip(server, clients, unique_username
 
     downloaded = _download_plaintext(client, commit["version_id"])
     assert downloaded == data
+
+
+def test_chunk_query_batch(server, clients, unique_username):
+    """
+    TASK-00283: /api/chunks/query lets the browser learn which chunk
+    hashes the server already has WITHOUT re-transmitting the chunk body,
+    mirroring the native client's own CHUNK_QUERY-based dedup
+    (vw_client_chunk_query_batch, docs/PROTOCOL.md §7.2's CHUNK_QUERY).
+    Before this endpoint existed, the gateway had no way to answer "do
+    you already have this chunk" - only "here it is, dedup or not"
+    (handle_chunk_upload) - so the browser always re-sent every byte on
+    a retry even though the server would have silently discarded most of
+    them anyway.
+    """
+    client = clients.login(unique_username, server=server)
+
+    known_data = b"already-uploaded-chunk-content"
+    known_hash = hashlib.sha256(known_data).hexdigest()
+    r = client.upload_chunk(known_hash, known_data)
+    assert r.status_code == 200, r.text
+
+    unknown_hash = hashlib.sha256(b"never-uploaded-anywhere").hexdigest()
+
+    r = client.query_chunks([known_hash, unknown_hash])
+    assert r.status_code == 200, r.text
+    assert r.json()["missing"] == [False, True]
+
+    # Response order must track request order, not just happen to match a
+    # sorted/hash-bucket internal order.
+    r = client.query_chunks([unknown_hash, known_hash])
+    assert r.status_code == 200, r.text
+    assert r.json()["missing"] == [True, False]
+
+
+def test_chunk_query_then_upload_skips_known_chunks(server, clients, unique_username):
+    """
+    End-to-end proof of the actual production flow web/src/api.ts's
+    uploadFile now uses (TASK-00283): hash every chunk, query which are
+    already present, upload only what's missing. Re-running the query
+    after every chunk already landed and skipping every chunk body must
+    still commit correctly - a query-driven skip decision that were ever
+    wrong would silently produce a file missing content.
+    """
+    client = clients.login(unique_username, server=server)
+
+    data = b"resumable-upload-test-content" * 200_000
+    chunk_size = 4 * 1024 * 1024
+    assert len(data) > chunk_size
+    chunk_hashes = []
+    chunks = []
+    for offset in range(0, len(data), chunk_size):
+        chunk = data[offset:offset + chunk_size]
+        chunks.append(chunk)
+        chunk_hashes.append(hashlib.sha256(chunk).hexdigest())
+
+    # First attempt: every chunk uploaded normally (simulates an initial
+    # attempt that got this far before, say, a page reload).
+    for h, chunk in zip(chunk_hashes, chunks):
+        r = client.upload_chunk(h, chunk)
+        assert r.status_code == 200, r.text
+
+    # "Resume" attempt: query first - every hash should already be
+    # present, so a real client would upload nothing here.
+    r = client.query_chunks(chunk_hashes)
+    assert r.status_code == 200, r.text
+    assert r.json()["missing"] == [False] * len(chunk_hashes)
+
+    r = client.commit_file("/resumed_upload.bin", len(data), chunk_hashes)
+    assert r.status_code == 200, r.text
+    downloaded = _download_plaintext(client, r.json()["version_id"])
+    assert downloaded == data
+
+
+def test_chunk_query_bad_request(server, clients, unique_username):
+    client = clients.login(unique_username, server=server)
+
+    r = client.post("/api/chunks/query", {})
+    assert r.status_code == 400
+    assert r.json()["status"] == "bad_request"
+
+    r = client.post("/api/chunks/query", {"chunk_hashes": []})
+    assert r.status_code == 400
+    assert r.json()["status"] == "bad_request"
+
+    r = client.post("/api/chunks/query", {"chunk_hashes": ["not-valid-hex"]})
+    assert r.status_code == 400
+    assert r.json()["status"] == "bad_request"
 
 
 def test_version_list_and_restore(server, clients, unique_username):
@@ -972,6 +1065,82 @@ def test_vault_passphrase_never_sent_to_gateway(server, clients, unique_username
     # (e.g. if a future refactor changes field names and the intersection
     # test above stops matching any recorded body).
     assert vault_shaped_bodies_checked >= 2  # vault_create + vault_key_fetch, at least
+
+
+# ── 2b. VAULT_DELETE (TASK-00280) ────────────────────────────────────────────
+
+def test_vault_delete_removes_it_from_list(server, clients, unique_username):
+    client = clients.login(unique_username, server=server)
+    r = client.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    folder_id = r.json()["dir_id"]
+
+    r = client.vault_create(folder_id, os.urandom(32).hex(), os.urandom(16).hex(), "")
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    r = client.vault_delete(vault_id)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+
+    r = client.vault_list()
+    assert r.status_code == 200
+    assert not any(v["vault_id"] == vault_id for v in r.json())
+
+    r = client.vault_key_fetch(vault_id)
+    assert r.status_code == 404, r.text
+
+
+def test_vault_delete_requires_ownership(server, clients, unique_username):
+    owner = clients.login(f"{unique_username}_owner", server=server)
+    stranger = clients.login(f"{unique_username}_stranger", server=server)
+
+    r = owner.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    folder_id = r.json()["dir_id"]
+    r = owner.vault_create(folder_id, os.urandom(32).hex(), os.urandom(16).hex(), "")
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    r = stranger.vault_delete(vault_id)
+    assert r.status_code == 403, r.text
+
+    # Untouched.
+    r = owner.vault_key_fetch(vault_id)
+    assert r.status_code == 200, r.text
+
+
+def test_vault_delete_rejects_while_a_version_still_references_it(server, clients, unique_username):
+    """Mirrors test_vault.py's server-level equivalent — the gateway's
+    send_file_op_error must map VW_ERR_VAULT_NOT_EMPTY to a real 409
+    business-logic response, not fall through to its default "evict the
+    session" branch (which would return 500 and log the browser out)."""
+    client = clients.login(unique_username, server=server)
+    r = client.mkdir("vault_home")
+    assert r.status_code == 200, r.text
+    folder_id = r.json()["dir_id"]
+
+    r = client.vault_create(folder_id, os.urandom(32).hex(), os.urandom(16).hex(), "")
+    assert r.status_code == 200, r.text
+    vault_id = r.json()["vault_id"]
+
+    data = b"opaque ciphertext-shaped payload"
+    h = hashlib.sha256(data).hexdigest()
+    r = client.upload_chunk(h, data)
+    assert r.status_code == 200, r.text
+    r = client.commit_file("/vault_home/secret.bin", len(data), [h],
+                            vault_id=vault_id, wrapped_dek_hex=os.urandom(48).hex())
+    assert r.status_code == 200, r.text
+
+    r = client.vault_delete(vault_id)
+    assert r.status_code == 409, r.text
+    assert r.json()["status"] == "vault_not_empty"
+
+    # Untouched, and the session must still be usable afterward — this is
+    # exactly the case that would incorrectly evict the session without
+    # the VW_ERR_VAULT_NOT_EMPTY case in send_file_op_error.
+    r = client.vault_key_fetch(vault_id)
+    assert r.status_code == 200, r.text
 
 
 def test_file_list_vault_id_survives_move_out_of_vault_folder(server, clients, unique_username):

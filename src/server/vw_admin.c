@@ -727,8 +727,9 @@ static void handle_cluster_status(vw_admin_server_t *srv, int fd)
     vw_err_t           rc;
 
 /* u64 node_id(8) + u8 role(1) + u8 is_active(1) + u8[2] pad(2)
- * + u8[128] hostname(128) + u64 sync_watermark(8) = 148 */
-#define NODE_ENTRY_SIZE 148u
+ * + u8[128] hostname(128) + u64 sync_watermark(8)
+ * + u32 client_conn_count(4, TASK-00284/00285) = 152 */
+#define NODE_ENTRY_SIZE 152u
 
     if (!srv->ctx.cluster) {
         uint8_t resp[8];
@@ -770,6 +771,10 @@ static void handle_cluster_status(vw_admin_server_t *srv, int fd)
             entry[9] = recs[i].is_active;
             memcpy(entry + 12, recs[i].hostname, 128);
             w64le(entry + 140, recs[i].sync_watermark);
+            /* TASK-00284/00285: 0 for a pre-upgrade replica, an inactive
+             * node, or the primary's own self-record — see
+             * vw_cluster_node_client_conn_count's own doc comment. */
+            w32le(entry + 148, vw_cluster_node_client_conn_count(srv->ctx.cluster, recs[i].node_id));
             send_all(fd, entry, sizeof(entry));
         }
     }

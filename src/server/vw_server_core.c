@@ -254,14 +254,14 @@ static vw_err_t handle_session_resume(vw_server_ctx_t *ctx, vw_conn_t *conn,
         return err;
     }
 
-    /* Revoke old token — best-effort.  On failure the old token remains valid
+    /* Revoke old token — best-effort. On failure the old token remains valid
      * until its natural expiry; this is acceptable because the new token is
-     * already in the client's hands and the TTL is bounded.
-     * TODO: log at WARN when the logging subsystem is available. */
-    vw_err_t revoke_err = vw_auth_revoke_session(ctx->auth, payload);
-    if (revoke_err != VW_OK && revoke_err != VW_ERR_NOT_FOUND) {
-        /* TODO: vw_log_warn("session revoke failed: %d", revoke_err); */
-    }
+     * already in the client's hands and the TTL is bounded. Failure is
+     * silently ignored — no project-wide logging subsystem exists to
+     * report it through (confirmed: the closest thing is a file-local
+     * LOG_DEBUG macro defined only in vw_file_handlers.c, unreachable
+     * from here). */
+    (void)vw_auth_revoke_session(ctx->auth, payload);
 
     return build_and_send_auth_ok(ctx, conn, new_token, user_id, out_info);
 }

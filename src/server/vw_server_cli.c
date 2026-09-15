@@ -738,9 +738,9 @@ static int cmd_cluster_status(int fd)
     uint32_t count = r32le(resp + 4);
     uint32_t off   = 8;
 
-#define NENTRY 148u
-    printf("%-8s  %-7s  %-5s  %-40s  %s\n",
-           "NODE_ID", "ROLE", "ACTV", "HOSTNAME", "SYNC_WATERMARK");
+#define NENTRY 152u
+    printf("%-8s  %-7s  %-5s  %-40s  %-16s  %s\n",
+           "NODE_ID", "ROLE", "ACTV", "HOSTNAME", "SYNC_WATERMARK", "FALLBACK_CLIENTS");
     for (uint32_t i = 0; i < count; i++) {
         if (off + NENTRY > resp_plen) break;
         uint64_t node_id   = r64le(resp + off);
@@ -749,14 +749,23 @@ static int cmd_cluster_status(int fd)
         char     hostname[129];
         memcpy(hostname, resp + off + 12, 128); hostname[128] = '\0';
         uint64_t watermark = r64le(resp + off + 140);
+        /* TASK-00284/00285: 0 for the primary's own self-record, a
+         * pre-upgrade replica, or an inactive node — not a real "zero
+         * clients" claim in those cases. */
+        uint32_t conn_count = r32le(resp + off + 148);
         off += NENTRY;
 
-        printf("%-8llu  %-7s  %-5s  %-40s  %llu\n",
-               (unsigned long long)node_id,
-               role == VW_NODE_ROLE_SELF ? "self" : "replica",
-               is_active ? "yes" : "no",
-               hostname,
-               (unsigned long long)watermark);
+        if (role == VW_NODE_ROLE_SELF) {
+            printf("%-8llu  %-7s  %-5s  %-40s  %-16llu  %s\n",
+                   (unsigned long long)node_id, "self",
+                   is_active ? "yes" : "no", hostname,
+                   (unsigned long long)watermark, "--");
+        } else {
+            printf("%-8llu  %-7s  %-5s  %-40s  %-16llu  %u\n",
+                   (unsigned long long)node_id, "replica",
+                   is_active ? "yes" : "no", hostname,
+                   (unsigned long long)watermark, (unsigned)conn_count);
+        }
     }
 #undef NENTRY
 

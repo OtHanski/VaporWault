@@ -324,6 +324,11 @@ bool ClientApp::ipc_file_list(const char *prefix, std::vector<VwGuiFileEntry> *o
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.file_list(active_account_id_, prefix, out);
 }
+bool ClientApp::ipc_shared_folder_list(uint64_t dir_file_id, uint8_t recursive,
+                                        std::vector<VwGuiRemoteFileEntry> *out, int *out_error_code) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.shared_folder_list(active_account_id_, dir_file_id, recursive, out, out_error_code);
+}
 bool ClientApp::ipc_search(const char *query, std::vector<VwGuiSearchEntry> *out,
                             uint8_t *out_truncated, int *out_error_code) {
     std::lock_guard<std::mutex> lk(status_mutex_);
@@ -380,6 +385,10 @@ int ClientApp::ipc_vault_unlock(uint64_t vault_id, char *passphrase) {
 bool ClientApp::ipc_vault_list(std::vector<VwGuiVaultEntry> *out, int *out_error_code) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.vault_list(active_account_id_, out, out_error_code);
+}
+int ClientApp::ipc_vault_delete(uint64_t vault_id) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.vault_delete(active_account_id_, vault_id);
 }
 int ClientApp::ipc_vault_upload(uint64_t vault_id, uint64_t file_id,
                                  const char *leaf_name, const char *local_path,

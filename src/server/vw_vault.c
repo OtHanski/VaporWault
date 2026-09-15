@@ -82,6 +82,28 @@ struct vw_vault_store {
 
     uint64_t    *vid_to_slot;    /* dense array indexed by vault_id */
     uint64_t     vid_to_slot_cap;
+
+    /*
+     * TASK-00290: in-memory-only pin count, dense-indexed by vault_id in
+     * lockstep with vid_to_slot (grown together in vid_to_slot_ensure,
+     * never independently — see that function). Never persisted: a pin
+     * only protects the brief window a FILE_COMMIT is validating this
+     * vault and writing its version record; a server that crashes and
+     * restarts has no in-flight requests left to protect, so losing pin
+     * state across a restart is the correct behavior, not a gap.
+     *
+     * Held nonzero, vw_vault_delete refuses to delete (returns
+     * VW_ERR_VAULT_NOT_EMPTY) even though handle_vault_delete's own
+     * versions.db scan (vw_store_version_vault_in_use) can't see this
+     * vault as "in use" yet — the version record doesn't exist until the
+     * pinning FILE_COMMIT finishes. This is deliberately the ONLY
+     * cross-module coordination point: vw_vault.c stays unaware of
+     * vw_file_store_t entirely, and never holds its own lock at the same
+     * time as vw_file_store_t's versions_lock (vw_vault_pin_if_exists and
+     * vw_vault_unpin are each self-contained, brief critical sections),
+     * so this fix carries no deadlock risk.
+     */
+    uint32_t    *pin_counts;
 };
 
 static int vid_to_slot_ensure(struct vw_vault_store *s, uint64_t vault_id)
@@ -89,11 +111,21 @@ static int vid_to_slot_ensure(struct vw_vault_store *s, uint64_t vault_id)
     if (vault_id < s->vid_to_slot_cap) return 0;
     uint64_t new_cap = s->vid_to_slot_cap ? s->vid_to_slot_cap * 2u : 64u;
     while (new_cap <= vault_id) new_cap *= 2u;
+
     uint64_t *tmp = (uint64_t *)realloc(s->vid_to_slot, new_cap * sizeof(uint64_t));
     if (!tmp) return -1;
-    memset(tmp + s->vid_to_slot_cap, 0,
+    s->vid_to_slot = tmp; /* keep the new pointer even if pin_counts fails below */
+
+    uint32_t *ptmp = (uint32_t *)realloc(s->pin_counts, new_cap * sizeof(uint32_t));
+    if (!ptmp) return -1; /* vid_to_slot_cap not bumped yet: old (smaller) region
+                            * of the just-grown vid_to_slot stays the only part in
+                            * use, so nothing is left inconsistent. */
+
+    memset(s->vid_to_slot + s->vid_to_slot_cap, 0,
            (size_t)(new_cap - s->vid_to_slot_cap) * sizeof(uint64_t));
-    s->vid_to_slot     = tmp;
+    memset(ptmp + s->vid_to_slot_cap, 0,
+           (size_t)(new_cap - s->vid_to_slot_cap) * sizeof(uint32_t));
+    s->pin_counts      = ptmp;
     s->vid_to_slot_cap = new_cap;
     return 0;
 }
@@ -142,7 +174,8 @@ vw_err_t vw_vault_store_open(const char *data_dir, vw_oplog_t *oplog,
         if (rec.vault_id == 0) continue;
         if (rec.vault_id >= s->next_vault_id) s->next_vault_id = rec.vault_id + 1;
         if (vid_to_slot_ensure(s, rec.vault_id) != 0) {
-            free(buf); free(s->vid_to_slot); vlt_rwlock_destroy(&s->lock); free(s);
+            free(buf); free(s->vid_to_slot); free(s->pin_counts);
+            vlt_rwlock_destroy(&s->lock); free(s);
             return VW_ERR_OOM;
         }
         s->vid_to_slot[rec.vault_id] = i;
@@ -152,7 +185,8 @@ vw_err_t vw_vault_store_open(const char *data_dir, vw_oplog_t *oplog,
     uint64_t blob_sz = 0;
     err = vw_fs_file_size(s->blob_path, &blob_sz);
     if (err != VW_OK) {
-        free(s->vid_to_slot); vlt_rwlock_destroy(&s->lock); free(s);
+        free(s->vid_to_slot); free(s->pin_counts);
+        vlt_rwlock_destroy(&s->lock); free(s);
         return err;
     }
     s->blob_size = blob_sz;
@@ -166,6 +200,7 @@ void vw_vault_store_close(vw_vault_store_t *s)
     if (!s) return;
     vlt_rwlock_destroy(&s->lock);
     free(s->vid_to_slot);
+    free(s->pin_counts);
     free(s);
 }
 
@@ -184,6 +219,18 @@ vw_err_t vw_vault_store_reload(vw_vault_store_t *live, const char *data_dir)
     live->nslots          = scratch->nslots;
     live->next_vault_id   = scratch->next_vault_id;
     live->blob_size       = scratch->blob_size;
+    /* TASK-00290: pin_counts is swapped in from scratch exactly like
+     * vid_to_slot (always freshly all-zero — a store this function
+     * reloads is, by construction, a replica: is_write_shaped_msg's
+     * dispatch gate rejects FILE_COMMIT before it ever reaches
+     * vw_vault_pin_if_exists on a replica, so `live` can never have a
+     * genuine outstanding pin here either). Keeping pin_counts and
+     * vid_to_slot_cap in lockstep this way (same allocation size,
+     * grown/replaced together everywhere) is what lets every other
+     * pin_counts access safely reuse vid_to_slot_cap as its own bounds
+     * check without a separate capacity field. */
+    free(live->pin_counts);
+    live->pin_counts = scratch->pin_counts;   scratch->pin_counts = NULL;
     vlt_rwlock_wunlock(&live->lock);
 
     vw_vault_store_close(scratch);
@@ -306,6 +353,7 @@ vw_err_t vw_vault_get_by_id(vw_vault_store_t *s, uint64_t vault_id,
         return VW_ERR_IO;
     }
     if (rec.vault_id != vault_id) { vlt_rwlock_runlock(&s->lock); return VW_ERR_NOT_FOUND; }
+    if (rec.deleted) { vlt_rwlock_runlock(&s->lock); return VW_ERR_NOT_FOUND; }
 
     uint8_t *vk = NULL, *params = NULL;
     if (rec.wrapped_vk_len > 0) {
@@ -334,6 +382,54 @@ vw_err_t vw_vault_get_by_id(vw_vault_store_t *s, uint64_t vault_id,
     return VW_OK;
 }
 
+/* ── vw_vault_pin_if_exists / vw_vault_unpin (TASK-00290) ─────────────────── */
+
+vw_err_t vw_vault_pin_if_exists(vw_vault_store_t *s, uint64_t vault_id,
+                                 vw_vault_record_t *out_rec)
+{
+    if (!s || !out_rec || vault_id == 0) return VW_ERR_INVALID_ARG;
+
+    /* Write lock, not read: this mutates pin_counts. Combining the
+     * existence/deleted check with the pin increment in one critical
+     * section is the whole point — see struct vw_vault_store's own doc
+     * comment on pin_counts for why that closes the TOCTOU this task is
+     * about. */
+    vlt_rwlock_wlock(&s->lock);
+
+    if (vault_id >= s->vid_to_slot_cap || s->vid_to_slot[vault_id] == 0) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    uint64_t slot = s->vid_to_slot[vault_id];
+
+    vw_vault_record_t rec;
+    uint64_t off = slot * (uint64_t)sizeof(rec);
+    if (fs_pread(s->db_path, &rec, sizeof(rec), off) != 0) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_IO;
+    }
+    if (rec.vault_id != vault_id || rec.deleted) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+
+    s->pin_counts[vault_id]++;
+    *out_rec = rec;
+
+    vlt_rwlock_wunlock(&s->lock);
+    return VW_OK;
+}
+
+void vw_vault_unpin(vw_vault_store_t *s, uint64_t vault_id)
+{
+    if (!s || vault_id == 0) return;
+
+    vlt_rwlock_wlock(&s->lock);
+    if (vault_id < s->vid_to_slot_cap && s->pin_counts[vault_id] > 0)
+        s->pin_counts[vault_id]--;
+    vlt_rwlock_wunlock(&s->lock);
+}
+
 vw_err_t vw_vault_scan(vw_vault_store_t *s,
                         int (*callback)(const vw_vault_record_t *rec, void *ud),
                         void *userdata)
@@ -358,4 +454,58 @@ vw_err_t vw_vault_scan(vw_vault_store_t *s,
     free(buf);
     vlt_rwlock_runlock(&s->lock);
     return VW_OK;
+}
+
+vw_err_t vw_vault_delete(vw_vault_store_t *s, uint64_t vault_id,
+                          uint64_t caller_user_id)
+{
+    if (!s || vault_id == 0) return VW_ERR_INVALID_ARG;
+
+    vlt_rwlock_wlock(&s->lock);
+
+    if (vault_id >= s->vid_to_slot_cap || s->vid_to_slot[vault_id] == 0) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    uint64_t slot = s->vid_to_slot[vault_id];
+    uint64_t off  = slot * (uint64_t)sizeof(vw_vault_record_t);
+
+    vw_vault_record_t rec;
+    if (fs_pread(s->db_path, &rec, sizeof(rec), off) != 0 || rec.vault_id != vault_id) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_NOT_FOUND;
+    }
+    if (rec.deleted) { vlt_rwlock_wunlock(&s->lock); return VW_ERR_NOT_FOUND; }
+    if (rec.owner_id != caller_user_id) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_PERMISSION;
+    }
+
+    /* TASK-00290: a FILE_COMMIT currently validating this vault
+     * (vw_vault_pin_if_exists succeeded, hasn't unpinned yet) has not
+     * written its version record — handle_vault_delete's own not-empty
+     * check (a versions.db scan) cannot see it as "in use" yet. Refuse
+     * exactly as if it already were, under the SAME lock that guards
+     * pin_counts, so no new pin can land between this check and the
+     * delete write below. */
+    if (vault_id < s->vid_to_slot_cap && s->pin_counts[vault_id] > 0) {
+        vlt_rwlock_wunlock(&s->lock);
+        return VW_ERR_VAULT_NOT_EMPTY;
+    }
+
+    uint64_t eid = 0;
+    vw_err_t rc = vw_oplog_append(s->oplog, VW_OPLOG_VAULT_DELETE,
+                                   &rec.owner_id, (uint32_t)sizeof(rec.owner_id), &eid);
+    if (rc != VW_OK) { vlt_rwlock_wunlock(&s->lock); return rc; }
+
+    uint64_t field_off = off + (uint64_t)offsetof(vw_vault_record_t, deleted);
+    uint8_t one = 1u;
+    rc = vw_fs_pwrite(s->db_path, field_off, &one, sizeof(one));
+    if (rc == VW_OK) rc = vw_fs_sync_file(s->db_path);
+
+    if (rc == VW_OK) (void)vw_oplog_confirm(s->oplog, eid);
+    else             (void)vw_oplog_abort(s->oplog, eid);
+
+    vlt_rwlock_wunlock(&s->lock);
+    return rc;
 }

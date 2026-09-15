@@ -287,6 +287,34 @@ endif()
 
 add_test(NAME unit_vw_storage_parity COMMAND test_vw_storage_parity)
 
+# ── vw_storage GC-race / quota accounting (TASK-00266) ───────────────────
+#
+# Same minimal dependency set as test_vw_storage_parity above (vw_storage.c
+# pulls in vw_store.c for vw_store_quota_add, which pulls in vw_oplog.c).
+# A separate binary from test_vw_storage_parity rather than folding these
+# cases in there, since that file's own header comment scopes it to Phase
+# 22 parity-group formation specifically.
+add_executable(test_vw_storage_gc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_storage_gc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_storage.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_ecc.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_store.c
+    ${CMAKE_SOURCE_DIR}/src/server/vw_oplog.c
+)
+
+target_include_directories(test_vw_storage_gc PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_vw_storage_gc PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_storage_gc PRIVATE pthread)
+endif()
+
+add_test(NAME unit_vw_storage_gc COMMAND test_vw_storage_gc)
+
 # ── vw_ipc (TASK-093: peer-UID verification) ─────────────────────────────
 #
 # vw_ipc.c lives in src/client and is not part of vw_core. Compile it

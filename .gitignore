@@ -1,8 +1,10 @@
 build/
 build-wsl/
 build-wsl-werror/
+build-wsl-fresh/
 build-msvc*/
 build-gw-*/
+android_smoketest/
 third_party/SDL2/
 *.log
 __pycache__/

@@ -13,6 +13,10 @@ struct ClusterNodeEntry {
     uint64_t    sync_watermark;
     uint64_t    lag_entries;
     char        hostname[129];  /* 128-byte NUL-padded field + NUL */
+    /* TASK-00284/00285: that node's most recently reported OPLOG_ACK
+     * client connection count — 0 for a pre-upgrade replica or an
+     * inactive node, not a real "zero clients" claim in that case. */
+    uint32_t    client_conn_count;
 };
 
 class VwViewCluster {
