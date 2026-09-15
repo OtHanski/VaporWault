@@ -115,6 +115,42 @@ set_tests_properties(integration_update_net PROPERTIES
     LABELS  "integration;update"
 )
 
+# test_update_manifest: TASK-00297 — update-manifest fetch/verify/parse/
+# rollback-ratchet pipeline. VW_UPDATE_NET_TEST_HOOKS (vw_update_net.c) +
+# VW_UPDATE_GITHUB_HOST/_PORT/_MANIFEST_PATH/_SIG_PATH (vw_update_manifest.c)
+# together redirect the whole pipeline at a local self-signed test server;
+# every test manifest is signed with the real update-manifest private key
+# and verified against the real compiled-in VW_UPDATE_MANIFEST_PUBKEY.
+add_executable(test_update_manifest
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_update_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_manifest.c
+)
+target_compile_definitions(test_update_manifest PRIVATE
+    VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATE_GITHUB_HOST=\"127.0.0.1\"
+    VW_UPDATE_PORT=43771
+    VW_UPDATE_MANIFEST_PATH=\"/update-manifest.json\"
+    VW_UPDATE_MANIFEST_SIG_PATH=\"/update-manifest.json.sig\"
+)
+target_include_directories(test_update_manifest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_update_manifest PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_update_manifest PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_update_manifest PRIVATE ws2_32)
+endif()
+add_test(NAME integration_update_manifest COMMAND test_update_manifest)
+set_tests_properties(integration_update_manifest PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
 # test_proto_update_hint: TASK-00292 — HELLO_OK/VERSION_REJECT's new optional
 # trailing update-hint block. Only needs vw_core (vw_proto.c + vw_net.c) —
 # no server/auth stack, same rationale as test_proto_recv_drain above.

@@ -6,6 +6,7 @@ set(VW_CLIENT_SOURCES
     vw_sync.c
     vw_cache.c
     vw_update_net.c
+    vw_update_manifest.c
 )
 
 if(UNIX)
