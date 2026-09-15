@@ -78,6 +78,11 @@ typedef enum {
 
     /* Crypto */
     VW_ERR_CRYPTO             = 500,
+    VW_ERR_CRYPTO_SIG_INVALID = 501,  /* TASK-00293: vw_crypto_ecdsa_p256_verify —
+                                          signature does not verify against the
+                                          given public key/hash, or the
+                                          signature/public key bytes are
+                                          malformed */
 
     /* File transfer */
     VW_ERR_CHUNK_HASH_MISMATCH = 600,  /* uploaded chunk SHA-256 != declared hash   */
@@ -124,6 +129,25 @@ typedef enum {
                                           currently connected to its read-only
                                           fallback server, not the primary; never
                                           sent over the wire, IPC-response only  */
+
+    /* Client-local update engine (TASK-00293; never sent over the wire —
+     * these describe failures in the client's own GitHub-manifest fetch/
+     * verify pipeline, not anything the VaporWault server can report) */
+    VW_ERR_UPDATE_MANIFEST_INVALID  = 802,  /* update-manifest signature check
+                                                failed, or the (already-verified)
+                                                bytes don't match the expected
+                                                fixed schema */
+    VW_ERR_UPDATE_MANIFEST_ROLLBACK = 803,  /* a validly-signed manifest whose
+                                                sequence number is below the
+                                                locally persisted ratchet —
+                                                rejected as a replay/downgrade
+                                                attempt */
+    VW_ERR_UPDATE_NET               = 804,  /* vw_update_net (outbound HTTPS to
+                                                GitHub) failed: TLS, timeout, bad
+                                                redirect, oversized response, etc. */
+    VW_ERR_UPDATE_ASSET_MISMATCH    = 805,  /* downloaded release asset's SHA-256
+                                                does not match the verified
+                                                manifest's declared value */
 } vw_err_t;
 
 /* ── Message types ───────────────────────────────────────────────────────── */

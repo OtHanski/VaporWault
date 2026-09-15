@@ -26,6 +26,12 @@ endfunction()
 # ── Phase 0 / 1 unit tests ────────────────────────────────────────────────
 
 vw_add_unit_test(vw_crypto  ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_crypto.c)
+# TASK-00293: test_vw_crypto's pubkey-drift-check case reads the committed
+# packaging/signing/update-manifest-pubkey.pem directly, to prove it and
+# src/core/vw_update_pubkey.h's compiled-in constant never silently diverge.
+target_compile_definitions(test_vw_crypto PRIVATE
+    VW_REPO_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
 vw_add_unit_test(vw_fs      ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_fs.c)
 
 # ── Oplog crash-injection tests (CJ-1 through CJ-5) ──────────────────────

@@ -18,6 +18,7 @@
 #include <mbedtls/gcm.h>
 #include <mbedtls/hkdf.h>
 #include <mbedtls/cipher.h>
+#include <mbedtls/pk.h>
 #include <psa/crypto.h>
 
 /* Argon2 reference implementation */
@@ -415,6 +416,44 @@ vw_err_t vw_crypto_totp_verify(const uint8_t *key, size_t key_len,
             return VW_OK;
     }
     return VW_ERR_AUTH_2FA_INVALID;
+}
+
+/* ── ECDSA P-256 signature verification (TASK-00293) ────────────────────── */
+
+vw_err_t vw_crypto_ecdsa_p256_verify(const uint8_t pubkey[VW_ECDSA_P256_PUBKEY_BYTES],
+                                      const uint8_t hash[VW_HASH_BYTES],
+                                      const uint8_t *sig_der, size_t sig_der_len) {
+    if (!pubkey || !hash || !sig_der || sig_der_len == 0) return VW_ERR_INVALID_ARG;
+    if (pubkey[0] != 0x04) return VW_ERR_CRYPTO_SIG_INVALID; /* not an uncompressed point */
+
+    /*
+     * Build a DER SubjectPublicKeyInfo around the raw point and hand it to
+     * mbedtls_pk_parse_public_key() — the public, documented mbedTLS API —
+     * rather than reaching into mbedtls_ecp_keypair's MBEDTLS_PRIVATE()
+     * grp/Q fields directly. The 26-byte prefix below is the fixed,
+     * well-known DER encoding of "EC public key, curve prime256v1
+     * (secp256r1/P-256)" — the same bytes mbedtls_pk_write_pubkey_der()
+     * itself emits ahead of the point (vw_acme.c's ec_pub_coords() reads
+     * exactly this shape in reverse, off the tail of its own DER buffer).
+     */
+    static const uint8_t spki_prefix[26] = {
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+        0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01,
+        0x07, 0x03, 0x42, 0x00
+    };
+    uint8_t der[sizeof(spki_prefix) + VW_ECDSA_P256_PUBKEY_BYTES];
+    memcpy(der, spki_prefix, sizeof(spki_prefix));
+    memcpy(der + sizeof(spki_prefix), pubkey, VW_ECDSA_P256_PUBKEY_BYTES);
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    int ret = mbedtls_pk_parse_public_key(&pk, der, sizeof(der));
+    if (ret != 0) { mbedtls_pk_free(&pk); return VW_ERR_CRYPTO_SIG_INVALID; }
+
+    ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, VW_HASH_BYTES,
+                             sig_der, sig_der_len);
+    mbedtls_pk_free(&pk);
+    return (ret == 0) ? VW_OK : VW_ERR_CRYPTO_SIG_INVALID;
 }
 
 /* ── Hex encoding ────────────────────────────────────────────────────────── */
