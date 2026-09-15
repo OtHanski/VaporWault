@@ -180,6 +180,68 @@ set_tests_properties(integration_proto_update_hint PROPERTIES
     LABELS  "integration;protocol"
 )
 
+# test_update_apply: TASK-00298 — vw_update_download_and_verify_asset()
+# and vw_update_stage_and_apply()'s extraction/payload-directory-resolution
+# logic. Compiles its own copy of vw_update_net.c + vw_update.c with
+# VW_UPDATE_NET_TEST_HOOKS (a REDIRECTING connect hook — vw_update.c
+# hardcodes "github.com" with no compile-time override, unlike
+# vw_update_manifest.c, so the hook itself must ignore the host/port it's
+# called with; see the test's own header comment). Needs the real built
+# vapourwault-updater binary (VW_UPDATER_EXE_PATH) copied into a fake
+# install_dir so vw_update_stage_and_apply's own spawn step succeeds.
+
+add_executable(test_update_apply
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_update_apply.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update.c
+)
+add_dependencies(test_update_apply vapourwault-updater)
+target_compile_definitions(test_update_apply PRIVATE
+    VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATER_EXE_PATH=\"$<TARGET_FILE:vapourwault-updater>\"
+    VW_TEST_SCRATCH_ROOT=\"${CMAKE_BINARY_DIR}/test_scratch\"
+)
+target_include_directories(test_update_apply PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_update_apply PRIVATE vw_core vw_version)
+if(UNIX)
+    target_link_libraries(test_update_apply PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_update_apply PRIVATE ws2_32)
+endif()
+add_test(NAME integration_update_apply COMMAND test_update_apply)
+set_tests_properties(integration_update_apply PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
+# test_updater_main: TASK-00298 — the standalone vapourwault-updater helper
+# (src/client/vw_updater_main.c). Invokes the REAL built binary as a
+# subprocess (it deliberately has no vw_core linkage — see its own header
+# comment — so this is the only way to test it as what actually ships)
+# rather than compiling its source into the test.
+
+add_executable(test_updater_main
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_updater_main.c
+)
+add_dependencies(test_updater_main vapourwault-updater)
+target_compile_definitions(test_updater_main PRIVATE
+    VW_UPDATER_EXE_PATH=\"$<TARGET_FILE:vapourwault-updater>\"
+)
+target_include_directories(test_updater_main PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+add_test(NAME integration_updater_main COMMAND test_updater_main)
+set_tests_properties(integration_updater_main PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
 # test_file_list_vault_id: TASK-156 regression — FILE_LIST_RESP now carries
 # a per-entry vault_id (it never did before). Needs the full server module
 # set (same list as vw_server_lib / test_vw_file_handlers, duplicated here

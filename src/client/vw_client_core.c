@@ -2396,3 +2396,15 @@ vw_update_install_kind_t vw_update_detect_install_kind(void) {
     return vw_fs_exists(marker_path) ? VW_UPDATE_KIND_PORTABLE
                                       : VW_UPDATE_KIND_PACKAGE_OR_UNKNOWN;
 }
+
+/*
+ * TASK-00298: public wrapper around self_exe_dir() (above) — the update
+ * orchestration module (vw_update.c) needs the running binary's own
+ * directory too (to locate the sibling vapourwault-updater helper and to
+ * know the real install_dir to hand it), and duplicating this platform
+ * self-path logic a second time would be worse than exposing this one
+ * function across the module boundary.
+ */
+vw_err_t vw_client_self_exe_dir(char *out, size_t out_sz) {
+    return self_exe_dir(out, out_sz) == 0 ? VW_OK : VW_ERR_IO;
+}

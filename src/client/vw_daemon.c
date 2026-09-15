@@ -5,8 +5,11 @@
 #include "vw_ipc.h"
 #include "vw_client_core.h"
 #include "vw_vault.h"
+#include "vw_update.h"
+#include "vw_update_manifest.h"
 #include "../core/vw_fs.h"
 #include "../core/vw_proto.h"
+#include "vw_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -325,6 +328,7 @@ static vw_err_t login_token_save(const char *account_dir, const uint8_t tok[VW_T
 static void cfg_defaults(vw_daemon_cfg_t *c) {
     c->ipc_port        = (uint16_t)DEFAULT_IPC_PORT;
     c->sync_interval_ms = DEFAULT_SYNC_MS;
+    c->update_policy    = VW_UPDATE_POLICY_NOTIFY;
 }
 
 static void cfg_apply_kv(vw_daemon_cfg_t *c, const char *key, const char *val) {
@@ -332,6 +336,11 @@ static void cfg_apply_kv(vw_daemon_cfg_t *c, const char *key, const char *val) {
         c->ipc_port = (uint16_t)strtoul(val, NULL, 10);
     else if (strcmp(key, "sync_interval_ms") == 0)
         c->sync_interval_ms = (uint32_t)strtoul(val, NULL, 10);
+    else if (strcmp(key, "update_policy") == 0)
+        /* TASK-00298: anything other than exactly "auto" is NOTIFY — fails
+         * safe toward the non-automatic default on a malformed value. */
+        c->update_policy = (strcmp(val, "auto") == 0) ? VW_UPDATE_POLICY_AUTO
+                                                        : VW_UPDATE_POLICY_NOTIFY;
     /* Unknown keys are silently ignored (forward-compat) — this also
      * quietly absorbs a pre-TASK-161 daemon.conf's now-relocated
      * server_host/server_port/ca_cert_pem_path/username keys without
@@ -390,6 +399,8 @@ vw_err_t vw_daemon_cfg_write_defaults(const char *state_dir,
     fprintf(fp, "# VaporWault daemon configuration\n");
     fprintf(fp, "ipc_port        = %u\n", (unsigned)cfg->ipc_port);
     fprintf(fp, "sync_interval_ms = %u\n", (unsigned)cfg->sync_interval_ms);
+    fprintf(fp, "update_policy = %s\n",
+            cfg->update_policy == VW_UPDATE_POLICY_AUTO ? "auto" : "notify");
     fclose(fp);
     return VW_OK;
 }
@@ -2258,6 +2269,140 @@ static void account_set_conn(vw_account_ctx_t *a, vw_client_sess_t *sess,
     vw_sync_set_read_only(a->sync_ctx, a->conn_mode == VW_ACCOUNT_CONN_FALLBACK);
 }
 
+/* ── Client auto-update integration (TASK-00298, ARCHITECTURE.md Phase 23) ──
+ *
+ * Daemon-wide statics, same convention as g_shutdown/g_log_path elsewhere
+ * in this file — this daemon is single-threaded by design (see this
+ * file's own header comment), so no locking is needed. Set once at the
+ * top of vw_daemon_run(); read/written only from that same thread
+ * thereafter (including via vw_daemon_apply_update_now(), which is only
+ * ever called synchronously from the IPC dispatch path on this same
+ * thread — see handle_ipc_client).
+ */
+static char               g_update_state_dir[512];
+static vw_update_policy_t g_update_policy = VW_UPDATE_POLICY_NOTIFY;
+static vw_daemon_update_status_t g_pending_update; /* zero-initialized: none available */
+static int64_t             g_last_auto_update_check = 0; /* unix seconds; 0 = never */
+#define VW_UPDATE_AUTO_CHECK_INTERVAL_SECS (24 * 60 * 60) /* daily */
+
+void vw_daemon_get_update_status(vw_daemon_update_status_t *out) {
+    if (out) *out = g_pending_update;
+}
+
+/*
+ * Re-fetches and re-verifies the manifest fresh (never trusts the cached
+ * g_pending_update snapshot for the actual install decision — see this
+ * function's own doc comment in vw_daemon.h), downloads and verifies the
+ * matching asset, stages it, and on success sets g_shutdown so this
+ * process's own existing main-loop exit path takes over — no new "is it
+ * safe to restart" logic is invented here.
+ */
+vw_err_t vw_daemon_apply_update_now(void) {
+    if (!g_pending_update.available) return VW_ERR_NOT_FOUND;
+
+    vw_update_manifest_t m;
+    vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "update apply: manifest re-fetch/verify failed: %d", (int)err);
+        return err;
+    }
+
+    char install_dir[600];
+    if (vw_client_self_exe_dir(install_dir, sizeof(install_dir)) != VW_OK) {
+        vw_log(LOG_WARN, "update apply: could not resolve own install directory");
+        return VW_ERR_IO;
+    }
+
+    char staging_dir[640];
+    snprintf(staging_dir, sizeof(staging_dir), "%s/update_staging", g_update_state_dir);
+    if (vw_fs_ensure_dir(staging_dir) != VW_OK) return VW_ERR_IO;
+
+    char archive_path[700];
+    err = vw_update_download_and_verify_asset(&m, staging_dir, archive_path, sizeof(archive_path));
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "update apply: asset download/verify failed: %d", (int)err);
+        return err;
+    }
+
+    err = vw_update_stage_and_apply(archive_path, install_dir);
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "update apply: stage/apply failed: %d", (int)err);
+        return err;
+    }
+
+    vw_log(LOG_INFO, "update to %s staged; restarting to apply", m.release_version);
+    g_shutdown = 1; /* reuse the existing graceful-shutdown path — see
+                        install_signal_handlers()'s SIGTERM handler,
+                        which sets this same flag */
+    return VW_OK;
+}
+
+/*
+ * Called on every reconnect/resume attempt that carried an update-hint
+ * (both the ordinary success path and the hard VW_ERR_PROTO_VERSION
+ * rejection — see vw_proto_update_hint_t's own doc comment for why both
+ * matter). Best-effort and never fatal to the caller's own connect flow:
+ * any failure here is logged and swallowed. When VW_UPDATE_POLICY_AUTO is
+ * configured, an update found available here is applied immediately with
+ * no prompt; NOTIFY (the default) only records it for later IPC/GUI
+ * surfacing (TASK-00299/300).
+ */
+static void handle_update_hint(const vw_proto_update_hint_t *hint) {
+    if (!hint || !hint->present) return;
+
+    vw_update_manifest_t m;
+    int available = 0;
+    vw_err_t err = vw_update_check_trigger(g_update_state_dir, hint->server_version, &m, &available);
+    if (err != VW_OK) {
+        vw_log(LOG_DEBUG, "update check failed (non-fatal): %d", (int)err);
+        return;
+    }
+    if (!available) return;
+
+    g_pending_update.available = 1;
+    snprintf(g_pending_update.server_version, sizeof(g_pending_update.server_version),
+             "%s", m.release_version);
+    vw_log(LOG_INFO, "update available: %s (current: %s)", m.release_version, VW_VERSION_STRING);
+
+    if (g_update_policy == VW_UPDATE_POLICY_AUTO)
+        (void)vw_daemon_apply_update_now(); /* logs its own failures */
+}
+
+/*
+ * TASK-00298: the headless/auto-policy gap this exists to close — a
+ * fresh install with zero configured accounts (or one whose configured
+ * server is never newer) would otherwise never trigger
+ * handle_update_hint() above at all, so "fully automatic" wouldn't
+ * actually be automatic for that case. Deliberately independent of any
+ * server connection, and deliberately gated on AUTO only — the NOTIFY
+ * default stays purely reactive to a real server's hint, never phoning
+ * home to GitHub on a schedule a notify-mode user didn't ask for.
+ */
+static void maybe_run_daily_auto_check(void) {
+    if (g_update_policy != VW_UPDATE_POLICY_AUTO) return;
+
+    int64_t now = (int64_t)time(NULL);
+    if (!vw_update_daily_check_due(g_last_auto_update_check, now, VW_UPDATE_AUTO_CHECK_INTERVAL_SECS))
+        return;
+    g_last_auto_update_check = now;
+
+    vw_update_manifest_t m;
+    vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
+    if (err != VW_OK) {
+        vw_log(LOG_DEBUG, "daily auto-update check failed (non-fatal): %d", (int)err);
+        return;
+    }
+
+    if (vw_update_version_is_newer_than_current(m.release_version)) {
+        g_pending_update.available = 1;
+        snprintf(g_pending_update.server_version, sizeof(g_pending_update.server_version),
+                 "%s", m.release_version);
+        vw_log(LOG_INFO, "daily check: update available: %s (current: %s)",
+               m.release_version, VW_VERSION_STRING);
+        (void)vw_daemon_apply_update_now(); /* AUTO policy already confirmed above */
+    }
+}
+
 /* Try a session-token resume against the primary. Returns NULL (offline)
  * if no valid token is on disk or the resume itself fails — never attempts
  * a fresh password login (the daemon has no password to use here; see
@@ -2277,13 +2422,21 @@ static vw_client_sess_t *try_connect_primary(const vw_account_cfg_t *acfg,
     uint8_t tok[VW_TOKEN_BYTES];
     if (tok_load(account_dir, tok) == VW_OK) {
         vw_client_sess_t *sess = NULL;
-        if (vw_client_resume(&cc, tok, &sess) == VW_OK) {
+        /* Zero first: vw_client_resume_ex() only populates *out_hint once
+         * negotiate() actually runs — an earlier failure (e.g. the
+         * underlying connect itself) never touches it, and this must
+         * never be read as uninitialized stack garbage. */
+        vw_proto_update_hint_t hint;
+        memset(&hint, 0, sizeof(hint));
+        if (vw_client_resume_ex(&cc, tok, &sess, &hint) == VW_OK) {
             vw_log(LOG_INFO, "session resumed for account '%s'", acfg->username);
             /* Persist fresh token */
             vw_client_get_token(sess, tok);
             tok_save(account_dir, tok);
+            handle_update_hint(&hint);
             return sess;
         }
+        handle_update_hint(&hint); /* fires even on the reject path — see doc comment above */
         vw_log(LOG_WARN, "session resume failed for account '%s', continuing offline", acfg->username);
     }
 
@@ -2315,9 +2468,12 @@ static vw_client_sess_t *try_connect_fallback(vw_account_ctx_t *a) {
                           ? a->cfg.fallback_ca_cert_pem_path : NULL;
 
     vw_client_sess_t *sess = NULL;
-    vw_err_t rc = vw_client_connect_with_hash(&cc, a->cfg.username,
-                                               (uint16_t)strlen(a->cfg.username),
-                                               a->login_token, NULL, NULL, &sess);
+    vw_proto_update_hint_t hint;
+    memset(&hint, 0, sizeof(hint)); /* see try_connect_primary's comment on why */
+    vw_err_t rc = vw_client_connect_with_hash_ex(&cc, a->cfg.username,
+                                                  (uint16_t)strlen(a->cfg.username),
+                                                  a->login_token, NULL, NULL, &sess, &hint);
+    handle_update_hint(&hint); /* fires on both success and failure */
     if (rc != VW_OK) {
         vw_log(LOG_WARN, "fallback connect failed for account '%s': %d",
                a->cfg.username, (int)rc);
@@ -2449,6 +2605,14 @@ static void account_registry_scan(const char *state_dir, account_registry_t *reg
 
 vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
     if (!cfg) return VW_ERR_INVALID_ARG;
+
+    /* TASK-00298: daemon-wide update state, set once for this process's
+     * lifetime (see this file's earlier "Client auto-update integration"
+     * comment for why these are plain statics, not threaded through every
+     * call site). */
+    snprintf(g_update_state_dir, sizeof(g_update_state_dir), "%s", cfg->state_dir);
+    g_update_policy = cfg->update_policy;
+    memset(&g_pending_update, 0, sizeof(g_pending_update));
 
     /* Daemonize on Linux if requested */
 #if defined(__linux__)
@@ -2691,6 +2855,12 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
                        "sync cycle for '%s' had %u permission-denied shared-folder mkdir attempt(s)",
                        a->cfg.username, (unsigned)perm_denied);
         }
+
+        /* e. TASK-00298: headless auto-policy daily update check — see
+         * maybe_run_daily_auto_check()'s own doc comment for why this is
+         * unconditional here (it no-ops immediately unless
+         * update_policy=auto) rather than gated on any account state. */
+        maybe_run_daily_auto_check();
 
         sync_now = 0;
     }

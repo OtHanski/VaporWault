@@ -29,6 +29,15 @@
 #  include <unistd.h>
 #endif
 
+/* Each hop below (exe_path -> dir -> marker) uses a strictly larger buffer
+ * than the one before it, so gcc's -Wformat-truncation can statically
+ * prove every snprintf here fits, rather than conservatively assuming
+ * worst case (this function gets inlined into its caller, so gcc DOES
+ * see the real destination size at each call site). */
+#define VW_TEST_EXE_PATH_CAP 4096
+#define VW_TEST_DIR_CAP      4160
+#define VW_TEST_MARKER_CAP   4224
+
 static void self_exe_dir_for_test(char *out, size_t out_sz) {
 #ifdef _WIN32
     char exe_path[MAX_PATH];
@@ -39,7 +48,7 @@ static void self_exe_dir_for_test(char *out, size_t out_sz) {
     *slash = '\0';
     snprintf(out, out_sz, "%s", exe_path);
 #else
-    char exe_path[4096];
+    char exe_path[VW_TEST_EXE_PATH_CAP];
     ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     VW_ASSERT(n > 0 && (size_t)n < sizeof(exe_path));
     exe_path[n] = '\0';
@@ -51,7 +60,7 @@ static void self_exe_dir_for_test(char *out, size_t out_sz) {
 }
 
 static void marker_path_for_test(char *out, size_t out_sz) {
-    char dir[4096];
+    char dir[VW_TEST_DIR_CAP];
     self_exe_dir_for_test(dir, sizeof(dir));
 #ifdef _WIN32
     snprintf(out, out_sz, "%s\\.vw-portable", dir);
@@ -62,7 +71,7 @@ static void marker_path_for_test(char *out, size_t out_sz) {
 
 VW_TEST_SUITE("vw_update_install_kind") {
 
-    char marker[4096];
+    char marker[VW_TEST_MARKER_CAP];
     marker_path_for_test(marker, sizeof(marker));
 
     /* Ensure a clean slate regardless of what a prior failed run left

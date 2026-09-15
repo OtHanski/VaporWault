@@ -344,6 +344,14 @@ static vw_err_t configure_ssl_defaults(mbedtls_ssl_config *conf,
  * why the same "parse every store cert into one mbedtls_x509_crt chain"
  * strategy doesn't work there.
  */
+/* load_pem_file() (defined below, used throughout this file for the
+ * server's own cert/key loading) is reused here too — buffer-based, not
+ * mbedtls_x509_crt_parse_file(), since this project deliberately avoids
+ * requiring MBEDTLS_FS_IO (see vw_smtp.c's own smtp_load_pem for the same
+ * convention). Forward-declared since its real definition comes later in
+ * this file, after load_system_ca_chain's own callers. */
+static vw_err_t load_pem_file(const char *path, unsigned char **out_buf, size_t *out_len);
+
 static int load_system_ca_chain(mbedtls_x509_crt *chain) {
     /* Standard system CA bundle locations across common Linux
      * distributions (Debian/Ubuntu, RHEL/Fedora, Alpine/others) — same
@@ -354,8 +362,11 @@ static int load_system_ca_chain(mbedtls_x509_crt *chain) {
         "/etc/ssl/cert.pem",
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        if (mbedtls_x509_crt_parse_file(chain, candidates[i]) == 0)
-            return 0;
+        unsigned char *buf = NULL; size_t buflen = 0;
+        if (load_pem_file(candidates[i], &buf, &buflen) != VW_OK) continue;
+        int ok = (mbedtls_x509_crt_parse(chain, buf, buflen) >= 0); /* >=0: at least one cert parsed */
+        free(buf);
+        if (ok) return 0;
     }
     return -1;
 }

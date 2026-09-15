@@ -42,13 +42,60 @@
 extern "C" {
 #endif
 
+/*
+ * TASK-00298: client auto-update consent policy (ARCHITECTURE.md Phase 23).
+ * NOTIFY (the default): the daemon only ever records that an update is
+ * available (surfaced later via IPC/GUI, TASK-00299/300) — a human must
+ * click "Update Now" to actually apply it. AUTO: an opt-in, hands-off mode
+ * for headless/unattended setups — the daemon applies a detected update
+ * itself, with no prompt, restarting on its own.
+ */
+typedef enum {
+    VW_UPDATE_POLICY_NOTIFY = 0,
+    VW_UPDATE_POLICY_AUTO   = 1,
+} vw_update_policy_t;
+
 typedef struct {
     char     state_dir[512];        /* daemon-global root — see this file's
                                       * header comment for the on-disk layout
                                       * underneath it */
     uint16_t ipc_port;              /* IPC listen port (default 47832)         */
     uint32_t sync_interval_ms;      /* periodic sync interval (default 30 000) */
+    vw_update_policy_t update_policy; /* TASK-00298; default VW_UPDATE_POLICY_NOTIFY */
 } vw_daemon_cfg_t;
+
+/*
+ * TASK-00298/00299: current update-availability status, as last observed
+ * by either a hint-triggered check (on an ordinary reconnect/resume) or
+ * the auto-policy daily background check. Queried by the IPC layer
+ * (VW_IPC_UPDATE_STATUS_REQ, TASK-00299) — not stored here as a full
+ * manifest, since applying an update always re-fetches and re-verifies
+ * fresh rather than trusting a potentially-stale cached copy.
+ */
+typedef struct {
+    int  available;
+    char server_version[64];   /* the version a check last saw as available */
+} vw_daemon_update_status_t;
+
+/*
+ * Returns the daemon's current update-availability snapshot. Safe to call
+ * from the same thread vw_daemon_run() runs on only (this daemon is
+ * single-threaded by design — see this file's header comment).
+ */
+void vw_daemon_get_update_status(vw_daemon_update_status_t *out);
+
+/*
+ * Applies whatever update was last observed as available (re-fetches and
+ * re-verifies the manifest fresh — never trusts the cached status above
+ * for the actual install decision), downloads and verifies the matching
+ * asset, stages it, and — only on success — triggers this daemon's own
+ * existing graceful-shutdown path so the update can complete on restart.
+ * Returns VW_ERR_NOT_FOUND if vw_daemon_get_update_status() would report
+ * nothing available. Used both by the AUTO policy (called automatically)
+ * and, in NOTIFY mode, by a future VW_IPC_UPDATE_APPLY_REQ handler
+ * (TASK-00299) once a human clicks "Update Now".
+ */
+vw_err_t vw_daemon_apply_update_now(void);
 
 /*
  * Load config from {state_dir}/daemon.conf (simple INI; missing keys get

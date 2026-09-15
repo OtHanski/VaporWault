@@ -167,6 +167,13 @@ typedef enum {
 vw_update_install_kind_t vw_update_detect_install_kind(void);
 
 /*
+ * Resolves the running binary's own directory into out (out_sz bytes,
+ * NUL-terminated on success). Used by TASK-00298's vw_update.c to locate
+ * the sibling vapourwault-updater helper and the real install directory.
+ */
+vw_err_t vw_client_self_exe_dir(char *out, size_t out_sz);
+
+/*
  * Close the connection without logging out (use when the session is already
  * expired or the server already closed the connection). Frees the session.
  * Safe to call with NULL.

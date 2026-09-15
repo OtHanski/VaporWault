@@ -79,6 +79,8 @@ static int pthread_cond_signal(pthread_cond_t *c)              { WakeConditionVa
 #  define VW_PID() ((unsigned)GetCurrentProcessId())
 #else
 #  include <sys/stat.h>
+#  include <unistd.h>
+#  include <stdlib.h>
 #  define VW_PID() ((unsigned)getpid())
 #endif
 

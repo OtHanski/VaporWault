@@ -492,3 +492,29 @@ if(UNIX)
     target_link_libraries(test_vw_update_install_kind PRIVATE pthread)
 endif()
 add_test(NAME unit_vw_update_install_kind COMMAND test_vw_update_install_kind)
+
+# test_vw_update_daily_check_due: TASK-00298 — the pure scheduling decision
+# behind the daemon's headless/auto-policy daily background update check
+# (vw_daemon.c's maybe_run_daily_auto_check). Compiles vw_update.c (and its
+# own link-time dependencies vw_update_net.c/vw_update_manifest.c) directly;
+# none of their network/manifest functions are exercised by this test, only
+# the pure vw_update_daily_check_due() function.
+add_executable(test_vw_update_daily_check_due
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_update_daily_check_due.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_manifest.c
+)
+target_include_directories(test_vw_update_daily_check_due PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_vw_update_daily_check_due PRIVATE vw_core vw_version)
+if(UNIX)
+    target_link_libraries(test_vw_update_daily_check_due PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_vw_update_daily_check_due PRIVATE ws2_32)
+endif()
+add_test(NAME unit_vw_update_daily_check_due COMMAND test_vw_update_daily_check_due)
