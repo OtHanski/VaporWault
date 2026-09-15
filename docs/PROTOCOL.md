@@ -2,7 +2,7 @@
 
 **Owner:** PRT.04  
 **Wire protocol version (`VW_PROTO_VERSION_CURRENT`, `src/core/vw_proto.h`):** 6 — the value actually negotiated in the `HELLO`/`HELLO_OK` handshake. Bumped only for changes that break an *existing* message's byte layout for a client that doesn't know about the change; last bumped for Phase 7 cluster support (§11 revision 6, `TASK-047`).  
-**Document revision (§11 Version History, below):** 34 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
+**Document revision (§11 Version History, below):** 35 — increments for every change recorded in this document, whether or not it required a wire version bump. Most revisions since 6 (new message types, purely-additive trailing fields) explicitly did **not** require one — see each entry's own "no protocol version bump required" note — which is why this number has kept climbing while the wire version above has stayed at 6 since Phase 7.  
 *(2026-08-05, `TASK-118`: the two numbers above used to be conflated under one "Current version" field reading "10" — a number that matched neither of them. Split into two clearly-labeled fields instead of picking one, since both are real and both matter for different audiences: implementers checking wire compatibility need the first; anyone reading this doc's edit history needs the second. Proposed by ARCH.00, reviewed and confirmed accurate by PRT.04 per `CLAUDE.md`'s document-ownership rule.)*  
 **Status:** Living document — hardening phase (see `ARCHITECTURE.md` Phase 8). §7.5/§7.10 (sharing) and §7.11 (vault/E2EE) are both fully implemented, client through GUI, as of `TASK-097`/`TASK-101` — see `ARCHITECTURE.md` Phases 4 and 9.
 
@@ -110,17 +110,76 @@ Client                          Server
 |--------------------|-----------|--------------------------------|
 | negotiated_version | uint16    | Version both sides will use    |
 | server_id          | bytes[16] | Server UUID (informational)    |
+| update_ext_ver     | uint8     | **Optional** (revision 35, `TASK-00292`) — present only when `total_len > 18`. Versions the trailing update-hint block itself; `1` for this revision. A reader that doesn't recognize the value present here treats the whole block as absent rather than erroring. |
+| server_version_len | uint8     | **Optional** — `0..31`, byte length of `server_version` |
+| server_version     | bytes[server_version_len] | **Optional** — ASCII, not NUL-terminated. The server's own software release version (e.g. `"0.4.2"`), distinct from `negotiated_version` above (wire protocol version) — see §6.4. |
 
 Negotiation rule: the server selects `min(client_max, VW_PROTO_VERSION_CURRENT)`. If that value is less than the server's minimum supported version, a VERSION_REJECT is sent instead.
 
 ### 6.3 VERSION_REJECT (server → client)  `0x0003`
 
-| Field       | Type   | Description               |
-|-------------|--------|---------------------------|
-| min_version | uint16 | Server's minimum version  |
-| max_version | uint16 | Server's maximum version  |
+| Field              | Type   | Description               |
+|--------------------|--------|----------------------------|
+| min_version        | uint16 | Server's minimum version  |
+| max_version        | uint16 | Server's maximum version  |
+| update_ext_ver     | uint8  | **Optional** (revision 35) — same shape and rules as HELLO_OK's, present only when `total_len > 4`. |
+| server_version_len | uint8  | **Optional** — `0..31` |
+| server_version     | bytes[server_version_len] | **Optional** — see §6.4. |
 
 After VERSION_REJECT the server closes the connection.
+
+### 6.4 Update-hint extension (revision 35, `TASK-00292`)
+
+Both HELLO_OK and VERSION_REJECT carry an **optional trailing block** — not a
+new message type — letting the server advertise its own software release
+version (`VW_VERSION_STRING`, e.g. `"0.4.2"`) to the client, distinct from
+`negotiated_version`/`min_version`/`max_version` above, which are all the
+*wire* protocol version (`VW_PROTO_VERSION_CURRENT`). This is the basis of
+the client auto-update feature (`ARCHITECTURE.md`'s Phase 23 / `TASK-00291`).
+
+**Compatibility is purely additive, deliberately not a new message:**
+
+- A server with nothing configured to advertise (`server_version` empty/NULL
+  at the call site) omits the block entirely — the message stays at its
+  original fixed size (18 bytes for HELLO_OK, 4 for VERSION_REJECT), byte-
+  for-byte identical to every revision before this one.
+- Both messages are read into fixed-size buffers with a `total_len < N` (not
+  `== N`) length check, so **a client built before this revision already
+  tolerates the extension with zero code change** — it reads only the fixed
+  fields it knows about and never looks at the trailing bytes. Verified
+  against the live implementation, not assumed (`vw_proto.c`'s
+  `vw_proto_negotiate`, both branches).
+- A new client talking to an old (pre-revision-35) server sees no extension
+  (`total_len` exactly 18/4) and correctly reports no hint.
+- `update_ext_ver` versions the extension block itself, independently of
+  `VW_PROTO_VERSION_CURRENT` — a future incompatible change to the block's
+  own layout can bump this byte without touching the wire protocol version,
+  and a reader seeing a value it doesn't recognize simply treats the block
+  as absent (never a hard error) rather than failing an otherwise-valid
+  handshake over a cosmetic hint.
+- **Hard compatibility ceiling: the extended message must never exceed the
+  client's 64-byte HELLO_OK/VERSION_REJECT read buffer.** With
+  `server_version_len` capped at 31, the worst case is 51 bytes (HELLO_OK)
+  or 37 bytes (VERSION_REJECT) — both comfortably under 64. This cap is
+  enforced by the encoder, not just documented.
+- `HELLO` (client → server, §6.1) is **deliberately unchanged** in this
+  revision — only the server's version is exchanged; the client's own
+  version is not advertised on the wire. This keeps compatibility reasoning
+  one-directional: only "does the client understand what the server sent"
+  ever matters, never the reverse.
+
+**Why this matters on the reject path, specifically:** before this revision,
+`VERSION_REJECT`'s payload was parsed by nobody — a client too old to even
+be accepted by a version-bumped server learned nothing about why, or what to
+do about it. `vw_proto_negotiate()`'s client branch now populates its
+`vw_proto_update_hint_t *out_hint` output parameter on **both** the
+`VW_OK` (HELLO_OK) and `VW_ERR_PROTO_VERSION` (VERSION_REJECT) return paths,
+specifically because a caller's session object may not survive a rejected
+negotiation — the hint has to be captured at the point of the call, not
+recovered from state afterward.
+
+No `VW_PROTO_VERSION_CURRENT` bump required — same purely-additive precedent
+as every other extension in this document (see §11 revision history).
 
 ---
 
@@ -2223,6 +2282,7 @@ through this connection) is the same either way.
 
 | Version | Date       | Author  | Changes                    |
 |---------|------------|---------|----------------------------|
+| 35      | 2026-09-15 | PRT.04  | Server-driven client auto-update, Phase 23 design (`ARCHITECTURE.md`, `TASK-00291`), wire piece (`TASK-00292`): HELLO_OK/VERSION_REJECT (§6.2/§6.3) both gain an optional trailing update-hint block (§6.4) — `update_ext_ver`/`server_version_len`/`server_version` — letting the server advertise its own software release version, distinct from the wire protocol version already exchanged. Not a new message type: both messages are already read into fixed-size buffers with a `total_len < N` check rather than `== N` (verified against `vw_proto.c`, not assumed), so a pre-revision-35 client already tolerates the extension with zero code change. Populates on **both** the HELLO_OK success path and the VERSION_REJECT hard-rejection path — previously nobody parsed VERSION_REJECT's payload at all, so a too-old client learned nothing about why it was rejected. `HELLO` (§6.1) deliberately unchanged — only the server's version is exchanged in this revision. Hard 64-byte compatibility ceiling (client's existing read buffer size), enforced by the encoder. Purely additive; no protocol version bump required. |
 | 34      | 2026-09-11 | PRT.04  | Replica-fallback visibility (§7.7), resolving `TASK-00284` — full-project review (`TASK-00269`) found no real signal existed for "N accounts currently on a fallback replica," only the approximate `replica_lag` alert. New `client_conn_count` (uint32) field on both `OPLOG_ACK` (replica → primary, its live `vw_conn_registry` count at send time) and `CLUSTER_STATUS_RESP`'s per-node entry (the primary's most recently received value per node). Piggybacked on the existing `OPLOG_PULL`/`_ACK` cycle rather than a new message pair, following the same reuse-the-authenticated-cluster-session pattern `TASK-00170`/`TASK-00259` already established. A replica's `vw_conn_registry` only ever tracks its normal client-facing `vw/1` listener (never the separate admin socket), and a replica is never anyone's configured primary target under this project's fallback design — so a live connection to a replica is, by definition, a client currently on fallback; no new connection-tagging needed. Staleness bounded by `replica_poll_interval_secs` (default 5s), same freshness bound `sync_watermark`/`lag_entries` already have. `TASK-00285` implements the server/admin-visibility side — `vapourwault-server-cli cluster status`'s FALLBACK_CLIENTS column and the desktop server GUI's cluster view both now surface it, sourced from `vw_cluster_node_client_conn_count`. That implementation pass also found and fixed a real gap in this design as first published: skipping the OPLOG_ACK round trip entirely on an empty/caught-up poll (the pre-`TASK-00284` behavior, harmless when OPLOG_ACK carried only a watermark) would have silently defeated the "bounded by the poll interval" staleness claim below the moment `client_conn_count` started riding the same exchange — both sides now always exchange OPLOG_ACK every poll cycle regardless of oplog activity, still no wire format change. Purely additive; no protocol version bump required. |
 | 33      | 2026-09-10 | PRT.04  | `VAULT_DELETE`/`_ACK` (§7.11.4, 0x0807/0x0808), resolving `TASK-00276` — a vault registration was previously write-only (`ARCHITECTURE.md`'s Phase 21 closure note: "there is no `VAULT_DELETE` wire message at all... vault records accumulate forever"), flagged during a full-project review (`TASK-00269`–`00287`). A plain soft-delete, same `revoked`-flag shape as `SHARE_REVOKE`/`LINK_REVOKE` rather than `vw_store_files.c`'s hard-delete GC path; only the vault's `owner_id` may delete it. New error code `VW_ERR_VAULT_NOT_EMPTY` (610, §10.1): the server refuses deletion while any file version — current or superseded — still carries this `vault_id`, since that version's `wrapped_dek` exists nowhere else and would become permanently unrecoverable. `TASK-00277` implements the storage-layer soft-delete and the server dispatch handler; client/CLI (`TASK-00278`), GUI (`TASK-00279`), and web gateway (`TASK-00280`) consumption of the new message are separate follow-on tasks — this revision is the wire contract only. Purely additive; no protocol version bump required. |
 | 32      | 2026-09-09 | PRT.04  | Phase 22 continued (`TASK-257`): new `CLUSTER_CHUNK_REPAIR_FETCH`/`_DATA` (0x0710/0x0711, §7.7) reversing the existing replica-pulls-from-primary chunk fetch direction so a primary can pull a clean chunk copy from a replica for repair. Rides the existing authenticated `NODE_HELLO` cluster session; no new credential, no new error codes (reuses `VW_ERR_NOT_FOUND`/`VW_ERR_CHUNK_CORRUPT`, both already normative per revision 31). Spec only — `TASK-259` implements the handlers; not yet wired into any repair pipeline (`TASK-260`). Purely additive; no protocol version bump required. |

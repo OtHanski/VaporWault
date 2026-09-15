@@ -204,7 +204,7 @@ vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     /* Derive auth_token = SHA-256(password) — PROTOCOL.md §8.1 Phase 1 */
@@ -235,7 +235,7 @@ vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     return do_auth_with_token(sess, username, username_len, auth_token,
@@ -255,7 +255,7 @@ vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     err = vw_proto_send(sess->conn, VW_MSG_SESSION_RESUME,
@@ -2220,7 +2220,7 @@ vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     /* TASK-186: optional trailing password field. */

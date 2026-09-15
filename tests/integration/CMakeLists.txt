@@ -79,6 +79,35 @@ set_tests_properties(integration_proto_recv_drain PROPERTIES
     LABELS  "integration;protocol"
 )
 
+# test_proto_update_hint: TASK-00292 — HELLO_OK/VERSION_REJECT's new optional
+# trailing update-hint block. Only needs vw_core (vw_proto.c + vw_net.c) —
+# no server/auth stack, same rationale as test_proto_recv_drain above.
+
+add_executable(test_proto_update_hint
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_proto_update_hint.c
+)
+
+target_include_directories(test_proto_update_hint PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_proto_update_hint PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_proto_update_hint PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_proto_update_hint PRIVATE ws2_32)
+endif()
+
+add_test(NAME integration_proto_update_hint
+         COMMAND test_proto_update_hint)
+
+set_tests_properties(integration_proto_update_hint PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;protocol"
+)
+
 # test_file_list_vault_id: TASK-156 regression — FILE_LIST_RESP now carries
 # a per-entry vault_id (it never did before). Needs the full server module
 # set (same list as vw_server_lib / test_vw_file_handlers, duplicated here

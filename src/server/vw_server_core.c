@@ -960,7 +960,7 @@ vw_err_t vw_server_conn_handle(vw_server_ctx_t *ctx,
     if (err != VW_OK) return err;
 
     uint16_t version;
-    err = vw_proto_negotiate(conn, 1 /*is_server*/, &version);
+    err = vw_proto_negotiate(conn, 1 /*is_server*/, &version, NULL, NULL);
     if (err != VW_OK) return err;
 
     vw_msg_type_t type;

@@ -402,6 +402,22 @@ typedef struct {
     uint16_t max_version;
 } vw_payload_version_reject_t;
 
+/*
+ * TASK-00292: optional trailing block appended to both HELLO_OK and
+ * VERSION_REJECT (after their fixed fields above), additive and NOT
+ * covered by VW_PROTO_VERSION_CURRENT — see docs/PROTOCOL.md's revision
+ * entry for this task. A reader that doesn't understand update_ext_ver
+ * simply treats the block as absent; a sender that has nothing to
+ * advertise omits it entirely (message stays its original fixed size).
+ */
+#define VW_UPDATE_EXT_VERSION_1        1u
+#define VW_UPDATE_HINT_VERSION_MAXLEN  31u  /* server_version_len is a u8 <= this */
+
+typedef struct {
+    int  present;                            /* 1 if the server sent an update-hint block */
+    char server_version[VW_UPDATE_HINT_VERSION_MAXLEN + 1]; /* NUL-terminated; "" if !present */
+} vw_proto_update_hint_t;
+
 typedef struct {
     uint32_t error_code;     /* vw_err_t */
     /* variable: string message */
@@ -664,9 +680,27 @@ vw_err_t vw_proto_recv(vw_conn_t *conn, vw_msg_type_t *out_type,
  * Version negotiation. Server: is_server=1. Client: is_server=0.
  * After calling this, both sides have agreed on *out_version.
  * Returns VW_ERR_PROTO_VERSION if no common version exists.
+ *
+ * server_version (TASK-00292): server-side input only, ignored when
+ * is_server=0 (pass NULL from client call sites). The software version
+ * string (e.g. VW_VERSION_STRING) the server should advertise in the
+ * trailing update-hint block of whichever of HELLO_OK/VERSION_REJECT it
+ * ends up sending. NULL or "" omits the block entirely (message stays its
+ * original fixed size — this is the default/legacy behavior). Must be
+ * <= VW_UPDATE_HINT_VERSION_MAXLEN bytes; longer values are silently
+ * truncated rather than failing negotiation over a cosmetic string.
+ *
+ * out_hint (TASK-00292): client-side output only, ignored when is_server=1
+ * (server call sites pass NULL). Populated with whatever update-hint block
+ * the server sent, on BOTH the success (HELLO_OK) path and the
+ * VW_ERR_PROTO_VERSION (VERSION_REJECT) path — the caller's session object
+ * may not survive a rejected negotiation, so this is the only place the
+ * hint can be captured. May be NULL if the caller doesn't care.
  */
 vw_err_t vw_proto_negotiate(vw_conn_t *conn, int is_server,
-                             uint16_t *out_version);
+                             uint16_t *out_version,
+                             const char *server_version,
+                             vw_proto_update_hint_t *out_hint);
 
 /* ── Serialisation helpers (write into a caller-provided buffer) ──────────── */
 
