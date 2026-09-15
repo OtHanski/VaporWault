@@ -70,6 +70,21 @@ vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
                              vw_client_sess_t **out_sess);
 
 /*
+ * TASK-00295: identical to vw_client_connect, plus out_hint (may be NULL)
+ * receiving the server's software-version update-hint
+ * (docs/PROTOCOL.md §6.4) — populated on BOTH success and the
+ * VW_ERR_PROTO_VERSION reject path, since *out_sess is never valid to read
+ * on that path. Only vw_daemon.c's account-connect loop needs this; every
+ * other caller should keep using the plain vw_client_connect above.
+ */
+vw_err_t vw_client_connect_ex(const vw_client_cfg_t *cfg,
+                                const char *username, uint16_t username_len,
+                                const void *password, size_t pw_len,
+                                vw_otp_callback_t otp_cb, void *otp_userdata,
+                                vw_client_sess_t **out_sess,
+                                vw_proto_update_hint_t *out_hint);
+
+/*
  * TASK-173: connect and authenticate with an already-derived auth_token
  * (SHA-256(password), the exact 32 bytes AUTH_REQUEST sends — see this
  * file's header comment) instead of a raw password. For a fallback
@@ -89,6 +104,14 @@ vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
                                        vw_otp_callback_t otp_cb, void *otp_userdata,
                                        vw_client_sess_t **out_sess);
 
+/* TASK-00295: see vw_client_connect_ex's doc comment above. */
+vw_err_t vw_client_connect_with_hash_ex(const vw_client_cfg_t *cfg,
+                                          const char *username, uint16_t username_len,
+                                          const uint8_t auth_token[VW_TOKEN_BYTES],
+                                          vw_otp_callback_t otp_cb, void *otp_userdata,
+                                          vw_client_sess_t **out_sess,
+                                          vw_proto_update_hint_t *out_hint);
+
 /*
  * Connect and resume a saved session using a stored token.  The server
  * validates the token and issues a fresh replacement (single-use resumption
@@ -100,6 +123,12 @@ vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
 vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,
                             const uint8_t saved_token[VW_TOKEN_BYTES],
                             vw_client_sess_t **out_sess);
+
+/* TASK-00295: see vw_client_connect_ex's doc comment above. */
+vw_err_t vw_client_resume_ex(const vw_client_cfg_t *cfg,
+                               const uint8_t saved_token[VW_TOKEN_BYTES],
+                               vw_client_sess_t **out_sess,
+                               vw_proto_update_hint_t *out_hint);
 
 /* ── Session accessors ───────────────────────────────────────────────────── */
 
@@ -118,6 +147,24 @@ uint8_t  vw_client_is_admin_of(const vw_client_sess_t *sess);
  * Safe to call with NULL.
  */
 void vw_client_logout(vw_client_sess_t *sess);
+
+/* ── Install-kind detection (TASK-00295) ─────────────────────────────────── */
+
+typedef enum {
+    /* A ".vw-portable" marker file was found next to the running binary —
+     * this is the tarball/zip extract-and-run distribution, the only
+     * install kind the auto-update feature (ARCHITECTURE.md Phase 23) may
+     * self-replace in v1. */
+    VW_UPDATE_KIND_PORTABLE,
+    /* The marker was absent, or couldn't be positively confirmed present
+     * for any reason (self-path resolution failure, filesystem error, a
+     * from-source developer build). Treated identically to a genuine
+     * .deb/.rpm/.msi package install: notify-only, never self-replacing —
+     * this is the fail-safe default, not merely the fallback. */
+    VW_UPDATE_KIND_PACKAGE_OR_UNKNOWN
+} vw_update_install_kind_t;
+
+vw_update_install_kind_t vw_update_detect_install_kind(void);
 
 /*
  * Close the connection without logging out (use when the session is already

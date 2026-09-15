@@ -7,6 +7,13 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#endif
+
 static void *(* volatile g_memset_fn)(void *, int, size_t) = memset;
 #define secure_zero(p, n) ((void)g_memset_fn((p), 0, (n)))
 
@@ -187,11 +194,25 @@ static vw_err_t do_auth_with_token(vw_client_sess_t *sess,
     return VW_ERR_PROTO_INVALID;
 }
 
-vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
-                             const char *username, uint16_t username_len,
-                             const void *password, size_t pw_len,
-                             vw_otp_callback_t otp_cb, void *otp_userdata,
-                             vw_client_sess_t **out_sess)
+/*
+ * TASK-00295: _ex variants add an optional out_hint parameter (may be
+ * NULL) carrying the server's update-hint (docs/PROTOCOL.md §6.4),
+ * populated on both success and the VW_ERR_PROTO_VERSION reject path —
+ * necessary because sess is destroyed before the caller sees a reject, so
+ * the hint can't live inside it. The plain (non-_ex) names stay
+ * source-and-binary-compatible thin wrappers passing NULL, rather than
+ * threading a new mandatory parameter through every one of this API's
+ * existing callers (client CLI, GUI, gateway, Android JNI, ~8 test files)
+ * for a hint only vw_daemon.c's account-connect/resume loop actually
+ * needs (TASK-00298).
+ */
+
+vw_err_t vw_client_connect_ex(const vw_client_cfg_t *cfg,
+                                const char *username, uint16_t username_len,
+                                const void *password, size_t pw_len,
+                                vw_otp_callback_t otp_cb, void *otp_userdata,
+                                vw_client_sess_t **out_sess,
+                                vw_proto_update_hint_t *out_hint)
 {
     if (!cfg || !username || !password || !out_sess) return VW_ERR_INVALID_ARG;
     if (!username_len || username_len > VW_MAX_USERNAME_BYTES)
@@ -204,7 +225,7 @@ vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, out_hint);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     /* Derive auth_token = SHA-256(password) — PROTOCOL.md §8.1 Phase 1 */
@@ -218,11 +239,22 @@ vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
     return err;
 }
 
-vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
-                                       const char *username, uint16_t username_len,
-                                       const uint8_t auth_token[VW_TOKEN_BYTES],
-                                       vw_otp_callback_t otp_cb, void *otp_userdata,
-                                       vw_client_sess_t **out_sess)
+vw_err_t vw_client_connect(const vw_client_cfg_t *cfg,
+                             const char *username, uint16_t username_len,
+                             const void *password, size_t pw_len,
+                             vw_otp_callback_t otp_cb, void *otp_userdata,
+                             vw_client_sess_t **out_sess)
+{
+    return vw_client_connect_ex(cfg, username, username_len, password, pw_len,
+                                 otp_cb, otp_userdata, out_sess, NULL);
+}
+
+vw_err_t vw_client_connect_with_hash_ex(const vw_client_cfg_t *cfg,
+                                          const char *username, uint16_t username_len,
+                                          const uint8_t auth_token[VW_TOKEN_BYTES],
+                                          vw_otp_callback_t otp_cb, void *otp_userdata,
+                                          vw_client_sess_t **out_sess,
+                                          vw_proto_update_hint_t *out_hint)
 {
     if (!cfg || !username || !auth_token || !out_sess) return VW_ERR_INVALID_ARG;
     if (!username_len || username_len > VW_MAX_USERNAME_BYTES)
@@ -235,16 +267,27 @@ vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, out_hint);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     return do_auth_with_token(sess, username, username_len, auth_token,
                                otp_cb, otp_userdata, out_sess);
 }
 
-vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,
-                            const uint8_t saved_token[VW_TOKEN_BYTES],
-                            vw_client_sess_t **out_sess)
+vw_err_t vw_client_connect_with_hash(const vw_client_cfg_t *cfg,
+                                       const char *username, uint16_t username_len,
+                                       const uint8_t auth_token[VW_TOKEN_BYTES],
+                                       vw_otp_callback_t otp_cb, void *otp_userdata,
+                                       vw_client_sess_t **out_sess)
+{
+    return vw_client_connect_with_hash_ex(cfg, username, username_len, auth_token,
+                                           otp_cb, otp_userdata, out_sess, NULL);
+}
+
+vw_err_t vw_client_resume_ex(const vw_client_cfg_t *cfg,
+                               const uint8_t saved_token[VW_TOKEN_BYTES],
+                               vw_client_sess_t **out_sess,
+                               vw_proto_update_hint_t *out_hint)
 {
     if (!cfg || !saved_token || !out_sess) return VW_ERR_INVALID_ARG;
 
@@ -255,7 +298,7 @@ vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,
     if (err != VW_OK) { free(sess); return err; }
 
     uint16_t version;
-    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, NULL);
+    err = vw_proto_negotiate(sess->conn, 0 /*is_server*/, &version, NULL, out_hint);
     if (err != VW_OK) { sess_destroy(sess); return err; }
 
     err = vw_proto_send(sess->conn, VW_MSG_SESSION_RESUME,
@@ -267,6 +310,13 @@ vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,
 
     *out_sess = sess;
     return VW_OK;
+}
+
+vw_err_t vw_client_resume(const vw_client_cfg_t *cfg,
+                            const uint8_t saved_token[VW_TOKEN_BYTES],
+                            vw_client_sess_t **out_sess)
+{
+    return vw_client_resume_ex(cfg, saved_token, out_sess, NULL);
 }
 
 void vw_client_get_token(const vw_client_sess_t *sess,
@@ -2276,4 +2326,73 @@ vw_err_t vw_client_link_access(const vw_client_cfg_t *cfg,
 
     sess_destroy(sess);
     return VW_ERR_PROTO_INVALID;
+}
+
+/* ── Install-kind detection (TASK-00295) ─────────────────────────────────── */
+
+/*
+ * Resolves the running binary's own directory into out (a caller-provided
+ * buffer of out_sz bytes, NUL-terminated on success). Returns 0 on
+ * success, -1 on any failure — every failure mode (path too long, API
+ * error, no directory separator found) is treated identically by the
+ * caller: fail safe toward "can't prove this is a portable install."
+ */
+static int self_exe_dir(char *out, size_t out_sz) {
+#ifdef _WIN32
+    char exe_path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
+    if (n == 0 || n >= sizeof(exe_path)) return -1;
+
+    char *slash = strrchr(exe_path, '\\');
+    if (!slash) return -1;
+    *slash = '\0';
+
+    size_t len = strlen(exe_path);
+    if (len >= out_sz) return -1;
+    memcpy(out, exe_path, len + 1);
+    return 0;
+#else
+    char exe_path[4096];
+    ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (n <= 0 || (size_t)n >= sizeof(exe_path)) return -1;
+    exe_path[n] = '\0';
+
+    char *slash = strrchr(exe_path, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+
+    size_t len = strlen(exe_path);
+    if (len >= out_sz) return -1;
+    memcpy(out, exe_path, len + 1);
+    return 0;
+#endif
+}
+
+/*
+ * Portable-vs-package install detection for the client auto-update
+ * feature (ARCHITECTURE.md's "Client auto-update: self-install scope
+ * (v1)" row). The tarball/zip release staging step (TASK-00301) drops a
+ * ".vw-portable" marker file next to the shipped binaries; CPack's
+ * declared install() rules never include it, so it is never present in a
+ * .deb/.rpm/.msi install.
+ *
+ * Deliberately fails safe toward VW_UPDATE_KIND_PACKAGE_OR_UNKNOWN
+ * whenever the marker can't be positively confirmed present — including a
+ * from-source developer build, a self-path resolution failure, or any
+ * filesystem error — since the asymmetric risk (a package-managed install
+ * user only ever seeing a notify-only message, vs. a portable-install
+ * user being wrongly offered a self-update button that could write into a
+ * package manager's directory) favors under-offering, not over-offering.
+ */
+vw_update_install_kind_t vw_update_detect_install_kind(void) {
+    char dir[4096];
+    if (self_exe_dir(dir, sizeof(dir)) != 0)
+        return VW_UPDATE_KIND_PACKAGE_OR_UNKNOWN;
+
+    char marker_path[4096 + 32];
+    if (vw_fs_path_join(marker_path, sizeof(marker_path), dir, ".vw-portable") != VW_OK)
+        return VW_UPDATE_KIND_PACKAGE_OR_UNKNOWN;
+
+    return vw_fs_exists(marker_path) ? VW_UPDATE_KIND_PORTABLE
+                                      : VW_UPDATE_KIND_PACKAGE_OR_UNKNOWN;
 }

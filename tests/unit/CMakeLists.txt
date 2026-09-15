@@ -473,3 +473,22 @@ if(UNIX)
     target_link_libraries(test_vw_gateway_remember PRIVATE pthread)
 endif()
 add_test(NAME unit_vw_gateway_remember COMMAND test_vw_gateway_remember)
+
+# test_vw_update_install_kind: TASK-00295 — portable-vs-package install
+# detection for the auto-update feature. Compiles vw_client_core.c
+# directly (needs vw_core only, no server/auth stack) — same rationale as
+# test_vw_gateway_remember above.
+add_executable(test_vw_update_install_kind
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_vw_update_install_kind.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_client_core.c
+)
+target_include_directories(test_vw_update_install_kind PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_vw_update_install_kind PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_vw_update_install_kind PRIVATE pthread)
+endif()
+add_test(NAME unit_vw_update_install_kind COMMAND test_vw_update_install_kind)
