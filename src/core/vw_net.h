@@ -217,6 +217,22 @@ vw_err_t vw_net_ctx_reload_cert(vw_net_ctx_t *ctx,
                                  const char *cert_pem_path,
                                  const char *key_pem_path);
 
+/*
+ * Test-only seam (compiled in only when VW_NET_DNS_TEST_HOOK is defined):
+ * overrides the getaddrinfo() call the bounded-DNS-resolution helper
+ * (TASK-00305, connect_with_timeout()'s dns_resolve_bounded()) uses
+ * internally, so a test can simulate a slow or unresponsive resolver
+ * without touching real DNS. Pass NULL to restore the real getaddrinfo()
+ * behavior. Same convention as VW_UPDATE_NET_TEST_HOOKS elsewhere in this
+ * codebase. struct addrinfo is only ever used here as an opaque pointer,
+ * so this header does not need <netdb.h>/<ws2tcpip.h>.
+ */
+#ifdef VW_NET_DNS_TEST_HOOK
+struct addrinfo;
+void vw_net_test_set_dns_resolver(
+        int (*fn)(const char *host, const char *port_str, struct addrinfo **out_res));
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -220,6 +220,191 @@ static void ensure_wsa_started(void) {
 }
 #endif
 
+#ifdef VW_NET_DNS_TEST_HOOK
+static int (*g_dns_test_resolver)(const char *, const char *, struct addrinfo **) = NULL;
+void vw_net_test_set_dns_resolver(
+        int (*fn)(const char *host, const char *port_str, struct addrinfo **out_res)) {
+    g_dns_test_resolver = fn;
+}
+#endif
+
+/*
+ * TASK-00305: getaddrinfo() has no timeout of its own — the connect-phase
+ * timeout below only ever bounded the TCP connect, not resolution, so a
+ * slow or unresponsive resolver could stall a caller for its own internal
+ * retry budget (well past a minute in the sandbox that found this). Bound
+ * it by running the actual getaddrinfo() call on a detached helper thread
+ * and waiting for it with a hard deadline: if the deadline passes first,
+ * the wait is abandoned and the orphaned thread frees its own context and
+ * result once (if ever) the resolver returns — a rare leaked thread is the
+ * accepted cost of a portable hard bound with no new external dependency
+ * (this project's existing detached-thread pattern, e.g. vw_cluster.c's
+ * per-replica accept threads).
+ */
+typedef struct {
+#ifdef _WIN32
+    CRITICAL_SECTION   lock;
+    CONDITION_VARIABLE cond;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+#endif
+    char *host;
+    char *port_str;
+    int   done;       /* set once the resolver has returned */
+    int   abandoned;  /* set by the waiter if it gave up before done */
+    int   gai_rc;
+    struct addrinfo *res;
+} dns_resolve_ctx_t;
+
+static void dns_resolve_ctx_free(dns_resolve_ctx_t *ctx) {
+#ifdef _WIN32
+    DeleteCriticalSection(&ctx->lock);
+#else
+    pthread_cond_destroy(&ctx->cond);
+    pthread_mutex_destroy(&ctx->lock);
+#endif
+    free(ctx->host);
+    free(ctx->port_str);
+    free(ctx);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI dns_resolve_thread(LPVOID arg)
+#else
+static void *dns_resolve_thread(void *arg)
+#endif
+{
+    dns_resolve_ctx_t *ctx = (dns_resolve_ctx_t *)arg;
+
+    struct addrinfo *res = NULL;
+    int rc;
+#ifdef VW_NET_DNS_TEST_HOOK
+    if (g_dns_test_resolver) {
+        rc = g_dns_test_resolver(ctx->host, ctx->port_str, &res);
+    } else
+#endif
+    {
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        rc = getaddrinfo(ctx->host, ctx->port_str, &hints, &res);
+    }
+
+#ifdef _WIN32
+    EnterCriticalSection(&ctx->lock);
+#else
+    pthread_mutex_lock(&ctx->lock);
+#endif
+    if (ctx->abandoned) {
+#ifdef _WIN32
+        LeaveCriticalSection(&ctx->lock);
+#else
+        pthread_mutex_unlock(&ctx->lock);
+#endif
+        if (res) freeaddrinfo(res);
+        dns_resolve_ctx_free(ctx);
+        return 0;
+    }
+    ctx->gai_rc = rc;
+    ctx->res    = res;
+    ctx->done   = 1;
+#ifdef _WIN32
+    WakeConditionVariable(&ctx->cond);
+    LeaveCriticalSection(&ctx->lock);
+#else
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->lock);
+#endif
+    return 0;
+}
+
+/* Resolve host:port_str with a hard wall-clock bound of timeout_ms. On
+ * success returns 0 and *out_res is the resolved list (caller still owns
+ * it and must freeaddrinfo() it). On timeout, allocation failure, or
+ * resolution failure, returns -1 and *out_res is NULL. */
+static int dns_resolve_bounded(const char *host, const char *port_str,
+                                uint32_t timeout_ms, struct addrinfo **out_res)
+{
+    *out_res = NULL;
+
+    dns_resolve_ctx_t *ctx = (dns_resolve_ctx_t *)calloc(1, sizeof(*ctx));
+    if (!ctx) return -1;
+    ctx->host     = strdup(host);
+    ctx->port_str = strdup(port_str);
+    if (!ctx->host || !ctx->port_str) {
+        free(ctx->host); free(ctx->port_str); free(ctx);
+        return -1;
+    }
+
+#ifdef _WIN32
+    InitializeCriticalSection(&ctx->lock);
+    InitializeConditionVariable(&ctx->cond);
+    HANDLE h = CreateThread(NULL, 0, dns_resolve_thread, ctx, 0, NULL);
+    if (!h) { dns_resolve_ctx_free(ctx); return -1; }
+    CloseHandle(h); /* detach — result comes back via ctx->lock/cond, not a join */
+#else
+    pthread_mutex_init(&ctx->lock, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int spawn_rc = pthread_create(&tid, &attr, dns_resolve_thread, ctx);
+    pthread_attr_destroy(&attr);
+    if (spawn_rc != 0) { dns_resolve_ctx_free(ctx); return -1; }
+#endif
+
+#ifdef _WIN32
+    EnterCriticalSection(&ctx->lock);
+    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    while (!ctx->done) {
+        uint64_t now = now_ns();
+        if (now >= deadline) break;
+        DWORD remaining_ms = (DWORD)((deadline - now) / 1000000ULL);
+        if (remaining_ms == 0) remaining_ms = 1;
+        SleepConditionVariableCS(&ctx->cond, &ctx->lock, remaining_ms);
+    }
+    if (!ctx->done) {
+        ctx->abandoned = 1;
+        LeaveCriticalSection(&ctx->lock);
+        return -1; /* dns_resolve_thread frees ctx once it eventually returns */
+    }
+    int gai_rc = ctx->gai_rc;
+    struct addrinfo *res = ctx->res;
+    LeaveCriticalSection(&ctx->lock);
+    dns_resolve_ctx_free(ctx);
+#else
+    pthread_mutex_lock(&ctx->lock);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec  += (time_t)(timeout_ms / 1000);
+    deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec  += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int wait_rc = 0;
+    while (!ctx->done && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&ctx->cond, &ctx->lock, &deadline);
+    if (!ctx->done) {
+        ctx->abandoned = 1;
+        pthread_mutex_unlock(&ctx->lock);
+        return -1; /* dns_resolve_thread frees ctx once it eventually returns */
+    }
+    int gai_rc = ctx->gai_rc;
+    struct addrinfo *res = ctx->res;
+    pthread_mutex_unlock(&ctx->lock);
+    dns_resolve_ctx_free(ctx);
+#endif
+
+    if (gai_rc != 0 || !res) return -1;
+    *out_res = res;
+    return 0;
+}
+
 static int connect_with_timeout(mbedtls_net_context *net,
                                  const char *host, const char *port_str,
                                  uint32_t timeout_ms)
@@ -231,13 +416,9 @@ static int connect_with_timeout(mbedtls_net_context *net,
     ensure_wsa_started();
 #endif
 
-    struct addrinfo hints, *res = NULL, *ai;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo *res = NULL, *ai;
 
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res)
+    if (dns_resolve_bounded(host, port_str, timeout_ms, &res) != 0 || !res)
         return MBEDTLS_ERR_NET_UNKNOWN_HOST;
 
     int connected = 0;

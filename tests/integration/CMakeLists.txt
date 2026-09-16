@@ -79,6 +79,39 @@ set_tests_properties(integration_proto_recv_drain PROPERTIES
     LABELS  "integration;protocol"
 )
 
+# test_net_dns_timeout: TASK-00305 — connect_with_timeout()'s bounded-DNS
+# helper must bound total wall-clock time (DNS + connect), not just the
+# connect phase. Compiles its own copy of vw_net.c (not vw_core, which
+# already contains an un-hooked build of it) with VW_NET_DNS_TEST_HOOK so
+# a fake resolver can simulate slow/unresponsive DNS deterministically.
+# Links MbedTLS directly (same as vw_core's own PUBLIC dependency in
+# src/core/CMakeLists.txt) rather than vw_core itself, since this target
+# supplies its own vw_net.c object and must not pull the un-hooked one
+# from the vw_core archive.
+
+add_executable(test_net_dns_timeout
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_net_dns_timeout.c
+    ${CMAKE_SOURCE_DIR}/src/core/vw_net.c
+)
+target_compile_definitions(test_net_dns_timeout PRIVATE VW_NET_DNS_TEST_HOOK)
+target_include_directories(test_net_dns_timeout PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_net_dns_timeout PRIVATE MbedTLS::mbedtls)
+if(UNIX)
+    target_link_libraries(test_net_dns_timeout PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_net_dns_timeout PRIVATE ws2_32)
+endif()
+
+add_test(NAME integration_net_dns_timeout COMMAND test_net_dns_timeout)
+set_tests_properties(integration_net_dns_timeout PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;network"
+)
+
 # test_update_net: TASK-00296 — outbound HTTPS GET client for the client
 # auto-update feature. Compiles its own copy of vw_update_net.c with
 # VW_UPDATE_NET_TEST_HOOKS (redirects the connect step at a local
