@@ -614,6 +614,44 @@ jobs:
                 --passphrase-fd 0 --detach-sign --armor "$f" <<< "$GPG_SIGNING_PASSPHRASE"
           done
 
+      # TASK-00303 (QA regression suite, coverage item "every published
+      # release asset has a valid GPG signature that verifies against the
+      # committed public key"): previously only documented as a MANUAL
+      # step for a human to run (docs/RELEASE.md's own `gpg --verify`
+      # instructions) — nothing actually re-checked it before publish.
+      # This gates the "Create or update GitHub Release" step below: if
+      # signing ever produced a bad .asc (or the private signing key's
+      # secret ever drifted from the committed public key), the release
+      # fails here, before anything is published, on every real release
+      # AND every workflow_dispatch dry run alike (this step runs before
+      # the `if: github.event_name == 'push'` gate). Uses an isolated
+      # --homedir containing ONLY the committed public key — never the
+      # just-imported private signing key's own keyring — so this
+      # specifically proves "verifies against the committed public key",
+      # not merely "verifies against whatever happens to be in the
+      # keyring already". Same file list as the signing step above.
+      - name: Verify GPG signatures against the committed public key
+        run: |
+          set -e
+          VERIFY_GNUPGHOME="$RUNNER_TEMP/gpg-verify-home"
+          mkdir -p "$VERIFY_GNUPGHOME"
+          chmod 700 "$VERIFY_GNUPGHOME"
+          gpg --homedir "$VERIFY_GNUPGHOME" --batch --import \
+              packaging/signing/vaporwault-releases-pubkey.asc
+          FILES_TO_SIGN=(
+            "dist/linux-release/vaporwault-${TAG}-linux-x86_64.tar.gz"
+            dist/linux-release/*.deb
+            dist/linux-release/*.rpm
+            "dist/linux-release/linux-packages.sha256"
+            "dist/windows-release/vaporwault-${TAG}-windows-x86_64.zip"
+            "dist/android-release/vaporwault-${TAG}-android.apk"
+            "update-manifest.json"
+          )
+          for f in "${FILES_TO_SIGN[@]}"; do
+            gpg --homedir "$VERIFY_GNUPGHOME" --batch --verify "${f}.asc" "$f"
+          done
+          rm -rf "$VERIFY_GNUPGHOME"
+
       # Re-running this workflow for a tag that was already published (e.g. after
       # a transient failure) uploads/overwrites assets instead of hard-failing
       # with "release already exists". TAG/REPO come from workflow-level `env:`

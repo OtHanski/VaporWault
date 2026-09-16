@@ -32,6 +32,13 @@
  * TC-5: a validly-signed but schema-invalid payload (verifies fine, isn't
  *       the expected JSON shape) is rejected by the parser, not silently
  *       half-accepted.
+ * TC-6: an unmodified, genuinely-signed manifest body — but signed by a
+ *       throwaway key that is NOT the real update-manifest signing key —
+ *       is rejected (TASK-00302 audit coverage: distinct from TC-2's
+ *       "body doesn't match its signature" case).
+ * TC-7: the manifest fetch succeeds but the .sig fetch 404s (a missing/
+ *       never-published signature sidecar) — rejected, not silently
+ *       treated as "no signature required" (TASK-00302 audit coverage).
  */
 
 #include "vw_test.h"
@@ -161,6 +168,27 @@ static const uint8_t MANIFEST_NEW_SIG[] = {
     0x67, 0x41, 0x14, 0x27, 0x7a, 0x09, 0x15, 0x85, 0x54, 0xc8, 0x9f
 };
 
+/* TC-6: MANIFEST_OK's exact bytes, signed with a throwaway EC P-256 key
+ * that is NOT the real update-manifest signing key — a structurally
+ * valid DER ECDSA signature that must still fail verification against
+ * the real compiled-in VW_UPDATE_MANIFEST_PUBKEY. Distinct from TC-2
+ * (tampered body, real key/signature pairing broken by a body edit):
+ * this is an unmodified, genuinely-signed body, just signed by the wrong
+ * party — the "an attacker with their own valid keypair signs a
+ * manifest" scenario. Generated offline (throwaway key, discarded
+ * immediately after — never committed, never reused for anything else):
+ *   openssl ecparam -name prime256v1 -genkey -noout -out /tmp/wrongkey.pem
+ *   openssl dgst -sha256 -sign /tmp/wrongkey.pem -out sig.der manifest_ok.json
+ */
+static const uint8_t MANIFEST_OK_WRONGKEY_SIG[] = {
+    0x30, 0x46, 0x02, 0x21, 0x00, 0xac, 0x15, 0x4a, 0x2b, 0xb4, 0x74, 0xd6,
+    0x89, 0x77, 0x8a, 0xc3, 0x78, 0x91, 0xea, 0x37, 0xbb, 0xf8, 0xae, 0xb6,
+    0xb2, 0x3d, 0x46, 0x4d, 0x29, 0xf2, 0x11, 0x05, 0x87, 0xaf, 0x4b, 0x15,
+    0x00, 0x02, 0x21, 0x00, 0xff, 0xee, 0x52, 0xcf, 0x8a, 0xc1, 0x1a, 0x31,
+    0x96, 0xb3, 0xcb, 0xc5, 0x42, 0xa8, 0x25, 0xd7, 0x66, 0x91, 0xe5, 0x65,
+    0x10, 0x08, 0x2e, 0x1e, 0xb2, 0x0e, 0xa3, 0x85, 0x27, 0x65, 0xbc, 0xb8
+};
+
 static const char MANIFEST_BADSCHEMA[] = "{\"foo\":\"bar\"}";
 static const uint8_t MANIFEST_BADSCHEMA_SIG[] = {
     0x30, 0x44, 0x02, 0x20, 0x44, 0x9f, 0x0a, 0x76, 0xa5, 0x56, 0x9c, 0xa1,
@@ -260,17 +288,53 @@ static void *dual_srv_thread(void *arg) {
     return NULL;
 }
 
-static pthread_t spawn_dual_srv(dual_srv_args_t *a) {
+/* TC-7: serves the manifest normally, then a bare 404 (no body) for the
+ * .sig fetch — simulates a missing/never-published signature sidecar,
+ * distinct from TC-2's "signature present but doesn't match" case. Reuses
+ * dual_srv_args_t for its cert/key/port/manifest_bytes/manifest_len
+ * fields only; sig_bytes/sig_len are unused here. */
+static void *manifest_then_404_srv_thread(void *arg) {
+    dual_srv_args_t *a = arg;
+    vw_net_ctx_t *net_ctx = NULL;
+    vw_err_t err = vw_net_listen("127.0.0.1", a->port, a->cert_path, a->key_path, &net_ctx);
+    a->bind_err = err;
+
+    pthread_mutex_lock(&a->mtx);
+    a->ready = 1;
+    pthread_cond_signal(&a->cond);
+    pthread_mutex_unlock(&a->mtx);
+
+    if (err != VW_OK) return NULL;
+
+    (void)serve_one(net_ctx, a->manifest_bytes, a->manifest_len);
+
+    vw_conn_t *conn = NULL;
+    if (vw_net_accept(net_ctx, &conn) == VW_OK) {
+        uint8_t discard[4096]; size_t got = 0;
+        (void)vw_net_recv_partial(conn, discard, sizeof(discard), &got);
+        static const char resp[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        (void)vw_net_send(conn, resp, sizeof(resp) - 1);
+        vw_net_close(conn);
+    }
+
+    vw_net_ctx_close(net_ctx);
+    return NULL;
+}
+
+static pthread_t spawn_srv_with_fn(dual_srv_args_t *a, void *(*fn)(void *)) {
     a->ready = 0;
     a->bind_err = VW_OK;
     pthread_mutex_init(&a->mtx, NULL);
     pthread_cond_init(&a->cond, NULL);
     pthread_t tid;
-    pthread_create(&tid, NULL, dual_srv_thread, a);
+    pthread_create(&tid, NULL, fn, a);
     pthread_mutex_lock(&a->mtx);
     while (!a->ready) pthread_cond_wait(&a->cond, &a->mtx);
     pthread_mutex_unlock(&a->mtx);
     return tid;
+}
+static pthread_t spawn_dual_srv(dual_srv_args_t *a) {
+    return spawn_srv_with_fn(a, dual_srv_thread);
 }
 static void join_dual_srv(pthread_t tid, dual_srv_args_t *a) {
     pthread_join(tid, NULL);
@@ -408,6 +472,47 @@ VW_TEST_SUITE("update_manifest") {
         vw_update_manifest_t m;
         vw_err_t err = vw_update_manifest_fetch_and_verify(state_dir, &m);
         VW_ASSERT_EQ(err, VW_ERR_UPDATE_MANIFEST_INVALID);
+
+        join_dual_srv(tid, &sa);
+    }
+
+    /* ── TC-6: unmodified body, genuinely-signed, but by the WRONG key ── */
+    VW_TEST_CASE("signature from a different key is rejected") {
+        dual_srv_args_t sa;
+        sa.cert_path = cert_path; sa.key_path = key_path; sa.port = (uint16_t)TEST_PORT;
+        sa.manifest_bytes = MANIFEST_OK; sa.manifest_len = sizeof(MANIFEST_OK) - 1;
+        sa.sig_bytes = MANIFEST_OK_WRONGKEY_SIG; sa.sig_len = sizeof(MANIFEST_OK_WRONGKEY_SIG);
+        pthread_t tid = spawn_dual_srv(&sa);
+        VW_ASSERT_EQ(sa.bind_err, VW_OK);
+
+        uint64_t ratchet_before = read_ratchet(state_dir);
+        vw_update_manifest_t m;
+        vw_err_t err = vw_update_manifest_fetch_and_verify(state_dir, &m);
+        /* MANIFEST_OK's sequence (5) is also below the ratchet TC-4 left
+         * at 9 — VW_ERR_UPDATE_MANIFEST_INVALID (not ROLLBACK) here
+         * additionally confirms signature verification is checked before
+         * the rollback-ratchet comparison ever runs, not just before
+         * JSON parsing. */
+        VW_ASSERT_EQ(err, VW_ERR_UPDATE_MANIFEST_INVALID);
+        VW_ASSERT_EQ(read_ratchet(state_dir), ratchet_before);
+
+        join_dual_srv(tid, &sa);
+    }
+
+    /* ── TC-7: manifest fetch OK, .sig fetch 404s (missing sidecar) ── */
+    VW_TEST_CASE("a missing .sig (404) is rejected, not silently skipped") {
+        dual_srv_args_t sa;
+        sa.cert_path = cert_path; sa.key_path = key_path; sa.port = (uint16_t)TEST_PORT;
+        sa.manifest_bytes = MANIFEST_OK; sa.manifest_len = sizeof(MANIFEST_OK) - 1;
+        sa.sig_bytes = NULL; sa.sig_len = 0; /* unused by this server variant */
+        pthread_t tid = spawn_srv_with_fn(&sa, manifest_then_404_srv_thread);
+        VW_ASSERT_EQ(sa.bind_err, VW_OK);
+
+        uint64_t ratchet_before = read_ratchet(state_dir);
+        vw_update_manifest_t m;
+        vw_err_t err = vw_update_manifest_fetch_and_verify(state_dir, &m);
+        VW_ASSERT(err != VW_OK);
+        VW_ASSERT_EQ(read_ratchet(state_dir), ratchet_before);
 
         join_dual_srv(tid, &sa);
     }
