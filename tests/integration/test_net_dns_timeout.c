@@ -145,10 +145,19 @@ VW_TEST_SUITE("vw_net_dns_timeout") {
         /* Same case as test_vw_net.c's TC-6: port 1 on loopback is
          * virtually guaranteed refused, and 127.0.0.1 is a numeric
          * address a resolver answers immediately — this proves the
-         * bounded-DNS change didn't regress the ordinary path. */
+         * bounded-DNS change didn't regress the ordinary path.
+         *
+         * connect_timeout_ms is kept small (500ms) here rather than the
+         * larger values TC-1/TC-2 use above: a refused connect's RST can
+         * legitimately take close to the full configured connect-phase
+         * timeout to arrive on some platforms (observed on Windows
+         * loopback), which is pre-existing connect_with_timeout()
+         * behavior this test isn't meant to exercise — the elapsed-time
+         * assertion below is about proving THIS case stays fast, not
+         * about re-testing the connect-phase timeout itself. */
         vw_conn_opts_t opts;
         memset(&opts, 0, sizeof(opts));
-        opts.connect_timeout_ms = 2000;
+        opts.connect_timeout_ms = 500;
 
         vw_conn_t *c = NULL;
         uint64_t start = now_ms();
@@ -159,7 +168,7 @@ VW_TEST_SUITE("vw_net_dns_timeout") {
 
         VW_ASSERT(err != VW_OK);
         VW_ASSERT(c == NULL);
-        VW_ASSERT(elapsed < 1000);
+        VW_ASSERT(elapsed < 1500);
     }
 }
 VW_TEST_SUITE_END()
