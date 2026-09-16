@@ -1,6 +1,7 @@
 #include "vw_view_settings.h"
 #include "../ClientApp.h"
 #include "imgui.h"
+#include "vw_version.h"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -98,6 +99,20 @@ static void refresh_2fa(ClientApp &app) {
     }
 }
 
+/* Client auto-update (TASK-00298/00299/00300; ARCHITECTURE.md Phase 23). */
+static bool s_update_loaded = false;
+static VwGuiUpdateStatus s_update_status;
+static char s_update_status_msg[160] = "";
+
+static void refresh_update_status(ClientApp &app) {
+    if (app.ipc_update_status(&s_update_status)) {
+        s_update_loaded = true;
+        s_update_status_msg[0] = '\0';
+    } else {
+        snprintf(s_update_status_msg, sizeof(s_update_status_msg), "Failed to fetch update status.");
+    }
+}
+
 void vw_view_settings_invalidate() {
     s_folders_loaded = false;
     s_folders.clear();
@@ -108,6 +123,8 @@ void vw_view_settings_invalidate() {
     s_2fa_loaded = false;
     s_2fa_password[0] = '\0';
     s_2fa_status[0] = '\0';
+    s_update_loaded = false;
+    s_update_status_msg[0] = '\0';
 }
 
 void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
@@ -316,6 +333,58 @@ void vw_view_settings_render(const VwIpcStatus & /*status*/, ClientApp &app) {
         ImGui::PopID();
     }
     if (s_notify_status[0]) ImGui::TextUnformatted(s_notify_status);
+
+    /* Client auto-update (TASK-00298/00299/00300). */
+    ImGui::Spacing();
+    ImGui::SeparatorText("Software update");
+    if (!s_update_loaded) refresh_update_status(app);
+    ImGui::Text("Current version: %s", VW_VERSION_STRING);
+
+    /* vw_update_install_kind_t: 0 = PORTABLE, 1 = PACKAGE_OR_UNKNOWN — see
+     * VwGuiUpdateStatus's own doc comment for why the numeric value, not
+     * the client-core enum header, is used here (same as ClientApp's
+     * render_update_banner()). */
+    bool portable = (s_update_status.install_kind == 0);
+
+    if (s_update_status.available) {
+        ImGui::Text("Update available: v%s", s_update_status.manifest_version.c_str());
+        if (!portable) {
+            ImGui::TextColored(ImVec4(0.4f, 0.75f, 1.0f, 1.0f),
+                "This install can't self-update. Download it from "
+                "github.com/OtHanski/VaporWault/releases.");
+        }
+    } else {
+        ImGui::TextDisabled("Up to date.");
+    }
+
+    if (ImGui::Button("Check for updates now##settings")) {
+        refresh_update_status(app);
+    }
+
+    if (portable) {
+        ImGui::SameLine();
+        bool auto_policy = (s_update_status.policy == 1);
+        if (ImGui::Checkbox("Fully automatic (no prompt)##settings", &auto_policy)) {
+            uint8_t requested = auto_policy ? 1 : 0;
+            uint8_t stored = 0;
+            int rc = app.ipc_update_policy_set(requested, &stored);
+            if (rc == 0) {
+                s_update_status.policy = stored;
+                s_update_status_msg[0] = '\0';
+            } else {
+                snprintf(s_update_status_msg, sizeof(s_update_status_msg),
+                         "Failed to update policy (err %d).", rc);
+                refresh_update_status(app); /* re-sync with real daemon state */
+            }
+        }
+    } else {
+        /* Notify-only (TASK-00300's own design boundary): no automatic-
+         * policy toggle for a non-portable install — offering it would
+         * be misleading for an install that can never actually
+         * self-apply anything. */
+        ImGui::TextDisabled("(Automatic updates aren't available for this install type.)");
+    }
+    if (s_update_status_msg[0]) ImGui::TextUnformatted(s_update_status_msg);
 
     /* Shutdown */
     ImGui::Spacing();

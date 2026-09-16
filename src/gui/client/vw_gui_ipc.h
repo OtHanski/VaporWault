@@ -162,6 +162,24 @@ struct VwGuiAccountEntry {
     uint8_t     conn_mode = 0;
 };
 
+/*
+ * Client auto-update (TASK-00298/00299/00300; ARCHITECTURE.md Phase 23).
+ * Mirrors VW_IPC_UPDATE_STATUS_RESP's fields exactly, same shape
+ * vapourwault-cli's `update status` decodes.
+ */
+struct VwGuiUpdateStatus {
+    uint8_t     available = 0;
+    std::string server_version;    /* raw server hint; informational/untrusted, may be empty */
+    std::string manifest_version;  /* verified release_version; empty if available == 0 */
+    /* vw_update_install_kind_t: 0 = PORTABLE (self-update capable),
+     * 1 = PACKAGE_OR_UNKNOWN — deliberately defaults to the fail-safe
+     * PACKAGE_OR_UNKNOWN value (never PORTABLE) if a fetch ever fails,
+     * same fail-safe-toward-notify-only convention TASK-00295's own
+     * detection function documents. */
+    uint8_t     install_kind = 1;
+    uint8_t     policy = 0;        /* 0 = notify, 1 = auto */
+};
+
 class VwGuiIpc {
 public:
     VwGuiIpc() = default;
@@ -403,6 +421,27 @@ public:
     bool version_list(uint32_t account_id, const char *virtual_path,
                        std::vector<VwGuiVersionEntry> *out, int *out_error_code);
     int version_restore(uint32_t account_id, const char *virtual_path, uint64_t version_id);
+
+    /*
+     * Client auto-update (TASK-00300). Daemon-global, not account-scoped
+     * — an update applies to the daemon binary itself, not to any one
+     * account's session.
+     */
+    bool fetch_update_status(VwGuiUpdateStatus *out);
+    /* Returns vw_err_t encoded as int; 0 = VW_OK, in which case the
+     * daemon has already staged the update and triggered its own
+     * graceful-shutdown path (the connection may close before or shortly
+     * after this call even returns — see VW_IPC_UPDATE_APPLY_ACK's own
+     * doc comment in vw_ipc.h). VW_ERR_NOT_FOUND if nothing is available.
+     * VW_ERR_UPDATE_NOT_PORTABLE if this install isn't a portable
+     * archive — the daemon's own independent enforcement of the same
+     * boundary fetch_update_status's install_kind already signals, not
+     * merely a UI-side convention this call trusts blindly. */
+    int send_update_apply();
+    /* policy: 0 = notify, 1 = auto. *out_policy (if non-null) receives
+     * the policy now in effect (echoed back), whether or not the call
+     * succeeded, mirroring the daemon's own ACK shape. */
+    int send_update_policy_set(uint8_t policy, uint8_t *out_policy);
 
 private:
     uint16_t port_      = VW_IPC_DEFAULT_PORT;
