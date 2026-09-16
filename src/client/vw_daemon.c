@@ -35,6 +35,15 @@
 #define DEFAULT_PORT         4430u
 #define DEFAULT_IPC_PORT     VW_IPC_DEFAULT_PORT
 #define DEFAULT_SYNC_MS      30000u
+/* TASK-00306: the main loop's per-iteration wait/sleep is capped to this
+ * many ms regardless of sync_interval_ms, so step (c) (accept/dispatch
+ * pending IPC connections) is reached at least this often even while
+ * accumulating towards a full sync_interval_ms — see vw_daemon_run's own
+ * comment at its main loop for the full incident (a daemon with zero
+ * watched roots could otherwise leave an IPC request unanswered for up
+ * to the full sync_interval_ms, since vw_watcher_wait blocks for the
+ * entire requested timeout when there is nothing to watch). */
+#define VW_DAEMON_MAX_WAIT_CHUNK_MS 1000u
 #define SESSION_TOKEN_FILE   "session.tok"
 #define LOGIN_TOKEN_FILE     "login_token.bin"
 #define PID_FILE             "daemon.pid"
@@ -2870,6 +2879,10 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
 
     int sync_now = 0;
     int shutdown  = 0;
+    /* TASK-00306: how much of the configured sync_interval_ms the current
+     * run of short wait chunks has covered so far — see the main loop's
+     * own comment below. */
+    uint32_t accumulated_wait_ms = 0;
 
     ipc_dispatch_ctx_t dc;
     dc.accounts      = &accounts;
@@ -2883,9 +2896,32 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
 
     while (!g_shutdown && !shutdown) {
 
-        /* a. Wait for filesystem events (or timeout) */
+        /* a. Wait for filesystem events (or timeout), in short chunks
+         * capped at VW_DAEMON_MAX_WAIT_CHUNK_MS so step (c) below (accept
+         * pending IPC connections) is reached often regardless of
+         * sync_interval_ms — see that constant's own comment (TASK-00306).
+         * accumulated_wait_ms tracks how much of the configured interval
+         * this run of chunks has covered; step (d)'s actual sync pass
+         * only runs once the full interval has accumulated (or a real
+         * event/overflow/explicit sync-now request short-circuits it) —
+         * chunking the wait must never change the sync-pass cadence. */
+        int got_watch_event = 0;
+        uint32_t chunk_ms;
+        if (cfg->sync_interval_ms > 0 && accumulated_wait_ms < cfg->sync_interval_ms) {
+            uint32_t remaining = cfg->sync_interval_ms - accumulated_wait_ms;
+            chunk_ms = (remaining < VW_DAEMON_MAX_WAIT_CHUNK_MS) ? remaining : VW_DAEMON_MAX_WAIT_CHUNK_MS;
+        } else {
+            /* sync_interval_ms == 0 ("block indefinitely" / event-only
+             * cadence — vw_watcher_wait's own documented sentinel) or the
+             * interval already fully accumulated this tick: still cap the
+             * wait itself for IPC responsiveness, just don't let it drive
+             * the time-based sync trigger below. */
+            chunk_ms = VW_DAEMON_MAX_WAIT_CHUNK_MS;
+        }
+
         if (watcher) {
-            vw_watcher_wait(watcher, cfg->sync_interval_ms);
+            vw_err_t wait_rc = vw_watcher_wait(watcher, chunk_ms);
+            got_watch_event = (wait_rc == VW_OK);
 
             /* b. Drain watch events */
             if (vw_watcher_overflowed(watcher)) {
@@ -2910,16 +2946,17 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
                 /* DELETED events: next sync walk will detect the missing file */
             }
         } else {
-            /* No watcher: sleep for sync interval (poll-only mode) */
+            /* No watcher: sleep for one capped chunk (poll-only mode) */
 #ifdef _WIN32
-            Sleep(cfg->sync_interval_ms);
+            Sleep(chunk_ms);
 #else
             struct timespec ts;
-            ts.tv_sec  = cfg->sync_interval_ms / 1000;
-            ts.tv_nsec = (cfg->sync_interval_ms % 1000) * 1000000L;
+            ts.tv_sec  = chunk_ms / 1000;
+            ts.tv_nsec = (chunk_ms % 1000) * 1000000L;
             nanosleep(&ts, NULL);
 #endif
         }
+        accumulated_wait_ms += chunk_ms;
 
         /* c. Accept and dispatch pending IPC connections */
         {
@@ -2934,8 +2971,24 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
 
         if (shutdown || g_shutdown) break;
 
+        /* Run the sync pass (step d, below) once the configured
+         * sync_interval_ms has fully accumulated across possibly-several
+         * short wait chunks, or immediately on a real watch event,
+         * overflow, or an explicit "sync now" IPC request — the same
+         * triggers that already caused an immediate sync before this
+         * task's fix, just no longer tied to the wait's own timeout
+         * length. */
+        int run_sync_pass = got_watch_event || sync_now ||
+                             (cfg->sync_interval_ms > 0 &&
+                              accumulated_wait_ms >= cfg->sync_interval_ms);
+        if (!run_sync_pass) {
+            maybe_run_daily_auto_check();
+            continue;
+        }
+        accumulated_wait_ms = 0;
+
         /* d. Round-robin one sync cycle per account (TASK-161) — every
-         * configured account keeps syncing every tick regardless of which
+         * configured account keeps syncing every pass regardless of which
          * one, if any, a connected GUI/CLI happens to be querying right
          * now. Reconnect-if-needed is per account too. */
         for (size_t i = 0; i < accounts.count; i++) {
@@ -3014,7 +3067,12 @@ vw_err_t vw_daemon_run(const vw_daemon_cfg_t *cfg, int daemon_mode) {
         /* e. TASK-00298: headless auto-policy daily update check — see
          * maybe_run_daily_auto_check()'s own doc comment for why this is
          * unconditional here (it no-ops immediately unless
-         * update_policy=auto) rather than gated on any account state. */
+         * update_policy=auto) rather than gated on any account state.
+         * Deliberately called here AND on the run_sync_pass=false early
+         * continue above (TASK-00306) rather than gated on the sync
+         * cadence too — it's independently self-throttled to once per
+         * VW_UPDATE_AUTO_CHECK_INTERVAL_SECS, so there's no reason to
+         * also tie it to how often the sync pass itself runs. */
         maybe_run_daily_auto_check();
 
         sync_now = 0;

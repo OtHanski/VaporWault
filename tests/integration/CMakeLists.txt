@@ -319,6 +319,27 @@ set_tests_properties(integration_updater_main PROPERTIES
     LABELS  "integration;update"
 )
 
+# test_daemon_ipc_responsiveness: TASK-00306 — a real daemon with zero
+# configured accounts (zero watched roots) and sync_interval_ms left at
+# its real production default (30000ms, NOT overridden down like
+# test_ipc_update.c's own daemon.conf) must still answer IPC requests
+# promptly, not up to the full interval late. Needs the real built
+# vapourwault-daemon + vapourwault-cli binaries, same as test_ipc_update.
+
+add_executable(test_daemon_ipc_responsiveness
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_daemon_ipc_responsiveness.c
+)
+add_dependencies(test_daemon_ipc_responsiveness vapourwault-daemon vapourwault-cli)
+target_compile_definitions(test_daemon_ipc_responsiveness PRIVATE
+    VW_DAEMON_EXE_PATH=\"$<TARGET_FILE:vapourwault-daemon>\"
+    VW_CLI_EXE_PATH=\"$<TARGET_FILE:vapourwault-cli>\"
+)
+add_test(NAME integration_daemon_ipc_responsiveness COMMAND test_daemon_ipc_responsiveness)
+set_tests_properties(integration_daemon_ipc_responsiveness PROPERTIES
+    TIMEOUT 90
+    LABELS  "integration;daemon;ipc"
+)
+
 endif() # VW_BUILD_CLIENT
 
 # test_file_list_vault_id: TASK-156 regression — FILE_LIST_RESP now carries
