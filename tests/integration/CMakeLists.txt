@@ -79,6 +79,269 @@ set_tests_properties(integration_proto_recv_drain PROPERTIES
     LABELS  "integration;protocol"
 )
 
+# test_net_dns_timeout: TASK-00305 — connect_with_timeout()'s bounded-DNS
+# helper must bound total wall-clock time (DNS + connect), not just the
+# connect phase. Compiles its own copy of vw_net.c (not vw_core, which
+# already contains an un-hooked build of it) with VW_NET_DNS_TEST_HOOK so
+# a fake resolver can simulate slow/unresponsive DNS deterministically.
+# Links MbedTLS directly (same as vw_core's own PUBLIC dependency in
+# src/core/CMakeLists.txt) rather than vw_core itself, since this target
+# supplies its own vw_net.c object and must not pull the un-hooked one
+# from the vw_core archive.
+
+add_executable(test_net_dns_timeout
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_net_dns_timeout.c
+    ${CMAKE_SOURCE_DIR}/src/core/vw_net.c
+)
+target_compile_definitions(test_net_dns_timeout PRIVATE VW_NET_DNS_TEST_HOOK)
+target_include_directories(test_net_dns_timeout PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_net_dns_timeout PRIVATE MbedTLS::mbedtls)
+if(UNIX)
+    target_link_libraries(test_net_dns_timeout PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_net_dns_timeout PRIVATE ws2_32)
+endif()
+
+add_test(NAME integration_net_dns_timeout COMMAND test_net_dns_timeout)
+set_tests_properties(integration_net_dns_timeout PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;network"
+)
+
+# test_update_net: TASK-00296 — outbound HTTPS GET client for the client
+# auto-update feature. Compiles its own copy of vw_update_net.c with
+# VW_UPDATE_NET_TEST_HOOKS (redirects the connect step at a local
+# self-signed test server instead of the real system-trust-store path,
+# which no local server can satisfy) and a short VW_UPDATE_RECV_TIMEOUT_MS
+# (same VW_ECC_MAX_DATA_SHARDS-style override convention as
+# test_repair_pipeline) so the timeout-enforcement case is fast.
+
+add_executable(test_update_net
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+)
+target_compile_definitions(test_update_net PRIVATE
+    VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATE_RECV_TIMEOUT_MS=1500
+    VW_UPDATE_CONNECT_TIMEOUT_MS=2000
+    VW_UPDATE_TOTAL_READ_DEADLINE_SECS=3
+    VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_1=\"127.0.0.1\"
+)
+target_include_directories(test_update_net PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_update_net PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_update_net PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_update_net PRIVATE ws2_32)
+endif()
+add_test(NAME integration_update_net COMMAND test_update_net)
+set_tests_properties(integration_update_net PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
+# test_update_manifest: TASK-00297 — update-manifest fetch/verify/parse/
+# rollback-ratchet pipeline. VW_UPDATE_NET_TEST_HOOKS (vw_update_net.c) +
+# VW_UPDATE_GITHUB_HOST/_PORT/_MANIFEST_PATH/_SIG_PATH (vw_update_manifest.c)
+# together redirect the whole pipeline at a local self-signed test server;
+# every test manifest is signed with the real update-manifest private key
+# and verified against the real compiled-in VW_UPDATE_MANIFEST_PUBKEY.
+add_executable(test_update_manifest
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_update_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_manifest.c
+)
+target_compile_definitions(test_update_manifest PRIVATE
+    VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATE_GITHUB_HOST=\"127.0.0.1\"
+    VW_UPDATE_PORT=43771
+    VW_UPDATE_MANIFEST_PATH=\"/update-manifest.json\"
+    VW_UPDATE_MANIFEST_SIG_PATH=\"/update-manifest.json.sig\"
+)
+target_include_directories(test_update_manifest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_update_manifest PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_update_manifest PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_update_manifest PRIVATE ws2_32)
+endif()
+add_test(NAME integration_update_manifest COMMAND test_update_manifest)
+set_tests_properties(integration_update_manifest PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
+# test_proto_update_hint: TASK-00292 — HELLO_OK/VERSION_REJECT's new optional
+# trailing update-hint block. Only needs vw_core (vw_proto.c + vw_net.c) —
+# no server/auth stack, same rationale as test_proto_recv_drain above.
+
+add_executable(test_proto_update_hint
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_proto_update_hint.c
+)
+
+target_include_directories(test_proto_update_hint PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+
+target_link_libraries(test_proto_update_hint PRIVATE vw_core)
+if(UNIX)
+    target_link_libraries(test_proto_update_hint PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_proto_update_hint PRIVATE ws2_32)
+endif()
+
+add_test(NAME integration_proto_update_hint
+         COMMAND test_proto_update_hint)
+
+set_tests_properties(integration_proto_update_hint PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;protocol"
+)
+
+# test_update_apply, test_ipc_update, test_updater_main all need the real
+# built vapourwault-updater/-daemon/-cli binaries (VW_BUILD_CLIENT targets,
+# defined in src/client/CMakeLists.txt), which don't exist in a
+# VW_BUILD_CLIENT=OFF configuration (e.g. the server-only Fuzz build) — CI
+# fix, 2026-09-16: CMake configure failed with "No target
+# vapourwault-updater" et al. when this file was still unconditionally
+# generating these three targets.
+if(VW_BUILD_CLIENT)
+
+# test_update_apply: TASK-00298 — vw_update_download_and_verify_asset()
+# and vw_update_stage_and_apply()'s extraction/payload-directory-resolution
+# logic. Compiles its own copy of vw_update_net.c + vw_update.c with
+# VW_UPDATE_NET_TEST_HOOKS (connect hook) plus VW_UPDATE_GITHUB_HOST/_PORT
+# (vw_update.c now follows the same override-macro convention
+# vw_update_manifest.c already established — CQR.08 finding, TASK-00298
+# review — so this target no longer needs a host-ignoring connect hook).
+# Needs the real built vapourwault-updater binary (VW_UPDATER_EXE_PATH)
+# copied into a fake install_dir so vw_update_stage_and_apply's own spawn
+# step succeeds.
+
+add_executable(test_update_apply
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_update_apply.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/client/vw_update.c
+)
+add_dependencies(test_update_apply vapourwault-updater)
+target_compile_definitions(test_update_apply PRIVATE
+    VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATE_GITHUB_HOST=\"127.0.0.1\"
+    VW_UPDATE_PORT=43772
+    VW_UPDATER_EXE_PATH=\"$<TARGET_FILE:vapourwault-updater>\"
+    VW_TEST_SCRATCH_ROOT=\"${CMAKE_BINARY_DIR}/test_scratch\"
+)
+target_include_directories(test_update_apply PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/client
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(test_update_apply PRIVATE vw_core vw_version)
+if(UNIX)
+    target_link_libraries(test_update_apply PRIVATE pthread)
+endif()
+if(WIN32)
+    target_link_libraries(test_update_apply PRIVATE ws2_32)
+endif()
+add_test(NAME integration_update_apply COMMAND test_update_apply)
+set_tests_properties(integration_update_apply PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
+# test_ipc_update: TASK-00299 — the UPDATE_* IPC messages and the
+# "vapourwault-cli update ..." subcommand group, exercised end-to-end
+# against the real built vapourwault-daemon + vapourwault-cli binaries.
+# No server/account needed — every UPDATE_* message is daemon-global.
+
+add_executable(test_ipc_update
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_ipc_update.c
+)
+add_dependencies(test_ipc_update vapourwault-daemon vapourwault-cli)
+target_compile_definitions(test_ipc_update PRIVATE
+    VW_DAEMON_EXE_PATH=\"$<TARGET_FILE:vapourwault-daemon>\"
+    VW_CLI_EXE_PATH=\"$<TARGET_FILE:vapourwault-cli>\"
+)
+# Root-caused (CLI.02, 2026-09-16 — see TASK-00299's Notes for the full
+# investigation and TASK-00306 for the underlying daemon-loop finding
+# filed separately): this test's daemon.conf pins sync_interval_ms to 200
+# (not the real 30000 default) specifically to avoid tripping
+# vw_watcher_wait()'s "blocks for the full timeout when there are zero
+# watched roots" behavior — with the real default, two IPC requests
+# issued moments apart (exactly what this test does) could
+# non-deterministically make the second one wait up to 30 real seconds
+# for the daemon's main loop to cycle back to its IPC-accept step. This
+# was originally misdiagnosed as a ctest-launch-specific sandbox artifact
+# before being root-caused via a debug build; see git history on this
+# file for that earlier (incorrect) comment.
+add_test(NAME integration_ipc_update COMMAND test_ipc_update)
+set_tests_properties(integration_ipc_update PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update;ipc"
+)
+
+# test_updater_main: TASK-00298 — the standalone vapourwault-updater helper
+# (src/client/vw_updater_main.c). Invokes the REAL built binary as a
+# subprocess (it deliberately has no vw_core linkage — see its own header
+# comment — so this is the only way to test it as what actually ships)
+# rather than compiling its source into the test.
+
+add_executable(test_updater_main
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_updater_main.c
+)
+add_dependencies(test_updater_main vapourwault-updater)
+target_compile_definitions(test_updater_main PRIVATE
+    VW_UPDATER_EXE_PATH=\"$<TARGET_FILE:vapourwault-updater>\"
+)
+target_include_directories(test_updater_main PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/unit
+)
+add_test(NAME integration_updater_main COMMAND test_updater_main)
+set_tests_properties(integration_updater_main PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update"
+)
+
+# test_daemon_ipc_responsiveness: TASK-00306 — a real daemon with zero
+# configured accounts (zero watched roots) and sync_interval_ms left at
+# its real production default (30000ms, NOT overridden down like
+# test_ipc_update.c's own daemon.conf) must still answer IPC requests
+# promptly, not up to the full interval late. Needs the real built
+# vapourwault-daemon + vapourwault-cli binaries, same as test_ipc_update.
+
+add_executable(test_daemon_ipc_responsiveness
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_daemon_ipc_responsiveness.c
+)
+add_dependencies(test_daemon_ipc_responsiveness vapourwault-daemon vapourwault-cli)
+target_compile_definitions(test_daemon_ipc_responsiveness PRIVATE
+    VW_DAEMON_EXE_PATH=\"$<TARGET_FILE:vapourwault-daemon>\"
+    VW_CLI_EXE_PATH=\"$<TARGET_FILE:vapourwault-cli>\"
+)
+add_test(NAME integration_daemon_ipc_responsiveness COMMAND test_daemon_ipc_responsiveness)
+set_tests_properties(integration_daemon_ipc_responsiveness PROPERTIES
+    TIMEOUT 90
+    LABELS  "integration;daemon;ipc"
+)
+
+endif() # VW_BUILD_CLIENT
+
 # test_file_list_vault_id: TASK-156 regression — FILE_LIST_RESP now carries
 # a per-entry vault_id (it never did before). Needs the full server module
 # set (same list as vw_server_lib / test_vw_file_handlers, duplicated here

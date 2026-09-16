@@ -72,6 +72,12 @@ void ClientApp::poll_loop() {
                     if (active_account_id_ == 0 && cached_accounts_.size() == 1)
                         active_account_id_ = cached_accounts_[0].account_id;
                 }
+
+                /* TASK-00300: same cadence as the two polls above — this
+                 * is what render_update_banner() and the settings view's
+                 * status display read, rather than issuing their own IPC
+                 * call every frame. */
+                ipc_.fetch_update_status(&cached_update_status_);
             }
         }
         /* Poll every 2 seconds. Sleep in 100 ms slices to stay responsive to stop(). */
@@ -128,6 +134,12 @@ void ClientApp::render_frame() {
         /* Daemon is running but not connected to server */
         active_view_ = AppView::Login;
         vw_view_login_render(snap, *this);
+        /* TASK-00300: daemon-global (an update applies to the daemon
+         * binary itself, not to any one account's session), so shown
+         * here too — drawn AFTER the view above so it overlays on top,
+         * not underneath it (ImGui draws later Begin/End calls on top of
+         * earlier ones within the same frame). */
+        render_update_banner();
         return;
     }
 
@@ -143,6 +155,11 @@ void ClientApp::render_frame() {
         vw_view_browser_render(snap, *this);
         break;
     }
+
+    /* Drawn last so it overlays on top of whichever view just rendered —
+     * see the other call site above (the not-logged-in branch) for the
+     * same rationale. */
+    render_update_banner();
 }
 
 void ClientApp::render_offline_banner() {
@@ -156,6 +173,92 @@ void ClientApp::render_offline_banner() {
     ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
         "Daemon offline — retrying every 2 s");
     ImGui::End();
+}
+
+/*
+ * Client auto-update (TASK-00300; daemon: TASK-00298/00299). Sibling to
+ * render_offline_banner() above — same persistent-top-banner shape, one
+ * row below the main menu bar rather than at y=0 (which the menu bar
+ * itself occupies whenever this banner is reachable — see its own call
+ * site in render_frame()). Reads the background-thread-refreshed
+ * cached_update_status_ (via update_status_snapshot()) rather than
+ * issuing its own IPC call every frame, matching every other persistent
+ * display in this class (cached_status_/cached_accounts_).
+ */
+void ClientApp::render_update_banner() {
+    VwGuiUpdateStatus st = update_status_snapshot();
+    if (!st.available) return;
+
+    /* "Later" dismisses for the current GUI session only — no persisted
+     * snooze state in v1 (the task's own documented scope decision); the
+     * banner reappears next launch, acceptable since it's non-blocking. */
+    static bool s_dismissed_this_session = false;
+    static bool s_open_confirm = false;
+    if (s_dismissed_this_session) return;
+
+    /* vw_update_install_kind_t: 0 = PORTABLE, 1 = PACKAGE_OR_UNKNOWN —
+     * see VwGuiUpdateStatus's own doc comment for why the numeric value,
+     * not the client-core enum header, is used here. A non-PORTABLE
+     * install NEVER gets an "Update Now" button, and this GUI never
+     * attempts to elevate/invoke a package manager itself — notify-only,
+     * with a link to the releases page. */
+    bool portable = (st.install_kind == 0);
+
+    /* y=28: the same literal every view (vw_view_browser.cpp,
+     * _queue/_settings/_shared/_vault.cpp) hardcodes as "just below the
+     * main menu bar" for its own top-left corner. This banner is drawn
+     * AFTER whichever view render_frame() dispatches to below, so it
+     * overlays that view's own top ~28px band rather than pushing its
+     * content down — accepted as a disclosed v1 layout tradeoff (see
+     * TASK-00300's notes) rather than reflowing all five views' hardcoded
+     * offsets for one occasional banner. */
+    ImGuiIO &io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0, 28));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, 28));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::Begin("##update_banner", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+
+    if (portable) {
+        ImGui::TextColored(ImVec4(0.4f, 0.75f, 1.0f, 1.0f),
+            "Update available: v%s", st.manifest_version.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Update Now##update_banner"))
+            s_open_confirm = true;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Later##update_banner"))
+            s_dismissed_this_session = true;
+    } else {
+        /* Notify-only: no "Update Now" button, ever — this install
+         * can't be self-replaced (TASK-00291's design boundary). */
+        ImGui::TextColored(ImVec4(0.4f, 0.75f, 1.0f, 1.0f),
+            "Update available: v%s — see github.com/OtHanski/VaporWault/releases to install it",
+            st.manifest_version.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Later##update_banner"))
+            s_dismissed_this_session = true;
+    }
+    ImGui::End();
+
+    if (s_open_confirm) {
+        ImGui::OpenPopup("Confirm update##banner");
+        s_open_confirm = false;
+    }
+    if (ImGui::BeginPopupModal("Confirm update##banner", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(
+            "Download, verify, and install this update now?\n"
+            "The daemon will restart to apply it — sync will briefly pause.");
+        ImGui::Spacing();
+        if (ImGui::Button("Update Now##confirm", ImVec2(130, 0))) {
+            ipc_update_apply();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##confirm", ImVec2(110, 0)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 }
 
 /* Multi-account (TASK-163): tab/dropdown near the top of the main window,
@@ -368,6 +471,19 @@ bool ClientApp::ipc_version_list(const char *virtual_path, std::vector<VwGuiVers
 int ClientApp::ipc_version_restore(const char *virtual_path, uint64_t version_id) {
     std::lock_guard<std::mutex> lk(status_mutex_);
     return ipc_.version_restore(active_account_id_, virtual_path, version_id);
+}
+
+bool ClientApp::ipc_update_status(VwGuiUpdateStatus *out) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.fetch_update_status(out);
+}
+int ClientApp::ipc_update_apply() {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.send_update_apply();
+}
+int ClientApp::ipc_update_policy_set(uint8_t policy, uint8_t *out_policy) {
+    std::lock_guard<std::mutex> lk(status_mutex_);
+    return ipc_.send_update_policy_set(policy, out_policy);
 }
 
 int ClientApp::ipc_file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id) {

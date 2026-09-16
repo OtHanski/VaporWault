@@ -73,3 +73,18 @@ fuzz_target(fuzz_search)
 #    TASK-262) — pure GF(256) math, no chunk-store or network dependency,
 #    but vw_server_lib already includes vw_ecc.c so no extra SRCS needed.
 fuzz_target(fuzz_ecc_decode)
+
+# 8. Client auto-update manifest parser (vw_update_manifest_parse,
+#    TASK-00297) — vw_update_manifest.c lives in src/client (not part of
+#    vw_server_lib) so it needs its own SRCS; vw_update_net.c is pulled in
+#    too purely to resolve symbols vw_update_manifest.c references
+#    (vw_update_https_get/_response_free) even though the fuzz harness
+#    itself only ever calls the pure parser, never the network fetch.
+fuzz_target(fuzz_update_manifest
+    SRCS
+        ${CMAKE_SOURCE_DIR}/src/client/vw_update_manifest.c
+        ${CMAKE_SOURCE_DIR}/src/client/vw_update_net.c
+)
+target_include_directories(fuzz_update_manifest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/client
+)

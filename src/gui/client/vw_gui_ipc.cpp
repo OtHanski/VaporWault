@@ -845,3 +845,43 @@ int VwGuiIpc::vault_download(uint32_t account_id, uint64_t vault_id, uint64_t fi
     return (int)read_u32_le(resp);
 }
 
+bool VwGuiIpc::fetch_update_status(VwGuiUpdateStatus *out) {
+    uint8_t resp[600]; uint32_t plen;
+    if (one_shot(VW_IPC_UPDATE_STATUS_REQ, nullptr, 0, VW_IPC_UPDATE_STATUS_RESP,
+                 resp, sizeof(resp), &plen) != VW_OK || plen < 1)
+        return false;
+
+    uint32_t off = 0;
+    out->available = resp[off]; off += 1u;
+    const char *sv = nullptr, *mv = nullptr; uint16_t sv_len = 0, mv_len = 0;
+    if (vw_ipc_read_str(resp, plen, &off, &sv, &sv_len) != VW_OK ||
+        vw_ipc_read_str(resp, plen, &off, &mv, &mv_len) != VW_OK ||
+        off + 2u > plen)
+        return false;
+    out->server_version   = std::string(sv, sv_len);
+    out->manifest_version = std::string(mv, mv_len);
+    out->install_kind = resp[off]; off += 1u;
+    out->policy       = resp[off]; off += 1u;
+    return true;
+}
+
+int VwGuiIpc::send_update_apply() {
+    uint8_t resp[4]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_UPDATE_APPLY_REQ, nullptr, 0, VW_IPC_UPDATE_APPLY_ACK,
+                             resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 4) return (int)VW_ERR_IO;
+    return (int)read_u32_le(resp);
+}
+
+int VwGuiIpc::send_update_policy_set(uint8_t policy, uint8_t *out_policy) {
+    uint8_t req[1] = { policy };
+    uint8_t resp[5]; uint32_t rlen;
+    vw_err_t err = one_shot(VW_IPC_UPDATE_POLICY_SET_REQ, req, sizeof(req),
+                             VW_IPC_UPDATE_POLICY_SET_ACK, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) return (int)err;
+    if (rlen < 5) return (int)VW_ERR_IO;
+    if (out_policy) *out_policy = resp[4];
+    return (int)read_u32_le(resp);
+}
+
