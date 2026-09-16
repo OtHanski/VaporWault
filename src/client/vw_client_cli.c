@@ -322,6 +322,87 @@ static int cmd_sync(vw_ipc_conn_t *conn) {
     return 0;
 }
 
+/* ── Subcommand: update (TASK-00299) ─────────────────────────────────────── */
+
+static int cmd_update_status(vw_ipc_conn_t *conn) {
+    uint8_t resp[600];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_UPDATE_STATUS_REQ, NULL, 0,
+                             VW_IPC_UPDATE_STATUS_RESP, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) {
+        fprintf(stderr, "update status: IPC error %d\n", (int)err);
+        return 1;
+    }
+    if (rlen < 1u) { fprintf(stderr, "update status: truncated response\n"); return 1; }
+
+    uint32_t off = 0;
+    uint8_t available = resp[off]; off += 1u;
+    const char *server_version = NULL, *manifest_version = NULL;
+    uint16_t sv_len = 0, mv_len = 0;
+    if (vw_ipc_read_str(resp, rlen, &off, &server_version, &sv_len) != VW_OK ||
+        vw_ipc_read_str(resp, rlen, &off, &manifest_version, &mv_len) != VW_OK ||
+        off + 2u > rlen) {
+        fprintf(stderr, "update status: truncated response\n");
+        return 1;
+    }
+    uint8_t install_kind = resp[off]; off += 1u;
+    uint8_t policy       = resp[off]; off += 1u;
+
+    printf("Update policy: %s\n", policy == 1 ? "auto" : "notify");
+    /* vw_update_install_kind_t: 0 = PORTABLE, 1 = PACKAGE_OR_UNKNOWN — the
+     * numeric values, not the client-core enum header, since this CLI
+     * doesn't otherwise need vw_client_core.h. */
+    printf("Install kind:  %s\n", install_kind == 0 ? "portable (self-update capable)"
+                                                       : "package/unknown (notify-only)");
+    printf("Update available: %s\n", available ? "yes" : "no");
+    if (available) {
+        if (sv_len > 0) printf("  Server advertised: %.*s\n", (int)sv_len, server_version);
+        printf("  Verified release:  %.*s\n", (int)mv_len, manifest_version);
+        if (install_kind != 0)
+            printf("  This install can't self-update — see the GitHub releases page.\n");
+        else
+            printf("  Run \"update apply\" to download, verify, and install it now.\n");
+    }
+    return 0;
+}
+
+static int cmd_update_apply(vw_ipc_conn_t *conn) {
+    uint8_t resp[4];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_UPDATE_APPLY_REQ, NULL, 0,
+                             VW_IPC_UPDATE_APPLY_ACK, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) {
+        fprintf(stderr, "update apply: IPC error %d\n", (int)err);
+        return 1;
+    }
+    if (check_u32_resp(resp, rlen, "update apply")) return 1;
+    printf("update staged — the daemon is restarting to apply it\n");
+    return 0;
+}
+
+static int cmd_update_policy_set(vw_ipc_conn_t *conn, const char *policy_str) {
+    uint8_t policy;
+    if (strcmp(policy_str, "notify") == 0) policy = 0;
+    else if (strcmp(policy_str, "auto") == 0) policy = 1;
+    else {
+        fprintf(stderr, "update policy: value must be \"notify\" or \"auto\"\n");
+        return 1;
+    }
+    uint8_t req[1] = { policy };
+    uint8_t resp[5];
+    uint32_t rlen = 0;
+    vw_err_t err = ipc_rpc(conn, VW_IPC_UPDATE_POLICY_SET_REQ, req, sizeof(req),
+                             VW_IPC_UPDATE_POLICY_SET_ACK, resp, sizeof(resp), &rlen);
+    if (err != VW_OK) {
+        fprintf(stderr, "update policy: IPC error %d\n", (int)err);
+        return 1;
+    }
+    if (check_u32_resp(resp, rlen, "update policy")) return 1;
+    uint8_t effective = (rlen >= 5u) ? resp[4] : policy;
+    printf("update policy set to: %s\n", effective == 1 ? "auto" : "notify");
+    return 0;
+}
+
 /* ── Subcommands: pause / resume ─────────────────────────────────────────── */
 
 /*
@@ -1494,6 +1575,14 @@ static void print_usage(const char *prog) {
         "                                what's in the local sync cache\n"
         "  notify list                   Show your email notification preferences\n"
         "  notify set <category> on|off  Toggle one notification category\n"
+        "  update status                 Show update availability, install kind,\n"
+        "                                and current policy\n"
+        "  update apply                  Download, verify, and install an\n"
+        "                                available update now (portable installs\n"
+        "                                only; daemon restarts on success)\n"
+        "  update policy notify|auto     Set the auto-update consent policy\n"
+        "                                (notify: prompt only; auto: apply with\n"
+        "                                no prompt, for headless setups)\n"
         "  shutdown                      Ask the daemon to stop\n"
         "\n"
         "Options:\n"
@@ -2114,6 +2203,46 @@ int vw_client_cli_main(int argc, char *argv[], uint16_t ipc_port) {
             return cmd_notify_set(ipc_port, account_id, category, on_off);
         }
         fprintf(stderr, "Usage: %s notify list | notify set <category> on|off\n", argv[0]);
+        return 1;
+    }
+
+    if (strcmp(cmd, "update") == 0) {
+        HELP_IF_REQUESTED();
+        if (argi >= argc) {
+            fprintf(stderr, "Usage: %s update status | update apply | "
+                            "update policy notify|auto\n", argv[0]);
+            return 1;
+        }
+        const char *subcmd = argv[argi++];
+
+        if (strcmp(subcmd, "status") == 0) {
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) return 1;
+            int rc = cmd_update_status(c);
+            vw_ipc_conn_close(c);
+            return rc;
+        }
+        if (strcmp(subcmd, "apply") == 0) {
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) return 1;
+            int rc = cmd_update_apply(c);
+            vw_ipc_conn_close(c);
+            return rc;
+        }
+        if (strcmp(subcmd, "policy") == 0) {
+            if (argi >= argc) {
+                fprintf(stderr, "Usage: %s update policy notify|auto\n", argv[0]);
+                return 1;
+            }
+            const char *policy_str = argv[argi++];
+            vw_ipc_conn_t *c = cli_connect(ipc_port);
+            if (!c) return 1;
+            int rc = cmd_update_policy_set(c, policy_str);
+            vw_ipc_conn_close(c);
+            return rc;
+        }
+        fprintf(stderr, "Usage: %s update status | update apply | "
+                        "update policy notify|auto\n", argv[0]);
         return 1;
     }
 

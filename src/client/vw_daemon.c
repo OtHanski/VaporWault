@@ -787,6 +787,246 @@ static void delete_account_dir(const char *account_dir) {
 #endif
 }
 
+/* ── Client auto-update integration (TASK-00298, ARCHITECTURE.md Phase 23) ──
+ *
+ * Daemon-wide statics, same convention as g_shutdown/g_log_path elsewhere
+ * in this file — this daemon is single-threaded by design (see this
+ * file's own header comment), so no locking is needed. Set once at the
+ * top of vw_daemon_run(); read/written only from that same thread
+ * thereafter (including via vw_daemon_apply_update_now(), which is only
+ * ever called synchronously from the IPC dispatch path on this same
+ * thread — see handle_ipc_client).
+ *
+ * Placed before handle_ipc_client (below) rather than after, unlike the
+ * rest of this file's roughly chronological layout — handle_ipc_client's
+ * own new VW_IPC_UPDATE_*_REQ cases (TASK-00299) need these statics and
+ * functions declared first.
+ */
+static char               g_update_state_dir[512];
+static vw_update_policy_t g_update_policy = VW_UPDATE_POLICY_NOTIFY;
+static vw_daemon_update_status_t g_pending_update; /* zero-initialized: none available */
+static int64_t             g_last_auto_update_check = 0; /* unix seconds; 0 = never */
+#define VW_UPDATE_AUTO_CHECK_INTERVAL_SECS (24 * 60 * 60) /* daily */
+
+void vw_daemon_get_update_status(vw_daemon_update_status_t *out) {
+    if (!out) return;
+    *out = g_pending_update;
+    out->install_kind = vw_update_detect_install_kind();
+}
+
+/*
+ * Re-fetches and re-verifies the manifest fresh (never trusts the cached
+ * g_pending_update snapshot for the actual install decision — see this
+ * function's own doc comment in vw_daemon.h), downloads and verifies the
+ * matching asset, stages it, and on success sets g_shutdown so this
+ * process's own existing main-loop exit path takes over — no new "is it
+ * safe to restart" logic is invented here.
+ */
+vw_err_t vw_daemon_apply_update_now(void) {
+    if (!g_pending_update.available) return VW_ERR_NOT_FOUND;
+
+    /* SEC.07 finding (TASK-00298 review): this is the single choke point
+     * for every self-replacing update — both today's AUTO-policy caller
+     * and any future manual "Update Now" IPC handler (TASK-00299) — so the
+     * "portable archives only" boundary the whole feature's threat model
+     * depends on (ARCHITECTURE.md Phase 23, TASK-00291's disclosed risk)
+     * MUST be enforced right here, not left to whichever caller happens
+     * to remember to check first. A .deb/.rpm/.msi install's files are not
+     * ours to rename over. */
+    if (vw_update_detect_install_kind() != VW_UPDATE_KIND_PORTABLE) {
+        vw_log(LOG_WARN, "update apply: refused — this install is not a portable archive");
+        return VW_ERR_UPDATE_NOT_PORTABLE;
+    }
+
+    vw_update_manifest_t m;
+    vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "update apply: manifest re-fetch/verify failed: %d", (int)err);
+        return err;
+    }
+
+    char install_dir[600];
+    if (vw_client_self_exe_dir(install_dir, sizeof(install_dir)) != VW_OK) {
+        vw_log(LOG_WARN, "update apply: could not resolve own install directory");
+        return VW_ERR_IO;
+    }
+
+    char staging_dir[640];
+    snprintf(staging_dir, sizeof(staging_dir), "%s/update_staging", g_update_state_dir);
+    if (vw_fs_ensure_dir(staging_dir) != VW_OK) return VW_ERR_IO;
+
+    char archive_path[700];
+    err = vw_update_download_and_verify_asset(&m, staging_dir, archive_path, sizeof(archive_path));
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "update apply: asset download/verify failed: %d", (int)err);
+        return err;
+    }
+
+    err = vw_update_stage_and_apply(archive_path, install_dir);
+    if (err != VW_OK) {
+        vw_log(LOG_WARN, "update apply: stage/apply failed: %d", (int)err);
+        return err;
+    }
+
+    vw_log(LOG_INFO, "update to %s staged; restarting to apply", m.release_version);
+    g_shutdown = 1; /* reuse the existing graceful-shutdown path — see
+                        install_signal_handlers()'s SIGTERM handler,
+                        which sets this same flag */
+    return VW_OK;
+}
+
+/*
+ * Called on every reconnect/resume attempt that carried an update-hint
+ * (both the ordinary success path and the hard VW_ERR_PROTO_VERSION
+ * rejection — see vw_proto_update_hint_t's own doc comment for why both
+ * matter). Best-effort and never fatal to the caller's own connect flow:
+ * any failure here is logged and swallowed. When VW_UPDATE_POLICY_AUTO is
+ * configured, an update found available here is applied immediately with
+ * no prompt; NOTIFY (the default) only records it for later IPC/GUI
+ * surfacing (TASK-00299/300).
+ */
+static void handle_update_hint(const vw_proto_update_hint_t *hint) {
+    if (!hint || !hint->present) return;
+
+    vw_update_manifest_t m;
+    int available = 0;
+    vw_err_t err = vw_update_check_trigger(g_update_state_dir, hint->server_version, &m, &available);
+    if (err != VW_OK) {
+        vw_log(LOG_DEBUG, "update check failed (non-fatal): %d", (int)err);
+        return;
+    }
+    if (!available) return;
+
+    g_pending_update.available = 1;
+    /* server_version is the raw, untrusted hint the connected server just
+     * advertised (TASK-00299's IPC layout distinguishes it from
+     * manifest_version below, the independently-verified release) —
+     * informational only, never used for any trust decision (see
+     * vw_update_check_trigger, which already re-derived `available`
+     * above from the freshly-verified manifest, not from this string). */
+    snprintf(g_pending_update.server_version, sizeof(g_pending_update.server_version),
+             "%s", hint->server_version);
+    snprintf(g_pending_update.manifest_version, sizeof(g_pending_update.manifest_version),
+             "%s", m.release_version);
+    vw_log(LOG_INFO, "update available: %s (current: %s)", m.release_version, VW_VERSION_STRING);
+
+    if (g_update_policy == VW_UPDATE_POLICY_AUTO)
+        (void)vw_daemon_apply_update_now(); /* logs its own failures */
+}
+
+/*
+ * TASK-00298: the headless/auto-policy gap this exists to close — a
+ * fresh install with zero configured accounts (or one whose configured
+ * server is never newer) would otherwise never trigger
+ * handle_update_hint() above at all, so "fully automatic" wouldn't
+ * actually be automatic for that case. Deliberately independent of any
+ * server connection, and deliberately gated on AUTO only — the NOTIFY
+ * default stays purely reactive to a real server's hint, never phoning
+ * home to GitHub on a schedule a notify-mode user didn't ask for.
+ */
+static void maybe_run_daily_auto_check(void) {
+    if (g_update_policy != VW_UPDATE_POLICY_AUTO) return;
+
+    int64_t now = (int64_t)time(NULL);
+    if (!vw_update_daily_check_due(g_last_auto_update_check, now, VW_UPDATE_AUTO_CHECK_INTERVAL_SECS))
+        return;
+    g_last_auto_update_check = now;
+
+    vw_update_manifest_t m;
+    vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
+    if (err != VW_OK) {
+        vw_log(LOG_DEBUG, "daily auto-update check failed (non-fatal): %d", (int)err);
+        return;
+    }
+
+    if (vw_update_version_is_newer_than_current(m.release_version)) {
+        g_pending_update.available = 1;
+        /* No server connection in this path — nothing advertised a hint,
+         * so server_version stays empty rather than echoing the manifest
+         * version under a field that means something else (TASK-00299). */
+        g_pending_update.server_version[0] = '\0';
+        snprintf(g_pending_update.manifest_version, sizeof(g_pending_update.manifest_version),
+                 "%s", m.release_version);
+        vw_log(LOG_INFO, "daily check: update available: %s (current: %s)",
+               m.release_version, VW_VERSION_STRING);
+        (void)vw_daemon_apply_update_now(); /* AUTO policy already confirmed above */
+    }
+}
+
+/*
+ * Persists a runtime update_policy change (VW_IPC_UPDATE_POLICY_SET_REQ,
+ * TASK-00299) to daemon.conf, preserving every other existing line —
+ * same read-whole-file/replace-or-append-one-line/atomic-write idiom as
+ * vw_update_manifest.c's own write_update_sequence, deliberately
+ * duplicated rather than shared (that module's own header comment
+ * documents the same module-boundary discipline: vw_daemon_cfg_t is
+ * private to this file). Unlike vw_daemon_cfg_write_defaults (which only
+ * ever writes a brand-new file), this always rewrites an existing one.
+ */
+static vw_err_t persist_update_policy(const char *state_dir, vw_update_policy_t policy) {
+    char path[512];
+    int pathlen = snprintf(path, sizeof(path), "%s/%s", state_dir, CONFIG_FILE);
+    if (pathlen <= 0 || (size_t)pathlen >= sizeof(path)) return VW_ERR_INVALID_ARG;
+
+    void *buf = NULL; size_t len = 0;
+    int had_file = (vw_fs_read_file(path, &buf, &len) == VW_OK);
+
+    static const char key[] = "update_policy";
+    size_t key_len = sizeof(key) - 1;
+
+    size_t out_cap = len + 64;
+    char *out = (char *)malloc(out_cap);
+    if (!out) { free(buf); return VW_ERR_OOM; }
+    size_t out_len = 0;
+
+    if (had_file) {
+        const char *p = (const char *)buf;
+        const char *end = p + len;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            const char *line_end = nl ? nl + 1 : end; /* include the \n if present */
+            size_t chunk_len = (size_t)(line_end - p);
+            size_t bare_len = nl ? (size_t)(nl - p) : chunk_len;
+
+            const char *kp = p;
+            while (kp < p + bare_len && (*kp == ' ' || *kp == '\t')) kp++;
+            size_t rem = bare_len - (size_t)(kp - p);
+            int is_policy_line = (rem > key_len && strncmp(kp, key, key_len) == 0 &&
+                                   (kp[key_len] == ' ' || kp[key_len] == '\t' || kp[key_len] == '='));
+
+            if (!is_policy_line) {
+                if (out_len + chunk_len > out_cap) {
+                    out_cap = (out_len + chunk_len) * 2;
+                    char *grown = (char *)realloc(out, out_cap);
+                    if (!grown) { free(out); free(buf); return VW_ERR_OOM; }
+                    out = grown;
+                }
+                memcpy(out + out_len, p, chunk_len);
+                out_len += chunk_len;
+            }
+            p = line_end;
+        }
+    }
+    free(buf);
+
+    char policy_line[64];
+    int pn = snprintf(policy_line, sizeof(policy_line), "update_policy = %s\n",
+                       policy == VW_UPDATE_POLICY_AUTO ? "auto" : "notify");
+    if (pn <= 0 || (size_t)pn >= sizeof(policy_line)) { free(out); return VW_ERR_INVALID_ARG; }
+    if (out_len + (size_t)pn > out_cap) {
+        out_cap = out_len + (size_t)pn;
+        char *grown = (char *)realloc(out, out_cap);
+        if (!grown) { free(out); return VW_ERR_OOM; }
+        out = grown;
+    }
+    memcpy(out + out_len, policy_line, (size_t)pn);
+    out_len += (size_t)pn;
+
+    vw_err_t err = vw_fs_atomic_write(path, out, out_len);
+    free(out);
+    return err;
+}
+
 /* ── IPC dispatch ────────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -2244,6 +2484,55 @@ static void handle_ipc_client(vw_ipc_conn_t *conn, ipc_dispatch_ctx_t *dc) {
         break;
     }
 
+    /* Client auto-update (TASK-00298/00299) — daemon-global, not
+     * account-scoped; see vw_ipc.h's payload doc for the full field
+     * layouts and rationale. */
+    case VW_IPC_UPDATE_STATUS_REQ: {
+        vw_daemon_update_status_t st;
+        vw_daemon_get_update_status(&st);
+
+        uint8_t rbuf[4 + 2 + sizeof(st.server_version) + 2 + sizeof(st.manifest_version) + 2];
+        uint32_t roff = 0;
+        rbuf[roff++] = (uint8_t)st.available;
+        uint16_t svlen = (uint16_t)strnlen(st.server_version, sizeof(st.server_version));
+        vw_ipc_write_str(rbuf, sizeof(rbuf), &roff, st.server_version, svlen);
+        uint16_t mvlen = (uint16_t)strnlen(st.manifest_version, sizeof(st.manifest_version));
+        vw_ipc_write_str(rbuf, sizeof(rbuf), &roff, st.manifest_version, mvlen);
+        rbuf[roff++] = (uint8_t)st.install_kind;
+        rbuf[roff++] = (uint8_t)g_update_policy; /* trailing field, see vw_ipc.h's payload doc */
+        vw_ipc_send(conn, VW_IPC_UPDATE_STATUS_RESP, rbuf, roff);
+        break;
+    }
+
+    case VW_IPC_UPDATE_APPLY_REQ: {
+        vw_err_t rc = vw_daemon_apply_update_now();
+        ipc_send_u32(conn, VW_IPC_UPDATE_APPLY_ACK, (uint32_t)rc);
+        break;
+    }
+
+    case VW_IPC_UPDATE_POLICY_SET_REQ: {
+        if (plen < 1u) {
+            uint8_t rbuf[5];
+            vw_write_u32le(rbuf, (uint32_t)VW_ERR_PROTO_TRUNCATED);
+            rbuf[4] = (uint8_t)g_update_policy;
+            vw_ipc_send(conn, VW_IPC_UPDATE_POLICY_SET_ACK, rbuf, sizeof(rbuf));
+            break;
+        }
+        uint8_t requested = buf[0];
+        vw_err_t rc = VW_OK;
+        if (requested != (uint8_t)VW_UPDATE_POLICY_NOTIFY && requested != (uint8_t)VW_UPDATE_POLICY_AUTO) {
+            rc = VW_ERR_INVALID_ARG; /* a live request, never silently coerced to a default */
+        } else {
+            g_update_policy = (vw_update_policy_t)requested;
+            rc = persist_update_policy(g_update_state_dir, g_update_policy);
+        }
+        uint8_t rbuf[5];
+        vw_write_u32le(rbuf, (uint32_t)rc);
+        rbuf[4] = (uint8_t)g_update_policy;
+        vw_ipc_send(conn, VW_IPC_UPDATE_POLICY_SET_ACK, rbuf, sizeof(rbuf));
+        break;
+    }
+
     default:
         break; /* unknown message: ignore */
     }
@@ -2267,153 +2556,6 @@ static void account_set_conn(vw_account_ctx_t *a, vw_client_sess_t *sess,
     a->conn_mode = sess ? mode : VW_ACCOUNT_CONN_OFFLINE;
     vw_sync_set_session(a->sync_ctx, a->sess);
     vw_sync_set_read_only(a->sync_ctx, a->conn_mode == VW_ACCOUNT_CONN_FALLBACK);
-}
-
-/* ── Client auto-update integration (TASK-00298, ARCHITECTURE.md Phase 23) ──
- *
- * Daemon-wide statics, same convention as g_shutdown/g_log_path elsewhere
- * in this file — this daemon is single-threaded by design (see this
- * file's own header comment), so no locking is needed. Set once at the
- * top of vw_daemon_run(); read/written only from that same thread
- * thereafter (including via vw_daemon_apply_update_now(), which is only
- * ever called synchronously from the IPC dispatch path on this same
- * thread — see handle_ipc_client).
- */
-static char               g_update_state_dir[512];
-static vw_update_policy_t g_update_policy = VW_UPDATE_POLICY_NOTIFY;
-static vw_daemon_update_status_t g_pending_update; /* zero-initialized: none available */
-static int64_t             g_last_auto_update_check = 0; /* unix seconds; 0 = never */
-#define VW_UPDATE_AUTO_CHECK_INTERVAL_SECS (24 * 60 * 60) /* daily */
-
-void vw_daemon_get_update_status(vw_daemon_update_status_t *out) {
-    if (out) *out = g_pending_update;
-}
-
-/*
- * Re-fetches and re-verifies the manifest fresh (never trusts the cached
- * g_pending_update snapshot for the actual install decision — see this
- * function's own doc comment in vw_daemon.h), downloads and verifies the
- * matching asset, stages it, and on success sets g_shutdown so this
- * process's own existing main-loop exit path takes over — no new "is it
- * safe to restart" logic is invented here.
- */
-vw_err_t vw_daemon_apply_update_now(void) {
-    if (!g_pending_update.available) return VW_ERR_NOT_FOUND;
-
-    /* SEC.07 finding (TASK-00298 review): this is the single choke point
-     * for every self-replacing update — both today's AUTO-policy caller
-     * and any future manual "Update Now" IPC handler (TASK-00299) — so the
-     * "portable archives only" boundary the whole feature's threat model
-     * depends on (ARCHITECTURE.md Phase 23, TASK-00291's disclosed risk)
-     * MUST be enforced right here, not left to whichever caller happens
-     * to remember to check first. A .deb/.rpm/.msi install's files are not
-     * ours to rename over. */
-    if (vw_update_detect_install_kind() != VW_UPDATE_KIND_PORTABLE) {
-        vw_log(LOG_WARN, "update apply: refused — this install is not a portable archive");
-        return VW_ERR_UPDATE_NOT_PORTABLE;
-    }
-
-    vw_update_manifest_t m;
-    vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
-    if (err != VW_OK) {
-        vw_log(LOG_WARN, "update apply: manifest re-fetch/verify failed: %d", (int)err);
-        return err;
-    }
-
-    char install_dir[600];
-    if (vw_client_self_exe_dir(install_dir, sizeof(install_dir)) != VW_OK) {
-        vw_log(LOG_WARN, "update apply: could not resolve own install directory");
-        return VW_ERR_IO;
-    }
-
-    char staging_dir[640];
-    snprintf(staging_dir, sizeof(staging_dir), "%s/update_staging", g_update_state_dir);
-    if (vw_fs_ensure_dir(staging_dir) != VW_OK) return VW_ERR_IO;
-
-    char archive_path[700];
-    err = vw_update_download_and_verify_asset(&m, staging_dir, archive_path, sizeof(archive_path));
-    if (err != VW_OK) {
-        vw_log(LOG_WARN, "update apply: asset download/verify failed: %d", (int)err);
-        return err;
-    }
-
-    err = vw_update_stage_and_apply(archive_path, install_dir);
-    if (err != VW_OK) {
-        vw_log(LOG_WARN, "update apply: stage/apply failed: %d", (int)err);
-        return err;
-    }
-
-    vw_log(LOG_INFO, "update to %s staged; restarting to apply", m.release_version);
-    g_shutdown = 1; /* reuse the existing graceful-shutdown path — see
-                        install_signal_handlers()'s SIGTERM handler,
-                        which sets this same flag */
-    return VW_OK;
-}
-
-/*
- * Called on every reconnect/resume attempt that carried an update-hint
- * (both the ordinary success path and the hard VW_ERR_PROTO_VERSION
- * rejection — see vw_proto_update_hint_t's own doc comment for why both
- * matter). Best-effort and never fatal to the caller's own connect flow:
- * any failure here is logged and swallowed. When VW_UPDATE_POLICY_AUTO is
- * configured, an update found available here is applied immediately with
- * no prompt; NOTIFY (the default) only records it for later IPC/GUI
- * surfacing (TASK-00299/300).
- */
-static void handle_update_hint(const vw_proto_update_hint_t *hint) {
-    if (!hint || !hint->present) return;
-
-    vw_update_manifest_t m;
-    int available = 0;
-    vw_err_t err = vw_update_check_trigger(g_update_state_dir, hint->server_version, &m, &available);
-    if (err != VW_OK) {
-        vw_log(LOG_DEBUG, "update check failed (non-fatal): %d", (int)err);
-        return;
-    }
-    if (!available) return;
-
-    g_pending_update.available = 1;
-    snprintf(g_pending_update.server_version, sizeof(g_pending_update.server_version),
-             "%s", m.release_version);
-    vw_log(LOG_INFO, "update available: %s (current: %s)", m.release_version, VW_VERSION_STRING);
-
-    if (g_update_policy == VW_UPDATE_POLICY_AUTO)
-        (void)vw_daemon_apply_update_now(); /* logs its own failures */
-}
-
-/*
- * TASK-00298: the headless/auto-policy gap this exists to close — a
- * fresh install with zero configured accounts (or one whose configured
- * server is never newer) would otherwise never trigger
- * handle_update_hint() above at all, so "fully automatic" wouldn't
- * actually be automatic for that case. Deliberately independent of any
- * server connection, and deliberately gated on AUTO only — the NOTIFY
- * default stays purely reactive to a real server's hint, never phoning
- * home to GitHub on a schedule a notify-mode user didn't ask for.
- */
-static void maybe_run_daily_auto_check(void) {
-    if (g_update_policy != VW_UPDATE_POLICY_AUTO) return;
-
-    int64_t now = (int64_t)time(NULL);
-    if (!vw_update_daily_check_due(g_last_auto_update_check, now, VW_UPDATE_AUTO_CHECK_INTERVAL_SECS))
-        return;
-    g_last_auto_update_check = now;
-
-    vw_update_manifest_t m;
-    vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
-    if (err != VW_OK) {
-        vw_log(LOG_DEBUG, "daily auto-update check failed (non-fatal): %d", (int)err);
-        return;
-    }
-
-    if (vw_update_version_is_newer_than_current(m.release_version)) {
-        g_pending_update.available = 1;
-        snprintf(g_pending_update.server_version, sizeof(g_pending_update.server_version),
-                 "%s", m.release_version);
-        vw_log(LOG_INFO, "daily check: update available: %s (current: %s)",
-               m.release_version, VW_VERSION_STRING);
-        (void)vw_daemon_apply_update_now(); /* AUTO policy already confirmed above */
-    }
 }
 
 /* Try a session-token resume against the primary. Returns NULL (offline)

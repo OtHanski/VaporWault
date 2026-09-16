@@ -233,6 +233,16 @@ typedef enum {
      * future caller that wants a full subtree in one round trip. */
     VW_IPC_SHARED_FOLDER_LIST_REQ  = 0x804F, /* C→D: account_id + dir_file_id + recursive(u8) */
     VW_IPC_SHARED_FOLDER_LIST_RESP = 0x8050, /* D→C: error_code + count + vw_file_entry_t-shaped entries (see payload doc below) */
+
+    /* Client auto-update (TASK-00298, TASK-00299) — daemon-global, not
+     * account-scoped (an update applies to the daemon binary itself, not
+     * any one account's session). */
+    VW_IPC_UPDATE_STATUS_REQ      = 0x8051, /* C→D: query current update state (no payload) */
+    VW_IPC_UPDATE_STATUS_RESP     = 0x8052, /* D→C: available(u8) + server_version + manifest_version + install_kind(u8) */
+    VW_IPC_UPDATE_APPLY_REQ       = 0x8053, /* C→D: user clicked "Update Now" (no payload) */
+    VW_IPC_UPDATE_APPLY_ACK       = 0x8054, /* D→C: error_code (daemon restarts itself on success) */
+    VW_IPC_UPDATE_POLICY_SET_REQ  = 0x8055, /* C→D: policy(u8: 0=notify, 1=auto) */
+    VW_IPC_UPDATE_POLICY_SET_ACK  = 0x8056, /* D→C: error_code + policy(u8) echoed back */
 } vw_ipc_msg_t;
 
 /*
@@ -707,6 +717,75 @@ typedef enum {
  *   daemon's own local sync cache, which has no entries for a shared
  *   folder the caller hasn't explicitly added as a sync target via
  *   VW_IPC_FOLDER_ADD_SHARED_REQ)
+ *
+ * VW_IPC_UPDATE_STATUS_REQ (TASK-00299): no payload.
+ * VW_IPC_UPDATE_STATUS_RESP:
+ *   u8     available          1 = a newer, independently ECDSA-verified
+ *                              release has been observed; 0 otherwise
+ *                              (every other field below is empty/0 when 0)
+ *   string server_version     the raw hint last advertised by whichever
+ *                              server this daemon is connected to
+ *                              (informational/untrusted — TASK-00298's own
+ *                              trust model never acts on this string
+ *                              itself; empty if the connection that
+ *                              triggered this check wasn't a server hint
+ *                              at all, e.g. the headless daily auto-check)
+ *   string manifest_version   the verified manifest's own release_version
+ *                              — what VW_IPC_UPDATE_APPLY_REQ below would
+ *                              actually install; empty if available == 0
+ *   u8     install_kind       vw_update_install_kind_t (0=PORTABLE,
+ *                              1=PACKAGE_OR_UNKNOWN), recomputed fresh on
+ *                              every query, never cached — a client MUST
+ *                              check this before ever showing an
+ *                              "Update Now" affordance (TASK-00300); a
+ *                              non-PORTABLE install only ever gets
+ *                              notify-only UI, and VW_IPC_UPDATE_APPLY_REQ
+ *                              itself independently refuses (see below) —
+ *                              this field exists so the UI doesn't have to
+ *                              round-trip an apply attempt just to learn
+ *                              that
+ *   u8     policy              the update_policy currently in effect
+ *                              (0=notify, 1=auto) — trailing field, same
+ *                              append convention as every other _RESP's
+ *                              trailing fields in this file (e.g.
+ *                              STATUS_RESP's any_on_fallback); lets
+ *                              VW_IPC_UPDATE_POLICY_SET_REQ's own effect
+ *                              be confirmed by a subsequent plain status
+ *                              query, not only by that request's own ACK
+ *
+ * VW_IPC_UPDATE_APPLY_REQ (TASK-00299): no payload. Requires
+ *   VW_IPC_UPDATE_STATUS_RESP.available == 1 as observed by a prior status
+ *   query — but, like every other step in this pipeline, the daemon
+ *   re-verifies everything itself rather than trusting the caller's own
+ *   most recent status snapshot.
+ * VW_IPC_UPDATE_APPLY_ACK:
+ *   u32    error_code         vw_err_t; 0 = VW_OK, in which case the
+ *                              daemon has already staged the update and
+ *                              triggered its own graceful-shutdown path —
+ *                              the connection may close before or shortly
+ *                              after this ACK is even read.
+ *                              VW_ERR_NOT_FOUND if nothing is available
+ *                              (matches STATUS_RESP.available == 0).
+ *                              VW_ERR_UPDATE_NOT_PORTABLE if this install
+ *                              isn't a portable archive (see
+ *                              install_kind above — this is the daemon's
+ *                              own independent enforcement of the same
+ *                              boundary, not merely a UI-side convention).
+ *                              Any other vw_err_t code from a
+ *                              re-fetch/verify/download/stage failure.
+ *
+ * VW_IPC_UPDATE_POLICY_SET_REQ (TASK-00299):
+ *   u8     policy              0 = notify, 1 = auto; any other value is
+ *                               VW_ERR_INVALID_ARG (never silently coerced
+ *                               to a default the way a malformed
+ *                               daemon.conf value fails-safe to NOTIFY —
+ *                               this is a live request, not a config
+ *                               parse, so a malformed one is reported).
+ * VW_IPC_UPDATE_POLICY_SET_ACK:
+ *   u32    error_code           vw_err_t; 0 = VW_OK
+ *   u8     policy                the policy now in effect (echoed back so
+ *                                 the caller doesn't have to separately
+ *                                 assume the write succeeded)
  */
 
 /* ── Opaque types ────────────────────────────────────────────────────────── */

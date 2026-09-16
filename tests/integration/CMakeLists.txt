@@ -224,6 +224,37 @@ set_tests_properties(integration_update_apply PROPERTIES
     LABELS  "integration;update"
 )
 
+# test_ipc_update: TASK-00299 — the UPDATE_* IPC messages and the
+# "vapourwault-cli update ..." subcommand group, exercised end-to-end
+# against the real built vapourwault-daemon + vapourwault-cli binaries.
+# No server/account needed — every UPDATE_* message is daemon-global.
+
+add_executable(test_ipc_update
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_ipc_update.c
+)
+add_dependencies(test_ipc_update vapourwault-daemon vapourwault-cli)
+target_compile_definitions(test_ipc_update PRIVATE
+    VW_DAEMON_EXE_PATH=\"$<TARGET_FILE:vapourwault-daemon>\"
+    VW_CLI_EXE_PATH=\"$<TARGET_FILE:vapourwault-cli>\"
+)
+# Root-caused (CLI.02, 2026-09-16 — see TASK-00299's Notes for the full
+# investigation and TASK-00306 for the underlying daemon-loop finding
+# filed separately): this test's daemon.conf pins sync_interval_ms to 200
+# (not the real 30000 default) specifically to avoid tripping
+# vw_watcher_wait()'s "blocks for the full timeout when there are zero
+# watched roots" behavior — with the real default, two IPC requests
+# issued moments apart (exactly what this test does) could
+# non-deterministically make the second one wait up to 30 real seconds
+# for the daemon's main loop to cycle back to its IPC-accept step. This
+# was originally misdiagnosed as a ctest-launch-specific sandbox artifact
+# before being root-caused via a debug build; see git history on this
+# file for that earlier (incorrect) comment.
+add_test(NAME integration_ipc_update COMMAND test_ipc_update)
+set_tests_properties(integration_ipc_update PROPERTIES
+    TIMEOUT 60
+    LABELS  "integration;update;ipc"
+)
+
 # test_updater_main: TASK-00298 — the standalone vapourwault-updater helper
 # (src/client/vw_updater_main.c). Invokes the REAL built binary as a
 # subprocess (it deliberately has no vw_core linkage — see its own header

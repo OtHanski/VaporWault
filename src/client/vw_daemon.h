@@ -36,6 +36,7 @@
  */
 
 #include "../core/vw_proto.h"
+#include "vw_client_core.h"   /* vw_update_install_kind_t */
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -74,7 +75,21 @@ typedef struct {
  */
 typedef struct {
     int  available;
-    char server_version[64];   /* the version a check last saw as available */
+    char server_version[64];    /* raw hint last advertised by the connected
+                                  * server (informational/untrusted — see
+                                  * vw_update.h; empty if the last check that
+                                  * found something available was the daily
+                                  * auto-policy timer, which has no server
+                                  * connection to get a hint from) */
+    char manifest_version[64];  /* the independently-verified manifest's own
+                                  * release_version — what "Update Now"
+                                  * would actually install; empty if
+                                  * available == 0 */
+    vw_update_install_kind_t install_kind; /* computed fresh on every query
+                                  * (a cheap filesystem check, TASK-00295) —
+                                  * never cached, so this can't go stale
+                                  * between an update becoming available and
+                                  * a caller actually checking it */
 } vw_daemon_update_status_t;
 
 /*
