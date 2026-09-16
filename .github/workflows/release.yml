@@ -137,31 +137,12 @@ jobs:
           sha256sum *.deb *.rpm > linux-packages.sha256
           cat linux-packages.sha256
 
-      # TASK-00288: detached GPG signatures over the .deb/.rpm artifacts and
-      # the checksum manifest, so a downloader can verify both file
-      # integrity (sha256) and real provenance (gpg) — see docs/RELEASE.md's
-      # signing section for the fingerprint, public key location, and
-      # verification steps. The private key/passphrase exist only as
-      # GitHub Actions secrets, imported into this ephemeral runner's
-      # keyring for this job's duration and discarded with it — never
-      # written to a committed file or build artifact. GitHub Actions
-      # masks both secrets automatically in log output since they're only
-      # ever referenced via `secrets.*`.
-      - name: Import GPG release signing key
-        env:
-          GPG_SIGNING_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_PRIVATE_KEY }}
-        run: echo "$GPG_SIGNING_PRIVATE_KEY" | gpg --batch --import
-
-      - name: Sign .deb/.rpm packages
-        env:
-          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
-        run: |
-          for f in *.deb *.rpm linux-packages.sha256; do
-            gpg --batch --yes --pinentry-mode loopback \
-                --local-user "$GPG_SIGNING_KEY_ID" \
-                --passphrase-fd 0 --detach-sign --armor "$f" <<< "$GPG_SIGNING_PASSPHRASE"
-          done
-
+      # TASK-00304: GPG signing of every release asset (this job's
+      # tarball/.deb/.rpm included) now happens once, centrally, in the
+      # `publish` job — after every platform's artifacts are downloaded
+      # there — rather than duplicated per-platform-job with the private
+      # key imported into a fresh ephemeral keyring on every runner. See
+      # `publish`'s own "Sign release assets with GPG" step.
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -171,7 +152,6 @@ jobs:
             vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz.sha256
             *.deb
             *.rpm
-            *.asc
             linux-packages.sha256
           if-no-files-found: error
 
@@ -584,6 +564,56 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/update-signing-key.pem"
 
+      # TASK-00304: GPG signing of every release asset, centralized here —
+      # the private key is imported exactly once per release run, not
+      # duplicated across build-linux/build-windows/build-android as it
+      # was before this task (when only build-linux imported it, and only
+      # signed the .deb/.rpm/linux-packages.sha256 it itself produced,
+      # leaving the tarball/zip/apk/manifest unsigned). Same ephemeral-
+      # keyring custody as before: imported for this job's duration only,
+      # discarded with the runner at job end, never written to a
+      # committed file or build artifact, and GitHub Actions masks both
+      # secrets automatically since they're only ever referenced via
+      # `secrets.*`.
+      #
+      # Explicitly enumerated, not a blanket `dist/**/*` sweep — every
+      # asset TASK-00304's own design calls for (the Linux tarball,
+      # Windows zip, Android APK, update-manifest.json) plus the
+      # pre-existing .deb/.rpm/linux-packages.sha256 set (moved here from
+      # build-linux, not newly added). Deliberately excludes the .msi
+      # installers and windows-packages.sha256: the .msi's signing story
+      # is Authenticode, a separate, already-recorded "staying unsigned"
+      # decision (docs/RELEASE.md) that a GPG .asc wouldn't change
+      # anything about, and extending to windows-packages.sha256 without
+      # a corresponding user-facing decision to do so was judged outside
+      # this task's own explicit scope — see this task's own Notes for
+      # the reasoning, flagged for SEC.07/CQR.08 to weigh in on rather
+      # than assumed uncontroversial.
+      - name: Import GPG release signing key
+        env:
+          GPG_SIGNING_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_PRIVATE_KEY }}
+        run: echo "$GPG_SIGNING_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign release assets with GPG
+        env:
+          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: |
+          set -e
+          FILES_TO_SIGN=(
+            "dist/linux-release/vaporwault-${TAG}-linux-x86_64.tar.gz"
+            dist/linux-release/*.deb
+            dist/linux-release/*.rpm
+            "dist/linux-release/linux-packages.sha256"
+            "dist/windows-release/vaporwault-${TAG}-windows-x86_64.zip"
+            "dist/android-release/vaporwault-${TAG}-android.apk"
+            "update-manifest.json"
+          )
+          for f in "${FILES_TO_SIGN[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --local-user "$GPG_SIGNING_KEY_ID" \
+                --passphrase-fd 0 --detach-sign --armor "$f" <<< "$GPG_SIGNING_PASSPHRASE"
+          done
+
       # Re-running this workflow for a tag that was already published (e.g. after
       # a transient failure) uploads/overwrites assets instead of hard-failing
       # with "release already exists". TAG/REPO come from workflow-level `env:`
@@ -605,6 +635,7 @@ jobs:
               dist/android-release/* \
               update-manifest.json \
               update-manifest.json.sig \
+              update-manifest.json.asc \
               --repo "$REPO" \
               --clobber
           else
@@ -614,6 +645,7 @@ jobs:
               dist/android-release/* \
               update-manifest.json \
               update-manifest.json.sig \
+              update-manifest.json.asc \
               --repo "$REPO" \
               --title "VaporWault $TAG" \
               --generate-notes

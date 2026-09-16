@@ -157,7 +157,8 @@ its usual SmartScreen/unknown-publisher prompt for the `.msi`.
 full-project review after the `v0.5.0` release-build break exposed how
 little the release pipeline itself was being exercised end-to-end:**
 
-- **Linux `.deb`/`.rpm` — GPG signing: implemented (`TASK-00288`).** A
+- **Every release asset — GPG signing: implemented (`TASK-00288`, scope
+  widened to all assets and centralized by `TASK-00304`).** A
   project-dedicated ed25519 signing key, User ID `VaporWault Releases`,
   fingerprint:
 
@@ -168,27 +169,53 @@ little the release pipeline itself was being exercised end-to-end:**
   (expires 2029-09-13 — extend it with `gpg --edit-key`/`expire` before
   then, or generate a fresh key and update this section if it ever
   lapses unextended). The public key is committed at
-  `packaging/signing/vaporwault-releases-pubkey.asc`. `release.yml`'s
-  `build-linux` job imports the private key from a `GPG_SIGNING_PRIVATE_KEY`
-  GitHub Actions secret (passphrase in a separate `GPG_SIGNING_PASSPHRASE`
-  secret) fresh for each run, produces a detached, ASCII-armored `.asc`
-  signature for every `.deb`/`.rpm` and for `linux-packages.sha256`, and
-  the imported key is discarded with the ephemeral runner at job end —
-  neither secret is ever written to a committed file or a build artifact,
-  and GitHub Actions masks both automatically in workflow log output
-  since they're only ever referenced via `secrets.*`.
+  `packaging/signing/vaporwault-releases-pubkey.asc`.
 
-  To verify a downloaded package:
+  Signing happens once, centrally, in the `publish` job — not per-platform
+  build job — after all three platform artifacts (`dist/linux-release/`,
+  `dist/windows-release/`, `dist/android-release/`) have been downloaded
+  and the `update-manifest.json` (see below) has been generated. `publish`
+  imports the private key from a `GPG_SIGNING_PRIVATE_KEY` GitHub Actions
+  secret (passphrase in a separate `GPG_SIGNING_PASSPHRASE` secret) fresh
+  for that run, produces a detached, ASCII-armored `.asc` signature for
+  every published asset — the Linux `.tar.gz`, `.deb`, `.rpm`, and
+  `linux-packages.sha256`, the Windows `.zip`, the Android `.apk`, and
+  `update-manifest.json` — and the imported key is discarded (`if:
+  always()`) immediately after the signing step, before the release is
+  created. Neither secret is ever written to a committed file or a build
+  artifact, and GitHub Actions masks both automatically in workflow log
+  output since they're only ever referenced via `secrets.*`.
+
+  Deliberately excluded from this GPG pass: the Windows `.msi` (Authenticode
+  is the correct signing mechanism there — a separate, already-recorded
+  decision, see below — and GPG signatures carry no execution-trust meaning
+  on Windows anyway) and `windows-packages.sha256` (not part of this task's
+  requested scope; revisit if a concrete need for it comes up).
+
+  To verify a downloaded asset:
 
   ```sh
   gpg --import packaging/signing/vaporwault-releases-pubkey.asc
   gpg --verify vaporwault-server_X.Y.Z_amd64.deb.asc vaporwault-server_X.Y.Z_amd64.deb
+  gpg --verify vaporwault-vX.Y.Z-linux-x86_64.tar.gz.asc vaporwault-vX.Y.Z-linux-x86_64.tar.gz
+  gpg --verify vaporwault-vX.Y.Z-windows-x86_64.zip.asc vaporwault-vX.Y.Z-windows-x86_64.zip
+  gpg --verify vaporwault-vX.Y.Z-android.apk.asc vaporwault-vX.Y.Z-android.apk
   ```
 
   A successful check prints `Good signature from "VaporWault Releases"` —
   also compare the fingerprint GPG reports against the one above, since a
   "good signature" only means *some* imported key signed it, not
   necessarily this project's.
+
+  **`update-manifest.json` carries two independent signatures for two
+  independent purposes**: `update-manifest.json.sig` is the ECDSA P-256
+  signature the client's own auto-update code verifies automatically at
+  runtime (§4 below) — a hand-rolled, minimal-surface scheme chosen
+  specifically so the client never needs an OpenPGP parser linked in.
+  `update-manifest.json.asc` is this GPG signature, for a human verifying
+  the manifest by hand with tools they already have; the client never
+  parses or checks it. Neither supersedes the other — both must keep
+  verifying correctly against their respective keys.
 
 - **Windows `.msi` — Authenticode: staying unsigned, deliberately, not
   revisited as a live gap anymore.** A real code-signing certificate
