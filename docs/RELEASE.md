@@ -354,6 +354,27 @@ sha256sum -c vaporwault-v0.2.0-linux-x86_64.tar.gz.sha256
 # compare against the contents of the .sha256 file
 ```
 
+**`update-manifest.json`** (`TASK-00301`; ARCHITECTURE.md Phase 23) ships
+alongside every release, with a detached ECDSA P-256 signature,
+`update-manifest.json.sig` — this is what every client's own auto-update
+check verifies before ever trusting the manifest's contents (never a
+manual step for an end user; documented here purely for anyone wanting to
+confirm the release pipeline signed it correctly). The public key is
+compiled into the client (`src/core/vw_update_pubkey.h`), generated via
+`packaging/signing/gen_update_keypair.sh` and also committed in PEM form
+at `packaging/signing/update-manifest-pubkey.pem`:
+
+```sh
+openssl dgst -sha256 -verify packaging/signing/update-manifest-pubkey.pem \
+  -signature update-manifest.json.sig update-manifest.json
+```
+
+This is a **separate key from the GPG packaging key** above — see
+`ARCHITECTURE.md`'s "Client auto-update: manifest signing key" decision
+row for why (no OpenPGP parsing exists anywhere in the client, and
+vendoring a full OpenPGP library to verify one small file conflicts with
+this project's minimal-dependencies constraint).
+
 ## 5. SDL2 vendoring (Windows GUI build)
 
 Linux release builds get SDL2 from the system package manager
@@ -417,6 +438,14 @@ building this feature, not a hypothetical.
   root during install/removal on the end user's machine, and the client MSI's
   custom action shells out to PowerShell (`packaging/windows/wix/`) — reviewed
   for the same class of argument-injection risk as above; see `TASK-153`.
+- The `publish` job's `UPDATE_SIGNING_KEY` secret (`TASK-00293`/`00301`) is
+  materialized to a runner-local temp file only for the single step that
+  signs `update-manifest.json`, then deleted immediately after by the very
+  next step regardless of outcome (`if: always()`) — same ephemeral-runner
+  custody pattern as the GPG/Android keystore secrets above. This secret
+  must be added to the repo (Settings → Secrets and variables → Actions)
+  before the first release build that needs it; the corresponding public
+  key is already committed (see §4 above).
 
 ## 8. Known limitations / follow-ups
 
@@ -455,6 +484,22 @@ Tracked in `TASK-151`/`TASK-152.md` (installer packages, `TASK-145`):
 - Still not exercised automatically in CI: no automated test actually installs
   either Windows MSI on a real machine as part of a workflow run — all of the
   above was real but manual/local verification.
+
+Tracked in `TASK-00301` (update-manifest generation/signing):
+
+- Never yet exercised against a real GitHub Actions run — the `jq`
+  manifest-building/`openssl` signing shell logic was verified locally
+  (representative fake asset checksums, a real throwaway EC keypair, and
+  the actual `vw_crypto_ecdsa_p256_verify()` client code confirming the
+  exact `openssl dgst -sha256 -sign` output it produces verifies
+  correctly), and the "fetch the previous manifest, 404 means sequence
+  starts at 1" logic was reasoned through against `curl`'s own documented
+  behavior — but none of this has run on a real hosted runner yet. Watch
+  the `publish` job's "Generate update-manifest.json" step's log on the
+  first real release build.
+- `update-manifest.json` currently ships with only its ECDSA `.sig` —
+  `TASK-00304` (not yet implemented) will add a GPG `.asc` sidecar to it
+  too, alongside every other release asset.
 
 Tracked in `TASK-142` (web gateway + frontend deployment docs):
 
