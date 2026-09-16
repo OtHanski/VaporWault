@@ -21,6 +21,12 @@
  * TC-5: a second redirect (302 -> 302 -> ...) is a hard failure.
  * TC-6: malformed status line / missing Content-Length rejected, no crash.
  * TC-7: a server that accepts but never responds trips the recv timeout.
+ * TC-8: a redirect to a host outside the allowlist (SEC.07 finding) is
+ *       rejected before ever attempting to connect to it — this target
+ *       overrides VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_1 to "127.0.0.1" (see
+ *       CMakeLists.txt) so TC-4/5 above can still exercise real redirects
+ *       against the local test server while this case proves the
+ *       allowlist mechanism itself actually rejects anything else.
  */
 
 #include "vw_test.h"
@@ -345,6 +351,31 @@ VW_TEST_SUITE("update_net") {
 
         join_raw_srv(t1, &s1);
         join_raw_srv(t2, &s2);
+    }
+
+    /* ── TC-8: redirect to a disallowed host is rejected up front ────── */
+    VW_TEST_CASE("redirect to a host outside the allowlist is rejected") {
+        uint16_t port_a = (uint16_t)(TEST_PORT_BASE + 8);
+
+        /* No server is ever started at "evil.example.invalid" — if the
+         * allowlist check were missing or broken, this would fail as a
+         * connect/DNS error rather than the expected VW_ERR_UPDATE_NET
+         * rejection, so this still meaningfully distinguishes the two. */
+        static const char redirect_resp[] =
+            "HTTP/1.1 302 Found\r\nLocation: https://evil.example.invalid/final\r\n"
+            "Content-Length: 0\r\n\r\n";
+
+        raw_srv_args_t sa;
+        sa.cert_path = cert_path; sa.key_path = key_path; sa.port = port_a;
+        sa.response = redirect_resp; sa.response_len = sizeof(redirect_resp) - 1; sa.hang_instead = 0;
+        pthread_t tid = spawn_raw_srv(&sa);
+        VW_ASSERT_EQ(sa.bind_err, VW_OK);
+
+        vw_update_response_t out;
+        vw_err_t err = vw_update_https_get("127.0.0.1", port_a, "/start", 4096, &out);
+        VW_ASSERT_EQ(err, VW_ERR_UPDATE_NET);
+
+        join_raw_srv(tid, &sa);
     }
 
     /* ── TC-6: malformed response rejected, no crash ─────────────────── */

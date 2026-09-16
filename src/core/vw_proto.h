@@ -148,6 +148,14 @@ typedef enum {
     VW_ERR_UPDATE_ASSET_MISMATCH    = 805,  /* downloaded release asset's SHA-256
                                                 does not match the verified
                                                 manifest's declared value */
+    VW_ERR_UPDATE_NOT_PORTABLE      = 806,  /* self-replacing update refused:
+                                                vw_update_detect_install_kind()
+                                                did not report
+                                                VW_UPDATE_KIND_PORTABLE — a
+                                                .deb/.rpm/.msi (or unknown)
+                                                install is never
+                                                self-replaced (SEC.07 finding,
+                                                TASK-00298) */
 } vw_err_t;
 
 /* ── Message types ───────────────────────────────────────────────────────── */

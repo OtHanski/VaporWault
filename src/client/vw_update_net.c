@@ -5,6 +5,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 
 /* Bounds shared by every fetch this module ever makes — the manifest is
  * small, an asset archive is larger but still bounded; individual callers
@@ -165,8 +167,15 @@ static vw_err_t parse_response_head(const uint8_t *hdr, size_t hdr_len,
             numbuf[val_len] = '\0';
             for (size_t i = 0; i < val_len; i++)
                 if (numbuf[i] < '0' || numbuf[i] > '9') return VW_ERR_UPDATE_NET;
-            out->content_length = atol(numbuf);
-            if (out->content_length < 0) return VW_ERR_UPDATE_NET;
+            /* strtol, not atol (SEC.07 finding): atol's behavior on an
+             * out-of-range value is undefined per the C standard;
+             * strtol's is well-defined (clamps to LONG_MAX/MIN and sets
+             * errno=ERANGE), which this checks for explicitly. */
+            errno = 0;
+            char *endp = NULL;
+            long cl = strtol(numbuf, &endp, 10);
+            if (errno == ERANGE || !endp || *endp != '\0' || cl < 0) return VW_ERR_UPDATE_NET;
+            out->content_length = cl;
         } else if (name_len == 17 && ieq_n(line, "transfer-encoding", 17)) {
             if (val_len >= 7 && ieq_n(val, "chunked", 7))
                 out->chunked = 1;
@@ -205,6 +214,45 @@ void vw_update_net_test_set_connect_hook(
     g_connect_hook = fn;
 }
 #endif
+
+/*
+ * SEC.07 finding (TASK-00296 review): a redirect's target host was
+ * previously unrestricted (any https:// host, TLS-verified against its
+ * own identity, but not otherwise pinned) — a compromised or malicious
+ * response could redirect the manifest/asset fetch to an arbitrary HTTPS
+ * host. This restricts a followed redirect to GitHub's own real release
+ * infrastructure rather than trusting an open redirect. Exact match or a
+ * "." + suffix subdomain match; never a bare suffix match (which would
+ * wrongly also accept "evilgithub.com").
+ *
+ * The two allowed suffixes are overridable via target_compile_definitions
+ * (same convention as VW_UPDATE_GITHUB_HOST elsewhere in this pipeline) so
+ * a test build can point this restriction at its own local test server's
+ * host instead of disabling the check outright — proving the allowlist
+ * mechanism itself works, not bypassing it.
+ */
+#ifndef VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_1
+#define VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_1 "github.com"
+#endif
+#ifndef VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_2
+#define VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_2 "githubusercontent.com"
+#endif
+
+static int host_is_allowed_redirect_target(const char *host) {
+    static const char *const allowed_suffixes[] = {
+        VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_1,
+        VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_2,
+    };
+    size_t hlen = strlen(host);
+    for (size_t i = 0; i < sizeof(allowed_suffixes) / sizeof(allowed_suffixes[0]); i++) {
+        size_t slen = strlen(allowed_suffixes[i]);
+        if (hlen == slen && ieq_n(host, allowed_suffixes[i], slen)) return 1;
+        if (hlen > slen && host[hlen - slen - 1] == '.' &&
+            ieq_n(host + hlen - slen, allowed_suffixes[i], slen))
+            return 1;
+    }
+    return 0;
+}
 
 static vw_err_t do_connect_for_fetch(const char *host, uint16_t port,
                                       const vw_conn_opts_t *opts,
@@ -381,6 +429,7 @@ vw_err_t vw_update_https_get(const char *host, uint16_t port, const char *path,
         if (parse_https_url(head.location, next_host, sizeof(next_host),
                              &next_port, next_path, sizeof(next_path)) != VW_OK)
             return VW_ERR_UPDATE_NET;
+        if (!host_is_allowed_redirect_target(next_host)) return VW_ERR_UPDATE_NET;
 
         memcpy(cur_host, next_host, strlen(next_host) + 1);
         memcpy(cur_path, next_path, strlen(next_path) + 1);

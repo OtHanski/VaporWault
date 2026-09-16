@@ -40,6 +40,7 @@
 #else
 #  include <unistd.h>
 #  include <sys/types.h>
+#  include <sys/stat.h>
 #  include <signal.h>
 #  include <dirent.h>
 #  include <errno.h>
@@ -59,6 +60,23 @@ static void join_path(char *out, size_t out_sz, const char *dir, const char *nam
 #else
     snprintf(out, out_sz, "%s/%s", dir, name);
 #endif
+}
+
+/*
+ * SEC.07 finding (TASK-00298 review): this helper performs privileged
+ * file renames into --target and, before this check, relied entirely on
+ * the upstream `tar`/bsdtar extraction step's own anti-traversal defaults
+ * (no -P/--absolute-names) to keep a staged entry name from ever
+ * containing a path separator or "..". Belt-and-suspenders: reject any
+ * entry name this process wasn't expecting outright, rather than trusting
+ * a third-party tool's defaults as the only line of defense.
+ */
+static int is_safe_entry_name(const char *name) {
+    if (!name || name[0] == '\0') return 0;
+    if (strcmp(name, ".") == 0) return 0; /* ".." is already caught by the substring check below */
+    if (strchr(name, '/') || strchr(name, '\\')) return 0;
+    if (strstr(name, "..")) return 0;
+    return 1;
 }
 
 /* ── Wait (bounded) for the old process to exit ─────────────────────────
@@ -144,7 +162,7 @@ static void swap_all(const char *staging_dir, const char *target_dir) {
 
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        if (!is_safe_entry_name(fd.cFileName)) continue;
 
         char staged[600], current[600], backup[620];
         join_path(staged,  sizeof(staged),  staging_dir, fd.cFileName);
@@ -171,10 +189,23 @@ static void swap_all(const char *staging_dir, const char *target_dir) {
 
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        if (!is_safe_entry_name(e->d_name)) continue;
 
-        char staged[600], current[600], backup[620];
-        join_path(staged,  sizeof(staged),  staging_dir, e->d_name);
+        char staged[600];
+        join_path(staged, sizeof(staged), staging_dir, e->d_name);
+
+        /* Explicit directory skip (CQR.08 finding, TASK-00298 review):
+         * matches the Windows branch's own FILE_ATTRIBUTE_DIRECTORY check
+         * above — real release archives are flat today, but without this
+         * a nested directory entry would fall through to rename() below
+         * and get moved into target_dir wholesale under the wrong
+         * shape, rather than being deliberately out of scope like its
+         * Windows counterpart already is. stat(), not the dirent's own
+         * d_type, since DT_DIR isn't guaranteed on every filesystem. */
+        struct stat st;
+        if (stat(staged, &st) == 0 && S_ISDIR(st.st_mode)) continue;
+
+        char current[600], backup[620];
         join_path(current, sizeof(current), target_dir,  e->d_name);
         snprintf(backup, sizeof(backup), "%s.old", current);
 

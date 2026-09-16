@@ -16,7 +16,6 @@
 #  include <sys/types.h>
 #  include <sys/wait.h>
 #  include <signal.h>
-#  include <errno.h>
 #  include <time.h>
 #endif
 
@@ -26,23 +25,57 @@
  * (docs/RELEASE.md) are always plain MAJOR.MINOR.PATCH, so this is a
  * documented, accepted scope limit, not an oversight. */
 
-typedef struct { int major, minor, patch; } vw_semver_t;
+typedef struct { uint32_t major, minor, patch; } vw_semver_t;
+
+/* Parses exactly one run of ASCII digits (no sign, no leading/trailing
+ * junk within the run) into *out, advancing *s past it. Capped at 9
+ * digits — comfortably beyond any real version component and small
+ * enough that the accumulated value can never itself overflow uint32_t
+ * (10^9 < 2^32) — rather than sscanf's "%d" (SEC.07/CQR.08 finding:
+ * an attacker-influenced or merely garbled version/hint string with a
+ * long digit run makes %d's overflow UB per the C standard). */
+static int parse_uint_component(const char **s, uint32_t *out) {
+    const char *p = *s;
+    if (*p < '0' || *p > '9') return -1;
+    uint32_t v = 0;
+    int ndigits = 0;
+    while (*p >= '0' && *p <= '9') {
+        if (ndigits >= 9) return -1;
+        v = v * 10 + (uint32_t)(*p - '0');
+        p++; ndigits++;
+    }
+    *out = v;
+    *s = p;
+    return 0;
+}
 
 static int parse_semver(const char *s, vw_semver_t *out) {
     if (!s) return -1;
-    int n = sscanf(s, "%d.%d.%d", &out->major, &out->minor, &out->patch);
-    return (n == 3) ? 0 : -1;
+    if (parse_uint_component(&s, &out->major) != 0) return -1;
+    if (*s != '.') return -1;
+    s++;
+    if (parse_uint_component(&s, &out->minor) != 0) return -1;
+    if (*s != '.') return -1;
+    s++;
+    if (parse_uint_component(&s, &out->patch) != 0) return -1;
+    /* Trailing garbage after the third component (matches sscanf's own
+     * prior "%d.%d.%d" behavior, which likewise never required the
+     * string to end there) is accepted, not rejected. */
+    return 0;
 }
 
 /* Returns >0 if a > b, <0 if a < b, 0 if equal. Unparseable inputs sort as
- * "not newer" (never trigger a false-positive update prompt on garbage). */
+ * "not newer" (never trigger a false-positive update prompt on garbage).
+ * Component comparisons are done in a wider signed type so the result
+ * itself can never overflow int, regardless of how the caller uses it. */
 static int semver_cmp(const char *a_str, const char *b_str) {
     vw_semver_t a, b;
     if (parse_semver(a_str, &a) != 0) return 0;
     if (parse_semver(b_str, &b) != 0) return 0;
-    if (a.major != b.major) return a.major - b.major;
-    if (a.minor != b.minor) return a.minor - b.minor;
-    return a.patch - b.patch;
+    if (a.major != b.major) return (a.major > b.major) ? 1 : -1;
+    if (a.minor != b.minor) return (a.minor > b.minor) ? 1 : -1;
+    if (a.patch != b.patch) return (a.patch > b.patch) ? 1 : -1;
+    return 0;
 }
 
 int vw_update_version_is_newer_than_current(const char *candidate_version) {
@@ -89,6 +122,19 @@ vw_err_t vw_update_check_trigger(const char *state_dir,
 
 #define VW_UPDATE_ASSET_MAX_BYTES (256u * 1024u * 1024u) /* generous cap for a portable archive */
 
+/* Overridable via target_compile_definitions — same convention
+ * vw_update_manifest.c already established for its own GitHub fetch
+ * (CQR.08 finding, TASK-00298 review: this asset fetch had hardcoded the
+ * literals directly instead of following that convention, forcing tests
+ * to redirect via the connect hook alone rather than a matching host
+ * override). Production never overrides these. */
+#ifndef VW_UPDATE_GITHUB_HOST
+#define VW_UPDATE_GITHUB_HOST "github.com"
+#endif
+#ifndef VW_UPDATE_PORT
+#define VW_UPDATE_PORT 443u
+#endif
+
 static const vw_update_manifest_asset_t *find_matching_asset(const vw_update_manifest_t *m) {
     for (uint32_t i = 0; i < m->asset_count; i++) {
         const vw_update_manifest_asset_t *a = &m->assets[i];
@@ -118,7 +164,7 @@ vw_err_t vw_update_download_and_verify_asset(const vw_update_manifest_t *m,
 
     vw_update_response_t resp;
     memset(&resp, 0, sizeof(resp));
-    vw_err_t err = vw_update_https_get("github.com", 443, path,
+    vw_err_t err = vw_update_https_get(VW_UPDATE_GITHUB_HOST, (uint16_t)VW_UPDATE_PORT, path,
                                         VW_UPDATE_ASSET_MAX_BYTES, &resp);
     if (err != VW_OK) return VW_ERR_UPDATE_NET;
 

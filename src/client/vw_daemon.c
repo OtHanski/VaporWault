@@ -2300,6 +2300,19 @@ void vw_daemon_get_update_status(vw_daemon_update_status_t *out) {
 vw_err_t vw_daemon_apply_update_now(void) {
     if (!g_pending_update.available) return VW_ERR_NOT_FOUND;
 
+    /* SEC.07 finding (TASK-00298 review): this is the single choke point
+     * for every self-replacing update — both today's AUTO-policy caller
+     * and any future manual "Update Now" IPC handler (TASK-00299) — so the
+     * "portable archives only" boundary the whole feature's threat model
+     * depends on (ARCHITECTURE.md Phase 23, TASK-00291's disclosed risk)
+     * MUST be enforced right here, not left to whichever caller happens
+     * to remember to check first. A .deb/.rpm/.msi install's files are not
+     * ours to rename over. */
+    if (vw_update_detect_install_kind() != VW_UPDATE_KIND_PORTABLE) {
+        vw_log(LOG_WARN, "update apply: refused — this install is not a portable archive");
+        return VW_ERR_UPDATE_NOT_PORTABLE;
+    }
+
     vw_update_manifest_t m;
     vw_err_t err = vw_update_manifest_fetch_and_verify(g_update_state_dir, &m);
     if (err != VW_OK) {

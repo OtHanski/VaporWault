@@ -239,6 +239,26 @@ static vw_err_t jparse_string(jcur_t *c, char *out, size_t out_cap) {
     return VW_OK;
 }
 
+/*
+ * SEC.07 finding (TASK-00298 review): `filename` and `release_version`
+ * both eventually get spliced directly into local filesystem paths
+ * (vw_update.c's download/staging/extraction logic) — reachable today
+ * only through a validly ECDSA-signed manifest, but that's exactly the
+ * kind of upstream-trust assumption defense-in-depth exists for (a future
+ * or misconfigured CI generator deriving release_version from an
+ * externally-influenceable git tag, for instance — see release.yml's own
+ * comment on why TAG is never interpolated unsanitized into a shell
+ * script for the same underlying reason). Rejected here, at parse time,
+ * so no consumer of a successfully-parsed manifest ever has to re-derive
+ * this check itself.
+ */
+static int is_path_safe_component(const char *s) {
+    if (!s || s[0] == '\0') return 0;
+    if (strchr(s, '/') || strchr(s, '\\')) return 0;
+    if (strstr(s, "..")) return 0;
+    return 1;
+}
+
 static vw_err_t jparse_uint(jcur_t *c, uint64_t *out) {
     jskip_ws(c);
     if (c->p >= c->end || *c->p < '0' || *c->p > '9') return VW_ERR_UPDATE_MANIFEST_INVALID;
@@ -277,6 +297,8 @@ static vw_err_t jparse_asset(jcur_t *c, vw_update_manifest_asset_t *a) {
             err = jparse_string(c, a->dist_kind, sizeof(a->dist_kind));
         } else if (strcmp(key, "filename") == 0) {
             err = jparse_string(c, a->filename, sizeof(a->filename));
+            if (err == VW_OK && !is_path_safe_component(a->filename))
+                return VW_ERR_UPDATE_MANIFEST_INVALID;
         } else if (strcmp(key, "sha256") == 0) {
             char hex[65];
             err = jparse_string(c, hex, sizeof(hex));
@@ -332,7 +354,11 @@ vw_err_t vw_update_manifest_parse(const char *data, size_t len, vw_update_manife
                 if (err == VW_OK) have_sequence = 1;
             } else if (strcmp(key, "release_version") == 0) {
                 err = jparse_string(&c, out->release_version, sizeof(out->release_version));
-                if (err == VW_OK) have_release_version = 1;
+                if (err == VW_OK) {
+                    if (!is_path_safe_component(out->release_version))
+                        return VW_ERR_UPDATE_MANIFEST_INVALID;
+                    have_release_version = 1;
+                }
             } else if (strcmp(key, "min_client_protocol_version") == 0) {
                 uint64_t v;
                 err = jparse_uint(&c, &v);

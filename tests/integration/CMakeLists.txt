@@ -96,6 +96,7 @@ target_compile_definitions(test_update_net PRIVATE
     VW_UPDATE_RECV_TIMEOUT_MS=1500
     VW_UPDATE_CONNECT_TIMEOUT_MS=2000
     VW_UPDATE_TOTAL_READ_DEADLINE_SECS=3
+    VW_UPDATE_REDIRECT_ALLOWED_SUFFIX_1=\"127.0.0.1\"
 )
 target_include_directories(test_update_net PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core
@@ -183,12 +184,13 @@ set_tests_properties(integration_proto_update_hint PROPERTIES
 # test_update_apply: TASK-00298 — vw_update_download_and_verify_asset()
 # and vw_update_stage_and_apply()'s extraction/payload-directory-resolution
 # logic. Compiles its own copy of vw_update_net.c + vw_update.c with
-# VW_UPDATE_NET_TEST_HOOKS (a REDIRECTING connect hook — vw_update.c
-# hardcodes "github.com" with no compile-time override, unlike
-# vw_update_manifest.c, so the hook itself must ignore the host/port it's
-# called with; see the test's own header comment). Needs the real built
-# vapourwault-updater binary (VW_UPDATER_EXE_PATH) copied into a fake
-# install_dir so vw_update_stage_and_apply's own spawn step succeeds.
+# VW_UPDATE_NET_TEST_HOOKS (connect hook) plus VW_UPDATE_GITHUB_HOST/_PORT
+# (vw_update.c now follows the same override-macro convention
+# vw_update_manifest.c already established — CQR.08 finding, TASK-00298
+# review — so this target no longer needs a host-ignoring connect hook).
+# Needs the real built vapourwault-updater binary (VW_UPDATER_EXE_PATH)
+# copied into a fake install_dir so vw_update_stage_and_apply's own spawn
+# step succeeds.
 
 add_executable(test_update_apply
     ${CMAKE_CURRENT_SOURCE_DIR}/test_update_apply.c
@@ -199,6 +201,8 @@ add_executable(test_update_apply
 add_dependencies(test_update_apply vapourwault-updater)
 target_compile_definitions(test_update_apply PRIVATE
     VW_UPDATE_NET_TEST_HOOKS
+    VW_UPDATE_GITHUB_HOST=\"127.0.0.1\"
+    VW_UPDATE_PORT=43772
     VW_UPDATER_EXE_PATH=\"$<TARGET_FILE:vapourwault-updater>\"
     VW_TEST_SCRATCH_ROOT=\"${CMAKE_BINARY_DIR}/test_scratch\"
 )

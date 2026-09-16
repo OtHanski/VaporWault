@@ -3,15 +3,11 @@
  * vw_update_download_and_verify_asset() and vw_update_stage_and_apply()
  * (src/client/vw_update.c).
  *
- * Uses VW_UPDATE_NET_TEST_HOOKS (vw_update_net.c's test seam) with a
- * REDIRECTING connect hook: unlike test_update_manifest.c/test_update_net.c
- * (which use compile-time VW_UPDATE_GITHUB_HOST overrides inside the file
- * being tested), vw_update.c hardcodes "github.com" with no such override
- * — by design, it's the manifest's OWN signed, version-pinned URL that
- * matters in production, never a second `latest`. So this test's hook
- * ignores whatever host/port it's called with and always connects to the
- * local test server instead; the hook is exactly the seam meant for this
- * (see vw_update_net.h's own doc comment on the hook).
+ * Uses VW_UPDATE_NET_TEST_HOOKS (vw_update_net.c's test seam, connect-only
+ * — cert verification mode) together with this target's own
+ * VW_UPDATE_GITHUB_HOST/_PORT compile-time overrides (vw_update.c follows
+ * the same override-macro convention vw_update_manifest.c already
+ * established), same as test_update_manifest.c/test_update_net.c.
  *
  * TC-1: happy path — server serves an asset whose SHA-256 matches the
  *       manifest exactly; the verified bytes land on disk unmodified.
@@ -303,16 +299,15 @@ static void join_single_srv(pthread_t tid, single_srv_args_t *a) {
     pthread_cond_destroy(&a->cond);
 }
 
-/* Ignores whatever host/port vw_update.c thinks it's connecting to
- * ("github.com", 443) and always dials the local test server instead —
- * see this file's header comment for why this (not a compile-time host
- * override) is the right seam for vw_update.c specifically. */
-static vw_err_t redirect_connect_hook(const char *host, uint16_t port,
-                                       const vw_conn_opts_t *opts,
-                                       vw_conn_t **out_conn) {
-    (void)host; (void)port;
-    return vw_net_connect_generic("127.0.0.1", (uint16_t)TEST_PORT, VW_CERT_VERIFY_NONE,
-                                   NULL, opts, out_conn);
+/* vw_update.c's VW_UPDATE_GITHUB_HOST/_PORT overrides (see CMakeLists.txt)
+ * already point host/port at the local test server — this hook only
+ * needs to swap in VW_CERT_VERIFY_NONE, since the test server's cert is
+ * self-signed and can't satisfy the real VW_CERT_VERIFY_SYSTEM_STORE
+ * path, same as test_update_manifest.c's own test_connect_hook. */
+static vw_err_t test_connect_hook(const char *host, uint16_t port,
+                                   const vw_conn_opts_t *opts,
+                                   vw_conn_t **out_conn) {
+    return vw_net_connect_generic(host, port, VW_CERT_VERIFY_NONE, NULL, opts, out_conn);
 }
 
 static void make_manifest_with_asset(vw_update_manifest_t *m, const char *filename,
@@ -332,7 +327,7 @@ static void make_manifest_with_asset(vw_update_manifest_t *m, const char *filena
 
 VW_TEST_SUITE("update_apply") {
     VW_ASSERT_EQ(vw_crypto_init(), VW_OK);
-    vw_update_net_test_set_connect_hook(redirect_connect_hook);
+    vw_update_net_test_set_connect_hook(test_connect_hook);
 
     char tmpdir[512];
     make_tmpdir(tmpdir, sizeof(tmpdir));
