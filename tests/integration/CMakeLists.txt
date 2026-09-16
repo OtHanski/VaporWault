@@ -181,6 +181,15 @@ set_tests_properties(integration_proto_update_hint PROPERTIES
     LABELS  "integration;protocol"
 )
 
+# test_update_apply, test_ipc_update, test_updater_main all need the real
+# built vapourwault-updater/-daemon/-cli binaries (VW_BUILD_CLIENT targets,
+# defined in src/client/CMakeLists.txt), which don't exist in a
+# VW_BUILD_CLIENT=OFF configuration (e.g. the server-only Fuzz build) — CI
+# fix, 2026-09-16: CMake configure failed with "No target
+# vapourwault-updater" et al. when this file was still unconditionally
+# generating these three targets.
+if(VW_BUILD_CLIENT)
+
 # test_update_apply: TASK-00298 — vw_update_download_and_verify_asset()
 # and vw_update_stage_and_apply()'s extraction/payload-directory-resolution
 # logic. Compiles its own copy of vw_update_net.c + vw_update.c with
@@ -276,6 +285,8 @@ set_tests_properties(integration_updater_main PROPERTIES
     TIMEOUT 60
     LABELS  "integration;update"
 )
+
+endif() # VW_BUILD_CLIENT
 
 # test_file_list_vault_id: TASK-156 regression — FILE_LIST_RESP now carries
 # a per-entry vault_id (it never did before). Needs the full server module
