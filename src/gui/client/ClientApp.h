@@ -86,6 +86,18 @@ public:
      * (the switcher, "add account") that runs on the render thread. */
     void switch_active_account(uint32_t account_id);
 
+    /* Snapshot of the last update-availability status received from the
+     * daemon (background-thread updated, same ~2s cadence as
+     * cached_status_ — TASK-00300). render_update_banner() and the
+     * settings view's status display both read this instead of issuing
+     * their own IPC call every frame; "check for updates now" and the
+     * policy toggle still issue their own live calls, matching every
+     * other on-demand action elsewhere in this class. */
+    VwGuiUpdateStatus update_status_snapshot() {
+        std::lock_guard<std::mutex> lk(status_mutex_);
+        return cached_update_status_;
+    }
+
     /* Snapshot of the accounts list, refreshed by the background poll
      * thread every ~2s (same cadence as cached_status_) — the switcher UI
      * reads this instead of issuing its own IPC call every frame. */
@@ -139,6 +151,11 @@ public:
     bool ipc_version_list(const char *virtual_path, std::vector<VwGuiVersionEntry> *out, int *out_error_code);
     int  ipc_version_restore(const char *virtual_path, uint64_t version_id);
 
+    /* Client auto-update (TASK-00300). Daemon-global, not account-scoped. */
+    bool ipc_update_status(VwGuiUpdateStatus *out);
+    int  ipc_update_apply();
+    int  ipc_update_policy_set(uint8_t policy, uint8_t *out_policy);
+
     int  ipc_file_mkdir(uint64_t new_parent_dir_id, const char *name, uint64_t *out_dir_id);
     int  ipc_vault_create(uint64_t folder_file_id, char *passphrase, uint64_t *out_vault_id);
     int  ipc_vault_unlock(uint64_t vault_id, char *passphrase);
@@ -157,6 +174,7 @@ private:
 
     std::mutex      status_mutex_;
     VwIpcStatus     cached_status_;
+    VwGuiUpdateStatus cached_update_status_;
     std::vector<VwGuiAccountEntry> cached_accounts_;
     std::atomic_bool poll_running_{false};
     SDL_Thread     *poll_thread_ = nullptr;
@@ -178,5 +196,6 @@ private:
     void poll_loop();
     void try_connect();
     void render_offline_banner();
+    void render_update_banner();
     void render_account_switcher();
 };

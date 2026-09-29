@@ -20,8 +20,11 @@
 
 #include "vw_test.h"
 #include "vw_crypto.h"
+#include "vw_update_pubkey.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <mbedtls/pk.h>
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
@@ -402,6 +405,153 @@ VW_TEST_SUITE("vw_crypto") {
         uint8_t a[1] = {0xFF};
         uint8_t b[1] = {0x00};
         VW_ASSERT(vw_crypto_constant_time_eq(a, b, 0));
+    }
+
+    /* ── ECDSA P-256 signature verification (TASK-00293) ────────────────── */
+    /* Known-answer vectors generated with real OpenSSL (NOT this codebase's
+     * own signer, which doesn't exist — this is the actual production
+     * scenario: CI signs with `openssl dgst -sign`, the client verifies
+     * with vw_crypto_ecdsa_p256_verify). Proves real interop, not just
+     * internal self-consistency:
+     *   openssl ecparam -name prime256v1 -genkey -noout -out key.pem
+     *   openssl ec -in key.pem -pubout -outform DER | tail -c 65 | xxd -p
+     *   printf 'VaporWault update-manifest test vector' | \
+     *     openssl dgst -sha256 -sign key.pem | xxd -p
+     */
+    {
+        static const uint8_t kat_pubkey[VW_ECDSA_P256_PUBKEY_BYTES] = {
+            0x04, 0x14, 0x8b, 0x13, 0xcb, 0xed, 0xc3, 0xd1, 0x05, 0x68,
+            0xd0, 0xf3, 0x40, 0x36, 0xe3, 0xe1, 0x08, 0x06, 0x62, 0xa5,
+            0xd1, 0x5c, 0x7f, 0xa9, 0xf7, 0x3c, 0x22, 0x52, 0xe0, 0xce,
+            0xa4, 0xaa, 0x26, 0xf4, 0x03, 0x0d, 0x9e, 0x4a, 0xdd, 0x0b,
+            0x54, 0x44, 0x34, 0x6a, 0x86, 0xef, 0xe2, 0x27, 0x04, 0xcc,
+            0x97, 0x72, 0xc6, 0x2e, 0xfe, 0xe6, 0x73, 0xfb, 0xd6, 0x82,
+            0x91, 0x07, 0xee, 0x2d, 0x91
+        };
+        static const uint8_t kat_hash[VW_HASH_BYTES] = {
+            0xa3, 0xa7, 0x33, 0xf8, 0x26, 0x75, 0xfc, 0x7d, 0xd4, 0xe0,
+            0x88, 0x11, 0x3b, 0x6f, 0x88, 0xae, 0x62, 0xc6, 0xde, 0x91,
+            0x0b, 0x9a, 0x4d, 0xa7, 0xea, 0xcc, 0xa0, 0x68, 0xfb, 0xda,
+            0x45, 0xfb
+        };
+        static const uint8_t kat_sig[] = {
+            0x30, 0x44, 0x02, 0x20, 0x77, 0xc3, 0xec, 0xbe, 0x41, 0xe3,
+            0x2d, 0x66, 0x5b, 0xd4, 0x62, 0xcd, 0x21, 0xaa, 0xc1, 0x5a,
+            0x90, 0x4d, 0xcd, 0x4c, 0xc1, 0xd2, 0xcc, 0x1d, 0x27, 0x6d,
+            0x4a, 0xef, 0x6b, 0xb3, 0x82, 0x3c, 0x02, 0x20, 0x58, 0xd9,
+            0x39, 0xb0, 0x2a, 0x78, 0xa6, 0x2c, 0x65, 0x9e, 0x6a, 0xf4,
+            0xd0, 0x43, 0xd9, 0x30, 0x68, 0x6b, 0x0a, 0x4b, 0x94, 0xc7,
+            0x8f, 0x1c, 0xd4, 0x04, 0x65, 0xd7, 0xfd, 0x41, 0x20, 0x6e
+        };
+
+        VW_TEST_CASE("ecdsa_p256_verify: real OpenSSL-signed known-answer vector verifies") {
+            VW_ASSERT_OK(vw_crypto_ecdsa_p256_verify(kat_pubkey, kat_hash,
+                                                      kat_sig, sizeof(kat_sig)));
+        }
+
+        VW_TEST_CASE("ecdsa_p256_verify: flipped signature byte rejected") {
+            uint8_t bad_sig[sizeof(kat_sig)];
+            memcpy(bad_sig, kat_sig, sizeof(kat_sig));
+            bad_sig[10] ^= 0x01;
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(kat_pubkey, kat_hash,
+                                                       bad_sig, sizeof(bad_sig)),
+                          VW_ERR_CRYPTO_SIG_INVALID);
+        }
+
+        VW_TEST_CASE("ecdsa_p256_verify: flipped hash byte rejected") {
+            uint8_t bad_hash[VW_HASH_BYTES];
+            memcpy(bad_hash, kat_hash, VW_HASH_BYTES);
+            bad_hash[0] ^= 0x01;
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(kat_pubkey, bad_hash,
+                                                       kat_sig, sizeof(kat_sig)),
+                          VW_ERR_CRYPTO_SIG_INVALID);
+        }
+
+        VW_TEST_CASE("ecdsa_p256_verify: wrong public key rejected") {
+            uint8_t bad_pub[VW_ECDSA_P256_PUBKEY_BYTES];
+            memcpy(bad_pub, kat_pubkey, sizeof(bad_pub));
+            bad_pub[40] ^= 0x01; /* still starts with 0x04, still a "point" */
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(bad_pub, kat_hash,
+                                                       kat_sig, sizeof(kat_sig)),
+                          VW_ERR_CRYPTO_SIG_INVALID);
+        }
+
+        VW_TEST_CASE("ecdsa_p256_verify: non-0x04-prefixed pubkey rejected without touching mbedTLS") {
+            uint8_t bad_pub[VW_ECDSA_P256_PUBKEY_BYTES];
+            memcpy(bad_pub, kat_pubkey, sizeof(bad_pub));
+            bad_pub[0] = 0x02; /* compressed-point marker, unsupported */
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(bad_pub, kat_hash,
+                                                       kat_sig, sizeof(kat_sig)),
+                          VW_ERR_CRYPTO_SIG_INVALID);
+        }
+
+        VW_TEST_CASE("ecdsa_p256_verify: truncated/garbage DER signature rejected, no crash") {
+            uint8_t short_sig[4] = { 0x30, 0x02, 0x00, 0x00 };
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(kat_pubkey, kat_hash,
+                                                       short_sig, sizeof(short_sig)),
+                          VW_ERR_CRYPTO_SIG_INVALID);
+        }
+
+        VW_TEST_CASE("ecdsa_p256_verify: NULL arguments rejected") {
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(NULL, kat_hash, kat_sig, sizeof(kat_sig)),
+                          VW_ERR_INVALID_ARG);
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(kat_pubkey, NULL, kat_sig, sizeof(kat_sig)),
+                          VW_ERR_INVALID_ARG);
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(kat_pubkey, kat_hash, NULL, sizeof(kat_sig)),
+                          VW_ERR_INVALID_ARG);
+            VW_ASSERT_ERR(vw_crypto_ecdsa_p256_verify(kat_pubkey, kat_hash, kat_sig, 0),
+                          VW_ERR_INVALID_ARG);
+        }
+    }
+
+    /* ── Pubkey drift check (TASK-00293) ─────────────────────────────────
+     * The update-manifest signing public key is committed twice — as a
+     * human-readable .pem (packaging/signing/update-manifest-pubkey.pem)
+     * and as the compiled-in raw-bytes constant
+     * (src/core/vw_update_pubkey.h, VW_UPDATE_MANIFEST_PUBKEY) — since the
+     * client only ever trusts the compiled-in form, never a file loaded at
+     * runtime (see that header's own comment for why). This test parses
+     * the committed .pem independently, at test time, via mbedTLS's public
+     * API (never touching the header's own bytes as an input), and fails
+     * loudly the moment the two ever diverge — e.g. someone rotates the
+     * key and updates one committed representation but forgets the other. */
+    VW_TEST_CASE("vw_update_pubkey: compiled-in constant matches committed .pem") {
+        /* mbedtls_pk_parse_public_keyfile() is gated behind MBEDTLS_FS_IO,
+         * which this project's minimal mbedTLS config doesn't enable (file
+         * I/O goes through vw_fs.c elsewhere) — read the bytes ourselves
+         * and hand them to the buffer-based mbedtls_pk_parse_public_key()
+         * instead, same pattern vw_acme.c's account-key loader uses for
+         * the private-key equivalent. */
+        char pem_path[1024];
+        snprintf(pem_path, sizeof(pem_path), "%s/packaging/signing/update-manifest-pubkey.pem",
+                  VW_REPO_SOURCE_DIR);
+
+        FILE *f = fopen(pem_path, "rb");
+        VW_ASSERT(f != NULL);
+        uint8_t pem_buf[512];
+        size_t pem_len = fread(pem_buf, 1, sizeof(pem_buf) - 1, f);
+        fclose(f);
+        VW_ASSERT(pem_len > 0 && pem_len < sizeof(pem_buf) - 1);
+        pem_buf[pem_len] = '\0'; /* mbedtls_pk_parse_public_key needs the
+                                    NUL for PEM input; buflen includes it */
+
+        mbedtls_pk_context pk;
+        mbedtls_pk_init(&pk);
+        int ret = mbedtls_pk_parse_public_key(&pk, pem_buf, pem_len + 1);
+        VW_ASSERT_EQ(ret, 0);
+
+        uint8_t der[200];
+        int len = mbedtls_pk_write_pubkey_der(&pk, der, sizeof(der));
+        VW_ASSERT(len >= (int)VW_ECDSA_P256_PUBKEY_BYTES);
+
+        /* Same "uncompressed point is the last 65 bytes of the DER
+         * SubjectPublicKeyInfo" technique vw_acme.c's ec_pub_coords() and
+         * vw_crypto_ecdsa_p256_verify()'s own encoder rely on. */
+        const uint8_t *point = der + sizeof(der) - VW_ECDSA_P256_PUBKEY_BYTES;
+        VW_ASSERT_EQ(point[0], 0x04);
+        VW_ASSERT_MEM_EQ(point, VW_UPDATE_MANIFEST_PUBKEY, VW_ECDSA_P256_PUBKEY_BYTES);
+
+        mbedtls_pk_free(&pk);
     }
 
     vw_crypto_cleanup();

@@ -275,6 +275,41 @@ vw_err_t vw_crypto_totp_verify(const uint8_t *key, size_t key_len,
                                 int64_t unix_time,
                                 const char *code);
 
+/* ── ECDSA P-256 signature verification (TASK-00293) ────────────────────── */
+
+/*
+ * Raw uncompressed SEC1 point: 0x04 || X(32 bytes) || Y(32 bytes). This is
+ * the same 65-byte point layout the ACME module's ec_pub_coords/JWK code
+ * (src/server/vw_acme.c) already works with, just packaged as one buffer
+ * instead of split X/Y.
+ */
+#define VW_ECDSA_P256_PUBKEY_BYTES 65u
+
+/*
+ * Verify an ECDSA P-256 signature over a caller-supplied SHA-256 digest.
+ *
+ *   pubkey      : raw uncompressed point, VW_ECDSA_P256_PUBKEY_BYTES bytes,
+ *                 first byte MUST be 0x04 (uncompressed point marker) —
+ *                 rejected otherwise without ever reaching mbedTLS.
+ *   hash        : VW_HASH_BYTES (32) — a SHA-256 digest the caller already
+ *                 computed (e.g. via vw_crypto_sha256/_file over the exact
+ *                 bytes that were signed). This function does not hash
+ *                 anything itself.
+ *   sig_der/len : ASN.1 DER-encoded ECDSA signature, the format
+ *                 mbedtls_pk_sign()/OpenSSL's `dgst -sign` both produce
+ *                 natively for an EC key — no raw-R||S conversion needed.
+ *
+ * Returns VW_OK only if the signature cryptographically verifies against
+ * the given public key and hash. Any other outcome (malformed pubkey,
+ * malformed signature, or a mechanically valid signature that just doesn't
+ * match) returns VW_ERR_CRYPTO_SIG_INVALID — callers must treat all
+ * non-VW_OK results identically (reject), never branch on the specific
+ * failure reason.
+ */
+vw_err_t vw_crypto_ecdsa_p256_verify(const uint8_t pubkey[VW_ECDSA_P256_PUBKEY_BYTES],
+                                      const uint8_t hash[VW_HASH_BYTES],
+                                      const uint8_t *sig_der, size_t sig_der_len);
+
 /* ── Hex encoding ────────────────────────────────────────────────────────── */
 
 /*

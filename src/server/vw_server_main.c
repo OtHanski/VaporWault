@@ -822,6 +822,10 @@ int vw_server_main_run(int argc, char *argv[]) {
         vw_log(LOG_ERROR, "vw_server_ctx_open failed"); goto shutdown; }
     vw_server_ctx_set_file_stores(sctx, file_store, chunks);
     vw_server_ctx_set_oplog(sctx, oplog);
+    /* TASK-00294: advertise this build's version to connecting clients so
+     * an out-of-date one can learn about (and eventually self-update to)
+     * a newer release — see docs/PROTOCOL.md §6.4. */
+    vw_server_ctx_set_version(sctx, VW_VERSION_STRING);
     vw_storage_set_store(chunks, store);
 
     /* TASK-207: notification dispatch is independent of password recovery

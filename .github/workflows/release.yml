@@ -106,6 +106,16 @@ jobs:
           mkdir -p "$STAGE"
           cp build/bin/* "$STAGE"/
           cp README.md "$STAGE"/
+          # TASK-00301: marks this as the portable, self-update-capable
+          # distribution (vw_update_detect_install_kind(), TASK-00295) —
+          # present ONLY here, in the tarball staging dir, never in what
+          # CPack packages for .deb/.rpm below (confirmed: CPack's own
+          # install() rules are the sole source of .deb/.rpm contents and
+          # never read from this directory). vapourwault-updater is
+          # already included by the `cp build/bin/*` above — it's an
+          # ordinary target in src/client/CMakeLists.txt, built
+          # unconditionally alongside every other client binary.
+          touch "$STAGE/.vw-portable"
           tar czf "${STAGE}.tar.gz" "$STAGE"
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
@@ -127,31 +137,12 @@ jobs:
           sha256sum *.deb *.rpm > linux-packages.sha256
           cat linux-packages.sha256
 
-      # TASK-00288: detached GPG signatures over the .deb/.rpm artifacts and
-      # the checksum manifest, so a downloader can verify both file
-      # integrity (sha256) and real provenance (gpg) — see docs/RELEASE.md's
-      # signing section for the fingerprint, public key location, and
-      # verification steps. The private key/passphrase exist only as
-      # GitHub Actions secrets, imported into this ephemeral runner's
-      # keyring for this job's duration and discarded with it — never
-      # written to a committed file or build artifact. GitHub Actions
-      # masks both secrets automatically in log output since they're only
-      # ever referenced via `secrets.*`.
-      - name: Import GPG release signing key
-        env:
-          GPG_SIGNING_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_PRIVATE_KEY }}
-        run: echo "$GPG_SIGNING_PRIVATE_KEY" | gpg --batch --import
-
-      - name: Sign .deb/.rpm packages
-        env:
-          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
-        run: |
-          for f in *.deb *.rpm linux-packages.sha256; do
-            gpg --batch --yes --pinentry-mode loopback \
-                --local-user "$GPG_SIGNING_KEY_ID" \
-                --passphrase-fd 0 --detach-sign --armor "$f" <<< "$GPG_SIGNING_PASSPHRASE"
-          done
-
+      # TASK-00304: GPG signing of every release asset (this job's
+      # tarball/.deb/.rpm included) now happens once, centrally, in the
+      # `publish` job — after every platform's artifacts are downloaded
+      # there — rather than duplicated per-platform-job with the private
+      # key imported into a fresh ephemeral keyring on every runner. See
+      # `publish`'s own "Sign release assets with GPG" step.
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -161,7 +152,6 @@ jobs:
             vaporwault-${{ env.TAG }}-linux-x86_64.tar.gz.sha256
             *.deb
             *.rpm
-            *.asc
             linux-packages.sha256
           if-no-files-found: error
 
@@ -278,6 +268,10 @@ jobs:
           Copy-Item build/bin/*.exe $stage/
           Copy-Item third_party/SDL2/lib/x64/SDL2.dll $stage/
           Copy-Item README.md $stage/
+          # TASK-00301: see the Linux job's identical marker for the full
+          # rationale — portable/self-update-capable, present only here,
+          # never in what CPack packages for the .msi below.
+          New-Item -ItemType File -Force "$stage/.vw-portable" | Out-Null
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "$stage.zip.sha256" -Value "$hash  $stage.zip" -NoNewline -Encoding ascii
@@ -468,23 +462,207 @@ jobs:
     name: Publish GitHub Release
     needs: [build-linux, build-windows, build-android]
     runs-on: ubuntu-latest
-    # Manual workflow_dispatch runs are build-only dry runs — never publish a
-    # real release from one.
-    if: github.event_name == 'push'
+    # NOT gated to push-only at the job level (unlike before TASK-00301):
+    # a workflow_dispatch dry run still needs to exercise manifest
+    # generation/signing below, per that task's own acceptance criteria.
+    # Only the step that actually mutates the real GitHub Release (at the
+    # bottom of this job) is gated to real tag pushes.
     permissions:
-      contents: write   # only this job needs write access, for gh release create/upload
+      contents: write   # only the publish step below needs write access, for gh release create/upload
     steps:
+      - name: Checkout (no submodules needed — only reading src/core/vw_proto.h)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
       - name: Download artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
+
+      # TASK-00301: read-only, best-effort fetch of the CURRENTLY published
+      # manifest purely to learn its `sequence` — the rollback-ratchet
+      # ordering the client (TASK-00297) enforces depends on this counter
+      # only ever moving forward. A 404 (the very first release ever, or a
+      # dry run against a repo with none published) is expected, not a
+      # failure: sequence simply starts at 1. Uses the same stable
+      # `releases/latest/download/...` alias the client itself fetches
+      # from (never api.github.com), so this step exercises the identical
+      # URL shape a real client would hit.
+      - name: Fetch previous update-manifest sequence
+        run: |
+          set -e
+          PREV_SEQ=0
+          HTTP_CODE=$(curl -sL -o prev-manifest.json -w '%{http_code}' \
+            "https://github.com/$REPO/releases/latest/download/update-manifest.json")
+          if [ "$HTTP_CODE" = "200" ]; then
+            PREV_SEQ=$(jq -r '.sequence // 0' prev-manifest.json)
+          fi
+          echo "Previous sequence: $PREV_SEQ (HTTP $HTTP_CODE)"
+          echo "PREV_SEQUENCE=$PREV_SEQ" >> "$GITHUB_ENV"
+
+      # Builds from $PKG_VERSION-equivalent (TAG with its leading "v"
+      # stripped, same as every build job's own PKG_VERSION), the
+      # already-computed sequence above, and the Linux/Windows assets'
+      # own already-computed .sha256 sidecars (reused, not re-hashed —
+      # `dist/*-release/` was populated by each build job's own
+      # "Stage release archive" step). min_client_protocol_version is
+      # grepped directly from src/core/vw_proto.h rather than
+      # hand-duplicated here, so it can never silently drift out of sync
+      # with the real wire protocol version.
+      - name: Generate update-manifest.json
+        run: |
+          set -e
+          RELEASE_VERSION="${TAG#v}"
+          NEW_SEQ=$((PREV_SEQUENCE + 1))
+          MIN_PROTO=$(grep -oP '#define\s+VW_PROTO_VERSION_CURRENT\s+\(\(uint16_t\)\K[0-9]+' src/core/vw_proto.h)
+          PUBLISHED_AT=$(date +%s)
+
+          LINUX_FILE="vaporwault-${TAG}-linux-x86_64.tar.gz"
+          WINDOWS_FILE="vaporwault-${TAG}-windows-x86_64.zip"
+          LINUX_SHA=$(cut -d' ' -f1 "dist/linux-release/${LINUX_FILE}.sha256")
+          WINDOWS_SHA=$(cut -d' ' -f1 "dist/windows-release/${WINDOWS_FILE}.sha256")
+
+          jq -n \
+            --argjson schema_version 1 \
+            --argjson sequence "$NEW_SEQ" \
+            --arg release_version "$RELEASE_VERSION" \
+            --argjson min_client_protocol_version "$MIN_PROTO" \
+            --argjson published_at "$PUBLISHED_AT" \
+            --arg linux_file "$LINUX_FILE" --arg linux_sha "$LINUX_SHA" \
+            --arg windows_file "$WINDOWS_FILE" --arg windows_sha "$WINDOWS_SHA" \
+            '{
+              schema_version: $schema_version,
+              sequence: $sequence,
+              release_version: $release_version,
+              min_client_protocol_version: $min_client_protocol_version,
+              published_at: $published_at,
+              assets: [
+                {platform: "linux", arch: "x86_64", dist_kind: "portable", filename: $linux_file, sha256: $linux_sha},
+                {platform: "windows", arch: "x86_64", dist_kind: "portable", filename: $windows_file, sha256: $windows_sha}
+              ]
+            }' > update-manifest.json
+          cat update-manifest.json
+
+      # TASK-00293: signs the manifest's raw bytes (never a re-serialized/
+      # canonicalized form — the client verifies over the exact bytes it
+      # fetched, before ever parsing them as JSON) with the dedicated
+      # ECDSA P-256 key distinct from the GPG packaging key. The private
+      # key is materialized from the UPDATE_SIGNING_KEY secret into a
+      # runner-local temp file for this step only, removed again by the
+      # very next step regardless of outcome — never committed, never a
+      # build artifact, never logged (GitHub Actions masks it automatically
+      # since it's only ever referenced via `secrets.*`).
+      - name: Sign update-manifest.json
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -e
+          echo "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/update-signing-key.pem"
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/update-signing-key.pem" \
+            -out update-manifest.json.sig update-manifest.json
+
+      - name: Remove update-signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/update-signing-key.pem"
+
+      # TASK-00304: GPG signing of every release asset, centralized here —
+      # the private key is imported exactly once per release run, not
+      # duplicated across build-linux/build-windows/build-android as it
+      # was before this task (when only build-linux imported it, and only
+      # signed the .deb/.rpm/linux-packages.sha256 it itself produced,
+      # leaving the tarball/zip/apk/manifest unsigned). Same ephemeral-
+      # keyring custody as before: imported for this job's duration only,
+      # discarded with the runner at job end, never written to a
+      # committed file or build artifact, and GitHub Actions masks both
+      # secrets automatically since they're only ever referenced via
+      # `secrets.*`.
+      #
+      # Explicitly enumerated, not a blanket `dist/**/*` sweep — every
+      # asset TASK-00304's own design calls for (the Linux tarball,
+      # Windows zip, Android APK, update-manifest.json) plus the
+      # pre-existing .deb/.rpm/linux-packages.sha256 set (moved here from
+      # build-linux, not newly added). Deliberately excludes the .msi
+      # installers and windows-packages.sha256: the .msi's signing story
+      # is Authenticode, a separate, already-recorded "staying unsigned"
+      # decision (docs/RELEASE.md) that a GPG .asc wouldn't change
+      # anything about, and extending to windows-packages.sha256 without
+      # a corresponding user-facing decision to do so was judged outside
+      # this task's own explicit scope — see this task's own Notes for
+      # the reasoning, flagged for SEC.07/CQR.08 to weigh in on rather
+      # than assumed uncontroversial.
+      - name: Import GPG release signing key
+        env:
+          GPG_SIGNING_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_PRIVATE_KEY }}
+        run: echo "$GPG_SIGNING_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign release assets with GPG
+        env:
+          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: |
+          set -e
+          FILES_TO_SIGN=(
+            "dist/linux-release/vaporwault-${TAG}-linux-x86_64.tar.gz"
+            dist/linux-release/*.deb
+            dist/linux-release/*.rpm
+            "dist/linux-release/linux-packages.sha256"
+            "dist/windows-release/vaporwault-${TAG}-windows-x86_64.zip"
+            "dist/android-release/vaporwault-${TAG}-android.apk"
+            "update-manifest.json"
+          )
+          for f in "${FILES_TO_SIGN[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --local-user "$GPG_SIGNING_KEY_ID" \
+                --passphrase-fd 0 --detach-sign --armor "$f" <<< "$GPG_SIGNING_PASSPHRASE"
+          done
+
+      # TASK-00303 (QA regression suite, coverage item "every published
+      # release asset has a valid GPG signature that verifies against the
+      # committed public key"): previously only documented as a MANUAL
+      # step for a human to run (docs/RELEASE.md's own `gpg --verify`
+      # instructions) — nothing actually re-checked it before publish.
+      # This gates the "Create or update GitHub Release" step below: if
+      # signing ever produced a bad .asc (or the private signing key's
+      # secret ever drifted from the committed public key), the release
+      # fails here, before anything is published, on every real release
+      # AND every workflow_dispatch dry run alike (this step runs before
+      # the `if: github.event_name == 'push'` gate). Uses an isolated
+      # --homedir containing ONLY the committed public key — never the
+      # just-imported private signing key's own keyring — so this
+      # specifically proves "verifies against the committed public key",
+      # not merely "verifies against whatever happens to be in the
+      # keyring already". Same file list as the signing step above.
+      - name: Verify GPG signatures against the committed public key
+        run: |
+          set -e
+          VERIFY_GNUPGHOME="$RUNNER_TEMP/gpg-verify-home"
+          mkdir -p "$VERIFY_GNUPGHOME"
+          chmod 700 "$VERIFY_GNUPGHOME"
+          gpg --homedir "$VERIFY_GNUPGHOME" --batch --import \
+              packaging/signing/vaporwault-releases-pubkey.asc
+          FILES_TO_SIGN=(
+            "dist/linux-release/vaporwault-${TAG}-linux-x86_64.tar.gz"
+            dist/linux-release/*.deb
+            dist/linux-release/*.rpm
+            "dist/linux-release/linux-packages.sha256"
+            "dist/windows-release/vaporwault-${TAG}-windows-x86_64.zip"
+            "dist/android-release/vaporwault-${TAG}-android.apk"
+            "update-manifest.json"
+          )
+          for f in "${FILES_TO_SIGN[@]}"; do
+            gpg --homedir "$VERIFY_GNUPGHOME" --batch --verify "${f}.asc" "$f"
+          done
+          rm -rf "$VERIFY_GNUPGHOME"
 
       # Re-running this workflow for a tag that was already published (e.g. after
       # a transient failure) uploads/overwrites assets instead of hard-failing
       # with "release already exists". TAG/REPO come from workflow-level `env:`
       # (never interpolated directly from a `${{ }}` expression into a shell
       # script) — same rationale as the build jobs' staging steps.
+      #
+      # Manual workflow_dispatch runs are build-only dry runs — never publish
+      # a real release from one (everything above this step still runs, so a
+      # dry run still exercises manifest generation/signing end-to-end).
       - name: Create or update GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -493,6 +671,9 @@ jobs:
               dist/linux-release/* \
               dist/windows-release/* \
               dist/android-release/* \
+              update-manifest.json \
+              update-manifest.json.sig \
+              update-manifest.json.asc \
               --repo "$REPO" \
               --clobber
           else
@@ -500,6 +681,9 @@ jobs:
               dist/linux-release/* \
               dist/windows-release/* \
               dist/android-release/* \
+              update-manifest.json \
+              update-manifest.json.sig \
+              update-manifest.json.asc \
               --repo "$REPO" \
               --title "VaporWault $TAG" \
               --generate-notes

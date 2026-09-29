@@ -5,6 +5,9 @@ set(VW_CLIENT_SOURCES
     vw_vault.c
     vw_sync.c
     vw_cache.c
+    vw_update_net.c
+    vw_update_manifest.c
+    vw_update.c
 )
 
 if(UNIX)
@@ -43,3 +46,13 @@ target_link_libraries(vapourwault-cli PRIVATE vw_core vw_version)
 if(WIN32)
     target_link_libraries(vapourwault-cli PRIVATE ws2_32)
 endif()
+
+# Update helper (TASK-00298) — deliberately no vw_core/vw_version linkage,
+# just raw file rename/unlink + wait-for-pid + spawn-process, so it can
+# safely swap the daemon binary (and, in principle, anything else this
+# update might replace) without depending on any file it might be
+# replacing. Ships inside the portable tar.gz/zip archives (TASK-00301),
+# never installed via CPack's .deb/.rpm/.msi rules.
+add_executable(vapourwault-updater
+    vw_updater_main.c
+)

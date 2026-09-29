@@ -22,7 +22,7 @@ vw_err_t VwServerConn::connect(const char *host, uint16_t port,
         return rc;
 
     /* Version negotiation: client side */
-    rc = vw_proto_negotiate(conn_, /*is_server=*/0, &proto_version_);
+    rc = vw_proto_negotiate(conn_, /*is_server=*/0, &proto_version_, NULL, NULL);
     if (rc != VW_OK) {
         vw_net_close(conn_);
         conn_ = nullptr;

@@ -160,10 +160,64 @@ vw_err_t vw_proto_recv(vw_conn_t *conn, vw_msg_type_t *out_type,
     return VW_OK;
 }
 
+/*
+ * TASK-00292: append the optional update-hint block (update_ext_ver u8 +
+ * server_version_len u8 + ASCII bytes) to a HELLO_OK/VERSION_REJECT payload
+ * already written up to *o. No-op (block omitted) when server_version is
+ * NULL/empty, which keeps the message at its original fixed size — old
+ * clients never see anything different from before this task.
+ */
+static void append_update_hint(uint8_t *b, uint32_t sz, uint32_t *o,
+                                const char *server_version) {
+    if (server_version == NULL || server_version[0] == '\0') return;
+
+    size_t len = strlen(server_version);
+    if (len > VW_UPDATE_HINT_VERSION_MAXLEN) len = VW_UPDATE_HINT_VERSION_MAXLEN;
+
+    /* Best-effort: these buffers are always sized generously enough by
+     * every call site below (18+2+31=51 and 4+2+31=37, both well under
+     * the 64/reject-sized stack buffers used), so failure here would be
+     * a caller bug, not a runtime condition to recover from. */
+    (void)pw_u8(b, sz, o, VW_UPDATE_EXT_VERSION_1);
+    (void)pw_u8(b, sz, o, (uint8_t)len);
+    (void)pw_raw(b, sz, o, server_version, (uint32_t)len);
+}
+
+/*
+ * TASK-00292: parse the optional trailing update-hint block out of an
+ * already-received HELLO_OK/VERSION_REJECT payload. known_fields_len is
+ * the size of the message's fixed portion (18 for HELLO_OK, 4 for
+ * VERSION_REJECT) — anything beyond that in plen is the extension.
+ * Never fails: a malformed/truncated/unrecognized-version extension is
+ * simply treated as absent (out_hint->present = 0) rather than rejecting
+ * an otherwise-valid handshake over a cosmetic hint.
+ */
+static void parse_update_hint(const uint8_t *payload, uint32_t plen,
+                               uint32_t known_fields_len,
+                               vw_proto_update_hint_t *out_hint) {
+    out_hint->present = 0;
+    out_hint->server_version[0] = '\0';
+
+    if (plen <= known_fields_len) return; /* no extension present */
+
+    uint32_t o = known_fields_len;
+    uint8_t ext_ver = 0, vlen = 0;
+    if (pr_u8(payload, plen, &o, &ext_ver) != VW_OK) return;
+    if (ext_ver != VW_UPDATE_EXT_VERSION_1)          return; /* unknown — treat as absent */
+    if (pr_u8(payload, plen, &o, &vlen) != VW_OK)    return;
+    if (vlen > VW_UPDATE_HINT_VERSION_MAXLEN)        return;
+    if (pr_raw(payload, plen, &o, out_hint->server_version, vlen) != VW_OK) return;
+
+    out_hint->server_version[vlen] = '\0';
+    out_hint->present = 1;
+}
+
 /* ── Version negotiation ─────────────────────────────────────────────────── */
 
 vw_err_t vw_proto_negotiate(vw_conn_t *conn, int is_server,
-                             uint16_t *out_version) {
+                             uint16_t *out_version,
+                             const char *server_version,
+                             vw_proto_update_hint_t *out_hint) {
     if (is_server) {
         /* Server: wait for HELLO, then send HELLO_OK or VERSION_REJECT */
         vw_msg_type_t type;
@@ -179,21 +233,27 @@ vw_err_t vw_proto_negotiate(vw_conn_t *conn, int is_server,
 
         /* We only support VW_PROTO_VERSION_CURRENT */
         if (client_max < VW_PROTO_VERSION_CURRENT) {
-            uint8_t reject[4];
-            vw_write_u16le(reject + 0, VW_PROTO_VERSION_CURRENT);  /* our min */
-            vw_write_u16le(reject + 2, VW_PROTO_VERSION_CURRENT);  /* our max */
+            uint8_t reject[4 + 2 + VW_UPDATE_HINT_VERSION_MAXLEN];
+            uint32_t o = 0;
+            (void)pw_u16(reject, sizeof(reject), &o, VW_PROTO_VERSION_CURRENT); /* our min */
+            (void)pw_u16(reject, sizeof(reject), &o, VW_PROTO_VERSION_CURRENT); /* our max */
+            append_update_hint(reject, sizeof(reject), &o, server_version);
             /* ignore send error — we're closing the connection immediately after */
-            (void)vw_proto_send(conn, VW_MSG_VERSION_REJECT, reject, sizeof(reject));
+            (void)vw_proto_send(conn, VW_MSG_VERSION_REJECT, reject, o);
             return VW_ERR_PROTO_VERSION;
         }
 
-        /* HELLO_OK: negotiated_version (2 bytes) + server_id (16 bytes) */
+        /* HELLO_OK: negotiated_version (2 bytes) + server_id (16 bytes)
+         * + optional update-hint block */
         uint16_t negotiated = VW_PROTO_VERSION_CURRENT;
-        uint8_t hello_ok[18];
-        vw_write_u16le(hello_ok, negotiated);
-        memset(hello_ok + 2, 0, 16);  /* server_id: zeroed (filled in by caller later) */
+        uint8_t hello_ok[18 + 2 + VW_UPDATE_HINT_VERSION_MAXLEN];
+        uint32_t o = 0;
+        (void)pw_u16(hello_ok, sizeof(hello_ok), &o, negotiated);
+        memset(hello_ok + o, 0, 16);  /* server_id: zeroed (filled in by caller later) */
+        o += 16;
+        append_update_hint(hello_ok, sizeof(hello_ok), &o, server_version);
 
-        err = vw_proto_send(conn, VW_MSG_HELLO_OK, hello_ok, sizeof(hello_ok));
+        err = vw_proto_send(conn, VW_MSG_HELLO_OK, hello_ok, o);
         if (err != VW_OK) return err;
 
         *out_version = negotiated;
@@ -212,12 +272,23 @@ vw_err_t vw_proto_negotiate(vw_conn_t *conn, int is_server,
         err = vw_proto_recv(conn, &type, payload, sizeof(payload), &plen);
         if (err != VW_OK) return err;
 
-        if (type == VW_MSG_VERSION_REJECT) return VW_ERR_PROTO_VERSION;
+        if (type == VW_MSG_VERSION_REJECT) {
+            if (out_hint != NULL) {
+                if (plen < 4) { out_hint->present = 0; out_hint->server_version[0] = '\0'; }
+                else parse_update_hint(payload, plen, 4, out_hint);
+            }
+            return VW_ERR_PROTO_VERSION;
+        }
         if (type != VW_MSG_HELLO_OK)       return VW_ERR_PROTO_INVALID;
         if (plen < 2)                      return VW_ERR_PROTO_INVALID;
 
         *out_version = vw_read_u16le(payload);
         if (*out_version != VW_PROTO_VERSION_CURRENT) return VW_ERR_PROTO_VERSION;
+
+        if (out_hint != NULL) {
+            if (plen < 18) { out_hint->present = 0; out_hint->server_version[0] = '\0'; }
+            else parse_update_hint(payload, plen, 18, out_hint);
+        }
     }
 
     return VW_OK;

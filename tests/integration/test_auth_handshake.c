@@ -321,6 +321,8 @@ VW_TEST_SUITE("auth_handshake") {
 
     vw_server_ctx_t *srv_ctx = NULL;
     VW_ASSERT_EQ(vw_server_ctx_open(auth, store, NULL, &srv_ctx), VW_OK);
+    /* TASK-00294: exercised by the new TC-4 below. */
+    vw_server_ctx_set_version(srv_ctx, "9.9.9-real-server-test");
 
     vw_client_cfg_t cli_cfg;
     memset(&cli_cfg, 0, sizeof(cli_cfg));
@@ -403,6 +405,31 @@ VW_TEST_SUITE("auth_handshake") {
             VW_ASSERT_EQ(vw_client_user_id_of(sess), test_uid);
             vw_client_close(sess);
         }
+    }
+
+    /* ── TC-4: real vw_server_ctx_set_version() reaches a real client
+     * (TASK-00294) — connects and negotiates only, no AUTH_REQUEST, proving
+     * the wiring from ctx config through vw_server_conn_handle's real
+     * vw_proto_negotiate call site all the way to the wire ────────────── */
+    VW_TEST_CASE("server advertises its configured version via update-hint") {
+        pthread_t tid = spawn_server(&sa, 1);
+        VW_ASSERT_EQ(sa.bind_err, VW_OK);
+
+        vw_conn_t *conn = NULL;
+        VW_ASSERT_EQ(vw_net_connect("127.0.0.1", (uint16_t)TEST_PORT,
+                                     VW_CERT_VERIFY_NONE, NULL, NULL, &conn), VW_OK);
+
+        uint16_t version;
+        vw_proto_update_hint_t hint;
+        vw_err_t err = vw_proto_negotiate(conn, 0, &version, NULL, &hint);
+        VW_ASSERT_EQ(err, VW_OK);
+        VW_ASSERT_EQ(hint.present, 1);
+        VW_ASSERT(strcmp(hint.server_version, "9.9.9-real-server-test") == 0);
+
+        vw_net_close(conn); /* closing without AUTH_REQUEST — server's next
+                                recv sees VW_ERR_NET_CLOSED promptly, not a
+                                10s auth-timeout wait */
+        join_server(tid, &sa);
     }
 
     /* ── Teardown ────────────────────────────────────────────────────────── */

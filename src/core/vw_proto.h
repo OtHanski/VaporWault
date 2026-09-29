@@ -78,6 +78,11 @@ typedef enum {
 
     /* Crypto */
     VW_ERR_CRYPTO             = 500,
+    VW_ERR_CRYPTO_SIG_INVALID = 501,  /* TASK-00293: vw_crypto_ecdsa_p256_verify —
+                                          signature does not verify against the
+                                          given public key/hash, or the
+                                          signature/public key bytes are
+                                          malformed */
 
     /* File transfer */
     VW_ERR_CHUNK_HASH_MISMATCH = 600,  /* uploaded chunk SHA-256 != declared hash   */
@@ -124,6 +129,33 @@ typedef enum {
                                           currently connected to its read-only
                                           fallback server, not the primary; never
                                           sent over the wire, IPC-response only  */
+
+    /* Client-local update engine (TASK-00293; never sent over the wire —
+     * these describe failures in the client's own GitHub-manifest fetch/
+     * verify pipeline, not anything the VaporWault server can report) */
+    VW_ERR_UPDATE_MANIFEST_INVALID  = 802,  /* update-manifest signature check
+                                                failed, or the (already-verified)
+                                                bytes don't match the expected
+                                                fixed schema */
+    VW_ERR_UPDATE_MANIFEST_ROLLBACK = 803,  /* a validly-signed manifest whose
+                                                sequence number is below the
+                                                locally persisted ratchet —
+                                                rejected as a replay/downgrade
+                                                attempt */
+    VW_ERR_UPDATE_NET               = 804,  /* vw_update_net (outbound HTTPS to
+                                                GitHub) failed: TLS, timeout, bad
+                                                redirect, oversized response, etc. */
+    VW_ERR_UPDATE_ASSET_MISMATCH    = 805,  /* downloaded release asset's SHA-256
+                                                does not match the verified
+                                                manifest's declared value */
+    VW_ERR_UPDATE_NOT_PORTABLE      = 806,  /* self-replacing update refused:
+                                                vw_update_detect_install_kind()
+                                                did not report
+                                                VW_UPDATE_KIND_PORTABLE — a
+                                                .deb/.rpm/.msi (or unknown)
+                                                install is never
+                                                self-replaced (SEC.07 finding,
+                                                TASK-00298) */
 } vw_err_t;
 
 /* ── Message types ───────────────────────────────────────────────────────── */
@@ -402,6 +434,22 @@ typedef struct {
     uint16_t max_version;
 } vw_payload_version_reject_t;
 
+/*
+ * TASK-00292: optional trailing block appended to both HELLO_OK and
+ * VERSION_REJECT (after their fixed fields above), additive and NOT
+ * covered by VW_PROTO_VERSION_CURRENT — see docs/PROTOCOL.md's revision
+ * entry for this task. A reader that doesn't understand update_ext_ver
+ * simply treats the block as absent; a sender that has nothing to
+ * advertise omits it entirely (message stays its original fixed size).
+ */
+#define VW_UPDATE_EXT_VERSION_1        1u
+#define VW_UPDATE_HINT_VERSION_MAXLEN  31u  /* server_version_len is a u8 <= this */
+
+typedef struct {
+    int  present;                            /* 1 if the server sent an update-hint block */
+    char server_version[VW_UPDATE_HINT_VERSION_MAXLEN + 1]; /* NUL-terminated; "" if !present */
+} vw_proto_update_hint_t;
+
 typedef struct {
     uint32_t error_code;     /* vw_err_t */
     /* variable: string message */
@@ -664,9 +712,27 @@ vw_err_t vw_proto_recv(vw_conn_t *conn, vw_msg_type_t *out_type,
  * Version negotiation. Server: is_server=1. Client: is_server=0.
  * After calling this, both sides have agreed on *out_version.
  * Returns VW_ERR_PROTO_VERSION if no common version exists.
+ *
+ * server_version (TASK-00292): server-side input only, ignored when
+ * is_server=0 (pass NULL from client call sites). The software version
+ * string (e.g. VW_VERSION_STRING) the server should advertise in the
+ * trailing update-hint block of whichever of HELLO_OK/VERSION_REJECT it
+ * ends up sending. NULL or "" omits the block entirely (message stays its
+ * original fixed size — this is the default/legacy behavior). Must be
+ * <= VW_UPDATE_HINT_VERSION_MAXLEN bytes; longer values are silently
+ * truncated rather than failing negotiation over a cosmetic string.
+ *
+ * out_hint (TASK-00292): client-side output only, ignored when is_server=1
+ * (server call sites pass NULL). Populated with whatever update-hint block
+ * the server sent, on BOTH the success (HELLO_OK) path and the
+ * VW_ERR_PROTO_VERSION (VERSION_REJECT) path — the caller's session object
+ * may not survive a rejected negotiation, so this is the only place the
+ * hint can be captured. May be NULL if the caller doesn't care.
  */
 vw_err_t vw_proto_negotiate(vw_conn_t *conn, int is_server,
-                             uint16_t *out_version);
+                             uint16_t *out_version,
+                             const char *server_version,
+                             vw_proto_update_hint_t *out_hint);
 
 /* ── Serialisation helpers (write into a caller-provided buffer) ──────────── */
 
